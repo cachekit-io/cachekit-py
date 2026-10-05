@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import faulthandler
 import logging
+import math
 import os
 import sys
 import threading
@@ -247,6 +248,20 @@ class TestSWRConfig:
 
         assert compute() == "v"
         assert backend.set_calls == [(ttl, 100)]
+
+    def test_preset_default_window_fits_the_cap_after_rounding(self) -> None:
+        """A fractional ttl is ceiled on the wire, so the derived window is bounded by the ceiled TTL."""
+        backend = FakeSWRBackend()
+        ttl = _CAP / 2 + 0.5  # goes out as 1_296_001
+        config = DecoratorConfig(backend=backend, ttl=ttl, swr_by_default=True)  # type: ignore[arg-type]
+
+        @cache(config=config)
+        def compute() -> str:
+            return "v"
+
+        assert compute() == "v"
+        assert backend.set_calls == [(ttl, _CAP // 2 - 1)]
+        assert math.ceil(ttl) + backend.set_calls[0][1] == _CAP
 
     def test_stale_ttl_without_ttl_raises(self) -> None:
         with pytest.raises(ConfigurationError, match="requires a positive ttl"):
