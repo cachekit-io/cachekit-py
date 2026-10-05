@@ -7,6 +7,7 @@ import copy
 import functools
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -883,7 +884,10 @@ def create_cache_wrapper(
         # Preset default (io()): stale window = ttl, capped so the total stays
         # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
         # above the cap leaves no window headroom -> no default (never negative).
-        _default_window = min(ttl, _max_total_ttl - ttl)
+        # Derived from the TTL as the wire sends it (whole seconds, ceiled), so a
+        # fractional ttl near the cap cannot round the sum past it into a 400.
+        _wire_ttl = math.ceil(ttl)
+        _default_window = min(_wire_ttl, _max_total_ttl - _wire_ttl)
         _stale_ttl = _default_window if _default_window > 0 else None
 
     _l2_swr_active = _stale_ttl is not None
