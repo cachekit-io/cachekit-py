@@ -13,6 +13,7 @@ This module implements BaseBackend protocol for filesystem-based caching with:
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import logging
@@ -171,7 +172,7 @@ class FileBackend:
 
     Security:
         - Uses O_NOFOLLOW to prevent symlink attacks
-        - Uses os.path.realpath() to resolve paths
+        - Resolves cache_dir with os.path.realpath() once, at construction; every op uses that path
         - Respects permissions and dir_permissions from config
         - Blake2b hashing prevents directory traversal attacks
 
@@ -212,6 +213,10 @@ class FileBackend:
                 original_exception=exc,
                 operation="init",
             ) from exc
+
+        # Resolved once: a relative cache_dir stays pinned to the init-time cwd, and no op pays a
+        # realpath (one lstat per path component).
+        self._cache_dir = os.path.realpath(config.cache_dir)
 
         # Cleanup orphaned temp files on startup
         self._cleanup_temp_files()
@@ -441,52 +446,52 @@ class FileBackend:
         # Generate temp file name
         temp_path = self._generate_temp_path(file_path)
 
-        with self._lock:
+        committed = False
+        try:
+            # Check entry count BEFORE write (security: prevent file persisting on error)
+            with self._lock:
+                self._check_entry_capacity(self._regular_file_size(file_path))
+
+            # Write and fsync OUTSIDE self._lock, as set_streaming does: holding it through the
+            # fsync made every get/exists/delete in this process wait out the whole set(). The temp
+            # path is unique per pid+ns and the commit below re-checks under the lock.
+            # Write to temp file with O_NOFOLLOW for security.
+            fd = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                self.config.permissions,
+            )
             try:
-                # Check entry count BEFORE write (security: prevent file persisting on error)
-                old_size = self._regular_file_size(file_path)
-                self._check_entry_capacity(old_size)
+                # Acquire exclusive write lock
+                self._acquire_file_lock(fd, exclusive=True)
 
-                # Write to temp file with O_NOFOLLOW for security
-                fd = os.open(
-                    temp_path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    self.config.permissions,
-                )
                 try:
-                    # Acquire exclusive write lock
-                    self._acquire_file_lock(fd, exclusive=True)
+                    # Write all data
+                    _write_fully(fd, file_data)
 
-                    try:
-                        # Write all data
-                        _write_fully(fd, file_data)
+                    # fsync to ensure data is on disk
+                    os.fsync(fd)
 
-                        # fsync to ensure data is on disk
-                        os.fsync(fd)
-
-                    finally:
-                        self._release_file_lock(fd)
                 finally:
-                    os.close(fd)
+                    self._release_file_lock(fd)
+            finally:
+                os.close(fd)
 
-                # Atomic rename (POSIX guarantees atomicity)
-                os.rename(temp_path, file_path)
-                self._note_write(old_size, len(file_data))
+            self._commit(temp_path, file_path, len(file_data))
+            committed = True
 
-                # Trigger eviction if over threshold
-                self._maybe_evict()
-
-            except OSError as exc:
-                # Clean up temp file if it exists
+        except OSError as exc:
+            raise BackendError(
+                f"Failed to write cache file: {exc}",
+                error_type=self._classify_os_error(exc, is_directory=False),
+                original_exception=exc,
+                operation="set",
+                key=key,
+            ) from exc
+        finally:
+            # Any failure, including a commit rejected at max_entry_count, discards the temp file.
+            if not committed:
                 self._safe_unlink(temp_path)
-
-                raise BackendError(
-                    f"Failed to write cache file: {exc}",
-                    error_type=self._classify_os_error(exc, is_directory=False),
-                    original_exception=exc,
-                    operation="set",
-                    key=key,
-                ) from exc
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: int | None = None) -> None:
         """Store a streamed value with the same atomicity, locking, and limits as ``set`` (LAB-766).
@@ -522,8 +527,8 @@ class FileBackend:
             with self._lock:
                 self._check_entry_capacity(self._regular_file_size(file_path))
 
-            # Stream OUTSIDE self._lock: unlike set()'s bounded os.write, the producer runs
-            # the whole serialization here (minutes for multi-GB frames), and holding the
+            # Stream OUTSIDE self._lock, as set() writes: the producer runs the whole
+            # serialization here (minutes for multi-GB frames), and holding the
             # process-wide lock would block every other FileBackend op for that window. The
             # in-process lock isn't what makes this safe anyway — the temp path is unique
             # per pid+ns, the flock gives cross-process exclusion, and the rename commit
@@ -564,16 +569,8 @@ class FileBackend:
                 else:
                     os.close(fd)
 
-            # Commit under the process lock: atomic rename + eviction bookkeeping only.
-            with self._lock:
-                # Sized again here, not at the capacity check: the stream ran outside the lock.
-                old_size = self._regular_file_size(file_path)
-                os.rename(temp_path, file_path)
-                committed = True
-                self._note_write(old_size, file_size)
-
-                # Trigger eviction if over threshold
-                self._maybe_evict()
+            self._commit(temp_path, file_path, file_size)
+            committed = True
 
         except OSError as exc:
             raise BackendError(
@@ -768,10 +765,13 @@ class FileBackend:
         Returns None when the key is missing, permanent (expiry field == 0), or already
         expired. Expired/corrupt entries are unlinked on read, mirroring ``get``/``exists``.
 
-        The sync file I/O inside an ``async`` signature intentionally matches the Redis
-        provider (async method wrapping a blocking client call); local disk reads are fast
-        and this keeps every backend's TTLInspectableBackend surface uniform.
+        Runs in a worker thread, as the async get/set paths do: on the event-loop thread it
+        would stall every coroutine while it waits for the process lock (LAB-7076).
         """
+        return await asyncio.to_thread(self._get_ttl, key)
+
+    def _get_ttl(self, key: str) -> int | None:
+        """Blocking body of ``get_ttl``."""
         file_path = self._key_to_path(key)
 
         with self._lock:
@@ -830,7 +830,13 @@ class FileBackend:
         ``ttl`` of 0 makes the entry permanent, matching ``set``. No on-disk format change:
         only bytes [6:14] are rewritten, so the payload and all other header fields are
         untouched (and cross-SDK File readers stay compatible).
+
+        Runs in a worker thread, like ``get_ttl``: its fsync would otherwise block the event loop.
         """
+        return await asyncio.to_thread(self._refresh_ttl, key, ttl)
+
+    def _refresh_ttl(self, key: str, ttl: int) -> bool:
+        """Blocking body of ``refresh_ttl``."""
         # Same TTL bounds as set()/set_streaming (security: prevent integer overflow/underflow).
         new_expiry = self._expiry_from_ttl(ttl)
 
@@ -954,6 +960,26 @@ class FileBackend:
             return None
         return st.st_size if stat.S_ISREG(st.st_mode) else None
 
+    def _commit(self, temp_path: str, file_path: str, new_size: int) -> None:
+        """Rename a written, fsynced temp file onto ``file_path`` under the process lock.
+
+        The entry is sized and the entry cap checked again here: the write ran outside the lock, so
+        concurrent new-key writers may all have passed the check before it. Only the rename, the
+        counters and the eviction check run under the lock.
+
+        Raises:
+            BackendError: If the entry is new and max_entry_count is reached; the caller discards
+                the temp file
+        """
+        with self._lock:
+            old_size = self._regular_file_size(file_path)
+            self._check_entry_capacity(old_size)
+            os.rename(temp_path, file_path)
+            self._note_write(old_size, new_size)
+
+            # Trigger eviction if over threshold
+            self._maybe_evict()
+
     def _note_write(self, old_size: int | None, new_size: int) -> None:
         """Count an entry this process just renamed into place (caller holds self._lock)."""
         if old_size is None:
@@ -976,7 +1002,7 @@ class FileBackend:
         """
         # Use blake2b with 16 bytes digest = 32 hex chars
         key_hash = hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
-        return os.path.join(os.path.realpath(self.config.cache_dir), key_hash)
+        return os.path.join(self._cache_dir, key_hash)
 
     def _generate_temp_path(self, target_path: str) -> str:
         """Generate unique temp file path for atomic write.
@@ -1037,7 +1063,7 @@ class FileBackend:
     def _cleanup_temp_files(self) -> None:
         """Delete orphaned temp files older than 60 seconds on startup."""
         try:
-            cache_dir = Path(self.config.cache_dir)
+            cache_dir = Path(self._cache_dir)
             current_time = time.time()
 
             for temp_file in cache_dir.glob("*.tmp.*"):
@@ -1066,7 +1092,7 @@ class FileBackend:
         """
         entries = []
         try:
-            with os.scandir(self.config.cache_dir) as it:
+            with os.scandir(self._cache_dir) as it:
                 for entry in it:
                     if entry.name.startswith(".") or ".tmp." in entry.name:
                         continue
@@ -1090,7 +1116,7 @@ class FileBackend:
             _warn_throttled(
                 _scan_failed_warn,
                 "FileBackend could not scan %s (%s); the entry counters keep their last values until a scan succeeds",
-                self.config.cache_dir,
+                self._cache_dir,
                 errno.errorcode.get(exc.errno or 0, type(exc).__name__),
             )
             return None

@@ -163,6 +163,32 @@ class TestFileBackendTTLInspection:
         with pytest.raises(BackendError):
             await file_backend.refresh_ttl("k", 100)
 
+    async def test_ttl_ops_leave_the_event_loop_free_while_the_lock_is_held(self, file_backend: FileBackend) -> None:
+        """LAB-7076: get_ttl/refresh_ttl wait for the process lock in a worker thread, not on the loop."""
+        import threading
+
+        file_backend.set("k", b"v", ttl=100)
+        held, release = threading.Event(), threading.Event()
+
+        def hold_lock() -> None:  # stands in for a set() committing on another thread
+            with file_backend._lock:
+                held.set()
+                release.wait(2)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert held.wait(2)
+        try:
+            tasks = [asyncio.ensure_future(file_backend.get_ttl("k")), asyncio.ensure_future(file_backend.refresh_ttl("k", 200))]
+            await asyncio.sleep(0.05)  # the loop runs on while both wait for the lock
+            assert not any(t.done() for t in tasks), "a TTL op blocked the event loop on the process lock"
+        finally:
+            release.set()
+            holder.join(2)
+        remaining, refreshed = await asyncio.gather(*tasks)
+        assert remaining is not None and 0 < remaining <= 200  # either order: before or after the refresh
+        assert refreshed is True
+
 
 # ----------------------------------------------------------------------- Memcached
 
@@ -494,10 +520,9 @@ class TestFileRefreshEndToEnd:
 
         with time_machine.travel(4050.0, tick=False):
             assert await fetch() == 1  # hit; remaining 50 < 90 -> triggers refresh, expiry->4150
-            # Drain any background refresh task the wrapper may have scheduled (File async
-            # methods do sync work, so a couple of loop yields fully complete it).
-            for _ in range(5):
-                await asyncio.sleep(0)
+            # Drain the background refresh task the wrapper scheduled (File's TTL methods run
+            # in a worker thread, so loop yields alone do not complete it).
+            await asyncio.gather(*(t for t in asyncio.all_tasks() if t is not asyncio.current_task()))
 
         with time_machine.travel(4120.0, tick=False):
             # Original expiry (4100) has passed. If the refresh worked, expiry is 4150 > 4120,

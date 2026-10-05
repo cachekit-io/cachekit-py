@@ -791,6 +791,23 @@ class TestCacheDirStructure:
         # File should exist (permissions may vary by OS)
         assert cache_files[0].exists()
 
+    def test_relative_cache_dir_is_resolved_once_at_init(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LAB-7076: writes, scans and eviction all stay in the init-time directory after a chdir."""
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        monkeypatch.chdir(tmp_path / "a")
+        backend = FileBackend(FileBackendConfig(cache_dir=Path("cache"), max_entry_count=100))
+        monkeypatch.chdir(tmp_path / "b")
+
+        backend.set("k", b"v")
+        assert backend.get("k") == b"v"
+        assert Path(backend._key_to_path("k")).parent == tmp_path / "a" / "cache"
+        for i in range(90):  # 91 > 90: the scan and the eviction must see the init-time directory
+            backend.set(f"fill{i}", b"v")
+        assert len(list((tmp_path / "a" / "cache").iterdir())) == 70
+        assert backend._calculate_cache_size()[1] == 70
+        assert not (tmp_path / "b" / "cache").exists()
+
 
 @pytest.mark.unit
 class TestErrorPaths:
@@ -2363,3 +2380,88 @@ class TestShortIOFailClosed:
         assert calls == [1, 1]
         assert get_value(1) == {"result": 1}  # the rewritten entry serves
         assert calls == [1, 1]
+
+
+@pytest.mark.unit
+class TestSetLockScope:
+    """LAB-7076: set() writes and fsyncs outside the process lock and re-checks the cap at commit."""
+
+    def test_get_does_not_wait_for_a_concurrent_set_fsync(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        import threading
+
+        backend.set("ready", b"v")
+        in_fsync, release = threading.Event(), threading.Event()
+        real_fsync = os.fsync
+
+        def blocking_fsync(fd: int) -> None:
+            in_fsync.set()
+            release.wait(5)
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", blocking_fsync)
+        writer = threading.Thread(target=backend.set, args=("slow", b"v"))
+        writer.start()
+        try:
+            assert in_fsync.wait(5)
+            got: list[bytes | None] = []
+            reader = threading.Thread(target=lambda: got.append(backend.get("ready")))
+            reader.start()
+            reader.join(2)
+            assert got == [b"v"], "get() waited for a concurrent set()'s fsync"
+        finally:
+            release.set()
+            writer.join(5)
+        assert backend.get("slow") == b"v"
+
+    @pytest.mark.parametrize("method", ["set", "set_streaming"])
+    def test_concurrent_new_keys_at_cap_minus_one_never_exceed_the_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+    ) -> None:
+        """N writers that all pass the pre-write check at cap-1: the commit admits exactly one."""
+        import threading
+
+        from cachekit.backends.errors import BackendError
+
+        cache_dir = tmp_path / "cache"
+        backend = FileBackend(FileBackendConfig(cache_dir=cache_dir, max_entry_count=100))
+        header = backend._build_header(0)
+        for i in range(99):
+            (cache_dir / f"{i:032x}").write_bytes(header + b"v")
+        backend._reconcile()
+        # Eviction that frees nothing (every unlink failing) is what lets the count reach the cap.
+        monkeypatch.setattr(backend, "_maybe_evict", lambda: None)
+
+        n = 4
+        barrier = threading.Barrier(n, timeout=5)
+        real_fsync = os.fsync
+
+        def fsync_after_all_writers_checked(fd: int) -> None:
+            barrier.wait()  # every writer has passed the pre-write check before any commits
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync_after_all_writers_checked)
+        outcomes: list[str] = []
+
+        def writer(i: int) -> None:
+            try:
+                if method == "set":
+                    backend.set(f"new{i}", b"v")
+                else:
+                    backend.set_streaming(f"new{i}", lambda f: f.write(b"v"))
+                outcomes.append("ok")
+            except BackendError as exc:
+                outcomes.append("rejected" if "max_entry_count" in str(exc) else repr(exc))
+            except Exception as exc:
+                outcomes.append(repr(exc))
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        monkeypatch.undo()
+
+        assert sorted(outcomes) == ["ok"] + ["rejected"] * (n - 1)
+        assert backend._calculate_cache_size()[1] == 100
+        assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
+        assert not list(cache_dir.glob("*.tmp.*")), "a rejected commit left its temp file behind"
