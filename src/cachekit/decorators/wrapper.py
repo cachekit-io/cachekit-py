@@ -42,6 +42,7 @@ from ..config.validation import ConfigurationError, hide_secret
 from ..interop import (
     InteropError,
     bind_flat_args,
+    encode_interop_value,
     ensure_interop_backend_compatible,
     generate_interop_key,
     validate_interop_config,
@@ -1411,6 +1412,25 @@ def create_cache_wrapper(
         flat = bind_flat_args(_interop_sig, call_args, call_kwargs)
         return generate_interop_key(namespace, interop, flat)
 
+    def _uncached_result(result: _T) -> _T:
+        """Return ``result`` from a degraded, uncached call, refusing what interop would refuse to store.
+
+        A call the breaker rejects, whose backend cannot be created, or whose sync L2 read
+        raises past the handler never reaches the store path, where interop raises InteropError
+        on an out-of-model value. Without this, that value contract would depend on breaker
+        state (LAB-5375). Any other encode failure degrades here as it does on the store path,
+        where it never reaches the caller.
+        """
+        if interop is None:
+            return result
+        try:
+            encode_interop_value(result)
+        except InteropError:
+            raise
+        except Exception as e:
+            logger().debug(f"interop value check skipped on an uncached call: {redact_error_for_log(e)}")
+        return result
+
     # The generated key is the only one carrying a serializer code, so it alone has a
     # pre-0.20.0 twin. One flag, read by both functions below, so the twin can never be
     # computed for a key the write path did not generate.
@@ -1837,7 +1857,7 @@ def create_cache_wrapper(
                 error_type="CircuitBreakerOpen",
             )
             reset_current_function_stats(token)
-            return func(*args, **kwargs)
+            return _uncached_result(func(*args, **kwargs))
 
         with features.create_span("redis_cache", span_attributes) as span:
             try:
@@ -1875,7 +1895,7 @@ def create_cache_wrapper(
                 )
                 # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
                 reset_current_function_stats(token)
-                return func(*args, **kwargs)
+                return _uncached_result(func(*args, **kwargs))
 
         # First interop call: the check above had no backend to check (see there).
         if interop is not None and not interop_checked:
@@ -1993,7 +2013,7 @@ def create_cache_wrapper(
             )
             # WHY: Early return on cache GET failure - same reason as L2 hit path
             reset_current_function_stats(token)
-            return func(*args, **kwargs)
+            return _uncached_result(func(*args, **kwargs))
 
         # CACHE MISS - Execute function and cache result
         # Note: Sync wrappers don't support distributed locking (backend protocol is async-only)
@@ -2224,7 +2244,7 @@ def create_cache_wrapper(
                     error="Circuit breaker rejected the request",
                     error_type="CircuitBreakerOpen",
                 )
-                return await func(*args, **kwargs)
+                return _uncached_result(await func(*args, **kwargs))
 
             # Initialize backend only when needed (lazy init for performance)
             if _backend is None:
@@ -2242,7 +2262,7 @@ def create_cache_wrapper(
                         namespace=namespace or "default",
                         duration_ms=0.0,
                     )
-                    return await func(*args, **kwargs)
+                    return _uncached_result(await func(*args, **kwargs))
                 _l2_scope()  # first call: the tenant check above ran before the backend existed
 
             # First interop call: the check above had no backend to check (see there).
