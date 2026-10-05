@@ -96,7 +96,7 @@ _registry["custom"] = CustomSerializer
 `@cache.secure`, `encryption=True` and a directly built `EncryptionWrapper` refuse a serializer whose
 class does not declare `cross_sdk_compatible = True`. Set it as a class attribute, not on an instance:
 
-```python notest
+```python
 from typing import ClassVar
 
 class CustomSerializer:
