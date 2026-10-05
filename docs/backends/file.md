@@ -75,7 +75,7 @@ backend = FileBackend(config)
 ## Characteristics
 
 - Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due, before rejecting a new entry at `max_entry_count`, or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). `set()` writes and fsyncs its temp file outside the backend's lock and takes the lock only to rename it into place, so a `get` on another thread in the same process does not wait for a concurrent `set()`'s fsync.
-- Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
+- Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. The entry whose write triggered eviction is never evicted by it, even when rapid writes share one coarse mtime. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
 - Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported. Within one process, use one `FileBackend` instance per cache directory: each instance tracks only its own writes against the size and entry caps (see [Performance Characteristics](#performance-characteristics))
 - Locking: non-blocking. An operation that finds an entry's file lock held fails at once with a `TIMEOUT` `BackendError`; it does not wait

@@ -459,6 +459,37 @@ class TestEviction:
         # rewrote it.
         assert survivors == {"e0", "new", *keys[22:]}
 
+    @pytest.mark.parametrize("mtimes", ["tied", "older_than_the_rest"])
+    def test_eviction_never_discards_the_entry_that_triggered_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mtimes: str
+    ) -> None:
+        """Rapid writes can share one coarse mtime tick; the tie must not evict the value just stored."""
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_size_mb=2, max_value_mb=1))
+        for i in range(5):  # 1.75 MB of 2 MB: the 500 KB set below crosses the 90% trigger
+            backend.set(f"key_{i}", b"x" * 350_000)
+        trigger_path = backend._key_to_path("trigger")
+        if mtimes == "tied":
+            real_scan = backend._scan_entries
+
+            def tied_scan() -> Any:  # every mtime equal, the new entry listed first
+                entries = real_scan()
+                if entries is None:
+                    return None
+                return sorted(((p, 0.0, size) for p, _, size in entries), key=lambda e: e[0] != trigger_path)
+
+            monkeypatch.setattr(backend, "_scan_entries", tied_scan)
+        else:
+            future = time.time() + 60
+            for i in range(5):
+                os.utime(backend._key_to_path(f"key_{i}"), (future, future))
+
+        backend.set("trigger", b"y" * 500_000)
+        monkeypatch.undo()
+
+        assert backend.get("trigger") == b"y" * 500_000
+        assert backend._calculate_cache_size()[1] < 6  # eviction still ran, on the other entries
+        assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
+
     def test_cache_respects_max_size_and_entry_limits(self, tmp_path: Path) -> None:
         """Test that cache respects both size and entry count limits."""
         config = FileBackendConfig(
@@ -2043,7 +2074,7 @@ class TestSecurityBugFixes:
         backend = FileBackend(config)
 
         # Disable eviction from the start to allow filling to exactly 100 entries
-        monkeypatch.setattr(backend, "_maybe_evict", lambda: None)
+        monkeypatch.setattr(backend, "_maybe_evict", lambda **_: None)
 
         # Fill to exactly max entry count
         for i in range(100):
@@ -2080,7 +2111,7 @@ class TestSecurityBugFixes:
         backend = FileBackend(config)
 
         # Disable eviction from the start
-        monkeypatch.setattr(backend, "_maybe_evict", lambda: None)
+        monkeypatch.setattr(backend, "_maybe_evict", lambda **_: None)
 
         # Fill to max capacity
         for i in range(100):
@@ -2433,7 +2464,7 @@ class TestSetLockScope:
             (cache_dir / f"{i:032x}").write_bytes(header + b"v")
         backend._reconcile()
         # Eviction that frees nothing (every unlink failing) is what lets the count reach the cap.
-        monkeypatch.setattr(backend, "_maybe_evict", lambda: None)
+        monkeypatch.setattr(backend, "_maybe_evict", lambda **_: None)
 
         n = 4
         barrier = threading.Barrier(n, timeout=5)

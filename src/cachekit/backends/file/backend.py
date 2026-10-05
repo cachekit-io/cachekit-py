@@ -977,8 +977,8 @@ class FileBackend:
             os.rename(temp_path, file_path)
             self._note_write(old_size, new_size)
 
-            # Trigger eviction if over threshold
-            self._maybe_evict()
+            # Trigger eviction if over threshold; never evict the entry this commit just wrote
+            self._maybe_evict(keep=file_path)
 
     def _note_write(self, old_size: int | None, new_size: int) -> None:
         """Count an entry this process just renamed into place (caller holds self._lock)."""
@@ -1155,12 +1155,16 @@ class FileBackend:
             or self._entry_count > self.config.max_entry_count * EVICTION_TRIGGER_THRESHOLD
         )
 
-    def _maybe_evict(self) -> None:
+    def _maybe_evict(self, keep: str | None = None) -> None:
         """Trigger eviction if cache exceeds 90% capacity (caller holds self._lock).
 
         Evicts the oldest-written files (by mtime; reads do not refresh it) until cache is at 70% capacity.
         Respects both max_size_mb and max_entry_count limits. Decides on the counters, and rescans
         before evicting anything, so a count drifted by another process never evicts on its own.
+
+        ``keep`` is never evicted: it is the entry the triggering write just committed. Writes in quick
+        succession can share one coarse mtime tick, and the sort would otherwise break that tie in scan
+        order, discarding the value the caller has just stored.
         """
         stale = time.monotonic() - self._reconciled_at >= RECONCILE_INTERVAL_SECONDS
         if not (stale or self._over_eviction_trigger()):
@@ -1176,6 +1180,8 @@ class FileBackend:
         for path, _, size in entries:
             if self._entry_bytes <= target_bytes and self._entry_count <= target_count:
                 break
+            if path == keep:
+                continue
             try:
                 os.unlink(path)
             except FileNotFoundError:
