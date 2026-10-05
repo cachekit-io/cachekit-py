@@ -769,7 +769,7 @@ class TestInteropValueContractOnDegradedPaths:
         def body(x: str) -> Any:
             executions.append(x)
             if x.startswith("deep"):
-                return _deeply_nested()
+                return _DEEP
             return {"bad": {1}} if x.startswith("bad") else f"v:{x}"  # a set is outside the data model
 
         async def async_body(x: str) -> Any:
@@ -834,7 +834,7 @@ class TestInteropValueContractOnDegradedPaths:
         """
         fn, executions, _ = await self._degrade(scenario, is_async, resolver, live_breakers, clock)
 
-        assert await _call(fn, "deep") == _deeply_nested()
+        assert await _call(fn, "deep") is _DEEP
 
         assert executions == ["deep"]
         assert backend.gets == backend.sets == 0
@@ -861,7 +861,7 @@ class TestInteropValueContractOnDegradedPaths:
         def body(x: str) -> Any:
             executions.append(x)
             if x.startswith("deep"):
-                return _deeply_nested()
+                return _DEEP
             return {"bad": {1}} if x.startswith("bad") else f"v:{x}"
 
         async def async_body(x: str) -> Any:
@@ -887,7 +887,12 @@ class TestInteropValueContractOnDegradedPaths:
     async def test_value_the_store_path_accepts_returns_after_a_failed_read(self, monkeypatch, is_async, backend, x):
         fn, executions = self._failing_read(monkeypatch, backend, is_async)
 
-        assert await _call(fn, x) == (_deeply_nested() if x == "deep" else f"v:{x}")
+        result = await _call(fn, x)
+
+        if x == "deep":
+            assert result is _DEEP
+        else:
+            assert result == f"v:{x}"
 
         assert executions == [x]
         assert get_current_function_stats() is None
@@ -899,3 +904,8 @@ def _deeply_nested() -> list[Any]:
     for _ in range(5000):
         value = [value]
     return value
+
+
+# Built once and asserted by identity: on Python 3.10 and 3.11, ``==`` on two such lists
+# recurses past the interpreter's limit itself and raises RecursionError.
+_DEEP = _deeply_nested()
