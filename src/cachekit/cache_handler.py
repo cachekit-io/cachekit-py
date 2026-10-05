@@ -647,6 +647,7 @@ class CacheSerializationHandler:
         enable_integrity_checking: bool = True,
         encryption_fail_closed: bool | None = None,
         interop_mode: bool = False,
+        backend_key_prefix: Callable[[], str] | None = None,
     ):
         """Initialize with serializer strategy and optional encryption.
 
@@ -686,6 +687,9 @@ class CacheSerializationHandler:
                                      AES-GCM authentication failure or key-fingerprint mismatch
                                      instead of silently recomputing.
                                    - False: explicit fail-open opt-out (warn + metric + recompute).
+            backend_key_prefix: Returns the backend's key_prefix in the calling context ("" when it
+                               has none). The AAD binds it ahead of the cache key (see _aad_key).
+                               None: no prefix, for a handler with no backend behind it.
 
         Raises:
             ConfigurationError: If encryption config is invalid (missing mode or both modes), or a
@@ -701,6 +705,7 @@ class CacheSerializationHandler:
         self.enable_integrity_checking = enable_integrity_checking
         self.interop_mode = interop_mode
         self._single_tenant_id: Optional[str] = None
+        self._backend_key_prefix: Callable[[], str] = backend_key_prefix or (lambda: "")
 
         # Interop mode (interop/v1, spec/interop-mode.md): values are ONE plain
         # MessagePack document — no ByteStorage envelope and no CK v3 frame, so
@@ -943,6 +948,21 @@ class CacheSerializationHandler:
                 f"side silently breaks cross-SDK decryption."
             )
 
+    def _aad_key(self, cache_key: str) -> str:
+        """The ``cache_key`` the AAD binds: the backend's key_prefix followed by the call key.
+
+        protocol ``spec/encryption.md`` defines it as the logical backend key, every client-side
+        prefix included, so an entry copied to another prefix (another Memcached ``key_prefix``,
+        another tenant's ``t:{tenant}:``) fails authentication. A tenant-scoped backend resolves
+        its prefix per context, so this is read on the same call as the backend operation.
+        Interop mode keeps the bare key, which its read path uses too: interop refuses any
+        prefixing backend. An empty or non-string key is passed through as is: the wrapper's own
+        checks refuse it.
+        """
+        if self.interop_mode or not cache_key or not isinstance(cache_key, str):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime arg
+            return cache_key
+        return f"{self._backend_key_prefix()}{cache_key}"
+
     def _get_cached_encryption_wrapper(self, tenant_id: str) -> Any:
         """Get or create cached EncryptionWrapper for tenant_id.
 
@@ -1014,6 +1034,7 @@ class CacheSerializationHandler:
             kwargs: Keyword arguments from cached function (for tenant extraction)
             cache_key: Cache key for AAD binding (SECURITY CRITICAL for encryption).
                       Required when encryption is enabled to prevent ciphertext substitution.
+                      The AAD binds it behind the backend's key_prefix (see _aad_key).
 
         Returns:
             Serialized data wrapped for cache storage
@@ -1081,7 +1102,7 @@ class CacheSerializationHandler:
                 serializer = self._get_cached_encryption_wrapper(tenant_id)
 
                 # EncryptionWrapper.serialize() requires cache_key for AAD v0x03 binding
-                serialized_data, metadata = serializer.serialize(data, cache_key)
+                serialized_data, metadata = serializer.serialize(data, self._aad_key(cache_key))
             else:
                 # No encryption - use base serializer directly (no cache_key needed)
                 serializer = self._base_serializer
@@ -1199,6 +1220,7 @@ class CacheSerializationHandler:
             data: Serialized data from cache (may be encrypted)
             cache_key: Cache key for AAD verification (SECURITY CRITICAL for encrypted data).
                       Required when data is encrypted to verify ciphertext binding.
+                      The AAD binds it behind the backend's key_prefix (see _aad_key).
             args: Positional arguments from cached function (for tenant extraction)
             kwargs: Keyword arguments from cached function (for tenant extraction)
 
@@ -1370,8 +1392,9 @@ class CacheSerializationHandler:
                     tenant_id = metadata.tenant_id
                 try:
                     serializer = self._get_cached_encryption_wrapper(tenant_id)
-                    # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
-                    return serializer.deserialize(serialized_data, metadata, cache_key)
+                    # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification.
+                    # One AAD, no retry with another key form (spec/encryption.md).
+                    return serializer.deserialize(serialized_data, metadata, self._aad_key(cache_key))
                 except KeyringConfigurationError as e:
                     if self.encryption:
                         raise

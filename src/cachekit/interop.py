@@ -522,8 +522,8 @@ def ensure_interop_backend_compatible(backend: Any) -> None:
 
     A backend key prefix (e.g. MemcachedBackend's ``key_prefix``) makes this
     SDK read/write ``{prefix}{ns}:{op}:{hash}`` while other SDKs use the bare
-    key — silent cross-SDK misses, and the encryption AAD binds the
-    UN-prefixed key. Backends that transform keys MUST expose the prefix as a
+    key — silent cross-SDK misses, and the encryption AAD would bind the
+    prefixed key, which no other SDK builds. Backends that transform keys MUST expose the prefix as a
     ``key_prefix`` attribute (contract); non-prefix key transforms are
     incompatible with interop mode entirely. Same decision as cachekit-ts
     (wrap-time + per-call guard) and cachekit-rs (read-time guard).

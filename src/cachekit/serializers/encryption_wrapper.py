@@ -63,7 +63,9 @@ class DecryptionAuthenticationError(EncryptionError):
     previous key). Distinct from plain :class:`EncryptionError`
     / :class:`SerializationError`, which cover corruption and format problems.
     Classification and the fail-open/fail-closed policy live in
-    ``cachekit.cache_handler.handle_decrypt_failure``.
+    ``cachekit.cache_handler.handle_decrypt_failure``, except on L1 reads, where the decorator
+    treats an L1 keying collision (another tenant's entry, or behind a prefixing backend one
+    bound to another prefix) as a plain miss.
     """
 
     pass
