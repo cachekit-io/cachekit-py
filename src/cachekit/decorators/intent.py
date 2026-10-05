@@ -12,11 +12,26 @@ from dataclasses import replace
 from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
-from ..config.decorator import UNSET
+from ..config.decorator import (
+    _FIELD_NAMES,
+    _PRESET_EXTRA_KWARGS,
+    _SECRET_KWARGS,
+    UNSET,
+    _hide_refused,
+    _reject_unsupported,
+)
 from ..config.validation import hide_secret, reveal_secret
+from .local_wrapper import _ALLOWED_PARAMS as _LOCAL_KWARGS
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# The encryption keywords bare @cache folds into its EncryptionConfig.
+_ENCRYPTION_KWARGS = frozenset(
+    {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
+)
+# Every keyword some form of @cache takes. Each form refuses those it does not take, and every form refuses any other.
+_DECORATOR_KWARGS = _FIELD_NAMES.union(_ENCRYPTION_KWARGS, _LOCAL_KWARGS, {"l1_enabled"}, *_PRESET_EXTRA_KWARGS.values())
 
 
 def cache(
@@ -103,17 +118,23 @@ def cache(
             to ``CACHEKIT_API_KEY`` when omitted. ``@cache.io`` always builds its
             own CachekitIOBackend and rejects ``backend=`` and ``config=`` with
             ConfigurationError. ``@cache.secure`` rejects ``config=`` too; its RORO
-            form is ``@cache(config=DecoratorConfig.secure(...))``.
+            form is ``@cache(config=DecoratorConfig.secure(...))``. Beside ``config=``
+            an override may name only a DecoratorConfig field or ``l1_enabled``, and
+            may not set ``encryption=`` on an encrypted config or ``backend=`` on an io
+            config. A keyword a form does not accept raises ConfigurationError
+            (``@cache.local``: TypeError).
 
     Returns:
         Decorated function with intelligent caching
     """
 
     # Secrets stay wrapped from here down, so no frame on an error's traceback holds them raw in a local or
-    # in this dict (CWE-532); each is unwrapped only where it is used.
-    for _secret in ("master_key", "api_key"):
-        if _secret in manual_overrides:
-            manual_overrides[_secret] = hide_secret(manual_overrides[_secret])
+    # in this dict (CWE-532); each is unwrapped only where it is used. So does a value under a keyword no form takes:
+    # it may be a key under a misspelt name (master_keey=), and a guard below can raise before the check that refuses it.
+    for _name in manual_overrides.keys() & _SECRET_KWARGS:
+        manual_overrides[_name] = hide_secret(manual_overrides[_name])
+    for _name in manual_overrides.keys() - _DECORATOR_KWARGS:
+        manual_overrides[_name] = _hide_refused(manual_overrides[_name])
 
     def decorator(f: F) -> F:
         # Every application works on its own copy: the pops and rewrites below would otherwise empty the dict
@@ -198,8 +219,7 @@ def cache(
             from cachekit.config.nested import EncryptionConfig
 
             _enc_passthrough = isinstance(overrides.get("encryption"), EncryptionConfig)
-            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
-            if not _enc_passthrough and (_enc_keys & overrides.keys()):
+            if not _enc_passthrough and (_ENCRYPTION_KWARGS & overrides.keys()):
                 enc_overrides: dict[str, Any] = {}
                 if "encryption" in overrides:
                     enc_overrides["enabled"] = overrides.pop("encryption")
@@ -207,6 +227,16 @@ def cache(
                     if _k in overrides:
                         enc_overrides[_k] = overrides.pop(_k)
                 overrides["encryption"] = replace(EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()})
+
+        # Checked here, not only in the preset's classmethod, so a refused value is wrapped in this frame's dicts too
+        # (CWE-532), and before @cache.secure looks up its key, so a misspelt keyword is not reported as a missing key.
+        if config is None:
+            _reject_unsupported(
+                f"The {_intent} preset" if _intent else "@cache",
+                overrides,
+                _FIELD_NAMES | _PRESET_EXTRA_KWARGS.get(_intent or "", frozenset()),
+                held_by=(manual_overrides,),
+            )
 
         # RORO config takes highest precedence
         if config is not None:
@@ -220,11 +250,28 @@ def cache(
                     f"integrity_checking={integrity_override!r} cannot override an encrypted config= "
                     "(e.g. DecoratorConfig.secure()). Omit integrity_checking."
                 )
+            # Nor may an override replace an encrypted config's EncryptionConfig, and with it the key and tenant
+            # mode, as DecoratorConfig.secure() refuses encryption= among its own kwargs.
+            if config.encryption.enabled is True and "encryption" in overrides:
+                raise ConfigurationError(
+                    "encryption= cannot override an encrypted config= (DecoratorConfig.secure(), or one built with "
+                    "encryption=EncryptionConfig(enabled=True, ...)). Set encryption options where the config is "
+                    "built, e.g. DecoratorConfig.secure(master_key=..., fail_closed=True)."
+                )
+            # io's CachekitIOBackend is the preset, as on @cache.io(backend=...).
+            if config._from_io and _explicit_backend:
+                raise ConfigurationError(
+                    "@cache(config=DecoratorConfig.io(...)) does not accept backend= — the io config always caches "
+                    "through its own CachekitIOBackend.\n\n"
+                    "To cache through another backend, use a different preset:\n"
+                    "  @cache(config=DecoratorConfig.production(backend=my_backend))"
+                )
             if overrides or backend is not UNSET:
                 # Apply overrides by creating new DecoratorConfig with merged settings
                 override_dict = overrides.copy()
                 if backend is not UNSET:
                     override_dict["backend"] = backend
+                _reject_unsupported("@cache(config=...)", override_dict, held_by=(overrides, manual_overrides))
                 resolved_config = replace(config, **override_dict)
         # Intent-based presets (renamed per Task 6)
         elif _intent == "minimal":  # Renamed from "fast"

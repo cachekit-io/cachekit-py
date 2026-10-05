@@ -1002,6 +1002,8 @@ class CacheSerializationHandler:
                 # hex string to bytes, wrapped inline: no local holds the decoded key
                 master_key=SecretBytes(bytes.fromhex(self.master_key)) if self.master_key else None,
                 fail_closed=self.encryption_fail_closed,
+                # A hex key may decode past 32 bytes; only a key passed to the wrapper raw must be exactly 32.
+                _master_key_from_hex=True,
             )
 
             # Enforce LRU cache size limit

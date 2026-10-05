@@ -112,6 +112,23 @@ assert wrapper.deserialize(data, meta, cache_key="users:1:ssn") == {"ssn": "123-
 
 EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
 
+## Direct Use
+
+Built directly, `EncryptionWrapper` takes the raw key: exactly 32 bytes for `master_key=` and for each
+of `previous_master_keys=`, not the hex string the decorators and `CACHEKIT_MASTER_KEY` take. Decode a
+hex key with `bytes.fromhex()`:
+
+```python
+from cachekit.serializers import EncryptionWrapper
+
+# secret_key: the 64-character hex key from your secret store, as @cache.secure takes it
+wrapper = EncryptionWrapper(master_key=bytes.fromhex(secret_key), previous_master_keys=[])
+```
+
+From 0.23.0, any other length raises when the wrapper is built. That includes the hex string's own
+64 bytes, `secret_key.encode()`, which earlier releases accepted as a different key
+([details](../error-codes.md#raw-key-is-not-32-bytes)).
+
 ## Zero-Knowledge Caching
 
 ```python notest

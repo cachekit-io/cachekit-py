@@ -666,8 +666,8 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
 **Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
 raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 `cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
-shorter than 32 bytes, more than three previous keys, or the current key repeated among
-them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+passed directly that is not exactly 32 bytes, more than three previous keys, or the current
+key repeated among them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
 settings load, so this surfaces only when keys bypass that check: passed to
 `EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
 environment's previous keys. Outside config-drift reads (below), the fault never
@@ -678,8 +678,8 @@ from the re-read after a distributed-lock wait, so the function does not run and
 circuit-breaker failure is counted. A key with no entry yet reads as a miss before the keyring
 is built, so the fault surfaces at the write instead, and the write raises it too, sync or async:
 the function has already run, but its result is neither cached nor returned, and no
-circuit-breaker failure is counted. Two cases take other paths: a missing or short *current*
-master key raises `EncryptionError`, and an encryption-disabled handler reading an entry that
+circuit-breaker failure is counted. Two cases take other paths: a missing *current* master key,
+or one of the wrong length, raises `EncryptionError`, and an encryption-disabled handler reading an entry that
 claims encryption treats the fault as corruption (miss + evict), because only the
 unauthenticated header sent it down the decrypt path.
 
