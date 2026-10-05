@@ -463,8 +463,8 @@ class DecoratorConfig:
         # encryption= is a field, but not one this preset takes: the EncryptionConfig below is the preset.
         if "encryption" in kwargs:
             raise ConfigurationError(
-                "The secure preset sets its own encryption; encryption= cannot override it. Pass fail_closed=, "
-                "single_tenant_mode=, deployment_uuid= or tenant_extractor= to it directly."
+                "The secure preset sets its own encryption; encryption= cannot override it. Pass any of "
+                f"{_SECURE_ENCRYPTION_OPTIONS} to it directly."
             )
         # Extract encryption-specific params from kwargs
         explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
@@ -702,12 +702,17 @@ class DecoratorConfig:
 
 # The keywords a preset or a config= override may name: DecoratorConfig's fields, less the private ones.
 _FIELD_NAMES = frozenset(f.name for f in fields(DecoratorConfig) if not f.name.startswith("_"))
-# The EncryptionConfig settings DecoratorConfig.secure() takes as keywords of its own.
-_SECURE_ENCRYPTION_KWARGS = frozenset({"single_tenant_mode", "deployment_uuid", "fail_closed"})
+# The EncryptionConfig settings bare @cache and @cache.secure take as flat keywords. The single list: add an option
+# here and both forms take it, so one cannot accept a setting the other refuses.
+_ENCRYPTION_FLAT_KWARGS = frozenset({"master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"})
+# The EncryptionConfig settings DecoratorConfig.secure() takes through **kwargs: all but its named parameters.
+_SECURE_ENCRYPTION_KWARGS = _ENCRYPTION_FLAT_KWARGS - {"master_key", "tenant_extractor"}
+# The options secure()'s encryption= refusal names instead: every flat keyword but master_key.
+_SECURE_ENCRYPTION_OPTIONS = ", ".join(f"{k}=" for k in sorted(_ENCRYPTION_FLAT_KWARGS - {"master_key"}))
 # The keywords a @cache.<preset> decorator takes beside the fields: its classmethod's own parameters, and secure's above.
 _PRESET_EXTRA_KWARGS = {
     "io": frozenset({"api_key"}),
-    "secure": _SECURE_ENCRYPTION_KWARGS | {"master_key", "tenant_extractor"},
+    "secure": _ENCRYPTION_FLAT_KWARGS,
 }
 
 

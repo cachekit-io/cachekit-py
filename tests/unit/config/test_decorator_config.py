@@ -10,6 +10,7 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import fields, replace
 
@@ -18,6 +19,7 @@ from pydantic import SecretStr
 
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
+from cachekit.config import decorator
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.nested import (
     BackpressureConfig,
@@ -28,6 +30,7 @@ from cachekit.config.nested import (
 )
 from cachekit.config.singleton import reset_settings
 from cachekit.config.validation import ConfigurationError
+from cachekit.decorators import intent
 
 
 @pytest.fixture
@@ -605,6 +608,18 @@ class TestPresetFieldOverrides:
                 return 1
 
         assert resolved == []
+
+    def test_bare_and_secure_take_the_same_encryption_keywords(self) -> None:
+        # Bare @cache folds these into its EncryptionConfig; secure() takes each as a named parameter or through
+        # **kwargs. A keyword one form takes and the other refuses is a setting that silently works on only one.
+        bare = intent._ENCRYPTION_KWARGS - {"encryption"}
+        named = set(inspect.signature(DecoratorConfig.secure).parameters) & bare
+        secure = named | decorator._SECURE_ENCRYPTION_KWARGS
+        assert bare == secure
+        assert decorator._PRESET_EXTRA_KWARGS["secure"] == secure
+        with pytest.raises(ConfigurationError) as excinfo:
+            DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=EncryptionConfig())
+        assert all(f"{k}=" in str(excinfo.value) for k in secure - {"master_key"})
 
     def test_l1_enabled_applies_on_top_of_l1_override(self, resolved: list[DecoratorConfig]) -> None:
         @cache.production(l1=L1CacheConfig(max_size_mb=200), l1_enabled=False)
