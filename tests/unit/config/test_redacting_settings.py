@@ -767,7 +767,7 @@ def _api_key_rows(form: Callable[[str], Any]) -> dict[str, _EntryPointRow]:
             ConfigurationError,
             _API_KEY,
         ),
-        # A key passed where no form takes one is still a key (LAB-8223).
+        # A key passed where no form takes one is still a key.
         "io-config-misplaced-key": (
             {},
             lambda: DecoratorConfig.io(api_key=key, master_key=_KEY_HEX),
