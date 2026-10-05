@@ -15,17 +15,17 @@ import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 from urllib.parse import quote
 
-from pydantic import SecretStr, ValidationError
+from pydantic import SecretBytes, SecretStr, ValidationError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.config.validation import ConfigurationError, hide_secret
+from cachekit.config.validation import ConfigurationError, hide_any_secret
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.logging import get_structured_logger
@@ -351,11 +351,19 @@ class CachekitIOBackend:
             ConfigurationError: missing or empty API key, one that is not an RFC 6750 bearer token, or an API URL that fails
                 validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
-        api_key = hide_secret(api_key)  # the config takes it wrapped; no local here holds it raw (CWE-532)
+        api_key = hide_any_secret(api_key)  # a bytes key too: no local here holds it raw (CWE-532)
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
         errors = None
         try:
-            self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
+            # The config takes a str key wrapped. A bytes key is unwrapped only here, inline, and its str field decodes it
+            # (hence the cast).
+            self._config = CachekitIOBackendConfig(
+                **{
+                    k: cast(Any, v.get_secret_value()) if isinstance(v, SecretBytes) else v
+                    for k, v in overrides.items()
+                    if v is not None
+                }
+            )
         except ValidationError as exc:
             errors = exc.errors(include_input=False)
         # Raised OUTSIDE the except block (CWE-532): the ValidationError's traceback holds the config's
