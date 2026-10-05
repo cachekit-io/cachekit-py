@@ -1638,18 +1638,24 @@ class TestCalculateCacheSizeEdgeCases:
 class TestMaybeEvictEdgeCases:
     """Test _maybe_evict error handling."""
 
-    def test_maybe_evict_handles_general_exception(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _maybe_evict handles general exception gracefully."""
-
-        backend._entry_count = backend.config.max_entry_count  # over the trigger, so eviction scans
+    def test_failed_rescan_neither_raises_nor_evicts_nor_zeroes_counters(
+        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rescan that fails (EIO, ESTALE) skips eviction and keeps the counters it had."""
+        backend.set("key1", b"value1")
+        backend._entry_count = backend.config.max_entry_count  # over the trigger, so eviction rescans
+        before = (backend._entry_count, backend._entry_bytes, backend._reconciled_at)
 
         def mock_scandir(path: Any) -> Any:
             raise RuntimeError("Unexpected error")
 
         monkeypatch.setattr(os, "scandir", mock_scandir)
 
-        # Should not raise (best-effort eviction)
-        backend._maybe_evict()
+        backend._maybe_evict()  # must not raise
+
+        assert (backend._entry_count, backend._entry_bytes, backend._reconciled_at) == before
+        monkeypatch.undo()
+        assert backend.exists("key1")
 
     def test_maybe_evict_skips_hidden_files(self, tmp_path: Path) -> None:
         """Test _maybe_evict skips hidden files."""

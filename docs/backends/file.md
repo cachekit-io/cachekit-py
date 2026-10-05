@@ -77,7 +77,7 @@ backend = FileBackend(config)
 - Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks `get` for that whole `set()`, because `set()` holds the backend's lock through its fsync.
 - Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
-- Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported
+- Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported. Within one process, use one `FileBackend` instance per cache directory: each instance tracks only its own writes against the size and entry caps (see [Performance Characteristics](#performance-characteristics))
 - Locking: non-blocking. An operation that finds an entry's file lock held fails at once with a `TIMEOUT` `BackendError`; it does not wait
 - Platform support: Full on Linux/macOS, limited on Windows (no O_NOFOLLOW)
 
@@ -145,7 +145,7 @@ The backend keeps its entry count and total size in memory. It seeds them with o
 scan when it starts and updates them on every write, delete, eviction and expired-entry
 cleanup it makes. So a `set()` checks the entry-count limit and the eviction trigger without
 scanning the directory, and its usual cost is one fsync whatever the cache size: about 25
-syscalls per `set()` at 0, 1,000 or 5,000 entries, against twice the entry count before.
+syscalls per `set()` at 0, 1,000 or 5,000 entries.
 
 Three things still scan the directory, and each scan costs time in proportion to the number
 of entries. A `set()` that pushes the cache past the eviction trigger rescans first, so it never
@@ -153,13 +153,15 @@ evicts on a stale count, and then evicts the oldest-written entries; that happen
 every `0.2 × max_entry_count` new keys. A `set()` that would be rejected at `max_entry_count`
 scans before it rejects. And the first `set()` more than 30 seconds after the last scan
 rescans, because the counters cannot see other processes' writes to the same directory. So
-the latency tail of `set()` still grows with the cache, but the typical `set()` no longer does.
+the latency tail of `set()` grows with the cache, and the typical `set()` does not.
 `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
 blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.
 
-Concurrent writers in several processes are unsupported (see [Characteristics](#characteristics)). If you
-run them anyway, each process sees the others' writes only at its next scan, so the cache can
-overshoot `max_size_mb` and `max_entry_count` by up to 30 seconds' worth of their writes.
+The counters belong to one `FileBackend` instance, not to the directory. Concurrent writers in
+several processes are unsupported (see [Characteristics](#characteristics)). If you run them anyway,
+each process sees the others' writes only at its next scan, so the cache can overshoot
+`max_size_mb` and `max_entry_count` by up to 30 seconds' worth of their writes. Two instances on
+one `cache_dir` in the same process behave the same way, so use one instance per directory.
 
 The fsync cost depends heavily on your disk, filesystem and load, so measure it where you will
 run. The harness reports set/get/delete p50 and p99 at 0, 1,000, 5,000 and 9,000 cached

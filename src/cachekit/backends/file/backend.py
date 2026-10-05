@@ -922,8 +922,8 @@ class FileBackend:
     def _regular_file_size(path: str) -> int | None:
         """Size of the regular file at ``path`` (not followed if a symlink), or None if there is none.
 
-        The single lstat replaces the os.path.exists the capacity check used to make, so learning
-        the overwritten entry's size for the counters costs no extra syscall.
+        One lstat both tells the capacity check whether this is an overwrite and gives the counters
+        the overwritten entry's size.
         """
         try:
             st = os.lstat(path)
@@ -971,7 +971,7 @@ class FileBackend:
         return os.path.join(dirname, f"{base}.tmp.{pid}.{ns}")
 
     def _safe_unlink(self, path: str) -> bool:
-        """Safely delete file, ignoring ENOENT errors.
+        """Best-effort delete: swallows any OSError, ENOENT included.
 
         Args:
             path: File path to delete
@@ -1033,11 +1033,11 @@ class FileBackend:
         except Exception:  # noqa: S110
             pass  # Don't fail init on cleanup errors
 
-    def _scan_entries(self) -> list[tuple[str, float, int]]:
+    def _scan_entries(self) -> list[tuple[str, float, int]] | None:
         """One pass over the cache directory: (path, mtime, size) of every cache entry.
 
         Skips hidden files, temp files, symlinks and anything else that is not a regular file.
-        Returns an empty list if the directory cannot be read.
+        Returns None if the directory cannot be read.
         """
         entries = []
         try:
@@ -1052,13 +1052,19 @@ class FileBackend:
                         continue  # File might have been deleted
                     if stat.S_ISREG(stat_info.st_mode):
                         entries.append((entry.path, stat_info.st_mtime, stat_info.st_size))
-        except Exception:  # noqa: S110
-            pass  # Unreadable directory: report it empty, as before
+        except Exception:
+            return None
         return entries
 
-    def _reconcile(self) -> list[tuple[str, float, int]]:
-        """Reset the entry counters from a fresh scan and return the scanned entries."""
+    def _reconcile(self) -> list[tuple[str, float, int]] | None:
+        """Reset the entry counters from a fresh scan and return the scanned entries.
+
+        A failed scan returns None and leaves the counters and the reconcile clock untouched:
+        zeroing them would switch off the entry cap and eviction until the next rescan.
+        """
         entries = self._scan_entries()
+        if entries is None:
+            return None
         self._entry_count = len(entries)
         self._entry_bytes = sum(size for _, _, size in entries)
         self._reconciled_at = time.monotonic()
@@ -1070,7 +1076,7 @@ class FileBackend:
         Returns:
             Tuple of (size_mb, file_count)
         """
-        entries = self._scan_entries()
+        entries = self._scan_entries() or []
         return sum(size for _, _, size in entries) / (1024 * 1024), len(entries)
 
     def _over_eviction_trigger(self) -> bool:
@@ -1087,15 +1093,12 @@ class FileBackend:
         Respects both max_size_mb and max_entry_count limits. Decides on the counters, and rescans
         before evicting anything, so a count drifted by another process never evicts on its own.
         """
-        entries = None
-        if time.monotonic() - self._reconciled_at >= RECONCILE_INTERVAL_SECONDS:
-            entries = self._reconcile()
-        if not self._over_eviction_trigger():
+        stale = time.monotonic() - self._reconciled_at >= RECONCILE_INTERVAL_SECONDS
+        if not (stale or self._over_eviction_trigger()):
             return
-        if entries is None:
-            entries = self._reconcile()
-            if not self._over_eviction_trigger():
-                return
+        entries = self._reconcile()
+        if entries is None or not self._over_eviction_trigger():
+            return
 
         target_bytes = self.config.max_size_mb * 1024 * 1024 * EVICTION_TARGET_THRESHOLD
         target_count = int(self.config.max_entry_count * EVICTION_TARGET_THRESHOLD)
