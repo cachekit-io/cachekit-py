@@ -1234,8 +1234,12 @@ class TestEvictionErrorPaths:
         backend = FileBackend(config)
 
         # Fill to 1.75MB of 2MB: the 500KB set below crosses the 90% trigger even with one file unseen
+        base = time.time() - 60
         for i in range(5):
             backend.set(f"key_{i}", b"x" * 350_000)
+            # Distinct, older mtimes: back-to-back writes can share one coarse timestamp tick, and a
+            # tie would let eviction pick the trigger entry itself.
+            os.utime(backend._key_to_path(f"key_{i}"), (base + i, base + i))
 
         # Fail the stat of the second file during eviction collection (concurrent deletion)
         _scandir_failing_stat_on(monkeypatch, 2)
