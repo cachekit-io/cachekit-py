@@ -4,13 +4,17 @@ Fixture: tests/unit/protocol/fixtures/encryption.json, vendored from
 cachekit-io/protocol @ 4b34c015878ccdaf48005251a97b406a5f2060db (vectors 1.3.0,
 sha256 pinned below). Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
-This file drives the ``master_key_input`` block. Rows go through the entry point a caller
-uses, not a shared decoder: the hex rows through ``@cache.secure`` (``master_key=`` and
-CACHEKIT_MASTER_KEY, plus CACHEKIT_PREVIOUS_MASTER_KEYS for the rejects), the raw rows through
-``EncryptionWrapper``, the raw-bytes entry point (a bytes ``master_key=`` on ``@cache.secure``
-is a TypeError, so it is not one). The accept row's entry is planted in the backend and must be
-read as a hit: the functions return a sentinel, so a recompute (the key or the tenant derived
-wrongly) fails the value assertion.
+This file drives the ``master_key_input`` block. Rows go through every place a key enters, not
+a shared decoder. Hex keys enter through ``@cache.secure``'s ``master_key=``, CACHEKIT_MASTER_KEY
+(read by the decorator, and by ``EncryptionWrapper`` when it is given no key) and
+CACHEKIT_PREVIOUS_MASTER_KEYS. Raw keys enter through ``EncryptionWrapper``'s ``master_key=`` and
+``previous_master_keys=`` (a bytes ``master_key=`` on ``@cache.secure`` is a TypeError, so it is
+not a raw-bytes entry point).
+
+The accept row's entry is planted in the backend and must be read as a hit, alone and next to
+``default_tenant_interop`` with that row's key as a previous key: the functions return a sentinel,
+so a recompute (the key or the tenant derived wrongly) fails the value assertion. Its raw bytes
+must derive the row's pinned fingerprint. Every reject row must be refused at each entry point.
 """
 
 from __future__ import annotations
@@ -44,6 +48,10 @@ ACCEPT_VALUE = [1, "two", 3.5, None, True]
 # default_tenant.vectors[default_tenant_interop]: same tenant, another master key, cache key and value.
 (DEFAULT_TENANT,) = FIXTURE["default_tenant"]["vectors"]
 DEFAULT_TENANT_MASTER_KEY_HEX = FIXTURE["master_key_hex"]
+
+# One refusal each: a non-hex string, or one that decodes short. Anything else (a missing key) fails the match.
+DECORATOR_REFUSAL = r"CACHEKIT_MASTER_KEY must be (hex-encoded|at least 32 bytes)"
+WRAPPER_REFUSAL = r"Invalid master key format|Master key must be at least 32 bytes"
 
 
 def _ids(group: str) -> list[str]:
@@ -87,7 +95,7 @@ def test_fixture_integrity() -> None:
 
 
 class TestAcceptRow:
-    """A hex entry point given the accept row's key and no tenant decrypts the sealed entry."""
+    """With no tenant, the hex entry points read the sealed entry; the raw bytes derive the pinned key."""
 
     def test_master_key_argument(self) -> None:
         backend = DictBackend()
@@ -131,17 +139,26 @@ class TestAcceptRow:
 
 @pytest.mark.parametrize("vector", MASTER_KEY_INPUT["reject_vectors"], ids=_ids("reject_vectors"))
 class TestHexRejectRows:
-    """Every hex entry point refuses each reject row, at decoration, before any read or write."""
+    """Every hex entry point refuses each reject row before any read or write."""
 
     def test_master_key_argument(self, vector: dict[str, Any]) -> None:
-        with pytest.raises(ConfigurationError):
+        with pytest.raises(ConfigurationError, match=DECORATOR_REFUSAL):
             _secure_get_all(DictBackend(), master_key=vector["master_key_hex"])
 
     def test_cachekit_master_key(self, vector: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", vector["master_key_hex"])
         reset_settings()
-        with pytest.raises(ConfigurationError):
+        with pytest.raises(ConfigurationError, match=DECORATOR_REFUSAL):
             _secure_get_all(DictBackend())
+
+    def test_cachekit_master_key_read_by_encryption_wrapper(
+        self, vector: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Given no key, the wrapper decodes CACHEKIT_MASTER_KEY itself, past the decorator's check."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", vector["master_key_hex"])
+        reset_settings()
+        with pytest.raises(EncryptionError, match=WRAPPER_REFUSAL):
+            EncryptionWrapper(previous_master_keys=[])
 
     def test_cachekit_previous_master_keys(self, vector: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", vector["master_key_hex"])
