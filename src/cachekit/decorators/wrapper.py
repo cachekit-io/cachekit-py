@@ -1242,7 +1242,6 @@ def create_cache_wrapper(
             # someone else's registry error is the same invisibility this helper exists
             # to remove.
             _stats.record_l2_hit(get_duration_ms)
-            features.set_operation_context("get", duration_ms=get_duration_ms)
             features.record_success()
             if features.collect_stats:
                 features.record_cache_operation(
@@ -1751,8 +1750,6 @@ def create_cache_wrapper(
                 try:
                     l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
 
-                    features.set_operation_context("l1_get", duration_ms=0.001)
-
                     # Record L1 cache hit metrics
                     if features.collect_stats:
                         features.record_cache_operation(
@@ -1921,7 +1918,6 @@ def create_cache_wrapper(
             if cached_result is not None:
                 # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
                 result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
-                features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
                 # Record cache hit in span
@@ -2029,8 +2025,6 @@ def create_cache_wrapper(
                     _track_and_record(cache_key)
 
                 # Record successful cache set
-                set_duration_ms = (time.time() - start_time) * 1000
-                features.set_operation_context("set", duration_ms=set_duration_ms)
                 features.record_success()
 
                 if features.collect_stats:
@@ -2166,8 +2160,6 @@ def create_cache_wrapper(
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                     try:
                         l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
-
-                        features.set_operation_context("l1_get", duration_ms=0.001)
 
                         # Record L1 cache hit metrics (same labels as the sync L1 hit)
                         if features.collect_stats:
@@ -2467,7 +2459,6 @@ def create_cache_wrapper(
 
                                 # Record successful cache set
                                 set_duration_ms = (time.perf_counter() - start_time) * 1000
-                                features.set_operation_context("set", duration_ms=set_duration_ms)
                                 features.record_success()
 
                                 if features.collect_stats:
@@ -2587,7 +2578,6 @@ def create_cache_wrapper(
 
                 # Record successful cache set
                 set_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.set_operation_context("set", duration_ms=set_duration_ms)
                 features.record_success()
 
                 if features.collect_stats:
