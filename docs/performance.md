@@ -9,9 +9,10 @@
 ## Key Numbers
 
 > [!TIP]
-> **Key numbers** (mean of five run medians, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03; indicative wall clock on a shared host):
+> **Key numbers** (mean of five run medians, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03 and 2026-10-04; indicative wall clock on a shared host):
 > - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (61k instructions per call, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 5.1–5.4μs. An L1-only hit never serializes, so payload size barely matters
+> - **Decorator + L1 hit with an L2 backend configured, same dict**: 239–276μs. With a backend, L1 holds bytes and every hit deserializes them
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns
 > - **Redis L2 hit**, L1 disabled, same dict, Redis on loopback: 0.41–0.42ms
 
@@ -21,13 +22,13 @@ Every figure on this page comes from a guard in `tests/performance/`:
 - **Timer**: `time.perf_counter_ns()` around each call
 - **Runs, not samples**: each guard takes 5 independent runs, with a forced garbage collection before each. The figure is the mean of the per-run medians with its 95% t band at df = 4 (`stats_utils.summarize`)
 - **Every raw sample kept**: percentiles cover all samples; outliers are counted, never filtered
-- **Warm-up**: each run warms up for at least 5,000 calls (2,000 for the raw L1 guard), stopping once the last 1,000 calls vary by less than 10%, and at most twice that minimum
+- **Warm-up**: each run warms up for at least 5,000 calls (2,000 for the raw L1 guard), stopping once the last 1,000 calls vary by less than 10%, and at most twice that minimum. The 10-thread guard warms up 5,000 calls once, then 100 per thread before each run
 - **Pre-flight**: each session prints whether the host is throttled or loaded (`measurement_env.py`)
 - **No tail claims at 5 runs**: the `P95` line of a guard's summary reads "inconclusive" unless it has at least 10 runs and 400 samples (the `P99` line needs 10 runs and 2,000 samples). Every guard below runs 5, so both lines read "inconclusive" and this page quotes no tail percentile. The guards' own lines after the summary ("Total measured", the ✅ line, "Decorator + complex payload") still print the raw p95 of every sample, which their thresholds check; at 5 runs that number does not support a tail claim
 
 ## Measured Figures
 
-Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards on 2026-10-03, CPython 3.14.3, x86_64 Linux. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards, CPython 3.14.3, x86_64 Linux: the first five rows on 2026-10-03, the last two on 2026-10-04. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
@@ -36,26 +37,33 @@ Each cell is the mean of five run medians ± its 95% t band (the summary's `Run 
 | Decorator + L1 hit, `@cache(backend=None, serializer="auto")`, 10K-row DataFrame | `test_production_realism.py::test_decorator_overhead_dataframe` | 5.38 ± 0.15μs | 5.08 ± 0.17μs |
 | Raw L1 byte-cache lookup, `L1Cache.get` of 1KB, no decorator | `test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous` | 354 ± 68ns | 362 ± 41ns |
 | Redis L2 hit, L1 disabled, same 100-user dict, Redis on loopback | `test_production_realism.py::test_redis_l2_roundtrip` | 416 ± 139μs | 407 ± 159μs |
+| Decorator + L1 hit with an L2 backend configured (in-process, never reached), same 100-user dict | `test_production_realism.py::test_decorator_overhead_l1_hit_with_backend` | 239 ± 31μs | 276 ± 120μs |
+| Decorator + L1 hit, `@cache(backend=None)`, same 100-user dict, 10 threads on one key, per call | `test_production_realism.py::test_concurrent_cache_access` | 5.77 ± 0.47μs | 6.39 ± 1.53μs |
 
-The bands run from ±1% to ±39% of their figure, and pass 2 sits between 2% above and 21% below pass 1. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
+The bands run from ±1% to ±43% of their figure, and pass 2 sits between 2% above and 21% below pass 1 on the first five rows, and up to 15% above it on the last two. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
 
 Run them yourself:
 ```bash
 uv run pytest tests/performance/test_production_realism.py -v -s \
   -k "complex_dict or dataclass or dataframe or redis_l2"
 uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous -v -s
+uv run pytest tests/performance/test_production_realism.py -v -s \
+  -k "with_backend or concurrent or encryption_overhead"
 # The Redis guard skips unless Redis answers at REDIS_URL (default redis://localhost:6379)
+# The encryption guard skips unless CACHEKIT_MASTER_KEY is set (64 hex characters)
 ```
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
 
 With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict, a dataclass and a 10K-row DataFrame all cost about the same: key generation, the lookup and the decorator's bookkeeping.
 
-With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. No guard measures it through the run-level harness yet, so this page quotes no figure for it.
+With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. For the 100-user dict it takes 239–276μs, against 5.6–6.4μs for an L1-only hit of the same dict: 37 to 50 times as much. Nearly all of the difference is deserializing 23.5KB of MessagePack back into about 400 nested dicts. It is still 57–68% of a loopback Redis L2 hit (0.41–0.42ms), which deserializes the same bytes after the round trip.
 
 ### Decorator + L1 Hit (Hot Path)
 
 An L1-only hit takes 5.0–6.4μs across the three payloads above.
+
+With ten threads calling one function on the same key at once, each call took 5.8–6.4μs at the median once its thread was running. That is execution time after scheduling, not request latency. Each sample starts inside its thread's loop, so on a GIL build, where only one thread runs Python at a time, the time a thread waits for its turn falls outside every sample. No guard measures how long a request waits under contention.
 
 The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **61,000 instructions per call** on CPython 3.12 and 62,000 on 3.14. Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
@@ -67,10 +75,9 @@ An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis 
 
 ## Not Measured Here
 
-These have no figure from the run-level harness, so this page quotes none:
-- **An L1 hit with an L2 backend configured**, which deserializes the stored bytes
-- **Concurrent access**: the 10-thread guard (`test_concurrent_cache_access`) collects every thread's samples into one list and computes its tail outside the run-level harness
-- **Encryption overhead**: `test_encryption_overhead` prints only means and raw p95s. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
+These have no figure from the run-level harness that supports a claim:
+- **Encryption overhead through the decorator**: `test_encryption_overhead` interleaves its plaintext and encrypted runs and prints both results, but on this shared host the difference between the arms' run medians stayed inside its own band in all four passes on the 100-user dict (from −0.4 ± 14.6μs to −97 ± 194μs, Welch 95%): two on a quiet host with one arm's runs after the other's, and two interleaved on a loaded host. That bounds nothing: decryption may cost little next to deserialization, or the noise may hide it. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
+- **Request latency under contention**: the 10-thread guard times each call after its thread is scheduled (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
 - **The async decorator, serializer comparisons and a Redis on another machine**
 
 For choosing a serializer, see the [Serializer Guide](serializers/README.md).
@@ -91,6 +98,7 @@ def expensive_function(user_id: int):
 **L1 gives you:**
 - No network round trip on a hit
 - An L1-only hit in 5.0–6.4μs, against 0.41–0.42ms for a loopback Redis L2 hit
+- With an L2 backend configured, an L1 hit of the 100-user dict in 239–276μs: it skips the round trip but still deserializes
 
 ### 2. Choose the Right Serializer
 
@@ -182,7 +190,7 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 - **Keep L1 on** (the default), so repeat reads skip the round trip
 - **Tune L1 size:** raise `L1CacheConfig(max_size_mb=...)` or `CACHEKIT_L1_MAX_SIZE_MB` (default: 100MB per namespace) if entries are evicted early
 - **Optimize L1 TTL:** Match L1 TTL to data freshness requirements
-- **Reduce payload size:** cache only what you need; the L2 path deserializes the whole value
+- **Reduce payload size:** cache only what you need; an L2 hit, and an L1 hit with a backend configured, deserialize the whole value
 
 ### Bottleneck 2: Decorator Overhead
 
@@ -220,17 +228,18 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 61,244 | 62,410 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 59,292 | 60,482 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 312,228 | 313,909 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 312,010 | 309,843 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 236,889 | 237,407 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 261,598 | 265,142 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 61,356 | 62,645 |
-| `serializer_auto` | `AutoSerializer` round trip | 69,446 | 70,682 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 23,792 | 23,833 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,946,487 | 1,955,979 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,652 | 117,851 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 61,218 | 62,690 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 59,065 | 60,655 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 313,831 | 315,952 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 313,907 | 311,730 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 236,193 | 237,396 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 262,890 | 266,031 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 60,843 | 61,954 |
+| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
+| `serializer_auto` | `AutoSerializer` round trip | 69,441 | 70,650 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 23,679 | 23,775 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,953,212 | 1,953,407 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 117,147 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 100,723 | 86,297 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 50,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.

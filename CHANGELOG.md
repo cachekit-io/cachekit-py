@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.22.0](https://github.com/cachekit-io/cachekit-py/compare/v0.21.0...v0.22.0) (2026-10-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cachekitio:** replace httpx with urllib3 for CachekitIO requests (LAB-7931) ([#502](https://github.com/cachekit-io/cachekit-py/issues/502))
+* **decorators:** refuse an encrypting serializer at decoration (LAB-5320) ([#467](https://github.com/cachekit-io/cachekit-py/issues/467))
+
+### Features
+
+* **cachekitio:** replace httpx with urllib3 for CachekitIO requests (LAB-7931) ([#502](https://github.com/cachekit-io/cachekit-py/issues/502)) ([3fe6772](https://github.com/cachekit-io/cachekit-py/commit/3fe6772899f23660d1c7f91496e7ca9f3752c710))
+* **cachekitio:** send a cachekit-py/&lt;version&gt; User-Agent (LAB-7052) ([#479](https://github.com/cachekit-io/cachekit-py/issues/479)) ([9dc474a](https://github.com/cachekit-io/cachekit-py/commit/9dc474aefffec5cd4879909b037cc17475d2bee2))
+* **invalidation:** announce each invalidation on a Redis pub/sub channel (LAB-652) ([#470](https://github.com/cachekit-io/cachekit-py/issues/470)) ([5733626](https://github.com/cachekit-io/cachekit-py/commit/57336262bea5f3a3c36d27db1f43b9bb1b4cd032))
+* **invalidation:** detect a silent Redis peer on the listener with TCP_USER_TIMEOUT (LAB-7586) ([#499](https://github.com/cachekit-io/cachekit-py/issues/499)) ([986e4ff](https://github.com/cachekit-io/cachekit-py/commit/986e4ff30e89ae0c5bcb535efe63910cf3244158))
+* **invalidation:** opt-in listener evicts L1 on other processes' invalidations (LAB-652) ([#472](https://github.com/cachekit-io/cachekit-py/issues/472)) ([1ae8f12](https://github.com/cachekit-io/cachekit-py/commit/1ae8f1244bd632229b5c09cd7ba246c899f0e6b9))
+* **l1:** a forked child starts with an empty L1 (LAB-652) ([#471](https://github.com/cachekit-io/cachekit-py/issues/471)) ([5097c12](https://github.com/cachekit-io/cachekit-py/commit/5097c12930179303790beefc3bb6b6e586d93d4b))
+
+
+### Bug Fixes
+
+* **arrow:** reject dict values that pyarrow stores as the wrong column (LAB-7490) ([#459](https://github.com/cachekit-io/cachekit-py/issues/459)) ([5cec332](https://github.com/cachekit-io/cachekit-py/commit/5cec3326d7c545458e4bc45ddbb2cabfb7a40156))
+* **cachekitio:** build the sync client on HTTP/1.1 with a 32-connection pool (LAB-7062) ([#489](https://github.com/cachekit-io/cachekit-py/issues/489)) ([80dbf5c](https://github.com/cachekit-io/cachekit-py/commit/80dbf5cdc79d3545db09c7711e53129021628925))
+* **cachekitio:** never reuse a parent's pooled connection after fork (LAB-7146) ([#468](https://github.com/cachekit-io/cachekit-py/issues/468)) ([15c1351](https://github.com/cachekit-io/cachekit-py/commit/15c13514e6cbd2ef0df2c77eae82366bb803e542))
+* **cachekitio:** parse X-CacheKit-Fresh-For with the spec grammar (LAB-7838) ([#504](https://github.com/cachekit-io/cachekit-py/issues/504)) ([6cb5f4d](https://github.com/cachekit-io/cachekit-py/commit/6cb5f4d1b91936cf87049fb68ba62f4587837d3a))
+* **cachekitio:** retry a write once on 503 with a short Retry-After (LAB-7686) ([#477](https://github.com/cachekit-io/cachekit-py/issues/477)) ([77a16a5](https://github.com/cachekit-io/cachekit-py/commit/77a16a52ed5d6a984b1b6a9a77780bcba6f66d3c))
+* **circuit-breaker:** stop the decorated function's exceptions tripping the breaker (LAB-5319) ([#485](https://github.com/cachekit-io/cachekit-py/issues/485)) ([af48926](https://github.com/cachekit-io/cachekit-py/commit/af489264b3597cf1e08df81256cea0c9d8188cf0))
+* **decorators:** degrade on async lock errors instead of raising or polling (LAB-5346) ([#473](https://github.com/cachekit-io/cachekit-py/issues/473)) ([6f901f6](https://github.com/cachekit-io/cachekit-py/commit/6f901f649e91359ea057615add8b214cbfff7e30))
+* **decorators:** refuse an encrypting serializer at decoration (LAB-5320) ([#467](https://github.com/cachekit-io/cachekit-py/issues/467)) ([ef4a7f2](https://github.com/cachekit-io/cachekit-py/commit/ef4a7f2db0136a6f415b7428aa171a84bab413bc))
+* **invalidation:** delete the pre-0.20.0 twin on no-args invalidation (LAB-5308) ([#464](https://github.com/cachekit-io/cachekit-py/issues/464)) ([f8365d3](https://github.com/cachekit-io/cachekit-py/commit/f8365d380f4d9a93a6555b93b988bbc1255bf92f))
+* **invalidation:** recommend --py-call-uwsgi-fork-hooks, never --py-call-osafterfork, for uWSGI (LAB-7855) ([#491](https://github.com/cachekit-io/cachekit-py/issues/491)) ([3e192f7](https://github.com/cachekit-io/cachekit-py/commit/3e192f7a4160d4ee75d7d5e0aebc27a76172bf28))
+* **invalidation:** throttle the listener's reconnect WARNING to one a minute (LAB-7638) ([#482](https://github.com/cachekit-io/cachekit-py/issues/482)) ([b3a6c8a](https://github.com/cachekit-io/cachekit-py/commit/b3a6c8a55d8f54638e4c791347473ab90966dc3a))
+* **l1:** bound one entry to an eighth of the L1 budget (LAB-7823) ([#487](https://github.com/cachekit-io/cachekit-py/issues/487)) ([35b6791](https://github.com/cachekit-io/cachekit-py/commit/35b6791467bf33a1cb2575d042171846f2b18bea))
+* **metrics:** size the duration and size histogram buckets for ms and bytes (LAB-7587) ([#476](https://github.com/cachekit-io/cachekit-py/issues/476)) ([f1a52bd](https://github.com/cachekit-io/cachekit-py/commit/f1a52bd0e5d850aa989773c97f42a7e7aaf86e6f))
+* **object-cache:** repair L1-only caches in a forked child (LAB-7856) ([#494](https://github.com/cachekit-io/cachekit-py/issues/494)) ([0a78131](https://github.com/cachekit-io/cachekit-py/commit/0a781311a10b2fa8c33b8e11ec5adf9656bc045d))
+* **redaction:** digest keys holding an unpaired surrogate instead of raising (LAB-7624) ([#497](https://github.com/cachekit-io/cachekit-py/issues/497)) ([000b110](https://github.com/cachekit-io/cachekit-py/commit/000b1108f97a69da1b74858159be1327554aa9d5))
+* **redis:** decide on hiredis before redis imports so 3.14t keeps the GIL off (LAB-7077) ([#465](https://github.com/cachekit-io/cachekit-py/issues/465)) ([c19ab6b](https://github.com/cachekit-io/cachekit-py/commit/c19ab6b8913fd26011617fc4afa806a9a67d3c64))
+* **swr:** release refresh slots stranded on stopped event loops (LAB-7295) ([#488](https://github.com/cachekit-io/cachekit-py/issues/488)) ([b41c626](https://github.com/cachekit-io/cachekit-py/commit/b41c6267ac1e3ebbeae51e1b4e9817c0b51b783d))
+
+
+### Performance Improvements
+
+* **cachekitio:** fan out whole-function invalidation deletes, 16 at a time (LAB-7070) ([#478](https://github.com/cachekit-io/cachekit-py/issues/478)) ([72026b1](https://github.com/cachekit-io/cachekit-py/commit/72026b1b5f5d3ee93b643dd9b1d5d494099ebe94))
+* **cachekitio:** keep idle connections 390 s with TCP keepalive 60/10/3 (LAB-7061) ([#483](https://github.com/cachekit-io/cachekit-py/issues/483)) ([c695bf2](https://github.com/cachekit-io/cachekit-py/commit/c695bf225210b7936b340cbdd3345dc92c079bd7))
+* **cachekitio:** skip the uncontended double-check read and release the miss lock in the background (LAB-7064) ([#480](https://github.com/cachekit-io/cachekit-py/issues/480)) ([f4b8dfe](https://github.com/cachekit-io/cachekit-py/commit/f4b8dfe17e63880b95bfda9ffda94082de3ed12a))
+* **decorators:** decide refresh_ttl_on_get from Fresh-For, refresh in the background (LAB-7074) ([#435](https://github.com/cachekit-io/cachekit-py/issues/435)) ([cc9bf65](https://github.com/cachekit-io/cachekit-py/commit/cc9bf65262193cc712e17d008b0730c00512409b))
+* **metrics:** recover the perf-ir drift on the L2 and miss paths (LAB-7801) ([#481](https://github.com/cachekit-io/cachekit-py/issues/481)) ([d200c3a](https://github.com/cachekit-io/cachekit-py/commit/d200c3aa239270cf62ef4dbf5a0e75d0f4b0a079))
+* **serializers:** memoize CK frame headers and pack AutoSerializer values without rebuilding the tree (LAB-7069) ([#441](https://github.com/cachekit-io/cachekit-py/issues/441)) ([c2e907a](https://github.com/cachekit-io/cachekit-py/commit/c2e907af30693bcadf924b992762c75fbbcebb24))
+
 ## [0.21.0](https://github.com/cachekit-io/cachekit-py/compare/v0.20.0...v0.21.0) (2026-10-03)
 
 

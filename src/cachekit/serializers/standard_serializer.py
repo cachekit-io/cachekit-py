@@ -155,7 +155,11 @@ def _standard_object_hook(obj: Any) -> Any:
     Returns:
         Restored Python object or original obj if not a datetime marker
     """
-    if isinstance(obj, dict):
+    # msgpack calls this once per decoded map. Every marker has exactly two keys (sentinel and
+    # value, as _standard_default writes them), so the length check returns any other map without
+    # the .get() calls. Keep it inline: a wrapper call costs more than it saves on text-heavy values.
+    # AutoSerializer's hook must not copy it: its set and ndarray markers have 3 and 4 keys.
+    if isinstance(obj, dict) and len(obj) == 2:
         if obj.get("__datetime__"):
             value = obj.get("value")
             if value is None:

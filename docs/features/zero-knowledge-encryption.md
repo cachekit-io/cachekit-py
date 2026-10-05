@@ -107,7 +107,7 @@ Python object (plaintext, in-app only)
 **Scenarios where encryption overhead matters**:
 
 1. **No sensitive data**: Public caching (prices, menus)
-2. **High-volume, low-margin**: Encryption adds 100-500μs
+2. **High-volume, low-margin**: every cache read and write pays a decrypt or encrypt step (see [Performance Impact](#performance-impact))
 3. **Already encrypted at transport**: TLS + encryption is redundant
 
 **Mitigation**: state `encryption=False` for non-sensitive data:
@@ -722,6 +722,8 @@ didn't recently disable encryption for that function, investigate.
    - **Zero-knowledge caching overhead is negligible in the benchmarked scenarios** (synthetic API payloads, user profiles, and 1,000-row DataFrames)
 
 Run benchmarks: `pytest tests/performance/test_encryption_overhead.py -v -s`
+
+Through the decorator, a wall-clock comparison of an L1 hit of a 23.5KB dict with and without encryption is inconclusive: the difference stayed inside run-to-run noise. See [Not Measured Here](../performance.md#not-measured-here) in the Performance Guide.
 
 ### Key Derivation (Per-Tenant)
 ```
