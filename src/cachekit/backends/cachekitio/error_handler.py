@@ -36,6 +36,10 @@ class HTTPTransportError(Exception):
         super().__init__(exc_type.__name__)
         self.exc_type = exc_type
 
+    def __reduce__(self) -> tuple[type[HTTPTransportError], tuple[type[Exception]]]:
+        # Pickled by the class, not by args (its name), so a BackendError carrying one still pickles and copies.
+        return (type(self), (self.exc_type,))
+
 
 def classify_http_error(
     exc: Exception,
@@ -56,8 +60,9 @@ def classify_http_error(
         key: Cache key involved (optional, for debugging)
 
     Returns:
-        BackendError with appropriate error_type classification. Its ``original_exception`` is ``exc`` for a
-        response status, and an HTTPTransportError naming ``exc``'s class for a transport failure, never ``exc``.
+        BackendError with appropriate error_type classification. Its ``original_exception`` is ``exc`` when
+        ``response`` is given, and otherwise (a transport failure) an HTTPTransportError naming ``exc``'s class,
+        never ``exc``.
 
     Classification rules:
         - HTTP 401/403: AUTHENTICATION (alert ops)
@@ -126,13 +131,14 @@ def classify_http_error(
                 key=key,
             )
 
-    # A transport failure keeps urllib3's exception class only (see HTTPTransportError).
-    cause = HTTPTransportError(type(exc))
+    # A transport failure keeps urllib3's exception class only (see HTTPTransportError). A status no rule above
+    # matches (a 3xx: requests are sent with redirect=False) keeps its HTTPStatusError, and with it the response.
+    cause = exc if response is not None else HTTPTransportError(type(exc))
 
     # TRANSIENT: Connection failures. Checked before TIMEOUT: urllib3's NewConnectionError subclasses
     # its ConnectTimeoutError. Only the exception TYPE goes in the message: urllib3 exception text
     # can embed the request URL, which carries the raw cache key in its path, and the message reaches
-    # log sinks via str(e) (CWE-532, LAB-304).
+    # log sinks via str(e) (CWE-532).
     if isinstance(exc, (u3.NewConnectionError, u3.ProtocolError, u3.SSLError, u3.ProxyError)):
         # A host with no CA bundle fails every request here; name the fix rather than look like a network flake.
         # A hostname mismatch (X509_V_ERR_HOSTNAME_MISMATCH, 62) is not a trust-store problem, so it keeps the type.

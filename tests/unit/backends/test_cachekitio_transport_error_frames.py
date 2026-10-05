@@ -24,7 +24,7 @@ import pytest
 from cachekit.backends.cachekitio import config as config_module
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
-from tests.unit.config.test_redacting_settings import _holds, _secret_forms
+from tests.unit.config.test_redacting_settings import _cachekit_locals_holding
 
 pytestmark = [pytest.mark.unit, pytest.mark.security]
 
@@ -73,30 +73,6 @@ def _raised(call: Callable[[], object]) -> BackendError:
     pytest.fail("the request did not fail")
 
 
-def _frames_holding(exc: BaseException, secret: str) -> list[str]:
-    """Every ``function:local`` that holds ``secret``, on the traceback of ``exc`` or of any exception reachable from it
-    through ``__cause__``, ``__context__`` or ``original_exception``, whoever's frame it is."""
-    texts, raw = _secret_forms(secret)
-    found: list[str] = []
-    seen: set[int] = set()
-    pending: list[BaseException | None] = [exc]
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        pending += [current.__cause__, current.__context__, getattr(current, "original_exception", None)]
-        tb = current.__traceback__
-        while tb is not None:
-            found += [
-                f"{tb.tb_frame.f_code.co_name}:{name}"
-                for name, value in tb.tb_frame.f_locals.items()
-                if _holds(value, texts, raw)
-            ]
-            tb = tb.tb_next
-    return found
-
-
 @pytest.mark.parametrize("call", _CALLS.values(), ids=_CALLS.keys())
 def test_transport_failure_reaches_no_frame_holding_the_api_key(
     peer: tuple[int, BackendErrorType],
@@ -109,7 +85,7 @@ def test_transport_failure_reaches_no_frame_holding_the_api_key(
     err = _raised(lambda: call(backend))
 
     assert err.error_type == error_type
-    assert _frames_holding(err, api_key) == []
+    assert _cachekit_locals_holding(err, api_key, below_caller=True) == []
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl for the loopback certificate")
@@ -134,4 +110,4 @@ def test_error_status_reaches_no_frame_holding_the_api_key(
         err = _raised(lambda: asyncio.run(backend._request_async("POST", "k")))
 
     assert err.message == "Client error: HTTP 405"
-    assert _frames_holding(err, api_key) == []
+    assert _cachekit_locals_holding(err, api_key, below_caller=True) == []

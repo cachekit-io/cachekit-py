@@ -8,6 +8,7 @@ the one a real urllib3 response or exception produces.
 from __future__ import annotations
 
 import asyncio
+import pickle
 import socket
 import ssl
 from collections.abc import Callable
@@ -62,6 +63,8 @@ _STATUS_RULES = [
     (404, BackendErrorType.PERMANENT, "Client error: HTTP 404"),
     (409, BackendErrorType.PERMANENT, "Client error: HTTP 409"),
     (422, BackendErrorType.PERMANENT, "Client error: HTTP 422"),
+    # No rule matches a 3xx (requests are sent with redirect=False): it is UNKNOWN, still a status with its response.
+    (302, BackendErrorType.UNKNOWN, "Unknown HTTP error: HTTPStatusError"),
 ]
 
 
@@ -256,6 +259,17 @@ class TestNetworkExceptionEndToEnd:
         assert err.__cause__ is err.original_exception
         assert err.__context__ is None
         _assert_type_only(err)
+
+
+class TestTransportErrorPickle:
+    """A transport BackendError survives pickling, as every BackendError does (a ProcessPoolExecutor worker's error)."""
+
+    @pytest.mark.parametrize(("make_exc", "error_type", "message"), _TRANSPORT_RULES, ids=_TRANSPORT_IDS)
+    def test_round_trip(self, make_exc: Callable[[], Exception], error_type: BackendErrorType, message: str) -> None:
+        exc = make_exc()
+        err = pickle.loads(pickle.dumps(classify_http_error(exc, operation="put", key="k")))  # noqa: S301 (own object)
+        assert (err.error_type, err.message, err.operation, err.key) == (error_type, message, "put", "k")
+        _assert_class_only_cause(err, exc)
 
 
 class TestContextPropagation:
