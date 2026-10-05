@@ -641,7 +641,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379
 
 **Message**: `The <preset> preset does not accept ...`, `@cache does not accept ...` or `@cache(config=...) does not accept ...`, naming each keyword
 
-**Exception**: `ConfigurationError`, raised when the decorator is applied or a `DecoratorConfig` preset is called. Earlier releases raised the dataclass's `TypeError`. `@cache.local`, which takes only the four [parameters](features/reference-caching.md#parameters) it lists, still raises `TypeError`.
+**Exception**: `ConfigurationError`, raised when the decorator is applied or a `DecoratorConfig` preset is called, before `@cache.secure` or `@cache.io` looks for its key, so a misspelt keyword is reported even when no key is set. Earlier releases raised the dataclass's `TypeError`. `@cache.local`, which takes only the four [parameters](features/reference-caching.md#parameters) it lists, still raises `TypeError`.
 
 **Cause**: a keyword that names no `DecoratorConfig` field, often a typo such as `tll=`, or one that only another form takes: `api_key=` outside `@cache.io`, or `master_key=`, `tenant_extractor=`, `single_tenant_mode=`, `deployment_uuid=` or `fail_closed=` on any preset but `secure`, or beside `config=`. Bare `@cache` folds those into its own `EncryptionConfig`, `secure` takes them as its own options, and a config already holds its own.
 

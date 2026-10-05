@@ -793,6 +793,21 @@ class TestUnsupportedKeywords:
         with pytest.raises(ConfigurationError, match="does not accept bogus"):
             DecoratorConfig.io(bogus=1)
 
+    def test_secure_decorator_rejects_before_looking_up_its_key(
+        self, resolved: list[DecoratorConfig], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No master key anywhere, so a check after the key lookup would report the missing key instead."""
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+        decorator = cache.secure(bogus=1)
+        with pytest.raises(ConfigurationError, match="The secure preset does not accept bogus"):
+
+            @decorator
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
     def test_misplaced_key_is_named_not_quoted(self) -> None:
         with pytest.raises(ConfigurationError, match="does not accept master_key") as exc_info:
             DecoratorConfig.minimal(master_key=_OTHER_KEY)

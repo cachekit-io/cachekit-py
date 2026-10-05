@@ -741,6 +741,19 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         ConfigurationError,
         _KEY_HEX,
     ),
+    # So is a key under a misspelt name: every refused value is wrapped, in each dict a frame holds.
+    "minimal-config-misspelt-key": ({}, lambda: DecoratorConfig.minimal(master_keey=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "minimal-intent-misspelt-key": ({}, lambda: cache.minimal(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "secure-intent-misspelt-key": ({}, lambda: cache.secure(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "io-intent-misspelt-key": ({}, lambda: cache.io(api_kye=_API_KEY)(_cached), ConfigurationError, _API_KEY),
+    "bare-misspelt-key": ({}, lambda: cache(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "bare-call-misspelt-key": ({}, lambda: cache(_cached, master_keey=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "config-form-misspelt-key": (
+        {},
+        lambda: cache(config=DecoratorConfig.minimal(), master_keey=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
     "config-form-encryption-override": (
         {},
         lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False)(_cached),

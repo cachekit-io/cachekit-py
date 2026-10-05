@@ -12,7 +12,7 @@ from dataclasses import replace
 from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
-from ..config.decorator import _SECRET_KWARGS, UNSET, _reject_unsupported
+from ..config.decorator import _FIELD_NAMES, _PRESET_EXTRA_KWARGS, _SECRET_KWARGS, UNSET, _reject_unsupported
 from ..config.validation import hide_secret, reveal_secret
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
@@ -212,6 +212,16 @@ def cache(
                         enc_overrides[_k] = overrides.pop(_k)
                 overrides["encryption"] = replace(EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()})
 
+        # Checked here, not only in the preset's classmethod, so a refused value is wrapped in this frame's dicts too
+        # (CWE-532), and before @cache.secure looks up its key, so a misspelt keyword is not reported as a missing key.
+        if config is None:
+            _reject_unsupported(
+                f"The {_intent} preset" if _intent else "@cache",
+                overrides,
+                _FIELD_NAMES | _PRESET_EXTRA_KWARGS.get(_intent or "", frozenset()),
+                held_by=(manual_overrides,),
+            )
+
         # RORO config takes highest precedence
         if config is not None:
             # DecoratorConfig instance provided (type checked above) - use it with overrides
@@ -245,7 +255,7 @@ def cache(
                 override_dict = overrides.copy()
                 if backend is not UNSET:
                     override_dict["backend"] = backend
-                _reject_unsupported("@cache(config=...)", override_dict)
+                _reject_unsupported("@cache(config=...)", override_dict, held_by=(overrides, manual_overrides))
                 resolved_config = replace(config, **override_dict)
         # Intent-based presets (renamed per Task 6)
         elif _intent == "minimal":  # Renamed from "fast"
@@ -279,7 +289,6 @@ def cache(
             resolved_config = DecoratorConfig.io(**overrides)
         else:
             # No intent specified - use default DecoratorConfig with overrides
-            _reject_unsupported("@cache", overrides)
             resolved_config = DecoratorConfig(backend=backend, **overrides)
 
         if _has_l1_enabled:

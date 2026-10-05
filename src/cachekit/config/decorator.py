@@ -702,18 +702,33 @@ class DecoratorConfig:
 _FIELD_NAMES = frozenset(f.name for f in fields(DecoratorConfig) if not f.name.startswith("_"))
 # The EncryptionConfig settings DecoratorConfig.secure() takes as keywords of its own.
 _SECURE_ENCRYPTION_KWARGS = frozenset({"single_tenant_mode", "deployment_uuid", "fail_closed"})
+# The keywords a @cache.<preset> decorator takes beside the fields: its classmethod's own parameters, and secure's above.
+_PRESET_EXTRA_KWARGS = {
+    "io": frozenset({"api_key"}),
+    "secure": _SECURE_ENCRYPTION_KWARGS | {"master_key", "tenant_extractor"},
+}
 
 
-def _reject_unsupported(where: str, kwargs: dict[str, Any], accepted: frozenset[str] = _FIELD_NAMES) -> None:
+def _reject_unsupported(
+    where: str,
+    kwargs: dict[str, Any],
+    accepted: frozenset[str] = _FIELD_NAMES,
+    *,
+    held_by: tuple[dict[str, Any], ...] = (),
+) -> None:
     """Raise ConfigurationError naming every keyword in ``kwargs`` that ``accepted`` lacks.
 
     An unsupported argument is a configuration error, never the dataclass's TypeError and never a silent drop
-    (protocol intent-presets.md § Explicit Configuration, rule 2).
+    (protocol intent-presets.md § Explicit Configuration, rule 2). ``held_by`` lists the caller's other dicts that
+    hold the same keywords.
     """
     unsupported = sorted(kwargs.keys() - accepted)
     if not unsupported:
         return
-    # A key passed where none is taken is still a key: wrap it in the caller's own dict before raising.
-    for name in kwargs.keys() & _SECRET_KWARGS:
-        kwargs[name] = hide_secret(kwargs[name])
+    # A key passed where none is taken is still a key, and a refused value may be one under a misspelt name
+    # (master_keey=): wrap both in every dict a frame on the traceback holds before raising.
+    hidden = _SECRET_KWARGS | set(unsupported)
+    for mapping in (kwargs, *held_by):
+        for name in mapping.keys() & hidden:
+            mapping[name] = hide_secret(mapping[name])
     raise ConfigurationError(f"{where} does not accept {', '.join(unsupported)}.")
