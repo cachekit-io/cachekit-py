@@ -582,6 +582,16 @@ class TestCompressedAadTokenIsFrozen:
         with pytest.raises(EncryptionError, match="compressed must be a bool"):
             wrapper.serialize({"v": 1}, cache_key=self.KEY)
 
+    def test_write_refuses_metadata_without_compressed(self) -> None:
+        """A serializer returning no metadata is refused as EncryptionError, not a bare AttributeError."""
+
+        class MarkedSerializer(_UnmarkedSerializer):
+            cross_sdk_compatible = True
+
+        wrapper = EncryptionWrapper(serializer=MarkedSerializer(), master_key=b"\xaa" * 32, tenant_id="t1")
+        with pytest.raises(EncryptionError, match="compressed must be a bool"):
+            wrapper.serialize({"v": 1}, cache_key=self.KEY)
+
     def test_handler_write_refuses_a_non_bool_compressed(self) -> None:
         handler = CacheSerializationHandler(
             serializer_name=StandardSerializer(enable_integrity_checking=1),  # type: ignore[arg-type]

@@ -469,10 +469,12 @@ class EncryptionWrapper:
         # The AAD's compressed component is a frozen token: exactly True or False
         # (spec/encryption.md). str() of anything else, such as a truthy 1 from a directly
         # built serializer, would seal the entry under a token no other SDK's reader builds.
-        # Write side only: reads keep accepting what is stored.
-        if not isinstance(raw_metadata.compressed, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — serializer-supplied
+        # Write side only: reads keep accepting what is stored. getattr, because a custom
+        # serializer may return no metadata at all; that is refused here too, not an AttributeError.
+        compressed = getattr(raw_metadata, "compressed", None)
+        if not isinstance(compressed, bool):
             raise EncryptionError(
-                f"Refusing to seal: serializer metadata compressed must be a bool, got {type(raw_metadata.compressed).__name__}"
+                f"Refusing to seal: serializer metadata compressed must be a bool, got {type(compressed).__name__}"
             )
 
         # Encrypt the serialized data
