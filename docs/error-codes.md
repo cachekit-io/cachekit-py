@@ -631,7 +631,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379
 
 **Exception**: `ConfigurationError`, raised when the decorator is applied or a `DecoratorConfig` preset is called. Earlier releases raised the dataclass's `TypeError`. `@cache.local`, which takes only the four [parameters](features/reference-caching.md#parameters) it lists, still raises `TypeError`.
 
-**Cause**: a keyword that names no `DecoratorConfig` field, often a typo such as `tll=`, or one that only another form takes: `api_key=` outside `@cache.io`, or `master_key=`, `tenant_extractor=`, `single_tenant_mode=`, `deployment_uuid=` or `fail_closed=` beside `config=`. Bare `@cache` folds those into its own `EncryptionConfig`; a config already holds its own.
+**Cause**: a keyword that names no `DecoratorConfig` field, often a typo such as `tll=`, or one that only another form takes: `api_key=` outside `@cache.io`, or `master_key=`, `tenant_extractor=`, `single_tenant_mode=`, `deployment_uuid=` or `fail_closed=` on any preset but `secure`, or beside `config=`. Bare `@cache` folds those into its own `EncryptionConfig`, `secure` takes them as its own options, and a config already holds its own.
 
 **Solution**: fix the spelling, or set the option where the form takes it, such as `@cache(config=DecoratorConfig.secure(master_key=secret_key, fail_closed=True))`.
 
@@ -642,6 +642,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379
 **Message**: one of
 - `The secure preset sets its own encryption; encryption= cannot override it. ...`
 - `encryption= cannot override an encrypted config= ...`
+- `@cache.io does not accept backend= — it always caches through CachekitIOBackend. ...`
 - `@cache(config=DecoratorConfig.io(...)) does not accept backend= ...`
 
 **Exception**: `ConfigurationError`, raised when the decorator is applied or the preset is called

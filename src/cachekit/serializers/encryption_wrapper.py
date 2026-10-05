@@ -297,11 +297,14 @@ class EncryptionWrapper:
             settings = get_settings()
             previous_master_keys = [SecretBytes(bytes.fromhex(key.get_secret_value())) for key in settings.previous_master_keys]
 
+        # The hex rule again, for keys read from settings: settings validate them at load, but the settings
+        # object takes later assignments unvalidated, and the Rust Keyring below checks only 16 bytes.
         for position, previous_key in enumerate(previous_master_keys):
             if len(previous_key) < 32:
                 raise KeyringConfigurationError(
-                    f"Previous master key at position {position} must be at least 32 bytes (256 bits), "
-                    f"got {len(previous_key)} — per-key requirements are identical to master_key."
+                    f"Previous master key at position {position} of CACHEKIT_PREVIOUS_MASTER_KEYS must be at least "
+                    f"32 bytes (256 bits) decoded, got {len(previous_key)} — per-key requirements are identical to "
+                    "master_key."
                 )
 
         # Initialize encryptor

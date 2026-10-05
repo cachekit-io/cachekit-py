@@ -660,9 +660,8 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
 **Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
 raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 `cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
-passed directly that is not exactly 32 bytes (one from `CACHEKIT_PREVIOUS_MASTER_KEYS` that
-decodes to fewer), more than three previous keys, or the current key repeated among
-them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+passed directly that is not exactly 32 bytes, more than three previous keys, or the current
+key repeated among them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
 settings load, so this surfaces only when keys bypass that check: passed to
 `EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
 environment's previous keys. Outside config-drift reads (below), the fault never

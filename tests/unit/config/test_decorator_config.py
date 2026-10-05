@@ -30,6 +30,19 @@ from cachekit.config.singleton import reset_settings
 from cachekit.config.validation import ConfigurationError
 
 
+@pytest.fixture
+def resolved(monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
+    """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
+    seen: list[DecoratorConfig] = []
+
+    def spy(f, config, **_kwargs):
+        seen.append(config)
+        return f
+
+    monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
+    return seen
+
+
 @pytest.mark.unit
 class TestDecoratorConfigDefaults:
     """Test DecoratorConfig default values."""
@@ -411,18 +424,6 @@ class TestSecureIntegrityChecking:
         "secure-kwarg": lambda v: cache.secure(master_key=_SECURE_KEY, integrity_checking=v),
     }
 
-    @pytest.fixture
-    def resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
-        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
-        seen: list[DecoratorConfig] = []
-
-        def spy(f, config, **_kwargs):
-            seen.append(config)
-            return f
-
-        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
-        return seen
-
     @pytest.mark.parametrize("form", FORMS, ids=list(FORMS))
     @pytest.mark.parametrize("value", [False, None], ids=["false", "none"])
     def test_disable_rejected_at_decoration(self, resolved: list[DecoratorConfig], form: str, value: object) -> None:
@@ -501,18 +502,6 @@ class TestL1EnabledFlag:
     accept it — and must keep the rest of the preset's L1 tuning (minimal/test ``swr_enabled=False``).
     """
 
-    @pytest.fixture(autouse=True)
-    def _resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
-        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
-        seen: list[DecoratorConfig] = []
-
-        def spy(f, config, **_kwargs):
-            seen.append(config)
-            return f
-
-        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
-        return seen
-
     @staticmethod
     def _decorate(decorator, **kwargs) -> None:
         @decorator(ttl=60, **kwargs)
@@ -521,19 +510,19 @@ class TestL1EnabledFlag:
 
     @pytest.mark.parametrize("l1_enabled", [False, True])
     @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
-    def test_preset_flips_only_enabled(self, _resolved: list[DecoratorConfig], preset: str, l1_enabled: bool) -> None:
+    def test_preset_flips_only_enabled(self, resolved: list[DecoratorConfig], preset: str, l1_enabled: bool) -> None:
         creds = _PRESET_KWARGS[preset]
         self._decorate(getattr(cache, preset), l1_enabled=l1_enabled, **creds)
-        assert _resolved[0].l1 == replace(getattr(DecoratorConfig, preset)(**creds).l1, enabled=l1_enabled)
+        assert resolved[0].l1 == replace(getattr(DecoratorConfig, preset)(**creds).l1, enabled=l1_enabled)
 
-    def test_config_form_keeps_config_l1(self, _resolved: list[DecoratorConfig]) -> None:
+    def test_config_form_keeps_config_l1(self, resolved: list[DecoratorConfig]) -> None:
         self._decorate(cache, config=DecoratorConfig.minimal(), l1_enabled=False)
-        assert _resolved[0].l1.enabled is False
-        assert _resolved[0].l1.swr_enabled is False
+        assert resolved[0].l1.enabled is False
+        assert resolved[0].l1.swr_enabled is False
 
-    def test_bare_form_uses_l1_defaults(self, _resolved: list[DecoratorConfig]) -> None:
+    def test_bare_form_uses_l1_defaults(self, resolved: list[DecoratorConfig]) -> None:
         self._decorate(cache, l1_enabled=False)
-        assert _resolved[0].l1 == L1CacheConfig(enabled=False)
+        assert resolved[0].l1 == L1CacheConfig(enabled=False)
 
 
 # One override per field a preset sets itself, each unequal to every preset's default for that field.
@@ -568,17 +557,6 @@ class TestPresetFieldOverrides:
     the preset default. Every other field keeps the preset's default.
     """
 
-    @pytest.fixture
-    def _resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
-        seen: list[DecoratorConfig] = []
-
-        def spy(f, config, **_kwargs):
-            seen.append(config)
-            return f
-
-        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
-        return seen
-
     @staticmethod
     def _assert_only_field_overridden(config: DecoratorConfig, preset: str, name: str) -> None:
         expected = _field_values(getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset]))
@@ -593,30 +571,30 @@ class TestPresetFieldOverrides:
         self._assert_only_field_overridden(config, preset, name)
 
     @pytest.mark.parametrize(("preset", "name"), _PRESET_FIELD_CASES)
-    def test_decorator_override_wins(self, _resolved: list[DecoratorConfig], preset: str, name: str) -> None:
+    def test_decorator_override_wins(self, resolved: list[DecoratorConfig], preset: str, name: str) -> None:
         value = _PRESET_OVERRIDES[preset][name]
 
         @getattr(cache, preset)(**_PRESET_KWARGS[preset], **{name: value})
         def fn() -> int:
             return 1
 
-        assert getattr(_resolved[0], name) is value
-        self._assert_only_field_overridden(_resolved[0], preset, name)
+        assert getattr(resolved[0], name) is value
+        self._assert_only_field_overridden(resolved[0], preset, name)
 
     @pytest.mark.parametrize("name", list(_NESTED_OVERRIDES))
-    def test_secure_override_keeps_encryption_invariants(self, _resolved: list[DecoratorConfig], name: str) -> None:
+    def test_secure_override_keeps_encryption_invariants(self, resolved: list[DecoratorConfig], name: str) -> None:
         classmethod_config = DecoratorConfig.secure(master_key=_SECURE_KEY, **{name: _NESTED_OVERRIDES[name]})
 
         @cache.secure(master_key=_SECURE_KEY, **{name: _NESTED_OVERRIDES[name]})
         def fn() -> int:
             return 1
 
-        for config in (classmethod_config, _resolved[0]):
+        for config in (classmethod_config, resolved[0]):
             assert config.encryption.enabled is True
             assert config.encryption.master_key == _SECURE_KEY
             assert config.integrity_checking is True
 
-    def test_secure_rejects_encryption_override(self, _resolved: list[DecoratorConfig]) -> None:
+    def test_secure_rejects_encryption_override(self, resolved: list[DecoratorConfig]) -> None:
         plaintext = EncryptionConfig(enabled=False)
         with pytest.raises(ConfigurationError, match="sets its own encryption"):
             DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=plaintext)
@@ -626,15 +604,15 @@ class TestPresetFieldOverrides:
             def fn() -> int:
                 return 1
 
-        assert _resolved == []
+        assert resolved == []
 
-    def test_l1_enabled_applies_on_top_of_l1_override(self, _resolved: list[DecoratorConfig]) -> None:
+    def test_l1_enabled_applies_on_top_of_l1_override(self, resolved: list[DecoratorConfig]) -> None:
         @cache.production(l1=L1CacheConfig(max_size_mb=200), l1_enabled=False)
         def fn() -> int:
             return 1
 
-        assert _resolved[0].l1.enabled is False
-        assert _resolved[0].l1.max_size_mb == 200
+        assert resolved[0].l1.enabled is False
+        assert resolved[0].l1.max_size_mb == 200
 
 
 _OTHER_KEY = "b" * 64  # pragma: allowlist secret
@@ -648,18 +626,6 @@ class TestConfigFormGuards:
     CachekitIOBackend it built. Each override is a ConfigurationError when the decorator is applied (protocol
     intent-presets.md § Explicit Configuration rule 2).
     """
-
-    @pytest.fixture
-    def resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
-        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
-        seen: list[DecoratorConfig] = []
-
-        def spy(f, config, **_kwargs):
-            seen.append(config)
-            return f
-
-        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
-        return seen
 
     ENCRYPTED_CONFIGS = {
         "secure": lambda: DecoratorConfig.secure(master_key=_SECURE_KEY),
@@ -756,18 +722,6 @@ class TestConfigFormGuards:
 class TestUnsupportedKeywords:
     """A keyword the form does not accept is a ConfigurationError at construction: never the dataclass's TypeError,
     never a silent drop (protocol intent-presets.md § Explicit Configuration rule 2, LAB-8223)."""
-
-    @pytest.fixture
-    def resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
-        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
-        seen: list[DecoratorConfig] = []
-
-        def spy(f, config, **_kwargs):
-            seen.append(config)
-            return f
-
-        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
-        return seen
 
     @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
     def test_classmethod_rejects_unknown_keyword(self, preset: str) -> None:

@@ -69,11 +69,6 @@ class TestEncryptionWrapperSetupErrors:
         finally:
             reset_settings()
 
-    def test_short_master_key_raises(self):
-        """EncryptionError when master_key is shorter than 32 bytes."""
-        with pytest.raises(EncryptionError, match="exactly 32 bytes"):
-            EncryptionWrapper(master_key=b"too_short")
-
 
 # A raw key of any length but 32 is refused, the 64 ASCII bytes of a hex key above all: they pass a
 # length floor and derive a key no other SDK derives (protocol intent-presets.md, Master Key Input rule 4).

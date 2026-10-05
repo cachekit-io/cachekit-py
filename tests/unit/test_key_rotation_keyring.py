@@ -473,8 +473,9 @@ class TestDecryptErrorTaxonomy:
 
 
 def _settings_previous_keys(monkeypatch: pytest.MonkeyPatch, keys: list[bytes]) -> None:
-    """Hand the wrapper previous keys that skip settings-load validation — the
-    position of any caller that passes previous_master_keys explicitly."""
+    """Hand the wrapper previous keys that skip settings-load validation, as a settings
+    object assigned to after load does (it validates no assignment). A key passed
+    explicitly never gets this far: __init__ holds it to exactly 32 bytes."""
     import cachekit.serializers.encryption_wrapper as ew
 
     stub = SimpleNamespace(previous_master_keys=[SecretStr(key.hex()) for key in keys])
