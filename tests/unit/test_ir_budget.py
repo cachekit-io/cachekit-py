@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import time
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
@@ -79,8 +84,258 @@ def test_ratchet_only_lowers_unless_increase_allowed() -> None:
 
 
 def test_default_parallelism_stays_small_on_a_big_machine() -> None:
-    """Each callgrind run holds about half a gigabyte, so the default must not grow with the core count."""
+    """A callgrind run peaks at up to a gigabyte, so the default must not grow with the core count."""
     assert 1 <= ir_budget.JOBS <= 8
+
+
+# A stand-in for the measured process: records its pid, then sleeps unless it is a warm-up run (n=1).
+SLEEPER = """
+import os, sys, time
+from pathlib import Path
+Path(__file__).with_name("pids").joinpath(str(os.getpid())).write_text(sys.argv[2])
+if sys.argv[2] != "1" or Path(__file__).with_name("sleep-warmup").exists():
+    time.sleep(60)
+"""
+
+# Runs the gate's measure() with the sleeper in place of callgrind + ir_workload.py.
+DRIVER = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from tests.performance import ir_budget as b
+b.WORKLOAD = Path(sys.argv[1])
+b._measure_one = lambda path, n, workdir, env, *timeout: b._run([], path, n, env, *timeout) or 0
+mode = sys.argv[4] if len(sys.argv) > 4 else ""
+if mode == "spawn":  # signal itself as soon as the first run is spawned
+    import os
+    class SignalOnSpawn(b.subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            Path(sys.argv[1]).with_name("spawned").write_text(str(self.pid))
+            os.kill(os.getpid(), int(sys.argv[3]))
+    b.subprocess.Popen = SignalOnSpawn
+elif mode == "submit":  # signal itself while submitting the second run, the first one live
+    import os, signal, time
+    submit = b.ThreadPoolExecutor.submit
+    calls = []
+    def submit_then_signal(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 1:
+                time.sleep(0.05)
+            os.kill(os.getpid(), int(sys.argv[3]))
+        return submit(self, *args, **kwargs)
+    b.ThreadPoolExecutor.submit = submit_then_signal
+elif mode == "again":  # signal itself again once the main thread takes the run lock after both runs started
+    import os, threading
+    class SignalOnceTaken:
+        def __init__(self, lock):
+            self.lock, self.fired = lock, False
+        def __enter__(self):
+            self.lock.acquire()
+            if self.fired or threading.current_thread() is not threading.main_thread():
+                return
+            if sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) >= 2:
+                self.fired = True
+                os.kill(os.getpid(), int(sys.argv[3]))
+        def __exit__(self, *exc):
+            self.lock.release()
+    b._children_lock = SignalOnceTaken(b._children_lock)
+elif mode == "inside":  # signal itself again at the Nth line run inside the first _kill_children(), callees included
+    import os, sys
+    state = {"armed": False, "lines": 0}
+    def line(frame, event, arg):
+        if event == "line" and state["lines"] < int(sys.argv[5]):
+            state["lines"] += 1
+            if state["lines"] == int(sys.argv[5]):
+                os.kill(os.getpid(), int(sys.argv[3]))
+        return line
+    def call(frame, event, arg):
+        if frame.f_code is b._kill_children.__code__:
+            state["armed"] = True
+        return line if state["armed"] and state["lines"] < int(sys.argv[5]) else None
+    sys.settrace(call)
+b.measure(["l1_hit"], 2)
+"""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _sleeper(tmp_path: Path) -> tuple[Path, Path]:
+    pids = tmp_path / "pids"
+    pids.mkdir()
+    script = tmp_path / "sleeper.py"
+    script.write_text(SLEEPER)
+    return script, pids
+
+
+def test_a_run_past_the_child_timeout_fails_the_gate_and_is_killed(tmp_path, monkeypatch) -> None:
+    script, pids = _sleeper(tmp_path)
+    monkeypatch.setattr(ir_budget, "WORKLOAD", script)
+    env = {"IR_BUDGET_LAYOUT": "48"}
+    with pytest.raises(RuntimeError, match=r"l1_hit n=1000 layout=48 ran past --child-timeout \(0\.01 min\)"):
+        ir_budget._run([], "l1_hit", 1000, env, timeout_s=0.6)
+    [pid] = (int(f.name) for f in pids.iterdir())
+    assert not _alive(pid)
+
+
+@pytest.mark.parametrize("minutes", ["0", "-1", "inf", "nan"])
+def test_the_child_timeout_must_be_a_positive_number_of_minutes(minutes: str, monkeypatch, capsys) -> None:
+    """0 or less times out every run, and inf or nan crash the first run instead of bounding it."""
+    monkeypatch.setattr(sys, "argv", ["ir_budget.py", "--child-timeout", minutes])
+    with pytest.raises(SystemExit, match="2"):
+        ir_budget._main()
+    assert "must be a positive number of minutes" in capsys.readouterr().err
+
+
+def test_a_fractional_child_timeout_is_kept() -> None:
+    assert ir_budget._positive_minutes("0.5") == 0.5
+
+
+def test_a_failed_run_fails_the_gate_without_waiting_for_the_runs_before_it(tmp_path, monkeypatch) -> None:
+    """Results are read in submission order, and an earlier run can take minutes: a failure must not queue behind it."""
+    script, pids = _sleeper(tmp_path)
+    monkeypatch.setattr(ir_budget, "WORKLOAD", script)
+    monkeypatch.setattr(ir_budget, "_stopped", False)  # measure() leaves it set, and _run reads it
+
+    def measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float) -> int:
+        if n == ir_budget.N_LO:  # the earlier run: sleeps 60 s
+            ir_budget._run([], path, n, env, timeout_s)
+            return 0
+        deadline = time.monotonic() + 30
+        while not any(f.read_text() != "1" for f in pids.iterdir()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        raise RuntimeError("stub run failed")
+
+    monkeypatch.setattr(ir_budget, "_measure_one", measure_one)
+    start = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="stub run failed"):
+            ir_budget.measure(["l1_hit"], 2)
+        assert time.monotonic() - start < 30, "the gate waited for the earlier run"
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        assert runs, "the earlier run never started"
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+    finally:
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("again", [False, True], ids=["once", "again-while-killing"])
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_to_the_gate_leaves_no_run_behind(tmp_path, sig: signal.Signals, again: bool) -> None:
+    """A second signal that lands while the gate holds its run lock must not leave the lock held and the runs alive."""
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    extra = [str(int(sig)), "again"] if again else []
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), *extra])  # noqa: S603 (trusted: this test's files)
+    try:
+        deadline = time.monotonic() + 30
+        while sum(f.read_text() != "1" for f in pids.iterdir()) < 2:  # both measured runs started
+            assert gate.poll() is None and time.monotonic() < deadline, "the stub runs never started"
+            time.sleep(0.05)
+        gate.send_signal(sig)
+        code = gate.wait(timeout=10)
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)  # an uncaught KeyboardInterrupt re-raises SIGINT
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_while_runs_are_being_submitted_leaves_no_run_behind(tmp_path, sig: signal.Signals) -> None:
+    """The pool waits for live runs when it unwinds, so they must be killed before it does."""
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "submit"])  # noqa: S603 (trusted: this test's files)
+    try:
+        code = gate.wait(timeout=20)  # the stub run sleeps 60 s: a gate that waits for it times out here
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        assert runs, "the stub run never started"
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_between_spawning_a_run_and_tracking_it_leaves_no_run_behind(tmp_path, sig: signal.Signals) -> None:
+    script, pids = _sleeper(tmp_path)
+    (tmp_path / "sleep-warmup").touch()  # the warm-up run sleeps too, so an orphan stays visible
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "spawn"])  # noqa: S603 (trusted: this test's files)
+    try:
+        code = gate.wait(timeout=20)
+        run = int((tmp_path / "spawned").read_text())  # the run may be killed before it records its own pid
+        deadline = time.monotonic() + 5
+        while _alive(run) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(run), "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)
+    finally:
+        gate.kill()
+        for f in [*pids.iterdir(), tmp_path / "spawned"]:
+            pid = int(f.read_text() if f.name == "spawned" else f.name) if f.exists() else 0
+            if pid and _alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("line", range(1, 13))
+def test_a_second_signal_anywhere_inside_the_kill_leaves_no_run_behind(tmp_path, line: int) -> None:
+    """The handler re-enters _kill_children() on the main thread, so nothing on that path may take a plain lock."""
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    sig = signal.SIGTERM
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "inside", str(line)])  # noqa: S603 (trusted: this test's files)
+    try:
+        deadline = time.monotonic() + 30
+        while sum(f.read_text() != "1" for f in pids.iterdir()) < 2:  # both measured runs started
+            assert gate.poll() is None and time.monotonic() < deadline, "the stub runs never started"
+            time.sleep(0.05)
+        gate.send_signal(sig)
+        code = gate.wait(timeout=20)  # a handler blocked on a lock its own thread holds never returns
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == 128 + sig
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
 
 
 def test_every_path_has_a_committed_budget() -> None:

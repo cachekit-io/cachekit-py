@@ -252,7 +252,14 @@ make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; need
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 
-The gate runs at most 8 callgrind processes at a time (fewer on a smaller machine), and each holds about half a gigabyte, so it can share a machine with other work. `--jobs N` changes that. A deliberate cost increase (a new feature on the hot path) is recorded with `uv run python tests/performance/ir_budget.py --update --allow-increase`, and the PR states why.
+The gate runs at most 8 callgrind processes at a time (fewer on a smaller machine), and each path peaks at 0.5 to 1.0 GiB per run, so it can share a machine with other work. `--jobs N` changes that. Callgrind runs still need a bound: a workload that grows under callgrind can use many GiB, and a FileBackend `set()` workload passed 9 GiB in under four minutes. The gate kills a run that takes longer than `--child-timeout` minutes (default 15) and fails, and it kills every live run when it exits, fails, or gets SIGINT or SIGTERM. On Linux with systemd, also cap the whole gate's memory and run time:
+
+```bash
+systemd-run --user --scope -p MemoryMax=10G -p MemorySwapMax=0 -p RuntimeMaxSec=90min -- \
+    uv run python tests/performance/ir_budget.py
+```
+
+The gate does not call `systemd-run` itself, because CI runners and macOS lack it. A deliberate cost increase (a new feature on the hot path) is recorded with `uv run python tests/performance/ir_budget.py --update --allow-increase`, and the PR states why.
 
 ---
 
