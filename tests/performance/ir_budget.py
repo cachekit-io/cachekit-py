@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import shutil
@@ -58,7 +59,7 @@ import sys
 import sysconfig
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 
 N_LO, N_HI = 1000, 3000
@@ -209,8 +210,8 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
     which moved a small path by up to 0.4% per op. No shell setting (CACHEKIT_* included) reaches
     the measured process; the two CACHEKIT_* settings below keep cachekit's background threads asleep.
 
-    Each run is killed after ``child_timeout_s``. A failed run, SIGINT or SIGTERM kills every live run
-    before the error propagates, so no callgrind process outlives this call. Call it from the main
+    Each run is killed after ``child_timeout_s``. The first failed run, SIGINT or SIGTERM kills every live
+    run before the error propagates, so no callgrind process outlives this call. Call it from the main
     thread: it handles SIGINT and SIGTERM while it runs.
     """
     env = {
@@ -235,8 +236,6 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in (N_LO, N_HI)]
         with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
-            # Leaving the pool waits for its live runs, so they are killed first, on any error from the
-            # first submit on.
             try:
                 futures = {
                     (p, n, shift): pool.submit(
@@ -244,15 +243,16 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
                     )
                     for p, n, shift in runs
                 }
+                # A run that fails behind a long earlier one is seen now, not once that one finishes.
+                for future in wait(futures.values(), return_when=FIRST_EXCEPTION).done:
+                    future.result()
                 ir = {key: future.result() for key, future in futures.items()}
-            except BaseException:
+            finally:
+                # Leaving the pool waits for its live runs, so they are killed first, from the first submit on.
                 pool.shutdown(wait=False, cancel_futures=True)
                 _kill_children()
-                raise
-    except BaseException:
-        _kill_children()  # a warm-up run interrupted before its own cleanup could run
-        raise
     finally:
+        _kill_children()  # a warm-up run interrupted before its own cleanup could run
         for sig, handler in previous.items():
             signal.signal(sig, handler)
     return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
@@ -290,6 +290,14 @@ def ratchet(budgets: dict[str, int], measured: dict[str, int], allow_increase: b
     return out
 
 
+def _positive_minutes(text: str) -> float:
+    """``--child-timeout``: 0 or less times out every run, and inf or nan crash the first one."""
+    minutes = float(text)
+    if not 0 < minutes < math.inf:  # false for nan as well
+        raise argparse.ArgumentTypeError(f"must be a positive number of minutes, not {text}")
+    return minutes
+
+
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--path", action="append", choices=PATHS, help="measure only this path (repeatable)")
@@ -304,7 +312,7 @@ def _main() -> int:
     )
     parser.add_argument(
         "--child-timeout",
-        type=float,
+        type=_positive_minutes,
         default=CHILD_TIMEOUT_MIN,
         metavar="MIN",
         help=f"kill a callgrind run after this many minutes and fail the gate (default {CHILD_TIMEOUT_MIN:g})",

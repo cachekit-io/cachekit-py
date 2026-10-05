@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -153,6 +154,52 @@ def test_a_run_past_the_child_timeout_fails_the_gate_and_is_killed(tmp_path, mon
         ir_budget._run([], "l1_hit", 1000, env, timeout_s=0.6)
     [pid] = (int(f.name) for f in pids.iterdir())
     assert not _alive(pid)
+
+
+@pytest.mark.parametrize("minutes", ["0", "-1", "inf", "nan"])
+def test_the_child_timeout_must_be_a_positive_number_of_minutes(minutes: str, monkeypatch, capsys) -> None:
+    """0 or less times out every run, and inf or nan crash the first run instead of bounding it."""
+    monkeypatch.setattr(sys, "argv", ["ir_budget.py", "--child-timeout", minutes])
+    with pytest.raises(SystemExit, match="2"):
+        ir_budget._main()
+    assert "must be a positive number of minutes" in capsys.readouterr().err
+
+
+def test_a_fractional_child_timeout_is_kept() -> None:
+    assert ir_budget._positive_minutes("0.5") == 0.5
+
+
+def test_a_failed_run_fails_the_gate_without_waiting_for_the_runs_before_it(tmp_path, monkeypatch) -> None:
+    """Results are read in submission order, and an earlier run can take minutes: a failure must not queue behind it."""
+    script, pids = _sleeper(tmp_path)
+    monkeypatch.setattr(ir_budget, "WORKLOAD", script)
+    monkeypatch.setattr(ir_budget, "_stop", threading.Event())  # measure() leaves it set, and _run reads it
+
+    def measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float) -> int:
+        if n == ir_budget.N_LO:  # the earlier run: sleeps 60 s
+            ir_budget._run([], path, n, env, timeout_s)
+            return 0
+        deadline = time.monotonic() + 30
+        while not any(f.read_text() != "1" for f in pids.iterdir()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        raise RuntimeError("stub run failed")
+
+    monkeypatch.setattr(ir_budget, "_measure_one", measure_one)
+    start = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="stub run failed"):
+            ir_budget.measure(["l1_hit"], 2)
+        assert time.monotonic() - start < 30, "the gate waited for the earlier run"
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        assert runs, "the earlier run never started"
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+    finally:
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
