@@ -107,6 +107,8 @@ def expensive_api_call(user_id: int):
 
 *cachekit.io is in closed beta — [request access](https://cachekit.io) to get started.*
 
+How fresh a cachekit.io read is, and how long a deleted project's data stays readable: [Consistency and Deletion](https://docs.cachekit.io/concepts/consistency/).
+
 </details>
 
 <details>
