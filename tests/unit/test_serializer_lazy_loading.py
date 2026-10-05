@@ -313,13 +313,14 @@ class TestDataStackLoadsOnFirstUse:
         [record] = [r for r in caplog.records if "msgpack columnar fallback" in r.getMessage()]
         assert record.levelno == level
 
-    @pytest.mark.parametrize("how", ["unloadable", "missing"])
+    @pytest.mark.parametrize("how", ["unloadable", "init_fails", "missing"])
     @pytest.mark.parametrize("path", ["numpy_raw", "nested_ndarray", "columnar_dataframe", "columnar_series"])
     def test_decode_without_the_data_stack_is_a_serialization_error(self, monkeypatch, path, how):
         """A missing or unloadable numpy/pandas is a SerializationError on every decode path, never ImportError/RuntimeError.
 
         A direct caller treats SerializationError as a miss and recomputes. "unloadable" is a package
-        find_spec sees (the HAS_* flag is true) whose import fails, e.g. a broken native library.
+        find_spec sees (the HAS_* flag is true) whose import fails, e.g. a broken native library;
+        "init_fails" is one whose import raises RuntimeError, as an extension module's init can.
         """
         import numpy as np
         import pandas as pd
@@ -340,6 +341,15 @@ class TestDataStackLoadsOnFirstUse:
 
         if how == "unloadable":
             monkeypatch.setitem(sys.modules, module, None)
+        elif how == "init_fails":
+            real_import = auto.importlib.import_module
+
+            def failing_import(name, package=None):
+                if name == module:
+                    raise RuntimeError("extension init failed")
+                return real_import(name, package)
+
+            monkeypatch.setattr(auto.importlib, "import_module", failing_import)
         else:
             monkeypatch.setattr(auto, f"HAS_{module.upper()}", False)
         with pytest.raises(SerializationError, match=r"cachekit\[data\]"):

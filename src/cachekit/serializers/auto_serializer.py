@@ -152,15 +152,16 @@ def _import_for_decode(name: str, installed: bool) -> Any:
     """Import numpy or pandas for a decode; a missing or unloadable package is a ``SerializationError``.
 
     ``installed`` is ``HAS_NUMPY`` / ``HAS_PANDAS``, which only say ``find_spec`` saw the package:
-    a broken native library still fails the import. Either way the entry cannot be read here, and
-    a direct ``deserialize()`` caller treats ``SerializationError`` as a miss and recomputes, where
-    an ``ImportError`` would crash it.
+    a broken native library still fails the import, with ``ImportError`` or whatever an extension
+    module's init raises (``RuntimeError``, say). Either way the entry cannot be read here, and a
+    direct ``deserialize()`` caller treats ``SerializationError`` as a miss and recomputes, where
+    any other class would crash it. The decorator path already wraps every such failure.
     """
     if not installed:
         raise SerializationError(f"Cannot deserialize: {name} is not installed. Install with: pip install 'cachekit[data]'")
     try:
         return importlib.import_module(name)
-    except ImportError as e:
+    except Exception as e:  # only the import runs here; the cause is chained
         raise SerializationError(
             f"Cannot deserialize: {name} failed to import. Install with: pip install 'cachekit[data]'"
         ) from e
