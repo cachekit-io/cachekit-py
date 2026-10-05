@@ -40,6 +40,7 @@ import time_machine
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.cache_handler import CacheOperationHandler
 from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators import wrapper as wrapper_module
@@ -837,6 +838,58 @@ class TestInteropValueContractOnDegradedPaths:
 
         assert executions == ["deep"]
         assert backend.gets == backend.sets == 0
+        assert get_current_function_stats() is None
+
+    @staticmethod
+    def _failing_read(monkeypatch: pytest.MonkeyPatch, backend: _CountingBackend, is_async: bool):
+        """An interop function whose L2 read raises past the handler; returns ``(fn, executions)``.
+
+        The handler reads a backend error as a miss, so that call goes on to the store path. Only an
+        exception that escapes the read reaches the wrapper's fallback, which runs the function uncached.
+        """
+        executions: list[str] = []
+
+        def failing_read(*_: Any, **__: Any) -> None:
+            raise RuntimeError("read failed past the handler")
+
+        async def failing_read_async(*_: Any, **__: Any) -> None:
+            failing_read()
+
+        monkeypatch.setattr(CacheOperationHandler, "get_cached_value", failing_read)
+        monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", failing_read_async)
+
+        def body(x: str) -> Any:
+            executions.append(x)
+            if x.startswith("deep"):
+                return _deeply_nested()
+            return {"bad": {1}} if x.startswith("bad") else f"v:{x}"
+
+        async def async_body(x: str) -> Any:
+            return body(x)
+
+        fn = cache(ttl=300, l1_enabled=False, namespace=f"lab5375-read-{int(is_async)}", interop="op", backend=backend)(
+            async_body if is_async else body
+        )
+        return fn, executions
+
+    async def test_out_of_model_return_raises_after_a_failed_read(self, monkeypatch, is_async, backend):
+        """Sync returns the function's value uncached, async goes on to the store path: both refuse it."""
+        fn, executions = self._failing_read(monkeypatch, backend, is_async)
+
+        with pytest.raises(InteropError):
+            await _call(fn, "bad")
+
+        assert executions == ["bad"]
+        assert backend.sets == 0
+        assert get_current_function_stats() is None
+
+    @pytest.mark.parametrize("x", ["good", "deep"])
+    async def test_value_the_store_path_accepts_returns_after_a_failed_read(self, monkeypatch, is_async, backend, x):
+        fn, executions = self._failing_read(monkeypatch, backend, is_async)
+
+        assert await _call(fn, x) == (_deeply_nested() if x == "deep" else f"v:{x}")
+
+        assert executions == [x]
         assert get_current_function_stats() is None
 
 

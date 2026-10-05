@@ -1413,13 +1413,14 @@ def create_cache_wrapper(
         flat = bind_flat_args(_interop_sig, call_args, call_kwargs)
         return generate_interop_key(namespace, interop, flat)
 
-    def _uncached_result(result: Any) -> Any:
+    def _uncached_result(result: _T) -> _T:
         """Return ``result`` from a degraded, uncached call, refusing what interop would refuse to store.
 
-        A call the breaker rejects, or whose backend cannot be created, never reaches the
-        store path, where interop raises InteropError on an out-of-model value. Without this,
-        that value contract would depend on breaker state (LAB-5375). Any other encode
-        failure degrades here as it does on the store path, where it never reaches the caller.
+        A call the breaker rejects, whose backend cannot be created, or whose sync L2 read
+        raises past the handler never reaches the store path, where interop raises InteropError
+        on an out-of-model value. Without this, that value contract would depend on breaker
+        state (LAB-5375). Any other encode failure degrades here as it does on the store path,
+        where it never reaches the caller.
         """
         if interop is None:
             return result
@@ -2016,7 +2017,7 @@ def create_cache_wrapper(
             )
             # WHY: Early return on cache GET failure - same reason as L2 hit path
             reset_current_function_stats(token)
-            return func(*args, **kwargs)
+            return _uncached_result(func(*args, **kwargs))
 
         # CACHE MISS - Execute function and cache result
         # Note: Sync wrappers don't support distributed locking (backend protocol is async-only)
