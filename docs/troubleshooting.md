@@ -309,7 +309,8 @@ def expensive_query(id):
 **What it means**:
 - A custom `CACHEKIT_API_URL` points to an internal/private host
 - SSRF protection blocks requests to non-allowlisted destinations
-- Only `api.cachekit.io` is permitted by default
+- Only `api.cachekit.io` and `api.staging.cachekit.io` are permitted by default, matched exactly
+- A subdomain (`not in allowlist`) or an ambiguous URL (`Invalid API URL: could not be parsed`) is rejected: use the exact hostname, or set `CACHEKIT_ALLOW_CUSTOM_HOST=true` for your own host. A custom host with non-ASCII characters must be given in its ASCII `xn--` form
 
 **Solutions**:
 

@@ -6,7 +6,7 @@ Server-Side Request Forgery (SSRF) protection for the CachekitIO backend.
 
 ## What This Means for @cache.io Users
 
-When you use `@cache.io`, the SDK connects to `api.cachekit.io` on your behalf. To prevent misuse, custom API URLs are blocked by default - only `api.cachekit.io` and `api.staging.cachekit.io` are allowed. If you need to point the SDK at a custom endpoint (staging, self-hosted, or testing), you must explicitly opt in via `allow_custom_host=True`.
+When you use `@cache.io`, the SDK connects to `api.cachekit.io` on your behalf. To prevent misuse, custom API URLs are blocked by default - only `api.cachekit.io` and `api.staging.cachekit.io` are allowed. If you need to point the SDK at a custom endpoint (self-hosted or testing), you must explicitly opt in via `allow_custom_host=True`.
 
 If you're seeing URL validation errors in your app, see the [Troubleshooting Guide](../troubleshooting.md) for common causes and fixes.
 
@@ -24,7 +24,7 @@ SSRF (Server-Side Request Forgery) occurs when an attacker can control the desti
 
 ## Protection Layers
 
-The SDK implements three layers of SSRF protection. Every layer checks the host the HTTP client will connect to: the URL is read with the same parser that builds the connection pool, and a URL whose host is ambiguous is rejected as unparseable.
+The SDK implements three layers of SSRF protection. Every layer checks the host the HTTP client will connect to: the host is read with the same parser that builds the connection pool, and a URL whose host is ambiguous is rejected as unparseable. A custom host with non-ASCII characters must therefore be given in its ASCII (`xn--`) form.
 
 ### 1. HTTPS Enforcement
 
@@ -142,9 +142,9 @@ Both implementations enforce the same exact hostname allowlist and block the pri
 
 ## Security Considerations
 
-1. **Hostname allowlist is the primary defense**: The IP blocking is defense-in-depth for obvious patterns. The hostname allowlist (`api.cachekit.io`, `api.staging.cachekit.io`) is the primary security control.
+1. **Hostname allowlist is the primary defense**: The hostname allowlist (`api.cachekit.io`, `api.staging.cachekit.io`, matched exactly) is the primary security control. The IP blocking is defense-in-depth for literal addresses.
 
-2. **DNS rebinding**: The SDK checks hostnames at configuration time, not at request time. DNS rebinding attacks that resolve to private IPs after validation are mitigated by the hostname allowlist (attackers can't control `*.cachekit.io` DNS).
+2. **DNS rebinding**: The SDK checks hostnames at configuration time, not at request time. DNS rebinding attacks that resolve to private IPs after validation are mitigated by the hostname allowlist: by default the SDK connects only to the two API hostnames, whose DNS cachekit controls.
 
 3. **IPv4-mapped IPv6**: The SDK checks a `::ffff:x.x.x.x` address (in dotted or hex form) as the IPv4 address it maps to.
 

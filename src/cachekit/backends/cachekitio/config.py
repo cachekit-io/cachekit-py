@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import socket
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
@@ -66,24 +66,25 @@ def is_private_ip(hostname: str) -> bool:
     if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        # The zone id of a scoped IPv6 address (fe80::1%eth0) does not change which network it is in.
+        # Anything after a % is ignored: a zone id (fe80::1%eth0) does not change which network an address is in.
         addr: IPv4Address | IPv6Address = ip_address(host.split("%", 1)[0])
     except ValueError:
         try:
             addr = IPv4Address(socket.inet_aton(host))
-        except (OSError, ValueError):  # Not an address; ValueError for an embedded NUL or a non-ASCII name.
+        except (OSError, ValueError):  # Not an address; ValueError for an embedded NUL.
             return False
     if isinstance(addr, IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     return any(addr in net for net in _PRIVATE_NETWORKS)
 
 
-def _api_host(url: str) -> str:
-    """The host the HTTP client connects to for ``url``: lowercase, IPv6 without brackets.
+def _parse_api_url(url: str) -> tuple[str, ParseResult]:
+    """The host the HTTP client connects to for ``url`` (lowercase, IPv6 without brackets), and the stdlib parse.
 
     The client builds its connection pool with urllib3, so the host is read with urllib3's parser, the one every
     check must see. A URL that the standard library reads with a different host, or that holds a backslash, is
-    rejected: its host depends on which parser reads it.
+    rejected: its host depends on which parser reads it. A non-ASCII host is rejected too (urllib3 reads it in its
+    IDNA ``xn--`` form, the standard library does not), so a custom host must be given in that ASCII form.
 
     Raises:
         ValueError: If the URL cannot be parsed, holds a backslash, or the two parsers disagree on its host.
@@ -93,12 +94,13 @@ def _api_host(url: str) -> str:
         raise ValueError("Invalid API URL: must not contain a backslash")
     # Each parser's own error can quote the whole netloc, so it is kept off the chain: raised outside the except.
     try:
-        hosts = ((parse_url(url).host or "").lower().strip("[]"), urlparse(url).hostname or "")
+        host = (parse_url(url).host or "").lower().strip("[]")
+        parsed = urlparse(url)
     except ValueError:  # urllib3's LocationParseError is a ValueError
-        hosts = None
-    if hosts is None or hosts[0] != hosts[1]:
+        host = parsed = None
+    if host is None or parsed is None or host != (parsed.hostname or ""):
         raise ValueError("Invalid API URL: could not be parsed")
-    return hosts[0]
+    return host, parsed
 
 
 class CachekitIOBackendConfig(BaseBackendConfig):
@@ -171,8 +173,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
             ValueError: If URL is invalid, carries credentials, uses non-HTTPS, names no host, or targets private IP
         """
         # Never echo the URL: its userinfo may carry credentials (CWE-532).
-        hostname = _api_host(v)
-        parsed = urlparse(v)
+        hostname, parsed = _parse_api_url(v)
 
         # Userinfo never authenticates here (the client sends only the Bearer key), and a password in
         # the URL reaches any log or error that prints it (CWE-532).
@@ -204,7 +205,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         if self.allow_custom_host:
             return
 
-        hostname = _api_host(self.api_url)
+        hostname = _parse_api_url(self.api_url)[0]
         if hostname not in ALLOWED_HOSTS:
             raise ValueError(
                 f"API URL hostname '{hostname}' not in allowlist. "

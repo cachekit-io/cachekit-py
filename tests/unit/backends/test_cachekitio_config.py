@@ -6,7 +6,7 @@ from pydantic import SecretStr, ValidationError
 from cachekit.backends.cachekitio.config import (
     ALLOWED_HOSTS,
     CachekitIOBackendConfig,
-    _api_host,
+    _parse_api_url,
     is_private_ip,
 )
 
@@ -194,6 +194,7 @@ class TestCachekitIOBackendConfig:
             "https://[::]",
             "https://10.1:8443/v1",
             "https://app.localhost",
+            "https://127.0.0.1%25x",  # anything after % is ignored
         ],
     )
     def test_private_ip_spellings_rejected_with_custom_host(self, url: str) -> None:
@@ -275,7 +276,7 @@ class TestSSRFBypassAttempts:
 
     def test_ipv4_mapped_ipv6_blocked(self) -> None:
         """IPv4-mapped IPv6 addresses should be blocked."""
-        # This tests the is_private_ip recursive check
+        # Checked as the IPv4 address each one maps to
         assert is_private_ip("::ffff:127.0.0.1") is True
         assert is_private_ip("::ffff:10.0.0.1") is True
         assert is_private_ip("::ffff:169.254.169.254") is True
@@ -294,7 +295,7 @@ class TestApiHost:
         ],
     )
     def test_host(self, url: str, host: str) -> None:
-        assert _api_host(url) == host
+        assert _parse_api_url(url)[0] == host
 
     @pytest.mark.parametrize(
         "url",
@@ -307,22 +308,28 @@ class TestApiHost:
             "https://[fe80::1%25eth0]",
             "https://api.cachekit.io:99999",
             "https://exa mple.com",
+            "https://münchen.example",  # a custom host must use its ASCII xn-- form
         ],
     )
     def test_ambiguous_or_unparseable_url_rejected(self, url: str) -> None:
         """A URL whose host is not the same to both parsers, or that neither can parse, is rejected at config load."""
         with pytest.raises(ValueError, match="Invalid API URL"):
-            _api_host(url)
+            _parse_api_url(url)
         for allow in (False, True):
             with pytest.raises(ValidationError, match="Invalid API URL"):
                 CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url, allow_custom_host=allow)
 
+    def test_idna_host_accepted_in_ascii_form(self) -> None:
+        assert _parse_api_url("https://xn--mnchen-3ya.example")[0] == "xn--mnchen-3ya.example"
+
     def test_error_never_quotes_the_url(self) -> None:
-        url = "https://user:hunter2@exa mple.com"  # pragma: allowlist secret
-        with pytest.raises(ValidationError) as excinfo:
-            CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url, allow_custom_host=True)
+        """Both parsers' own errors quote this userinfo; neither reaches the raised error or its chain."""
+        url = "https://user:hunter2\uff20example.com"  # fullwidth @  # pragma: allowlist secret
+        with pytest.raises(ValueError) as excinfo:
+            _parse_api_url(url)
         assert "hunter2" not in str(excinfo.value)
-        assert excinfo.value.__cause__ is None or "hunter2" not in repr(excinfo.value.__cause__)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
 
     def test_url_without_host_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must name a host"):
