@@ -16,12 +16,18 @@ if TYPE_CHECKING:
 class HTTPStatusError(Exception):
     """A response with an error status, kept as the BackendError's ``original_exception``.
 
-    The message names the status only: the response carries no request URL, so neither does this.
+    The message names the status only: the response carries no request URL, so neither does this. ``response`` is
+    ``None`` on a pickled or copied one: a live response holds its connection pool, which does not pickle.
     """
 
-    def __init__(self, response: BaseHTTPResponse) -> None:
-        super().__init__(f"HTTP {response.status}")
+    def __init__(self, status: int, response: BaseHTTPResponse | None = None) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
         self.response = response
+
+    def __reduce__(self) -> tuple[type[HTTPStatusError], tuple[int]]:
+        # Pickled by the status, not by args (its message), so a BackendError carrying one still pickles and copies.
+        return (type(self), (self.status,))
 
 
 class HTTPTransportError(Exception):

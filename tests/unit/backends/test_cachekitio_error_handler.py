@@ -32,7 +32,7 @@ _URL = "https://api.cachekit.io/v1/cache/user%3Asecret-42"
 
 def _status_error(status: int) -> tuple[HTTPStatusError, BaseHTTPResponse]:
     resp = response(status)
-    return HTTPStatusError(resp), resp
+    return HTTPStatusError(status, resp), resp
 
 
 def _send(mode: str, handler: Callable[[FakeRequest], BaseHTTPResponse]) -> BackendError:
@@ -92,6 +92,7 @@ class TestHTTPStatusClassification:
         """HTTPStatusError is the cause logged with the BackendError: its text carries no URL."""
         exc, resp = _status_error(500)
         assert str(exc) == "HTTP 500"
+        assert exc.status == 500
         assert exc.response is resp
 
 
@@ -106,7 +107,7 @@ class TestHTTPStatusEndToEnd:
         assert err.message == message
         assert err.operation == "put"
         assert isinstance(err.original_exception, HTTPStatusError)
-        assert err.original_exception.response.status == status
+        assert err.original_exception.status == status
 
     @pytest.mark.parametrize("mode", ["sync", "async"])
     def test_value_too_large_413_is_permanent(self, mode: str) -> None:
@@ -121,6 +122,7 @@ class TestHTTPStatusEndToEnd:
         err = _send(mode, lambda request: response(429, headers={"Retry-After": "7"}))
         assert err.error_type == BackendErrorType.TRANSIENT
         assert isinstance(err.original_exception, HTTPStatusError)
+        assert err.original_exception.response is not None
         assert err.original_exception.response.headers["Retry-After"] == "7"
         assert _rate_limit_delay(err) == 7
 
@@ -261,15 +263,32 @@ class TestNetworkExceptionEndToEnd:
         _assert_type_only(err)
 
 
-class TestTransportErrorPickle:
-    """A transport BackendError survives pickling, as every BackendError does (a ProcessPoolExecutor worker's error)."""
+class TestErrorPickle:
+    """A classified BackendError survives pickling, as every BackendError does (a ProcessPoolExecutor worker's error)."""
 
     @pytest.mark.parametrize(("make_exc", "error_type", "message"), _TRANSPORT_RULES, ids=_TRANSPORT_IDS)
-    def test_round_trip(self, make_exc: Callable[[], Exception], error_type: BackendErrorType, message: str) -> None:
+    def test_transport_round_trip(self, make_exc: Callable[[], Exception], error_type: BackendErrorType, message: str) -> None:
         exc = make_exc()
         err = pickle.loads(pickle.dumps(classify_http_error(exc, operation="put", key="k")))  # noqa: S301 (own object)
         assert (err.error_type, err.message, err.operation, err.key) == (error_type, message, "put", "k")
         _assert_class_only_cause(err, exc)
+
+    @pytest.mark.parametrize(("status", "error_type", "message"), _STATUS_RULES)
+    def test_status_round_trip(self, status: int, error_type: BackendErrorType, message: str) -> None:
+        """The copy keeps the status and drops the response: a live one holds its connection pool, which does not pickle."""
+        exc, resp = _status_error(status)
+        err = pickle.loads(pickle.dumps(classify_http_error(exc, response=resp, operation="put", key="k")))  # noqa: S301
+        assert (err.error_type, err.message, err.operation, err.key) == (error_type, message, "put", "k")
+        cause = err.original_exception
+        assert isinstance(cause, HTTPStatusError)
+        assert (cause.status, str(cause), cause.response) == (status, f"HTTP {status}", None)
+
+    def test_copied_rate_limit_has_no_wait(self) -> None:
+        """A copied 429 has no response to read Retry-After from, so paced invalidation does not wait on it."""
+        resp = response(429, headers={"Retry-After": "7"})
+        err = classify_http_error(HTTPStatusError(429, resp), response=resp)
+        assert _rate_limit_delay(err) == 7
+        assert _rate_limit_delay(pickle.loads(pickle.dumps(err))) is None  # noqa: S301 (own object)
 
 
 class TestContextPropagation:

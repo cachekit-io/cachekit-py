@@ -150,7 +150,7 @@ def _rate_limit_delay(error: BackendError) -> int | None:
     quota or balance deny (``X-CacheKit-Deny-Reason``): waiting does not clear it.
     """
     cause = error.original_exception
-    if isinstance(cause, HTTPStatusError) and cause.response.status == 429:
+    if isinstance(cause, HTTPStatusError) and cause.status == 429 and cause.response is not None:
         return _retry_after_seconds(cause.response, _MAX_RATE_LIMIT_WAIT_S)
     return None
 
@@ -453,7 +453,7 @@ class CachekitIOBackend:
         """``response`` if it is a 2xx, or a 404 that ``miss_on_404`` accepts; otherwise the classified BackendError."""
         if 200 <= response.status < 300 or (miss_on_404 and response.status == 404):
             return response
-        exc = HTTPStatusError(response)
+        exc = HTTPStatusError(response.status, response)
         raise classify_http_error(exc, response=response, operation=method.lower()) from exc
 
     def _request_sync(
