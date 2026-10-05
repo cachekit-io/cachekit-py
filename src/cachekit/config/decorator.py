@@ -466,8 +466,9 @@ class DecoratorConfig:
                 "The secure preset sets its own encryption; encryption= cannot override it. Pass any of "
                 f"{_SECURE_ENCRYPTION_OPTIONS} to it directly."
             )
-        # Every EncryptionConfig setting this preset takes as a keyword, passed through by name. An omitted one keeps
-        # EncryptionConfig's default (fail_closed=None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED, default fail open).
+        # The EncryptionConfig settings this preset takes through **kwargs, passed through by name. An omitted
+        # deployment_uuid or fail_closed keeps EncryptionConfig's default (fail_closed=None defers to
+        # CACHEKIT_ENCRYPTION_FAIL_CLOSED, default fail open); single_tenant_mode is resolved below.
         encryption_kwargs = {k: kwargs.pop(k) for k in _SECURE_ENCRYPTION_KWARGS if k in kwargs}
 
         # SECURITY INVARIANT: integrity_checking is forced to True. A request to turn it off is
@@ -482,7 +483,7 @@ class DecoratorConfig:
         # Normalize empty string to None (security: empty string treated as single-tenant)
         tenant_extractor = tenant_extractor or None
 
-        # Determine tenant mode: explicit param > tenant_extractor check
+        # Tenant mode: an explicit non-None single_tenant_mode wins; otherwise derived from tenant_extractor
         if encryption_kwargs.get("single_tenant_mode") is None:
             encryption_kwargs["single_tenant_mode"] = tenant_extractor is None
 
