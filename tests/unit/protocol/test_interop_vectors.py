@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import msgpack
 import pytest
 
 from cachekit.interop import (
@@ -157,20 +158,28 @@ def test_error_vectors(vector: dict[str, Any]):
             canonical_args_bytes(vector_args(vector["args"]))
 
 
+# Decoded values for the reader accept vectors tagged JSON cannot carry (the fixture omits their "value").
+READER_VALUES_NOT_IN_FIXTURE = {
+    "reader_non_string_map_key": {1: 42},
+    "reader_ext_type": msgpack.ExtType(1, b"\x2a"),
+}
+
+
 @pytest.mark.parametrize("vector", VECTORS["reader_accept_vectors"], ids=lambda v: v["name"])
 def test_reader_accept_vectors(vector: dict[str, Any]):
-    """The value reader decodes every well-formed, non-canonical document; where tagged JSON
-    can carry the value (not an integer map key or an ext type), it is the decoded value."""
-    decoded = decode_interop_value(bytes.fromhex(vector["input_hex"]))
-    if "value" in vector:
-        assert decoded == from_tagged(vector["value"])
+    """The value reader decodes every well-formed, non-canonical document to its value: the
+    fixture's tagged-JSON one, or ours where tagged JSON cannot carry it."""
+    expected = from_tagged(vector["value"]) if "value" in vector else READER_VALUES_NOT_IN_FIXTURE[vector["name"]]
+    assert decode_interop_value(bytes.fromhex(vector["input_hex"])) == expected
 
 
 @pytest.mark.parametrize("vector", VECTORS["reader_reject_vectors"], ids=lambda v: v["name"])
 def test_reader_reject_vectors(vector: dict[str, Any]):
-    """The value reader rejects every reader reject vector (message text is not normative)."""
-    with pytest.raises(InteropDecodeError):
+    """The value reader rejects every reader reject vector by its trailing-bytes check (message text
+    is not normative); the cause pins that it is not the CK-frame diagnostic."""
+    with pytest.raises(InteropDecodeError) as excinfo:
         decode_interop_value(bytes.fromhex(vector["input_hex"]))
+    assert isinstance(excinfo.value.__cause__, msgpack.exceptions.ExtraData)
 
 
 def test_lone_surrogate_rejected():

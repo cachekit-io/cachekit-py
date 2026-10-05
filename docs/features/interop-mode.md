@@ -142,7 +142,7 @@ assert data.hex() == "82a36167651ea46e616d65a5616c696365"  # canonical: sorted k
 assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 ```
 
-`decode_interop_value` accepts any well-formed document, canonical or not: padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. A map with an array or map as a key raises `InteropDecodeError`, as do trailing bytes after the one document.
+`decode_interop_value` accepts any well-formed document, canonical or not: padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. Trailing bytes after the one document raise `InteropDecodeError`.
 
 ## Conformance
 

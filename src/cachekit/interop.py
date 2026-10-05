@@ -494,8 +494,10 @@ def _revive_sentinels(obj: Any) -> Any:
 def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     """Decode one plain-MessagePack interop value document.
 
-    Readers accept any well-formed MessagePack document (canonical or not),
-    but MUST consume exactly one document — trailing bytes are rejected
+    Readers accept any well-formed MessagePack document (canonical or not):
+    a hashable non-str map key (int, float, bytes, ExtType, a revived temporal)
+    decodes as-is, and an unhashable one raises InteropDecodeError. Readers
+    MUST consume exactly one document — trailing bytes are rejected
     (msgpack-python raises ExtraData). A CK v3 frame prefix gets the
     protocol#11 diagnostic instead of decoding its magic byte as int 67.
     """
@@ -507,9 +509,9 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
             "check that every writer for this key uses @cache(interop=...)."
         )
     # strict_map_key=False: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must
-    # accept. msgpack's default exists against hash flooding, but array/map keys still fail as unhashable, and
-    # a 64-bit int shares its full hash with at most 8 others and a float64 with at most one per exponent
-    # (str/bytes are SipHash-keyed), so a forged entry's colliding-key chains stay bounded, not O(n).
+    # accept. msgpack's default exists against hash flooding. Here an array/map key still fails as unhashable,
+    # str/bytes hashes are SipHash-keyed, and int/float hashes, though unseeded, are each shared by a bounded
+    # set (at most 13 ints in msgpack's range, about 200 float64s), so colliding-key chains stay bounded.
     try:
         return unpackb_bounded(raw, raw=False, strict_map_key=False, object_hook=_revive_sentinels)
     except Exception as e:
