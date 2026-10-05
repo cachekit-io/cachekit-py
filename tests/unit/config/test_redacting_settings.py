@@ -777,12 +777,6 @@ def _api_key_rows(form: Callable[[str], Any]) -> dict[str, _EntryPointRow]:
         "io-config-bad-proxy": (_BAD_PROXY_ENV, lambda: DecoratorConfig.io(api_key=key), LocationParseError, _API_KEY),
         "io-intent-bad-proxy": (_BAD_PROXY_ENV, lambda: cache.io(api_key=key)(_cached), LocationParseError, _API_KEY),
         # A key passed where no form takes one is still a key.
-        "io-config-misplaced-key": (
-            {},
-            lambda: DecoratorConfig.io(api_key=key, master_key=_KEY_HEX),
-            ConfigurationError,
-            _KEY_HEX,
-        ),
         "secure-config-misplaced-api-key": (
             {},
             lambda: DecoratorConfig.secure(master_key=_KEY_HEX, api_key=key),
@@ -821,6 +815,12 @@ _ENTRY_POINT_ROWS: dict[str, _EntryPointRow] = {
     **{name + suffix: row for suffix, form in _API_KEY_FORMS.items() for name, row in _api_key_rows(form).items()},
     # A key passed where no form takes one is still a key (LAB-8223).
     "minimal-config-misplaced-key": ({}, lambda: DecoratorConfig.minimal(master_key=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "io-config-misplaced-key": (
+        {},
+        lambda: DecoratorConfig.io(api_key=_API_KEY, master_key=_KEY_HEX),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
     "config-form-misplaced-key": (
         {},
         lambda: cache(config=DecoratorConfig.minimal(), master_key=_KEY_HEX)(_cached),
