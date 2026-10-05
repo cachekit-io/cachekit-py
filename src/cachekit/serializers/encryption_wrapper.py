@@ -216,7 +216,8 @@ class EncryptionWrapper:
                 match, never by trial decryption. Writes always use master_key.
                 Each key passed is raw bytes, exactly 32 of them, as master_key.
             _master_key_from_hex: Internal, for CacheSerializationHandler: master_key holds the bytes of a
-                hex key the caller gave a decorator, which the hex rule lets run past 32 bytes.
+                hex key the caller gave a decorator, which the hex rule lets run past 32 bytes. Passing it
+                yourself bypasses the exactly-32-byte check.
         """
         master_key = None if master_key is None else _hide_key(master_key)
         if previous_master_keys is not None:
