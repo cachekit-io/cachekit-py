@@ -249,7 +249,7 @@ Budgets are per interpreter (minor version, build flavour, machine); an interpre
 **Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.3% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
 
 ```bash
-make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 120 runs, several minutes)
+make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 130 runs, several minutes)
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 
