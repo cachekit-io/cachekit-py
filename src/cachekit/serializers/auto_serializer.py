@@ -25,6 +25,7 @@ already loaded); decode imports them on first use.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
 from datetime import date, datetime, time
@@ -147,6 +148,25 @@ def _is_plain_numpy_numeric(dtype: Any) -> bool:
     return not pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in ("i", "u", "f")
 
 
+def _import_for_decode(name: str, installed: bool) -> Any:
+    """Import numpy or pandas for a decode; a missing or unloadable package is a ``SerializationError``.
+
+    ``installed`` is ``HAS_NUMPY`` / ``HAS_PANDAS``, which only say ``find_spec`` saw the package:
+    a broken native library still fails the import, with ``ImportError`` or whatever an extension
+    module's init raises (``RuntimeError``, say). Either way the entry cannot be read here, and a
+    direct ``deserialize()`` caller treats ``SerializationError`` as a miss and recomputes, where
+    any other class would crash it. The decorator path already wraps every such failure.
+    """
+    if not installed:
+        raise SerializationError(f"Cannot deserialize: {name} is not installed. Install with: pip install 'cachekit[data]'")
+    try:
+        return importlib.import_module(name)
+    except Exception as e:  # only the import runs here; the cause is chained
+        raise SerializationError(
+            f"Cannot deserialize: {name} failed to import. Install with: pip install 'cachekit[data]'"
+        ) from e
+
+
 def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
     """``np.dtype(spec)`` for a dtype the cache entry itself supplies, refusing what the writer never emits.
 
@@ -155,7 +175,7 @@ def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
     before any array is built. Columnar (DataFrame/Series) entries only ever carry dtypes that
     pass ``_is_plain_numpy_numeric``, the write-side predicate, so ``numeric_only`` mirrors it.
     """
-    import numpy as np
+    np = _import_for_decode("numpy", HAS_NUMPY)
 
     dtype = np.dtype(spec)
     if numeric_only and not _is_plain_numpy_numeric(dtype):
@@ -187,7 +207,7 @@ def _column_values(info: dict[str, Any], what: str) -> Any:
     """
     marker = info["type"]
     if marker == "numeric":
-        import numpy as np
+        np = _import_for_decode("numpy", HAS_NUMPY)
 
         # .copy() → writable values that do not alias the source buffer (#157).
         return np.frombuffer(info["data"], dtype=_dtype_from_untrusted(info["dtype"], numeric_only=True)).copy()
@@ -382,11 +402,9 @@ def _auto_object_hook(obj: Any) -> Any:
                 return set(value_list)
 
         if obj.get("__ndarray__") is True:
-            if not HAS_NUMPY:
-                raise SerializationError("Cannot deserialize numpy array: numpy is not installed")
+            np = _import_for_decode("numpy", HAS_NUMPY)
             if "data" not in obj or "shape" not in obj or "dtype" not in obj:
                 raise SerializationError("Invalid ndarray format: missing required fields in cached data")
-            import numpy as np
 
             # .copy(): writable result that does not alias the source buffer (the L1-cached bytes on a hit) — #157.
             return np.frombuffer(obj["data"], dtype=_dtype_from_untrusted(obj["dtype"])).reshape(obj["shape"]).copy()
@@ -542,7 +560,11 @@ class AutoSerializer:
         except ImportError as exc:
             # No pyarrow is the expected no-[data]-extra case; an installed pyarrow that fails to import is a
             # broken install. arrow_serializer wraps pyarrow's own error, so name the cause.
-            level = logging.WARNING if find_spec("pyarrow") is not None else logging.DEBUG
+            try:
+                installed = find_spec("pyarrow") is not None
+            except ValueError:  # sys.modules["pyarrow"] holds a module with no __spec__: there, but broken
+                installed = True
+            level = logging.WARNING if installed else logging.DEBUG
             logger.log(
                 level,
                 "ArrowSerializer unavailable, DataFrames use the msgpack columnar fallback: %s",
@@ -921,10 +943,10 @@ class AutoSerializer:
             value = unpackb_bounded(data, **self._msgpack_unpack_opts)
         except PAYLOAD_DECODE_ERRORS as msgpack_error:
             # NUMPY_RAW entries were routed structurally at the top, so nothing reaching here can be
-            # a NumPy payload (and a NumPy attempt would raise RuntimeError without the [data]
-            # extra). Report every reason for the miss: the msgpack one is the decode-bound
-            # rejection for a forged entry and must not vanish behind the envelope error. Both
-            # causes quote untrusted bytes, so both are bounded here.
+            # a NumPy payload (and a NumPy attempt would fail without the [data] extra). Report every
+            # reason for the miss: the msgpack one is the decode-bound rejection for a forged entry
+            # and must not vanish behind the envelope error. Both causes quote untrusted bytes, so
+            # both are bounded here.
             raise SerializationError(
                 "Cache entry is not a decodable MessagePack payload"
                 f"{f' (envelope: {bounded_error(envelope_error)})' if envelope_error else ''}"
@@ -995,15 +1017,10 @@ class AutoSerializer:
     def _deserialize_numpy(self, data: bytes) -> np.ndarray:
         """Deserialize NumPy array from NUMPY_RAW binary format.
 
-        Requires: numpy installed (HAS_NUMPY=True)
-
         Raises:
-            RuntimeError: If numpy not installed
-            SerializationError: If data format is invalid or unrecognized
+            SerializationError: If numpy is missing or fails to import, or the data format is
+                invalid or unrecognized
         """
-        if not HAS_NUMPY:
-            raise RuntimeError("NumPy not installed. Install with: pip install cachekit[data]")
-
         # Strip + verify the optional 8-byte xxHash3-64 checksum prefix written by integrity-on
         # serialization. Detect by structure (like ArrowSerializer): a checksummed entry is
         # [8-byte checksum][NUMPY_RAW...]; a raw entry (integrity-off / legacy) is [NUMPY_RAW...].
@@ -1024,12 +1041,10 @@ class AutoSerializer:
         only into the result array.
 
         Raises:
-            RuntimeError: If numpy not installed
-            SerializationError: If data format is invalid or unrecognized
+            SerializationError: If numpy is missing or fails to import, or the data format is
+                invalid or unrecognized
         """
-        if not HAS_NUMPY:
-            raise RuntimeError("NumPy not installed. Install with: pip install cachekit[data]")
-        import numpy as np
+        np = _import_for_decode("numpy", HAS_NUMPY)
 
         # A memoryview has no .startswith/.decode; compare slices and decode a bytes copy.
         if data[:9] != b"NUMPY_RAW":
@@ -1114,15 +1129,11 @@ class AutoSerializer:
         ``unpackb_bounded`` first, so this method never touches the wire bytes and never re-runs
         the decode bound. A forged non-dict body is refused by the ``_expect`` shape gate.
 
-        Requires: pandas installed (HAS_PANDAS=True)
-
         Raises:
-            RuntimeError: If pandas not installed
-            SerializationError: forged document shape — see ``_expect`` / ``_column_values``
+            SerializationError: pandas is missing or fails to import, or a forged document shape —
+                see ``_expect`` / ``_column_values``
         """
-        if not HAS_PANDAS:
-            raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
-        import pandas as pd
+        pd = _import_for_decode("pandas", HAS_PANDAS)
 
         serialized = _expect(document, dict, "document")
         columns_data = {}
@@ -1171,15 +1182,11 @@ class AutoSerializer:
         :meth:`_deserialize_dataframe` (its callers run ``unpackb_bounded`` first). A forged
         non-dict body is refused by the ``_expect`` shape gate.
 
-        Requires: pandas installed (HAS_PANDAS=True)
-
         Raises:
-            RuntimeError: If pandas not installed
-            SerializationError: forged document shape — see ``_expect`` / ``_column_values``
+            SerializationError: pandas is missing or fails to import, or a forged document shape —
+                see ``_expect`` / ``_column_values``
         """
-        if not HAS_PANDAS:
-            raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
-        import pandas as pd
+        pd = _import_for_decode("pandas", HAS_PANDAS)
 
         serialized = _expect(document, dict, "document")
         series = pd.Series(_column_values(serialized, "series"), name=serialized["name"])

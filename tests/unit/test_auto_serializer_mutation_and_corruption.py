@@ -498,14 +498,14 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="ArrowSerializer not available"):
             _no_arrow().deserialize(data, meta)
 
-    def test_a_structural_numpy_read_without_numpy_raises_runtime_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_structural_numpy_read_without_numpy_raises_serialization_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The structural route calls the body parser directly, so the parser carries the guard."""
         import cachekit.serializers.auto_serializer as auto
 
         data, _ = AutoSerializer().serialize(np.arange(3.0))
         monkeypatch.setattr(auto, "HAS_NUMPY", False)
 
-        with pytest.raises(RuntimeError, match="NumPy not installed"):
+        with pytest.raises(SerializationError, match=r"numpy is not installed.*cachekit\[data\]"):
             AutoSerializer().deserialize(data, None)
 
     def test_deserialize_numpy_verifies_a_checksummed_entry_itself(self) -> None:

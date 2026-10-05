@@ -312,3 +312,70 @@ class TestDataStackLoadsOnFirstUse:
             assert AutoSerializer()._arrow_serializer is None
         [record] = [r for r in caplog.records if "msgpack columnar fallback" in r.getMessage()]
         assert record.levelno == level
+
+    @pytest.mark.parametrize("how", ["unloadable", "init_fails", "missing"])
+    @pytest.mark.parametrize("path", ["numpy_raw", "nested_ndarray", "columnar_dataframe", "columnar_series"])
+    def test_decode_without_the_data_stack_is_a_serialization_error(self, monkeypatch, path, how):
+        """A missing or unloadable numpy/pandas is a SerializationError on every decode path, never ImportError/RuntimeError.
+
+        A direct caller treats SerializationError as a miss and recomputes. "unloadable" is a package
+        find_spec sees (the HAS_* flag is true) whose import fails, e.g. a broken native library;
+        "init_fails" is one whose import raises RuntimeError, as an extension module's init can.
+        """
+        import numpy as np
+        import pandas as pd
+
+        from cachekit.serializers import AutoSerializer
+        from cachekit.serializers import auto_serializer as auto
+        from cachekit.serializers.base import SerializationError
+
+        value, module = {
+            "numpy_raw": (np.arange(3.0), "numpy"),
+            "nested_ndarray": ({"a": np.arange(3)}, "numpy"),
+            "columnar_dataframe": (pd.DataFrame({"x": [1.0, 2.0]}), "pandas"),
+            "columnar_series": (pd.Series([1.5, 2.5], name="s"), "pandas"),
+        }[path]
+        serializer = AutoSerializer()
+        serializer._arrow_serializer = None  # force the msgpack-columnar DataFrame path
+        data, meta = serializer.serialize(value)
+
+        if how == "unloadable":
+            monkeypatch.setitem(sys.modules, module, None)
+        elif how == "init_fails":
+            real_import = auto.importlib.import_module
+
+            def failing_import(name, package=None):
+                if name == module:
+                    raise RuntimeError("extension init failed")
+                return real_import(name, package)
+
+            monkeypatch.setattr(auto.importlib, "import_module", failing_import)
+        else:
+            monkeypatch.setattr(auto, f"HAS_{module.upper()}", False)
+        with pytest.raises(SerializationError, match=r"cachekit\[data\]"):
+            serializer.deserialize(data, meta)
+
+    def test_arrow_classification_survives_a_pyarrow_module_without_a_spec(self, monkeypatch, caplog):
+        """``find_spec`` raises ValueError for a sys.modules entry whose ``__spec__`` is None; that is a broken install, not a crash."""
+        import types
+
+        import pandas as pd
+
+        from cachekit.serializers import AutoSerializer
+        from cachekit.serializers.base import SerializationError
+
+        df = pd.DataFrame({"x": [1.0, 2.0]})
+        arrow_data, arrow_meta = AutoSerializer().serialize(df)
+        assert arrow_meta.original_type == "arrow"
+
+        monkeypatch.setitem(sys.modules, "pyarrow", types.ModuleType("pyarrow"))  # __spec__ is None
+        monkeypatch.setitem(sys.modules, "cachekit.serializers.arrow_serializer", None)
+        serializer = AutoSerializer()
+        with caplog.at_level(logging.DEBUG, logger="cachekit.serializers.auto_serializer"):
+            data, meta = serializer.serialize(df)
+        assert meta.original_type == "dataframe"
+        pd.testing.assert_frame_equal(serializer.deserialize(data, meta), df)
+        with pytest.raises(SerializationError, match="ArrowSerializer not available"):
+            serializer.deserialize(arrow_data, arrow_meta)
+        [record] = [r for r in caplog.records if "msgpack columnar fallback" in r.getMessage()]
+        assert record.levelno == logging.WARNING
