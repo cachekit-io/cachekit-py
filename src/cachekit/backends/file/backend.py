@@ -905,13 +905,17 @@ class FileBackend:
         Args:
             old_size: Size of the entry being overwritten, or None for a new entry
 
+        A count at the cap is confirmed by a rescan before rejecting, so a count drifted high by
+        foreign deletes does not reject. If that rescan fails, the check fails closed: it rejects on
+        the count it has, keeping the cap while the directory cannot be read.
+
         Raises:
             BackendError: If storing a new entry would exceed max_entry_count
         """
         if self.config.max_entry_count <= 0 or old_size is not None:
             return
         if self._entry_count >= self.config.max_entry_count:
-            self._reconcile()  # never reject on a count that may have drifted
+            self._reconcile()
             if self._entry_count >= self.config.max_entry_count:
                 raise BackendError(
                     f"Entry count {self._entry_count} would exceed max_entry_count ({self.config.max_entry_count})",
@@ -1036,7 +1040,9 @@ class FileBackend:
     def _scan_entries(self) -> list[tuple[str, float, int]] | None:
         """One pass over the cache directory: (path, mtime, size) of every cache entry.
 
-        Skips hidden files, temp files, symlinks and anything else that is not a regular file.
+        Skips hidden files, temp files, symlinks and anything else that is not a regular file, and
+        entries deleted mid-scan. An entry whose stat fails any other way (EIO, ESTALE) is kept with
+        size 0 and mtime 0, so the count never runs low on a partial scan and eviction tries it first.
         Returns None if the directory cannot be read.
         """
         entries = []
@@ -1048,8 +1054,11 @@ class FileBackend:
                     try:
                         # lstat, never follow a symlink (security)
                         stat_info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue  # Deleted mid-scan
                     except OSError:
-                        continue  # File might have been deleted
+                        entries.append((entry.path, 0.0, 0))
+                        continue
                     if stat.S_ISREG(stat_info.st_mode):
                         entries.append((entry.path, stat_info.st_mtime, stat_info.st_size))
         except Exception:

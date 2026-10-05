@@ -1566,6 +1566,58 @@ class TestEntryBookkeeping:
         assert backend._calculate_cache_size()[1] == 70
         assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
 
+    def test_partial_scan_with_failed_stats_never_undercounts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An entry whose stat fails with EIO still counts, so a partial scan cannot hide entries."""
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_entry_count=100))
+        for i in range(85):
+            backend.set(f"k{i}", b"v")
+        real_scandir = os.scandir
+
+        class _EIOEntry:
+            def __init__(self, entry: os.DirEntry[str]) -> None:
+                self.name, self.path = entry.name, entry.path
+
+            def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+                raise OSError(errno.EIO, "I/O error")
+
+        class _Listing:
+            def __init__(self, path: Any) -> None:
+                with real_scandir(path) as it:
+                    self._entries = [_EIOEntry(e) if i % 5 == 0 else e for i, e in enumerate(it)]
+
+            def __enter__(self) -> list[Any]:
+                return self._entries
+
+            def __exit__(self, *exc: object) -> None:
+                pass
+
+        monkeypatch.setattr(os, "scandir", _Listing)
+        backend._reconcile()
+        assert backend._entry_count == 85
+
+        for i in range(6):  # 91 > 90: the rescan still sees every entry and evicts to 70
+            backend.set(f"new{i}", b"v")
+        monkeypatch.undo()
+        assert backend._calculate_cache_size()[1] == 70
+
+    def test_failed_capacity_rescan_fails_closed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """At the cap with an unreadable directory, a new entry is rejected on the count it has."""
+        from cachekit.backends.errors import BackendError
+
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_entry_count=100))
+        backend.set("a", b"v")
+        backend._entry_count = 100
+
+        def failing_scandir(path: Any) -> Any:
+            raise OSError(errno.EIO, "I/O error")
+
+        monkeypatch.setattr(os, "scandir", failing_scandir)
+        with pytest.raises(BackendError, match="max_entry_count"):
+            backend.set("b", b"v")
+        backend.set("a", b"w")  # overwrites still pass
+        monkeypatch.undo()
+        assert not backend.exists("b")
+
     def test_drifted_high_count_does_not_evict(self, tmp_path: Path) -> None:
         backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_entry_count=100))
         for i in range(80):

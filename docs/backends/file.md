@@ -74,7 +74,7 @@ backend = FileBackend(config)
 
 ## Characteristics
 
-- Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks `get` for that whole `set()`, because `set()` holds the backend's lock through its fsync.
+- Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due, before rejecting a new entry at `max_entry_count`, or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks `get` for that whole `set()`, because `set()` holds the backend's lock through its fsync.
 - Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
 - Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported. Within one process, use one `FileBackend` instance per cache directory: each instance tracks only its own writes against the size and entry caps (see [Performance Characteristics](#performance-characteristics))
@@ -151,7 +151,8 @@ Three things still scan the directory, and each scan costs time in proportion to
 of entries. A `set()` that pushes the cache past the eviction trigger rescans first, so it never
 evicts on a stale count, and then evicts the oldest-written entries; that happens about once
 every `0.2 × max_entry_count` new keys. A `set()` that would be rejected at `max_entry_count`
-scans before it rejects. And the first `set()` more than 30 seconds after the last scan
+scans before it rejects; if the directory cannot be read just then, it rejects on the count it
+has, keeping the cap rather than guessing. And the first `set()` more than 30 seconds after the last scan
 rescans, because the counters cannot see other processes' writes to the same directory. So
 the latency tail of `set()` grows with the cache, and the typical `set()` does not.
 `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
