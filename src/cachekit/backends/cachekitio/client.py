@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
 
 import urllib3
+from pydantic import SecretStr
 from urllib3.util import Timeout, make_headers, parse_url
 
 from cachekit.hash_utils import redact_error_for_log
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
     from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
-_ClientKey = tuple[str, str, float, int]
+_ClientKey = tuple[str, SecretStr, float, int]
 
 
 def _user_agent() -> str:
@@ -222,7 +223,9 @@ def _own_leases() -> _Leases:
 
 
 def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
-    return (config.api_url, config.api_key.get_secret_value(), config.timeout, config.connection_pool_size)
+    # The key stays a SecretStr, which compares and hashes by its value: building a client can raise (a malformed proxy
+    # URL), and lease_http_client's frame holds this tuple on that error's traceback (CWE-532).
+    return (config.api_url, config.api_key, config.timeout, config.connection_pool_size)
 
 
 def lease_http_client(config: CachekitIOBackendConfig) -> ClientLease:

@@ -19,12 +19,14 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, ValidationInfo, create_model, field_validator
 from pydantic_core import PydanticCustomError
+from urllib3.exceptions import LocationParseError
 
 import cachekit
 from cachekit import DecoratorConfig, cache
 from cachekit._rust_serializer import KeyringConfigurationError
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio import CachekitIOBackend
+from cachekit.backends.cachekitio import client as cachekitio_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
 from cachekit.backends.memcached.config import MemcachedBackendConfig
@@ -738,6 +740,9 @@ _BYTES_KEY_ROWS: dict[str, Callable[[], object]] = {
 
 _EntryPointRow = tuple[dict[str, str], Callable[[], object], type[BaseException], str | bytes]
 
+# The lowercase names: urllib.request.getproxies prefers them, and an empty no_proxy drops any NO_PROXY bypass.
+_BAD_PROXY_ENV = {"https_proxy": "http://[", "no_proxy": ""}
+
 
 def _api_key_rows(form: Callable[[str], Any]) -> dict[str, _EntryPointRow]:
     """The entry-point rows that pass an API key, each passing it as ``form`` makes it from a str. A row's secret is the
@@ -767,6 +772,10 @@ def _api_key_rows(form: Callable[[str], Any]) -> dict[str, _EntryPointRow]:
             ConfigurationError,
             _API_KEY,
         ),
+        # The client is built after the config validates, and a malformed proxy URL fails there.
+        "io-backend-bad-proxy": (_BAD_PROXY_ENV, lambda: CachekitIOBackend(api_key=key), LocationParseError, _API_KEY),
+        "io-config-bad-proxy": (_BAD_PROXY_ENV, lambda: DecoratorConfig.io(api_key=key), LocationParseError, _API_KEY),
+        "io-intent-bad-proxy": (_BAD_PROXY_ENV, lambda: cache.io(api_key=key)(_cached), LocationParseError, _API_KEY),
         # A key passed where no form takes one is still a key.
         "io-config-misplaced-key": (
             {},
@@ -1075,6 +1084,8 @@ class TestEntryPointFrameLocals:
         for name, value in env.items():
             monkeypatch.setenv(name, value)
         singleton.reset_settings()
+        # A fresh lease cache, so each row builds its own client: a cached one would skip the build that raises.
+        monkeypatch.setattr(cachekitio_client, "_leases", cachekitio_client._Leases())
 
         with pytest.raises(raised) as exc_info:
             call()
