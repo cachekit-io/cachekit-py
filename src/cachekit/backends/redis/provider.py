@@ -21,7 +21,7 @@ import weakref
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
 from urllib.parse import quote as url_encode
 
 import redis
@@ -33,7 +33,11 @@ from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError, UnsupportedTenantError
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.backends.redis.error_handler import classify_redis_error
+from cachekit.config.validation import hide_secret
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
+
+if TYPE_CHECKING:
+    from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +134,11 @@ class PerRequestRedisBackend:
     - Fix #5: health_check() doesn't leak tenant_id
     - Fix #6: Implements ALL optional protocols completely
     - Fix #9: Fail-fast validation - raises RuntimeError if tenant_id is None
+
+    A failed operation raises its BackendError outside the ``except`` block, from the
+    cause ``classify_redis_error`` keeps, and from a frame that holds neither the client
+    nor its pool nor a pipeline in a local: their reprs list the password, and an error
+    tracker sends the locals of every frame on a raised error's traceback (CWE-532).
 
     Tenant scoping format: t:{url_encoded_tenant_id}:{key}
 
@@ -276,7 +285,8 @@ class PerRequestRedisBackend:
             return None
         except Exception as exc:
             # Fix #3: Use centralized error classification
-            raise classify_redis_error(exc, operation="get", key=key) from exc
+            error = classify_redis_error(exc, operation="get", key=key)
+        raise error from error.original_exception
 
     def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
         """Store value in Redis storage with tenant scoping.
@@ -295,9 +305,11 @@ class PerRequestRedisBackend:
                 self._client.setex(scoped_key, ttl, value)
             else:
                 self._client.set(scoped_key, value)
+            return
         except Exception as exc:
             # Fix #3: Use centralized error classification
-            raise classify_redis_error(exc, operation="set", key=key) from exc
+            error = classify_redis_error(exc, operation="set", key=key)
+        raise error from error.original_exception
 
     def delete(self, key: str) -> bool:
         """Delete key from Redis storage with tenant scoping.
@@ -323,7 +335,8 @@ class PerRequestRedisBackend:
             return result > 0
         except Exception as exc:
             # Fix #3: Use centralized error classification
-            raise classify_redis_error(exc, operation="delete", key=key) from exc
+            error = classify_redis_error(exc, operation="delete", key=key)
+        raise error from error.original_exception
 
     def exists(self, key: str) -> bool:
         """Check if key exists in Redis storage with tenant scoping.
@@ -349,7 +362,8 @@ class PerRequestRedisBackend:
             return result > 0
         except Exception as exc:
             # Fix #3: Use centralized error classification
-            raise classify_redis_error(exc, operation="exists", key=key) from exc
+            error = classify_redis_error(exc, operation="exists", key=key)
+        raise error from error.original_exception
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check Redis backend health status.
@@ -429,7 +443,8 @@ class PerRequestRedisBackend:
                 return None
             return ttl if ttl > 0 else None
         except Exception as exc:
-            raise classify_redis_error(exc, operation="get_ttl", key=key) from exc
+            error = classify_redis_error(exc, operation="get_ttl", key=key)
+        raise error from error.original_exception
 
     async def refresh_ttl(self, key: str, ttl: int) -> bool:
         """Refresh TTL on existing key (TTLInspectableBackend protocol).
@@ -450,7 +465,8 @@ class PerRequestRedisBackend:
             # Redis EXPIRE returns 1 if TTL was set, 0 if key doesn't exist
             return bool(result)
         except Exception as exc:
-            raise classify_redis_error(exc, operation="refresh_ttl", key=key) from exc
+            error = classify_redis_error(exc, operation="refresh_ttl", key=key)
+        raise error from error.original_exception
 
     @asynccontextmanager
     async def acquire_lock(
@@ -473,7 +489,9 @@ class PerRequestRedisBackend:
             True if lock acquired, False if timeout waiting
 
         Raises:
-            BackendError: If Redis operation fails
+            BackendError: If a Redis operation fails, or the block raises. An exception the
+                block raised is kept whole as ``original_exception``; a redis-py failure
+                keeps only its class (see ``classify_redis_error``).
 
         Note:
             Each acquisition attempt is one non-blocking ``SET NX`` round-trip run via
@@ -499,6 +517,7 @@ class PerRequestRedisBackend:
         # Resolve it here, in the caller's context: run_in_executor does not carry contextvars,
         # so the executor callables below must never read tenant_context themselves.
         scoped_key = f"{self._scoped_key(key)}:lock"
+        body_error: Optional[Exception] = None
         try:
             from redis.lock import Lock
 
@@ -558,12 +577,17 @@ class PerRequestRedisBackend:
                 await asyncio.sleep(lock.sleep)
             try:
                 yield acquired
+            except Exception as exc:
+                body_error = exc  # raised by the caller's code in the block, not by redis-py
+                raise
             finally:
                 # Release lock if acquired (also run in thread pool)
                 if acquired:
                     await _release()
+            return
         except Exception as exc:
-            raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+            error = classify_redis_error(exc, operation="acquire_lock", key=key, keep_exception=exc is body_error)
+        raise error from error.original_exception
 
     def track_key(self, registry_id: str, key: str) -> None:
         """Record a written cache key in the registry's tracking set (KeyTrackableBackend protocol).
@@ -582,12 +606,15 @@ class PerRequestRedisBackend:
         """
         scoped_reg = self._scoped_key(registry_id)
         try:
-            pipe = self._client.pipeline(transaction=False)
-            pipe.sadd(scoped_reg, key)
-            pipe.expire(scoped_reg, _TRACKING_SET_TTL_SECONDS)
-            pipe.execute()
+            # Chained, never bound to a local: a pipeline's repr lists the password. A pipelined
+            # command returns its pipeline; redis-py's annotations give the reply type instead.
+            self._client.pipeline(transaction=False).sadd(scoped_reg, key).expire(  # pyright: ignore[reportAttributeAccessIssue]
+                scoped_reg, _TRACKING_SET_TTL_SECONDS
+            ).execute()
+            return
         except Exception as exc:
-            raise classify_redis_error(exc, operation="track_key", key=registry_id) from exc
+            error = classify_redis_error(exc, operation="track_key", key=registry_id)
+        raise error from error.original_exception
 
     def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
         """Delete every tracked key of a registry, then every local key the drain missed
@@ -665,14 +692,16 @@ class PerRequestRedisBackend:
                 self._client.unlink(*(self._scoped_key(k) for k in chunk))
                 out.update(chunk)
         except Exception as exc:
-            raise classify_redis_error(exc, operation="drain_tracked", key=registry_id) from exc
-        logger.log(
-            logging.WARNING if len(out) > _DRAIN_WARN_KEYS else logging.INFO,
-            "Key registry drained %d keys for %s",
-            len(out),
-            redact_cache_key(registry_id),
-        )
-        return out
+            error = classify_redis_error(exc, operation="drain_tracked", key=registry_id)
+        else:
+            logger.log(
+                logging.WARNING if len(out) > _DRAIN_WARN_KEYS else logging.INFO,
+                "Key registry drained %d keys for %s",
+                len(out),
+                redact_cache_key(registry_id),
+            )
+            return out
+        raise error from error.original_exception
 
     def listener_pool(self) -> redis.ConnectionPool:
         """A one-connection pool for the invalidation listener, cloned from this backend's pool.
@@ -734,21 +763,25 @@ class PerRequestRedisBackend:
             timeout_ms: Timeout in milliseconds
 
         Raises:
-            BackendError: With error_type=TIMEOUT if timeout exceeded
+            BackendError: If the block raises, classified by ``classify_redis_error`` (a
+                redis-py TimeoutError as TIMEOUT), with the block's exception kept whole as
+                ``original_exception``
         """
         # Redis socket timeout is set globally on client
         # This is a best-effort implementation (coarser-grained)
         original_timeout = self._client.connection_pool.connection_kwargs.get("socket_timeout")
         timeout_sec = timeout_ms / 1000.0
-        pool, token = self._client.connection_pool, object()
-        outermost = _open_windows.setdefault(pool, (original_timeout, token))[1] is token
+        # The pool is never bound to a local: its repr lists the password (see the class docstring).
+        token = object()
+        outermost = _open_windows.setdefault(self._client.connection_pool, (original_timeout, token))[1] is token
 
         try:
             # Set socket timeout
             self._client.connection_pool.connection_kwargs["socket_timeout"] = timeout_sec
             yield
         except Exception as exc:
-            raise classify_redis_error(exc, operation=operation) from exc
+            # Only the caller's code in the block raises here: its exception is kept whole.
+            raise classify_redis_error(exc, operation=operation, keep_exception=True) from exc
         finally:
             # Restore original timeout
             if original_timeout is not None:
@@ -756,7 +789,7 @@ class PerRequestRedisBackend:
             else:
                 self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
             if outermost:
-                _open_windows.pop(pool, None)
+                _open_windows.pop(self._client.connection_pool, None)
 
 
 class RedisBackendProvider:
@@ -781,7 +814,7 @@ class RedisBackendProvider:
 
     def __init__(
         self,
-        redis_url: str,
+        redis_url: str | SecretStr,
         pool_size: Optional[int] = None,
         config: Optional[RedisBackendConfig] = None,
     ) -> None:
@@ -790,7 +823,7 @@ class RedisBackendProvider:
         Fix #1: Creates pool ONCE (expensive operation).
 
         Args:
-            redis_url: Redis connection URL
+            redis_url: Redis connection URL, as a string or a SecretStr
             pool_size: Connection pool size; overrides config.connection_pool_size
             config: Pool and socket settings; defaults to RedisBackendConfig.from_env().
                 Its redis_url field is ignored: the redis_url argument wins.
@@ -798,6 +831,7 @@ class RedisBackendProvider:
         Raises:
             BackendError: If Redis connection fails
         """
+        redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inside the pool builder (CWE-532)
         try:
             # Fix #1: Create connection pool ONCE. Shared builder wires the
             # finite socket timeouts, so the ping below fails fast on an
@@ -811,8 +845,10 @@ class RedisBackendProvider:
 
             # Validate connection works
             self._client.ping()
+            return
         except Exception as exc:
-            raise classify_redis_error(exc, operation="init") from exc
+            error = classify_redis_error(exc, operation="init")
+        raise error from error.original_exception
 
     def get_backend(self) -> BaseBackend:
         """Get a backend whose fallback tenant is the current one (cheap: ~50ns).
