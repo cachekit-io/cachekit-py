@@ -631,7 +631,7 @@ class TestStandardSerializerIntegrityChecking:
 
     def test_value_equal_to_a_valid_envelope_is_refused_with_integrity_off(self) -> None:
         """The documented residual on the other side: a value that IS a valid envelope's fields
-        verifies, so it is refused on every read, with its own metadata and without."""
+        verifies, so it is refused on every plaintext read, with its own metadata and without."""
         envelope_fields = msgpack.unpackb(_envelope(8))
         off = StandardSerializer(enable_integrity_checking=False)
         data, meta = off.serialize(envelope_fields)
@@ -640,10 +640,40 @@ class TestStandardSerializerIntegrityChecking:
             with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
                 off.deserialize(data, metadata)
 
-    def test_decrypted_read_skips_the_envelope_probe(self) -> None:
+    @pytest.mark.parametrize(
+        ("payload_len", "legacy"),
+        [
+            pytest.param(8, False, id="bin8"),
+            pytest.param(300, False, id="bin16"),
+            pytest.param(70_000, False, id="bin32"),
+            pytest.param(8, True, id="legacy-fixarray"),
+            pytest.param(300, True, id="legacy-array16"),
+            pytest.param(70_000, True, id="legacy-array32"),
+        ],
+    )
+    def test_decrypted_read_probes_only_the_legacy_layout(self, payload_len, legacy) -> None:
         """``encrypted`` metadata means EncryptionWrapper decrypted these bytes under an AAD that binds
-        ``compressed``, so the stored form is known and nothing is sniffed: the same value the plaintext
-        read refuses comes back. A ``compressed=True`` header still refuses on either read."""
+        ``compressed``. The only writer that sealed an envelope under ``compressed=False`` (AutoSerializer
+        before 0.12.0) predates the bin layout, so a decrypted bin-layout value is never probed and comes
+        back, while a decrypted legacy-layout envelope is still verified and refused."""
+        data = _envelope(payload_len, legacy=legacy)
+        off = StandardSerializer(enable_integrity_checking=False)
+        _, meta = off.serialize(None)
+        decrypted = SerializationMetadata.from_dict({**meta.to_dict(), "encrypted": True})
+        spy = _RetrieveSpy(off._byte_storage)
+        off._byte_storage = spy  # type: ignore[assignment]
+
+        if legacy:
+            with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+                off.deserialize(data, decrypted)
+        else:
+            assert off.deserialize(data, decrypted) == msgpack.unpackb(data)
+        assert spy.calls == int(legacy)
+
+    def test_decrypted_read_skips_the_envelope_probe(self) -> None:
+        """A decrypted bin-layout value equal to a valid envelope's fields comes back unprobed, while the
+        same bytes on a plaintext read are refused. A ``compressed=True`` header still refuses on either
+        read."""
         envelope_fields = msgpack.unpackb(_envelope(8))
         off = StandardSerializer(enable_integrity_checking=False)
         data, meta = off.serialize(envelope_fields)

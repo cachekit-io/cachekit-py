@@ -625,7 +625,9 @@ them (cachekit-py#170):
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext (including
   plaintext in a container other than the one the serializer writes, such as Arrow IPC without
-  its checksum prefix: decrypted bytes are never sniffed for a legacy form), or a
+  its checksum prefix, or, for an integrity-off `StandardSerializer`, a legacy-layout ByteStorage
+  envelope such as `AutoSerializer` before 0.12.0 sealed under `compressed=False`: a decrypted
+  legacy form is refused, never decoded), or a
   non-string or non-UTF-8-encodable `original_type`, or a non-UTF-8-encodable `compressed`,
   in the frame header. Such a value
   cannot be built into the AAD at all, so no tag check runs — the read is

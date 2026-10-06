@@ -473,14 +473,27 @@ class TestArrowPostDecryptContainer:
 
 
 class TestStandardPostDecryptContainer:
-    """After a decrypt, an integrity-off StandardSerializer decodes plain MessagePack and never probes
-    for a ByteStorage envelope: the AAD binds ``compressed``, so the stored form is already known.
+    """After a decrypt, an integrity-off StandardSerializer probes only for a legacy-layout envelope.
 
-    The value is a valid envelope's four fields, which the plaintext probe refuses on every read."""
+    The AAD binds ``compressed``, and the one writer that sealed an envelope under ``compressed=False``
+    (AutoSerializer before 0.12.0) used the legacy int-array layout. So a value equal to a current (bin)
+    envelope's four fields, which the plaintext probe refuses, comes back; a legacy envelope does not."""
 
     @pytest.fixture
     def envelope_fields(self) -> list[Any]:
         return msgpack.unpackb(StandardSerializer(enable_integrity_checking=True).serialize({"actual": "inner"})[0])
+
+    @staticmethod
+    def _handler() -> tuple[CacheOperationHandler, _DictCacheStrategy, CacheSerializationHandler]:
+        serialization = CacheSerializationHandler(
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            enable_integrity_checking=False,
+        )
+        strategy = _DictCacheStrategy({})
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=strategy)  # type: ignore[arg-type]
+        return handler, strategy, serialization
 
     def test_both_encrypted_read_paths_return_an_envelope_shaped_value(self, envelope_fields):
         wrapper = EncryptionWrapper(
@@ -492,20 +505,35 @@ class TestStandardPostDecryptContainer:
         assert wrapper.deserialize_without_key_identity(sealed, meta, cache_key="key:a") == envelope_fields
 
     def test_handler_read_of_an_envelope_shaped_value_is_a_hit(self, envelope_fields):
-        serialization = CacheSerializationHandler(
-            encryption=True,
-            single_tenant_mode=True,
-            master_key=_HEX_KEY,
-            enable_integrity_checking=False,
-        )
-        strategy = _DictCacheStrategy({})
-        handler = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=strategy)  # type: ignore[arg-type]
-
+        handler, strategy, serialization = self._handler()
         strategy.store["key:a"] = serialization.serialize_data(envelope_fields, cache_key="key:a")
         hit = handler.get_cached_value("key:a")
         assert hit is not None
         assert hit.value == envelope_fields
         assert strategy.deleted == []
+
+    def test_handler_read_of_a_sealed_legacy_envelope_is_miss_and_evicted(self):
+        """A pre-0.12.0 AutoSerializer entry: an integrity-on envelope in the legacy layout, sealed under
+        ``compressed=False``. It is refused (miss + evict), never returned as its four fields."""
+        value = {"user_id": 123, "name": "Alice"}
+        handler, strategy, serialization = self._handler()
+        strategy.store["key:a"] = serialization.serialize_data(value, cache_key="key:a")
+        _, metadata_dict, serializer_name = SerializationWrapper.unwrap(strategy.store["key:a"])
+        assert metadata_dict["compressed"] is False
+
+        compressed, checksum, original_size, fmt = msgpack.unpackb(StandardSerializer().serialize(value)[0])
+        legacy = msgpack.packb([list(compressed), checksum, original_size, fmt], use_bin_type=True)
+        wrapper = EncryptionWrapper(
+            serializer=StandardSerializer(enable_integrity_checking=False),
+            master_key=_KEY_BYTES,
+            tenant_id=metadata_dict["tenant_id"],
+        )
+        aad = wrapper._create_aad(SerializationMetadata.from_dict(metadata_dict), "key:a")
+        sealed = wrapper.encryptor.encrypt_with_keys(legacy, aad, wrapper.tenant_keys)
+        strategy.store["key:a"] = SerializationWrapper.wrap(sealed, metadata_dict, serializer_name)
+
+        assert handler.get_cached_value("key:a") is None
+        assert strategy.deleted == ["key:a"]
 
 
 class TestConfigDriftRead:

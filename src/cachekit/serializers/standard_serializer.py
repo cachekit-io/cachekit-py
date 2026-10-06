@@ -38,7 +38,9 @@ from .base import (
 
 # Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
 # marker: bin8/16/32 in the current encoding, an int array (fixarray, array16, array32) in the legacy one.
-_ENVELOPE_PAYLOAD_MARKERS = frozenset((0xC4, 0xC5, 0xC6, *range(0x90, 0xA0), 0xDC, 0xDD))
+_BIN_PAYLOAD_MARKERS = frozenset((0xC4, 0xC5, 0xC6))
+_LEGACY_PAYLOAD_MARKERS = frozenset((*range(0x90, 0xA0), 0xDC, 0xDD))
+_ENVELOPE_PAYLOAD_MARKERS = _BIN_PAYLOAD_MARKERS | _LEGACY_PAYLOAD_MARKERS
 # Largest declared payload an integrity-off reader verifies; verifying costs a full decompress (see deserialize).
 _ENVELOPE_PROBE_MAX_SIZE = 256 * 1024
 # lz4_flex's get_maximum_output_size for that budget: the most compressed bytes any envelope within it carries.
@@ -351,7 +353,9 @@ class StandardSerializer:
                 layout come back decoded as their fields, and a value equal to a valid envelope's
                 fields (declaring at most 256 KiB) is refused on every plaintext read. A read with
                 ``metadata.encrypted`` (decrypted by :class:`EncryptionWrapper`, whose AAD binds
-                ``compressed``) skips that probe and returns such a value; ``compressed`` still refuses.
+                ``compressed``) probes only the legacy int-array layout, which AutoSerializer before
+                0.12.0 sealed under ``compressed=False``. So a value equal to a current (bin) envelope's
+                fields comes back there, while ``compressed=True`` and a legacy envelope still refuse.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -372,9 +376,11 @@ class StandardSerializer:
                 raise SerializationError(_CROSS_CONFIG_ERROR)
             data = immutable_buffer(data)  # the decode and the envelope probe must judge one snapshot
             value = unpackb_bounded(data, **self._msgpack_unpack_opts)
-            # Decrypted bytes are never probed: the AAD binds compressed, so the writer's form is known.
+            # A decrypted read probes only the legacy layout. The AAD binds compressed, and the one writer
+            # that sealed an envelope under compressed=False (AutoSerializer before 0.12.0) predates bin.
             decrypted = metadata is not None and metadata.encrypted
-            if not decrypted and self._is_verified_envelope(data, value):
+            markers = _LEGACY_PAYLOAD_MARKERS if decrypted else _ENVELOPE_PAYLOAD_MARKERS
+            if self._is_verified_envelope(data, value, markers):
                 raise SerializationError(_CROSS_CONFIG_ERROR)
             return value
         except SerializationError:
@@ -383,14 +389,15 @@ class StandardSerializer:
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
-    def _is_verified_envelope(self, data: bytes | memoryview, value: Any) -> bool:
-        """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope that passes ``retrieve()``."""
+    def _is_verified_envelope(self, data: bytes | memoryview, value: Any, markers: frozenset[int]) -> bool:
+        """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope whose payload marker
+        is in ``markers`` and that passes ``retrieve()``."""
         # Necessary conditions, never a verdict. The layout test spares ordinary reads the attempt. The
         # size caps bound it: retrieve() copies the whole payload slot and decompresses the whole declared
         # payload before it checks the checksum, and a caller can cache a value shaped like a large
         # envelope. A 0x94 lead that decoded is a 4-element list whose slot 0 is bytes or a list, so
         # value[2] is the declared original_size and len(value[0]) the compressed length.
-        if len(data) < 2 or data[0] != 0x94 or data[1] not in _ENVELOPE_PAYLOAD_MARKERS:
+        if len(data) < 2 or data[0] != 0x94 or data[1] not in markers:
             return False
         if not isinstance(value[2], int) or value[2] > _ENVELOPE_PROBE_MAX_SIZE:
             return False
