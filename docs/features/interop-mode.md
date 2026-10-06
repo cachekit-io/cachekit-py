@@ -142,7 +142,7 @@ assert data.hex() == "82a36167651ea46e616d65a5616c696365"  # canonical: sorted k
 assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 ```
 
-`decode_interop_value` accepts any well-formed document, canonical or not: padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. Trailing bytes after the one document raise `InteropDecodeError`, and so does a map holding more than 32 distinct keys that share one hash value: some key types (a MessagePack timestamp, a float) hash without a random seed, so a forged entry could otherwise make one read quadratic in its key count.
+`decode_interop_value` accepts any well-formed document, canonical or not: padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. Trailing bytes after the one document raise `InteropDecodeError`, and so does a map holding more than 32 entries whose key is neither a string nor bytes. Those key types (an int, a float, a MessagePack timestamp) hash without a random seed, so a forged entry could choose hashes that make one read quadratic in its key count. The data model writes only string keys.
 
 ## Conformance
 

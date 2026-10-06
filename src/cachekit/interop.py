@@ -491,39 +491,28 @@ def _revive_sentinels(obj: dict[Any, Any]) -> Any:
     return obj
 
 
-# Most distinct keys one map may hold under a single hash value. No honest document comes near it (an int
-# hash value is shared by at most 13 ints in msgpack's range), so it only rejects a map built to collide.
-_MAX_KEYS_PER_HASH = 32
+# Most entries one map may hold under a key that is neither str nor bytes. str and bytes hash under a
+# per-process secret; int, float and msgpack.Timestamp hash without one, so a forged entry can choose its
+# keys' hashes. Sharing one hash makes each insert compare against every earlier key. Distinct hashes chosen
+# so their dict probe sequences merge (CPython's perturbation is spent after 13 probes, and every sequence
+# then walks the same cycle) make each insert walk one shared chain. Either way the build is quadratic in the
+# key count, so the count is what is capped. The interop data model writes only string keys. At 32, a forged
+# map's decode costs at most ~3.5x an honest one of the same size (32 Timestamps on one hash).
+_MAX_NON_STRING_KEYS = 32
 
 
 def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
-    """msgpack object_pairs_hook: build a map without letting colliding keys make it quadratic.
-
-    Non-str keys are allowed (IOP-18), but some hash without a seed: msgpack.Timestamp hashes its
-    (seconds, nanoseconds) tuple, which a forged entry can invert to put thousands of distinct keys on
-    one hash, and floats share hashes too. Each insert then compares against every earlier collider.
-    Counting distinct keys per hash and refusing the map past _MAX_KEYS_PER_HASH keeps every probe chain
-    short, whatever the key type, so no accepted key type is narrowed.
-    """
+    """msgpack object_pairs_hook: build one map, refusing one whose keys could make the build quadratic."""
     # msgpack's C unpacker passes a list, its pure-Python fallback a one-shot generator: materialise it
-    # once, or the checks below consume it and the map silently decodes empty.
+    # once, or the count below consumes it and the map silently decodes empty.
     pairs = list(pairs)
-    if len(pairs) <= _MAX_KEYS_PER_HASH or all(type(k) is str for k, _ in pairs):  # too few to collide / SipHash
-        result = dict(pairs)
-    else:
-        result: dict[Any, Any] = {}
-        per_hash: dict[int, int] = {}
-        for k, v in pairs:
-            if k not in result:  # a repeated key overwrites; it adds no collider
-                h = hash(k)
-                per_hash[h] = per_hash.get(h, 0) + 1
-                if per_hash[h] > _MAX_KEYS_PER_HASH:
-                    raise InteropDecodeError(
-                        f"stored value has a map with more than {_MAX_KEYS_PER_HASH} distinct keys sharing one hash "
-                        "value: a hash-flood bound, not a framing error. The entry is likely forged."
-                    )
-            result[k] = v
-    return _revive_sentinels(result)
+    # Entries, not distinct keys: telling keys apart needs a hash table of them, the very build being bounded.
+    if len(pairs) > _MAX_NON_STRING_KEYS and sum(type(k) not in (str, bytes) for k, _ in pairs) > _MAX_NON_STRING_KEYS:
+        raise InteropDecodeError(
+            f"stored value has a map with more than {_MAX_NON_STRING_KEYS} entries keyed by neither str nor bytes: "
+            "a hash-flood bound, not a framing error. The entry is likely forged."
+        )
+    return _revive_sentinels(dict(pairs))
 
 
 def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
@@ -532,10 +521,10 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     Readers accept any well-formed MessagePack document (canonical or not):
     a hashable non-str map key (int, float, bytes, ExtType, a revived temporal)
     decodes as-is, and an unhashable one raises InteropDecodeError, as does a
-    map with more than _MAX_KEYS_PER_HASH distinct keys sharing one hash (a hash flood). Readers
-    MUST consume exactly one document — trailing bytes are rejected
-    (msgpack-python raises ExtraData). A CK v3 frame prefix gets the
-    protocol#11 diagnostic instead of decoding its magic byte as int 67.
+    map with more than _MAX_NON_STRING_KEYS entries keyed by neither str nor
+    bytes (a hash flood). Readers MUST consume exactly one document — trailing
+    bytes are rejected (msgpack-python raises ExtraData). A CK v3 frame prefix
+    gets the protocol#11 diagnostic instead of decoding its magic byte as int 67.
     """
     raw = bytes(data)
     if raw[: len(_CK_FRAME_MAGIC)] == _CK_FRAME_MAGIC:
