@@ -309,8 +309,7 @@ class ArrowSerializer:
 
         Returns:
             Tuple of (Arrow IPC bytes, metadata)
-            Format (integrity ON): [8-byte xxHash3-64 checksum][Arrow IPC bytes]
-            Format (integrity OFF): [Arrow IPC bytes]
+            Format: [8-byte xxHash3-64 checksum][Arrow IPC bytes]
 
         Raises:
             TypeError: If obj is not a DataFrame or dict of arrays
@@ -403,7 +402,8 @@ class ArrowSerializer:
 
         Args:
             data: Bytes from serialize() (with or without checksum envelope)
-            metadata: Optional metadata (ignored - Arrow IPC is self-describing)
+            metadata: Optional metadata. Only ``encrypted`` is read: ``True`` means ``data`` is
+                decrypted plaintext, which must be the checksummed form (see below).
 
         Returns:
             Deserialized DataFrame (format depends on return_format setting)
@@ -425,7 +425,13 @@ class ArrowSerializer:
             if xxhash.xxh3_64_digest(body) != expected_checksum:
                 raise SerializationError("Checksum validation failed - data corruption detected")
         elif n >= 6 and bytes(mv[:6]) == b"ARROW1":
-            # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry)
+            # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry).
+            # Plaintext only. The protocol selects the post-decryption container from the
+            # reader's configuration, never by sniffing (spec/encryption.md), and no release
+            # wrote this form under encryption through the cache handler. After a decrypt it is
+            # a container mismatch, refused like any other (miss + evict in the handler).
+            if metadata is not None and metadata.encrypted:
+                raise SerializationError("Invalid data: decrypted Arrow payload lacks the checksum prefix")
             body = mv
         else:
             raise SerializationError(

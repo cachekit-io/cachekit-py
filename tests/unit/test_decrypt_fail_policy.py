@@ -31,7 +31,7 @@ from cachekit.cache_handler import (
     handle_decrypt_failure,
 )
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import EnvelopeShapeError, SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.base import EnvelopeShapeError, SerializationError, SerializationMetadata, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionError,
@@ -404,6 +404,70 @@ class TestGetCachedValueFailPolicy:
         handler, strategy, serialization = _make_operation_handler(fail_closed=True)
         strategy.store["key:a"] = serialization.serialize_data({"v": 7}, cache_key="key:a")
         assert handler.get_cached_value("key:a") == CacheHit({"v": 7}, strategy.store["key:a"], len(strategy.store["key:a"]))
+
+
+class TestArrowPostDecryptContainer:
+    """After a decrypt, Arrow decodes only its configured container: [xxHash3-64][ARROW1...].
+
+    The bare ARROW1 form survives for plaintext legacy entries only; spec/encryption.md forbids
+    sniffing or falling back between containers on decrypted bytes."""
+
+    @pytest.fixture
+    def df(self):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        return pd.DataFrame({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})
+
+    @staticmethod
+    def _arrow_wrapper(tenant_id: str = "t1") -> EncryptionWrapper:
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        return EncryptionWrapper(serializer=ArrowSerializer(), master_key=_KEY_BYTES, tenant_id=tenant_id)
+
+    @staticmethod
+    def _seal_bare(wrapper: EncryptionWrapper, df, metadata, cache_key: str) -> bytes:
+        """Seal bare ARROW1 bytes as the plaintext, under the reader's own AAD."""
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        checksummed, _ = ArrowSerializer().serialize(df)
+        bare = checksummed[8:]
+        assert bare[:6] == b"ARROW1"
+        return wrapper.encryptor.encrypt_with_keys(bare, wrapper._create_aad(metadata, cache_key), wrapper.tenant_keys)
+
+    def test_both_encrypted_read_paths_refuse_bare_arrow(self, df):
+        wrapper = self._arrow_wrapper()
+        _, meta = wrapper.serialize(df, cache_key="key:a")
+        sealed = self._seal_bare(wrapper, df, meta, "key:a")
+        with pytest.raises(EncryptionError, match="lacks the checksum prefix"):
+            wrapper.deserialize(sealed, meta, cache_key="key:a")
+        with pytest.raises(EncryptionError, match="lacks the checksum prefix"):
+            wrapper.deserialize_without_key_identity(sealed, meta, cache_key="key:a")
+
+    def test_handler_read_of_sealed_bare_arrow_is_miss_and_evicted(self, df):
+        pd = pytest.importorskip("pandas")
+        serialization = CacheSerializationHandler(
+            serializer_name="arrow",
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            enable_integrity_checking=False,
+        )
+        strategy = _DictCacheStrategy({})
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=strategy)  # type: ignore[arg-type]
+
+        # integrity_checking=False does not choose the container: the cache reads its own writes.
+        strategy.store["key:a"] = serialization.serialize_data(df, cache_key="key:a")
+        hit = handler.get_cached_value("key:a")
+        assert hit is not None
+        pd.testing.assert_frame_equal(hit.value, df)
+
+        _, metadata_dict, serializer_name = SerializationWrapper.unwrap(strategy.store["key:a"])
+        wrapper = self._arrow_wrapper(tenant_id=metadata_dict["tenant_id"])
+        sealed = self._seal_bare(wrapper, df, SerializationMetadata.from_dict(metadata_dict), "key:a")
+        strategy.store["key:a"] = SerializationWrapper.wrap(sealed, metadata_dict, serializer_name)
+
+        assert handler.get_cached_value("key:a") is None
+        assert strategy.deleted == ["key:a"]
 
 
 class TestConfigDriftRead:
