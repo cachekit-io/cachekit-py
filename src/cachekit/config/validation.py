@@ -46,10 +46,11 @@ def hide_any_secret(value: bytes | bytearray | memoryview) -> SecretBytes: ...
 @overload
 def hide_any_secret(value: str | _T) -> SecretStr | _T: ...
 def hide_any_secret(value: object) -> object:
-    """``hide_secret`` that wraps bytes too, as SecretBytes, for a value refused if it is bytes: a value under a keyword
-    no form of ``@cache`` takes, or a ``master_key=`` that takes a hex string (see ``refuse_bytes_key``).
+    """``hide_secret`` that wraps bytes too, as SecretBytes, for a value that may be bytes: an ``api_key=``, which takes
+    bytes as it does a str, or a value refused if it is bytes: one under a keyword no form of ``@cache`` takes, or a
+    ``master_key=`` that takes a hex string (see ``refuse_bytes_key``).
 
-    Never raises, so a caller rebinds its parameter through it before the refusal does.
+    Never raises, so a caller rebinds its parameter through it before any check can raise.
     """
     if isinstance(value, (bytes, bytearray, memoryview)):
         return SecretBytes(bytes(value))

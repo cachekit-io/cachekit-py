@@ -18,7 +18,7 @@ from .nested import (
     L1CacheConfig,
     MonitoringConfig,
 )
-from .validation import ConfigurationError, hide_any_secret, hide_secret, refuse_bytes_key, reveal_secret
+from .validation import ConfigurationError, hide_any_secret, refuse_bytes_key, reveal_secret
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -648,7 +648,7 @@ class DecoratorConfig:
             >>> DecoratorConfig.io(api_key="ck_test_key", ttl=300).ttl  # pragma: allowlist secret
             300
         """
-        api_key = hide_secret(api_key)  # passed down wrapped (CWE-532)
+        api_key = hide_any_secret(api_key)  # passed down wrapped, a bytes key too (CWE-532)
         # Before the backend is built: a rejected call builds none, and a misspelt keyword is not masked by a missing key.
         _reject_unsupported("The io preset", kwargs)
         # Lazy import to avoid circular dependency and keep SaaS backend optional

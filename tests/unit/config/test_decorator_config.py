@@ -329,9 +329,10 @@ class TestIoPreset:
         assert isinstance(config.backend, CachekitIOBackend)
         return config.backend._config.api_key.get_secret_value()
 
-    def test_api_key_argument_builds_backend_with_that_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("key", ["ck_arg", b"ck_arg"], ids=["str", "bytes"])  # pragma: allowlist secret
+    def test_api_key_argument_builds_backend_with_that_key(self, monkeypatch: pytest.MonkeyPatch, key: str | bytes) -> None:
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
-        assert self._key_of(DecoratorConfig.io(api_key="ck_arg")) == "ck_arg"  # pragma: allowlist secret
+        assert self._key_of(DecoratorConfig.io(api_key=key)) == "ck_arg"  # type: ignore[arg-type]  # pragma: allowlist secret
 
     def test_api_key_argument_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
@@ -353,11 +354,20 @@ class TestIoPreset:
         with pytest.raises(ConfigurationError, match=r"api_key=.*CACHEKIT_API_KEY"):
             DecoratorConfig.io()
 
-    def test_empty_argument_is_an_error_not_an_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """api_key=settings.tenant_key yielding "" must not silently cache under the env tenant's key."""
+    @pytest.mark.parametrize(
+        "build",
+        [DecoratorConfig.io, lambda api_key: cache.io(api_key=api_key)(lambda: 1)],
+        ids=["config", "decorator"],
+    )
+    @pytest.mark.parametrize("key", ["", b""], ids=["str", "bytes"])
+    def test_empty_argument_is_an_error_not_an_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, build: Callable[..., object], key: str | bytes
+    ) -> None:
+        """api_key=settings.tenant_key yielding "" must not silently cache under the env tenant's key, nor b"", which
+        is falsy wrapped as a secret too."""
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
         with pytest.raises(ConfigurationError, match="requires an API key"):
-            DecoratorConfig.io(api_key="")
+            build(api_key=key)
 
     def test_two_keys_in_one_process_reach_the_wire_separately(self) -> None:
         """Regression: the per-thread HTTP client was first-wins, so a second key's backend

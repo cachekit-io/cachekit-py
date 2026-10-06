@@ -13,17 +13,20 @@ import pathlib
 import sys
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, ValidationInfo, create_model, field_validator
 from pydantic_core import PydanticCustomError
+from urllib3.exceptions import LocationParseError
 
 import cachekit
 from cachekit import DecoratorConfig, cache
 from cachekit._rust_serializer import KeyringConfigurationError
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio import CachekitIOBackend
+from cachekit.backends.cachekitio import client as cachekitio_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
 from cachekit.backends.memcached.config import MemcachedBackendConfig
@@ -735,25 +738,81 @@ _BYTES_KEY_ROWS: dict[str, Callable[[], object]] = {
 }
 
 
+_EntryPointRow = tuple[dict[str, str], Callable[[], object], type[BaseException], str | bytes]
+
+# The lowercase names: urllib.request.getproxies prefers them, and an empty no_proxy drops any NO_PROXY bypass.
+_BAD_PROXY_ENV = {"https_proxy": "http://[", "no_proxy": ""}
+
+
+def _api_key_rows(form: Callable[[str], Any]) -> dict[str, _EntryPointRow]:
+    """The entry-point rows that pass an API key, each passing it as ``form`` makes it from a str. A row's secret is the
+    str key whatever the form: _cachekit_locals_holding matches a str as text and as its UTF-8 bytes."""
+    key = form(_API_KEY)
+    return {
+        "io-backend-timeout": ({}, lambda: CachekitIOBackend(api_key=key, timeout=-1), ConfigurationError, _API_KEY),
+        "io-backend-env-timeout": (
+            {"CACHEKIT_TIMEOUT": "-1"},
+            lambda: CachekitIOBackend(api_key=key),
+            ConfigurationError,
+            _API_KEY,
+        ),
+        "io-backend-url": (
+            {},
+            lambda: CachekitIOBackend(api_key=key, api_url="https://example.com"),
+            ConfigurationError,
+            _API_KEY,
+        ),
+        "io-backend-bad-token": ({}, lambda: CachekitIOBackend(api_key=form(_API_KEY + "\n")), ConfigurationError, _API_KEY),
+        "io-backend-with-timeout": ({}, lambda: CachekitIOBackend(api_key=key).with_timeout(-1), ConfigurationError, _API_KEY),
+        "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=key, timeout=-1), ConfigurationError, _API_KEY),
+        "io-intent-typo": ({}, lambda: cache.io(api_key=key, timeout=-1)(_cached), ConfigurationError, _API_KEY),
+        "io-intent-env-timeout": (
+            {"CACHEKIT_TIMEOUT": "-1"},
+            lambda: cache.io(api_key=key)(_cached),
+            ConfigurationError,
+            _API_KEY,
+        ),
+        # The client is built after the config validates, and a malformed proxy URL fails there.
+        "io-backend-bad-proxy": (_BAD_PROXY_ENV, lambda: CachekitIOBackend(api_key=key), LocationParseError, _API_KEY),
+        "io-config-bad-proxy": (_BAD_PROXY_ENV, lambda: DecoratorConfig.io(api_key=key), LocationParseError, _API_KEY),
+        "io-intent-bad-proxy": (_BAD_PROXY_ENV, lambda: cache.io(api_key=key)(_cached), LocationParseError, _API_KEY),
+        # A key passed where no form takes one is still a key.
+        "secure-config-misplaced-api-key": (
+            {},
+            lambda: DecoratorConfig.secure(master_key=_KEY_HEX, api_key=key),
+            ConfigurationError,
+            _API_KEY,
+        ),
+        # So is a key under a misspelt name, also when another guard raises before the keyword check.
+        "io-intent-misspelt-key": ({}, lambda: cache.io(api_kye=key)(_cached), ConfigurationError, _API_KEY),
+        "config-form-misspelt-key-beside-io-backend": (
+            {},
+            lambda: cache(config=DecoratorConfig.io(api_key=key), backend=None, api_kye=key)(_cached),
+            ConfigurationError,
+            _API_KEY,
+        ),
+        "io-intent-misspelt-key-beside-config": (
+            {},
+            lambda: cache.io(config=DecoratorConfig.minimal(), api_kye=key)(_cached),
+            ConfigurationError,
+            _API_KEY,
+        ),
+    }
+
+
+# Every _api_key_rows row runs with each of these: @cache.io, DecoratorConfig.io and CachekitIOBackend take a bytes key too,
+# and hold it only wrapped, as they do a str one.
+_API_KEY_FORMS: dict[str, Callable[[str], Any]] = {
+    "": str,
+    "-bytes-api-key": str.encode,
+    "-bytearray-api-key": lambda text: bytearray(text.encode()),
+    "-memoryview-api-key": lambda text: memoryview(text.encode()),
+}
+
+
 # (env, call, raised, secret) per public entry point that takes a secret or reads one from the environment.
-_ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[BaseException], str | bytes]] = {
-    "io-backend-timeout": ({}, lambda: CachekitIOBackend(api_key=_API_KEY, timeout=-1), ConfigurationError, _API_KEY),
-    "io-backend-env-timeout": (
-        {"CACHEKIT_TIMEOUT": "-1"},
-        lambda: CachekitIOBackend(api_key=_API_KEY),
-        ConfigurationError,
-        _API_KEY,
-    ),
-    "io-backend-url": (
-        {},
-        lambda: CachekitIOBackend(api_key=_API_KEY, api_url="https://example.com"),
-        ConfigurationError,
-        _API_KEY,
-    ),
-    "io-backend-bad-token": ({}, lambda: CachekitIOBackend(api_key=_API_KEY + "\n"), ConfigurationError, _API_KEY),
-    "io-backend-with-timeout": ({}, lambda: CachekitIOBackend(api_key=_API_KEY).with_timeout(-1), ConfigurationError, _API_KEY),
-    "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=_API_KEY, timeout=-1), ConfigurationError, _API_KEY),
-    "io-intent-typo": ({}, lambda: cache.io(api_key=_API_KEY, timeout=-1)(_cached), ConfigurationError, _API_KEY),
+_ENTRY_POINT_ROWS: dict[str, _EntryPointRow] = {
+    **{name + suffix: row for suffix, form in _API_KEY_FORMS.items() for name, row in _api_key_rows(form).items()},
     # A key passed where no form takes one is still a key (LAB-8223).
     "minimal-config-misplaced-key": ({}, lambda: DecoratorConfig.minimal(master_key=_KEY_HEX), ConfigurationError, _KEY_HEX),
     "io-config-misplaced-key": (
@@ -761,12 +820,6 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         lambda: DecoratorConfig.io(api_key=_API_KEY, master_key=_KEY_HEX),
         ConfigurationError,
         _KEY_HEX,
-    ),
-    "secure-config-misplaced-api-key": (
-        {},
-        lambda: DecoratorConfig.secure(master_key=_KEY_HEX, api_key=_API_KEY),
-        ConfigurationError,
-        _API_KEY,
     ),
     "config-form-misplaced-key": (
         {},
@@ -778,7 +831,6 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
     "minimal-config-misspelt-key": ({}, lambda: DecoratorConfig.minimal(master_keey=_KEY_HEX), ConfigurationError, _KEY_HEX),
     "minimal-intent-misspelt-key": ({}, lambda: cache.minimal(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
     "secure-intent-misspelt-key": ({}, lambda: cache.secure(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
-    "io-intent-misspelt-key": ({}, lambda: cache.io(api_kye=_API_KEY)(_cached), ConfigurationError, _API_KEY),
     "bare-misspelt-key": ({}, lambda: cache(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
     "bare-call-misspelt-key": ({}, lambda: cache(_cached, master_keey=_KEY_HEX), ConfigurationError, _KEY_HEX),
     "config-form-misspelt-key": (
@@ -802,23 +854,11 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         ConfigurationError,
         _KEY_HEX,
     ),
-    "config-form-misspelt-key-beside-io-backend": (
-        {},
-        lambda: cache(config=DecoratorConfig.io(api_key=_API_KEY), backend=None, api_kye=_API_KEY)(_cached),
-        ConfigurationError,
-        _API_KEY,
-    ),
     "minimal-intent-misspelt-key-beside-encrypting-serializer": (
         {},
         lambda: cache.minimal(serializer="encrypted", master_keey=_KEY_HEX)(_cached),
         ConfigurationError,
         _KEY_HEX,
-    ),
-    "io-intent-misspelt-key-beside-config": (
-        {},
-        lambda: cache.io(config=DecoratorConfig.minimal(), api_kye=_API_KEY)(_cached),
-        ConfigurationError,
-        _API_KEY,
     ),
     "bare-misspelt-key-beside-non-config": (
         {},
@@ -861,12 +901,6 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False)(_cached),
         ConfigurationError,
         _KEY_HEX,
-    ),
-    "io-intent-env-timeout": (
-        {"CACHEKIT_TIMEOUT": "-1"},
-        lambda: cache.io(api_key=_API_KEY)(_cached),
-        ConfigurationError,
-        _API_KEY,
     ),
     "secure-intent-ttl": ({}, lambda: cache.secure(master_key=_KEY_HEX, ttl=-5)(_cached), ValueError, _KEY_HEX),
     "secure-intent-env-size": (
@@ -1050,6 +1084,8 @@ class TestEntryPointFrameLocals:
         for name, value in env.items():
             monkeypatch.setenv(name, value)
         singleton.reset_settings()
+        # A fresh lease cache, so each row builds its own client: a cached one would skip the build that raises.
+        monkeypatch.setattr(cachekitio_client, "_leases", cachekitio_client._Leases())
 
         with pytest.raises(raised) as exc_info:
             call()

@@ -110,11 +110,39 @@ class TestInit:
         with pytest.raises(ConfigurationError, match="api_key"):
             CachekitIOBackend(api_url=TEST_API_URL)
 
-    def test_empty_key_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """An empty key would go out as 'Bearer ' — reject it where the preset is built."""
+    @pytest.mark.parametrize("form", [bytes, bytearray, memoryview])
+    def test_bytes_key_builds_the_config_its_str_does(self, form: type[bytes | bytearray | memoryview]) -> None:
+        """An API key is an ASCII token, so bytes carry no second meaning: a bytes key is taken as its str is."""
+        from_bytes = CachekitIOBackend(api_url=TEST_API_URL, api_key=form(TEST_API_KEY.encode()))  # type: ignore[arg-type]
+        assert from_bytes._config == CachekitIOBackend(api_url=TEST_API_URL, api_key=TEST_API_KEY)._config
+
+    @pytest.mark.parametrize(
+        ("key", "error"),
+        [
+            (b"ck_live_SECRET\xff\xfe", "Input should be a valid string"),  # pragma: allowlist secret
+            (bytearray("ck_live_SECRET\u00e9".encode()), "not a valid bearer token"),  # pragma: allowlist secret
+            (memoryview(b"ck_live_SECRET\n"), "not a valid bearer token"),  # pragma: allowlist secret
+        ],
+        ids=["not-utf-8", "non-ascii-letter", "newline"],
+    )
+    def test_bytes_key_that_is_not_an_ascii_token_raises(self, monkeypatch: pytest.MonkeyPatch, key: object, error: str) -> None:
+        """A bytes key is decoded as UTF-8 and then checked as a str key is; neither failure quotes it."""
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
-        with pytest.raises(ConfigurationError, match="api_key"):
-            CachekitIOBackend(api_key="")
+        with pytest.raises(ConfigurationError, match=error) as info:
+            CachekitIOBackend(api_key=key)  # type: ignore[arg-type]
+        assert "SECRET" not in str(info.value)
+        assert "SECRET" not in repr(info.value)
+
+    @pytest.mark.parametrize("env_key", [None, "ck_env_key"], ids=["no-env-key", "env-key"])
+    @pytest.mark.parametrize("key", ["", b"", bytearray(), memoryview(b"")], ids=["str", "bytes", "bytearray", "memoryview"])
+    def test_empty_key_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch, key: object, env_key: str | None) -> None:
+        """An empty key would go out as 'Bearer ' — reject it where the preset is built. CACHEKIT_API_KEY never stands in
+        for it: a key passed names the caller's tenant, and an empty one wrapped as a secret is falsy."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        if env_key is not None:
+            monkeypatch.setenv("CACHEKIT_API_KEY", env_key)
+        with pytest.raises(ConfigurationError, match="requires an API key"):
+            CachekitIOBackend(api_key=key)  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         "key",
