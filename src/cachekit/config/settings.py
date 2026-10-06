@@ -203,7 +203,7 @@ class CachekitConfig(RedactingSettings):
     # Encryption configuration
     master_key: Optional[SecretStr] = Field(
         default=None,
-        description="Master encryption key (hex-encoded, minimum 32 bytes for AES-256)",
+        description="Master encryption key (hex-encoded; use exactly 32 bytes, 64 hex characters)",
     )
     previous_master_keys: Annotated[list[SecretStr], NoDecode] = Field(
         default_factory=list,
@@ -213,7 +213,7 @@ class CachekitConfig(RedactingSettings):
             "under a listed key stay readable through the rotation window; writes "
             "always use master_key. At most 3 keys — more is rejected at load, "
             "never truncated. Per-key validation is identical to master_key "
-            "(hex-encoded, minimum 32 bytes). Spec: protocol spec/encryption.md "
+            "(hex-encoded, at least 32 bytes; use exactly 32). Spec: protocol spec/encryption.md "
             "→ 'Key Rotation (Keyring)'."
         ),
     )

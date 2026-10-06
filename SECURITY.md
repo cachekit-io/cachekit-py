@@ -160,7 +160,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 
 | Requirement | Implementation |
 |:------------|:---------------|
-| Key size | Minimum 32 bytes (256 bits) |
+| Key size | Use exactly 32 bytes (256 bits, 64 hex characters); shorter keys are rejected |
 | Configuration | `CACHEKIT_MASTER_KEY` env var |
 | Activation | `@cache.secure`, or an explicit encryption option (`encryption=True` + tenant mode). The env var is a key source only, never a switch: a master key present on a cache that states no encryption intent raises `ConfigurationError` at decoration, on every preset except `@cache.secure` and `@cache.local` ([rules](docs/features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)) |
 | Logging | Never exposed in logs/errors |

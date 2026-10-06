@@ -205,7 +205,7 @@ def operation(x):
 ### Invalid Key Format
 ```bash
 export CACHEKIT_MASTER_KEY="not_hex"  # Invalid
-# Error: "CACHEKIT_MASTER_KEY must be hex-encoded, minimum 32 bytes"
+# Error: "CACHEKIT_MASTER_KEY must be hex-encoded: ..."
 # Solution: Use 64-char hex string
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
@@ -407,7 +407,7 @@ export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
 Rules enforced at config load — rejected, never truncated or silently fixed:
 
 - **Cap**: at most 3 decrypt-only keys.
-- **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, ≥32 bytes).
+- **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, at least 32 bytes; use exactly 32).
 - **Current key not in the list**: the current master key must not re-appear in
   the decrypt-only list — the detectable signature of re-promoting a retired key.
 
@@ -824,7 +824,7 @@ A: Key mismatch or data corruption. Check CACHEKIT_MASTER_KEY hasn't changed.
 
 **Q: Key rotation failing**
 A: Check `CACHEKIT_PREVIOUS_MASTER_KEYS` — comma-separated hex, each key subject to
-the same rules as `CACHEKIT_MASTER_KEY` (≥32 bytes), at most 3 entries, and the
+the same rules as `CACHEKIT_MASTER_KEY` (at least 32 bytes; use exactly 32), at most 3 entries, and the
 current `CACHEKIT_MASTER_KEY` must **not** appear in the list. Follow the keyring
 rotation pattern above: keep the retiring key decrypt-only until the runbook's
 [Phase 3](https://docs.cachekit.io/concepts/key-rotation/#scheduled-rotation-three-phases)

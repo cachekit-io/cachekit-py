@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Reference caching (`@cache.local()`) caches opaque, non-serializable objects — things that can't be converted to bytes. Perfect for SDK connections, ML models, database connections, and language runtime objects that must maintain identity.
+Reference caching (`@cache.local()`, a Python-only, SDK-local preset) caches opaque, non-serializable objects — things that can't be converted to bytes. Perfect for SDK connections, ML models, database connections, and language runtime objects that must maintain identity.
 
 ```python notest
 from cachekit import cache

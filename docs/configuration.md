@@ -82,7 +82,7 @@ CACHEKIT_ARROW_COMPRESSION=zstd
 # With it set, every preset except @cache.secure and @cache.local must state its intent:
 # one with no encryption intent raises ConfigurationError at decoration (use encryption=False
 # for plaintext).
-CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
+CACHEKIT_MASTER_KEY=<64-hex-char-key-exactly-32-bytes>
 # Key rotation: decrypt-only previous master keys (comma-separated hex, max 3,
 # same per-key requirements as CACHEKIT_MASTER_KEY). Entries written under a
 # listed key stay readable through the rotation window; writes always use
@@ -378,20 +378,22 @@ def secure_function():
 
 **Feature Matrix by Intent:**
 
-| Intent | Default TTL | SWR | Max Size | Notes |
-|--------|-------------|-----|----------|-------|
-| `minimal()` | 300 s | ❌ | 100 MB | Speed-first, no integrity check |
-| `test()` | 300 s | ❌ | 100 MB | Deterministic, no monitoring |
-| `dev()` | 300 s | L1-only¹ | 100 MB | Verbose logs, no Prometheus except `circuit_breaker_state` |
-| `production()` | 600 s | L1-only¹ | 100 MB | Full observability |
-| `secure()` | 600 s | ❌ | 100 MB | AES-256-GCM encryption required; refuses `backend=None`, so no L1-only SWR |
-| `io()` | 3600 s | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| Intent | Default TTL | SWR | Max Size | Backend unreachable² | Notes |
+|--------|-------------|-----|----------|----------------------|-------|
+| `minimal()` | 300 s | ❌ | 100 MB | Function runs, no error | Speed-first, no integrity check |
+| `test()` | 300 s | ❌ | 100 MB | Function runs, no error | Deterministic, no monitoring |
+| `dev()` | 300 s | L1-only¹ | 100 MB | Function runs, no error | Verbose logs, no Prometheus except `circuit_breaker_state` |
+| `production()` | 600 s | L1-only¹ | 100 MB | Function runs, no error | Full observability |
+| `secure()` | 600 s | ❌ | 100 MB | Function runs, no error | AES-256-GCM encryption required; refuses `backend=None`, so no L1-only SWR |
+| `io()` | 3600 s | ✓ | 100 MB | Function runs, no error | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
-**Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript; `dev()` / `test()` are Python-only presets and take `minimal`'s 300 s. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). Two consequences of a finite default: an entry this process writes also lives in its L1 for the same TTL (previously L1's own 300 s when no `ttl` was set), and the presets' `swr_enabled` / `stale_ttl` features — which need a positive `ttl` — are now active without an explicit `ttl=`.
+**Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript; `dev()` / `test()` are SDK-local, Python-only presets (as is `@cache.local`, which has no backend) and take `minimal`'s 300 s. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). Two consequences of a finite default: an entry this process writes also lives in its L1 for the same TTL (previously L1's own 300 s when no `ttl` was set), and the presets' `swr_enabled` / `stale_ttl` features — which need a positive `ttl` — are now active without an explicit `ttl=`.
 
 **Invalidation is not a preset feature.** Every preset's `invalidate_cache()` deletes from L1 and L2 alike. Evicting other processes' L1 copies is the process-wide `CACHEKIT_INVALIDATION_LISTENER_ENABLED` ([Environment Variables](#environment-variables)), off by default and set by no preset ([Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction)). On the tenant-scoped Redis backend, an entry with `ttl=None` or a TTL above 7 days outlives the key registry's tracking set, so call `invalidate_cache()` before you retire such a function (**Set lifetime** under [Whole-Function Invalidation](features/l1-invalidation.md#whole-function-invalidation)).
 
 ¹ Within-TTL refresh-ahead SWR runs **only in L1-only mode** (`backend=None`), where the SDK re-runs your function in the background past `ttl * swr_threshold_ratio`. With a backend configured, these presets have no SWR — `swr_enabled` has no effect outside L1-only mode (Redis exposes no read-side freshness signal). The only backed SWR is `@cache.io`'s past-TTL [`stale_ttl`](#stale-while-revalidate-stale_ttl) mode.
+
+² No preset raises when its backend is down or unreachable: the call logs the failure and runs your function, and the result still goes to L1 unless the backend could not be built on the first call ([Connection Errors](error-codes.md#connection-errors)).
 
 ---
 
@@ -581,8 +583,8 @@ python -c "import os; print(f'Key length: {len(os.getenv(\"CACHEKIT_MASTER_KEY\"
 ```
 
 **Valid key formats**:
-- 64 character hex string (32 bytes)
-- Minimum requirement: 32 bytes (64 hex characters)
+- Use exactly 32 bytes: a 64-character hex string
+- Validation accepts 32 bytes or more, but cachekit-ts accepts only exactly 32, so a longer key cannot share a cache with it
 
 **Invalid key formats**:
 ```bash

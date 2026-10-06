@@ -436,7 +436,7 @@ class DecoratorConfig:
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:
-            master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
+            master_key: Encryption master key (hex-encoded; use exactly 32 bytes, 64 hex characters)
             tenant_extractor: Optional tenant ID extractor (an object with .extract(args, kwargs)) for
                 per-tenant key derivation. Not a tenancy boundary: see docs/features/zero-knowledge-encryption.md
             **kwargs: Overrides (ttl, namespace, backend, l1, circuit_breaker, backpressure, monitoring, etc.)
