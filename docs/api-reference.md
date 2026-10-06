@@ -617,7 +617,7 @@ The library includes intelligent error classification to distinguish between tra
 
 ### Error Categories
 
-The Redis backend wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`. The checks run in this order, and the first one an exception matches sets its category. A class can therefore land in a different category from its parent: `AuthenticationError` subclasses `ConnectionError`, and `NoPermissionError`, `ReadOnlyError`, `ClusterDownError` and `TryAgainError` subclass `ResponseError`.
+The tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`) wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`; a `RedisBackend` you construct yourself reports every failure as `UNKNOWN`. The checks run in this order, and the first one an exception matches sets its category. A class can therefore land in a different category from its parent: `AuthenticationError` subclasses `ConnectionError`, and `NoPermissionError`, `ReadOnlyError`, `ClusterDownError` and `TryAgainError` subclass `ResponseError`.
 
 1. **`AUTHENTICATION`**:
    - `redis.exceptions.AuthenticationError`, `redis.exceptions.NoPermissionError` - Wrong credentials or missing ACL permission
@@ -636,6 +636,8 @@ The Redis backend wraps each redis-py exception in a `BackendError` whose `error
    - `redis.exceptions.LockError` - Lock acquisition failures
 
 5. **`UNKNOWN`**: any other exception
+
+Either backend keeps only the redis-py exception's class, never the exception: the `BackendError`'s `original_exception`, which is also its `__cause__`, is a `RedisClientError` (`cachekit.backends.redis.error_handler`) whose `exc_type` is that class. Test `issubclass(err.original_exception.exc_type, redis.exceptions.AuthenticationError)`, not `isinstance(err.original_exception, ...)`. The exception is dropped because its traceback holds the Redis password (see [SECURITY.md](../SECURITY.md#cache-key-redaction-in-logs-cwe-532)).
 
 ### Connection Failures
 When Redis is unavailable:

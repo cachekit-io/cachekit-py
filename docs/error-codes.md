@@ -383,7 +383,7 @@ Depending on where the failure happens, the log line is one of:
 - `Cache operation '...' failed for key '...': ...` (WARNING; the last part names the error, e.g. `BackendError(transient)`)
 - `Backend error getting key ...: BackendError(...)` (ERROR)
 
-The redis-py exceptions below reach your code only when you use a Redis client directly. A direct call on a cachekit backend, such as `RedisBackend.get()`, raises the wrapping `BackendError`.
+The redis-py exceptions below reach your code only when you use a Redis client directly. A direct call on a cachekit backend, such as `RedisBackend.get()`, raises a `BackendError` instead, which keeps only the redis-py exception's class ([Error Categories](api-reference.md#error-categories)).
 
 ### Redis unreachable
 
