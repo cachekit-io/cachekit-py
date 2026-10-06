@@ -76,7 +76,6 @@ class TestIntentBasedProduction:
         """Production preset enables full monitoring."""
         config = DecoratorConfig.production(backend=None)
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
         assert config.monitoring.enable_structured_logging is True
 
     def test_production_config_backpressure_enabled(self):
@@ -112,7 +111,6 @@ class TestIntentBasedSecure:
         """Secure preset enables full monitoring for audit trail."""
         config = DecoratorConfig.secure(master_key="a" * 64)
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
 
     def test_secure_decorator_requires_master_key(self, monkeypatch):
         """@cache.secure raises when no master_key param AND no env var."""

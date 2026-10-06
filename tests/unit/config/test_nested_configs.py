@@ -206,7 +206,6 @@ class TestMonitoringConfig:
         """Test default values."""
         config = MonitoringConfig()
         assert config.collect_stats is True
-        assert config.enable_tracing is True
         assert config.enable_structured_logging is True
         assert config.enable_prometheus_metrics is True
 
@@ -214,12 +213,10 @@ class TestMonitoringConfig:
         """Test custom configuration."""
         config = MonitoringConfig(
             collect_stats=False,
-            enable_tracing=False,
             enable_structured_logging=False,
             enable_prometheus_metrics=False,
         )
         assert config.collect_stats is False
-        assert config.enable_tracing is False
         assert config.enable_structured_logging is False
         assert config.enable_prometheus_metrics is False
 
@@ -234,8 +231,13 @@ class TestMonitoringConfig:
         config = MonitoringConfig()
         config.validate()  # Should not raise
 
-        config = MonitoringConfig(collect_stats=False, enable_tracing=False)
+        config = MonitoringConfig(collect_stats=False)
         config.validate()  # Should not raise
+
+    def test_enable_tracing_removed(self) -> None:
+        """enable_tracing was a no-op and is gone: passing it fails loudly."""
+        with pytest.raises(TypeError):
+            MonitoringConfig(enable_tracing=True)  # type: ignore[call-arg]
 
 
 @pytest.mark.unit

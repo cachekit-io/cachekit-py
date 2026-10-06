@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 import pytest
 
 from cachekit import cache
+from cachekit.cache_handler import CacheOperationHandler
 from cachekit.l1_cache import get_l1_cache_manager
 from cachekit.reliability.async_metrics import AsyncMetricsCollector, _metrics_cache
 
@@ -123,3 +124,37 @@ def test_collector_counts_one_record_once(sync_mode: bool) -> None:
 
     counter = _metrics_cache["cache_operations_total"]  # process-wide: shared by every collector
     assert counter.labels(operation="get", namespace=namespace, success="True", serializer="rust")._value.get() == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+async def test_l2_get_failure_records_one_failure(
+    recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch, is_async: bool
+) -> None:
+    """A failed L2 GET records one failure sample, never a second one under operation="exception"."""
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise ConnectionError("backend down")
+
+    async def fail_async(*args: Any, **kwargs: Any) -> None:
+        fail()
+
+    monkeypatch.setattr(CacheOperationHandler, "get_cached_value", fail)
+    monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", fail_async)
+
+    if is_async:
+
+        @cache(backend=_ByteStore(), ttl=60, namespace="single-record-get-failure-async")
+        async def compute() -> dict[str, int]:
+            return {"answer": 42}
+
+    else:
+
+        @cache(backend=_ByteStore(), ttl=60, namespace="single-record-get-failure-sync")
+        def compute() -> dict[str, int]:
+            return {"answer": 42}
+
+    assert await _call(compute) == {"answer": 42}
+
+    assert [r["operation"] for r in recorded if not r["success"]] == ["cache_get"], recorded
+    assert all(r["operation"] != "exception" for r in recorded), recorded

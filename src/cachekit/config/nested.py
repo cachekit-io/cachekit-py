@@ -230,11 +230,10 @@ class BackpressureConfig:
 class MonitoringConfig:
     """Observability and monitoring configuration.
 
-    Controls collection of statistics, tracing, structured logging, and metrics export.
+    Controls collection of statistics, structured logging, and metrics export.
 
     Attributes:
         collect_stats: Collect cache hit/miss statistics (default: True)
-        enable_tracing: Enable distributed tracing (default: True)
         enable_structured_logging: Enable structured JSON logging (default: True)
         enable_prometheus_metrics: Export Prometheus metrics (default: True)
 
@@ -256,7 +255,6 @@ class MonitoringConfig:
     """
 
     collect_stats: bool = True
-    enable_tracing: bool = True
     enable_structured_logging: bool = True
     enable_prometheus_metrics: bool = True
 
