@@ -355,7 +355,8 @@ class StandardSerializer:
                 ``metadata.encrypted`` (decrypted by :class:`EncryptionWrapper`, whose AAD binds
                 ``compressed``) probes only the legacy int-array layout, which AutoSerializer before
                 0.12.0 sealed under ``compressed=False``. So a value equal to a current (bin) envelope's
-                fields comes back there, while ``compressed=True`` and a legacy envelope still refuse.
+                fields comes back there, while ``compressed=True`` and a legacy envelope declaring at
+                most 256 KiB still refuse; a larger legacy envelope comes back as its fields.
 
         Examples:
             >>> serializer = StandardSerializer()

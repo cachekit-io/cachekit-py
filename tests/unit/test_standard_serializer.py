@@ -670,7 +670,7 @@ class TestStandardSerializerIntegrityChecking:
             assert off.deserialize(data, decrypted) == msgpack.unpackb(data)
         assert spy.calls == int(legacy)
 
-    def test_decrypted_read_skips_the_envelope_probe(self) -> None:
+    def test_decrypted_bin_layout_read_skips_the_envelope_probe(self) -> None:
         """A decrypted bin-layout value equal to a valid envelope's fields comes back unprobed, while the
         same bytes on a plaintext read are refused. A ``compressed=True`` header still refuses on either
         read."""
