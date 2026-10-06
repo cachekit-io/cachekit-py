@@ -491,12 +491,41 @@ def _revive_sentinels(obj: Any) -> Any:
     return obj
 
 
+# Most distinct keys one map may hold under a single hash value. No honest document comes near it (an int
+# hash value is shared by at most 13 ints in msgpack's range), so it only rejects a map built to collide.
+_MAX_KEYS_PER_HASH = 32
+
+
+def _build_map(pairs: list[tuple[Any, Any]]) -> Any:
+    """msgpack object_pairs_hook: build a map without letting colliding keys make it quadratic.
+
+    Non-str keys are allowed (IOP-18), but some hash without a seed: msgpack.Timestamp hashes its
+    (seconds, nanoseconds) tuple, which a forged entry can invert to put thousands of distinct keys on
+    one hash, and floats share hashes too. Each insert then compares against every earlier collider.
+    Counting distinct keys per hash and refusing the map past _MAX_KEYS_PER_HASH keeps every probe chain
+    short, whatever the key type, so no accepted key type is narrowed.
+    """
+    if all(type(k) is str for k, _ in pairs):  # SipHash-keyed: nothing to bound
+        return _revive_sentinels(dict(pairs))
+    result: dict[Any, Any] = {}
+    per_hash: dict[int, int] = {}
+    for k, v in pairs:
+        if k not in result:  # a repeated key overwrites; it adds no collider
+            h = hash(k)
+            per_hash[h] = per_hash.get(h, 0) + 1
+            if per_hash[h] > _MAX_KEYS_PER_HASH:
+                raise ValueError(f"map holds more than {_MAX_KEYS_PER_HASH} distinct keys with one hash")
+        result[k] = v
+    return _revive_sentinels(result)
+
+
 def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     """Decode one plain-MessagePack interop value document.
 
     Readers accept any well-formed MessagePack document (canonical or not):
     a hashable non-str map key (int, float, bytes, ExtType, a revived temporal)
-    decodes as-is, and an unhashable one raises InteropDecodeError. Readers
+    decodes as-is, and an unhashable one raises InteropDecodeError, as does a
+    map with more than 32 distinct keys sharing one hash (a hash flood). Readers
     MUST consume exactly one document — trailing bytes are rejected
     (msgpack-python raises ExtraData). A CK v3 frame prefix gets the
     protocol#11 diagnostic instead of decoding its magic byte as int 67.
@@ -509,11 +538,10 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
             "check that every writer for this key uses @cache(interop=...)."
         )
     # strict_map_key=False: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must
-    # accept. msgpack's default exists against hash flooding. Here an array/map key still fails as unhashable,
-    # str/bytes hashes are SipHash-keyed, and int/float hashes, though unseeded, are each shared by a bounded
-    # set (at most 13 ints in msgpack's range, about 200 float64s), so colliding-key chains stay bounded.
+    # accept. msgpack's default exists against hash flooding; _build_map bounds that instead, and an
+    # array/map key still fails as unhashable.
     try:
-        return unpackb_bounded(raw, raw=False, strict_map_key=False, object_hook=_revive_sentinels)
+        return unpackb_bounded(raw, raw=False, strict_map_key=False, object_pairs_hook=_build_map)
     except Exception as e:
         raise InteropDecodeError(f"stored value is not a single well-formed MessagePack document: {e}") from e
 

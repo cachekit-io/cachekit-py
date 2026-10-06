@@ -182,6 +182,66 @@ def test_reader_reject_vectors(vector: dict[str, Any]):
     assert isinstance(excinfo.value.__cause__, msgpack.exceptions.ExtraData)
 
 
+def _colliding_timestamps(n: int) -> list[msgpack.Timestamp]:
+    """n distinct Timestamps with one hash, by inverting CPython's 64-bit two-item tuple hash.
+
+    Timestamp hashes (seconds, nanoseconds) with no seed, so a forged entry can do the same: without a
+    bound, 4,000 such keys made one decode take ~0.6 s (quadratic in the key count).
+    """
+    mask, p1, p2, p5 = (1 << 64) - 1, 11400714785074694791, 14029467366897019727, 2870177450012600261
+
+    def rotr(x: int, r: int) -> int:
+        return ((x >> r) | (x << (64 - r))) & mask
+
+    out, inv1, inv2, target = [], pow(p1, -1, 1 << 64), pow(p2, -1, 1 << 64), 12345
+    nanoseconds = 0
+    while len(out) < n:
+        nanoseconds += 1
+        acc1 = (rotr(target * inv1 & mask, 31) - hash(nanoseconds) * p2) & mask
+        seconds = ((rotr(acc1 * inv1 & mask, 31) - p5) * inv2) & mask
+        if seconds < (1 << 61) - 1:  # hash(seconds) == seconds below the modulus
+            out.append(msgpack.Timestamp(seconds, nanoseconds))
+    return out
+
+
+def _map_document(pairs: list[tuple[Any, Any]]) -> bytes:
+    """A map16 of the given pairs, in order, duplicates kept (packb would merge them)."""
+    return b"\xde" + len(pairs).to_bytes(2, "big") + b"".join(msgpack.packb(k) + msgpack.packb(v) for k, v in pairs)
+
+
+class TestReaderHashFlood:
+    """strict_map_key=False lets unseeded-hash keys in; the reader must bound their collisions."""
+
+    def test_timestamp_keys_sharing_one_hash_are_bounded(self):
+        keys = _colliding_timestamps(4000)
+        assert len({hash(k) for k in keys}) == 1 and len(set(keys)) == 4000
+        assert decode_interop_value(_map_document([(k, 0) for k in keys[:32]])) == dict.fromkeys(keys[:32], 0)
+        with pytest.raises(InteropDecodeError, match="distinct keys with one hash"):
+            decode_interop_value(_map_document([(k, 0) for k in keys[:33]]))
+        # The 4,000-key flood is refused at the 33rd collider instead of after ~8M comparisons.
+        with pytest.raises(InteropDecodeError, match="distinct keys with one hash"):
+            decode_interop_value(_map_document([(k, 0) for k in keys]))
+
+    def test_float_keys_sharing_one_hash_are_bounded(self):
+        # 2.0**a hashes to 2**(a mod 61): every a in one residue class collides, 34 of them in float64's range.
+        keys = [2.0**a for a in range(-1074, 1024) if a % 61 == 5]
+        assert len(keys) == 34 and len({hash(k) for k in keys}) == 1
+        with pytest.raises(InteropDecodeError, match="distinct keys with one hash"):
+            decode_interop_value(_map_document([(k, 0) for k in keys]))
+
+    def test_repeated_key_is_not_counted_as_a_collider(self):
+        # A repeated key overwrites (last wins); it adds no probe-chain length, so it must not trip the bound.
+        assert decode_interop_value(_map_document([(1, i) for i in range(100)])) == {1: 99}
+
+    def test_non_str_key_types_still_decode(self):
+        # The bound narrows no key type: ext and revived temporal keys still decode alongside str keys.
+        sentinel = {"__datetime__": True, "value": "2024-01-01T00:00:00+00:00"}
+        doc = _map_document([("a", 1), (msgpack.ExtType(1, b"*"), 2), (b"k", 3), (None, 4), (1.5, 5)])
+        assert decode_interop_value(doc) == {"a": 1, msgpack.ExtType(1, b"*"): 2, b"k": 3, None: 4, 1.5: 5}
+        revived = decode_interop_value(b"\x81" + msgpack.packb(sentinel) + b"\x01")
+        assert revived == {datetime.fromisoformat(sentinel["value"]): 1}
+
+
 def test_lone_surrogate_rejected():
     """Strings must be well-formed Unicode scalar sequences (spec self-test:
     portable JSON cannot express a lone surrogate, so there is no error vector)."""
