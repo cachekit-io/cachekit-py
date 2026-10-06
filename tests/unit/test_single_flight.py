@@ -454,6 +454,50 @@ async def test_a_read_after_invalidation_does_not_join_a_trip_that_started_durin
     assert await during == 100  # it overlapped the invalidation
 
 
+@pytest.mark.parametrize("invalidate_args", [(1,), ()], ids=["one-key", "whole-function"])
+async def test_a_cancelled_invalidation_still_forgets_trips_that_started_during_its_delete(
+    invalidate_args: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker running the delete forgets the calls in flight after it, even when the caller
+    awaiting it was cancelled: a read after the delete never joins a trip that read the old entry."""
+    forgets = 0
+    real_forget = AsyncFlights.forget
+
+    def counting_forget(self: AsyncFlights, cache_keys: Any) -> None:
+        nonlocal forgets
+        real_forget(self, cache_keys)
+        forgets += 1
+
+    monkeypatch.setattr(AsyncFlights, "forget", counting_forget)
+    version = 100
+
+    async def compute(x: int) -> int:
+        return version
+
+    backend = _RacingDeleteBackend()
+    fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"sf-{uuid.uuid4().hex}")(compute)
+    assert await fn(1) == 100
+
+    version = 200
+    invalidation = asyncio.create_task(fn.ainvalidate_cache(*invalidate_args))
+    assert await asyncio.to_thread(backend.deleting.wait, 5)
+    backend.hold_reads = True
+    during = asyncio.create_task(fn(1))  # reads the old entry, then is held in flight
+    await _until_async(lambda: backend.reads_held == 1)
+    invalidation.cancel()  # while its worker is still deleting
+    with pytest.raises(asyncio.CancelledError):
+        await invalidation
+    backend.finish_delete.set()
+    await _until_async(lambda: forgets == 2)  # the worker forgot again after its delete
+
+    after = asyncio.create_task(fn(1))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    backend.release_reads.set()
+    assert await asyncio.wait_for(after, 5) == 200
+    assert await during == 100  # it overlapped the invalidation
+
+
 async def _until_async(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
