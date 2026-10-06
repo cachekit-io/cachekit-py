@@ -35,10 +35,10 @@ class RedisBackend:
     Reuses existing CacheClientProvider infrastructure for connection management.
     Implements the four required operations: get, set, delete, exists.
 
-    No method binds the client to a local, and a failed one raises its BackendError
-    outside the ``except`` block, from a cause that keeps no redis-py frame
-    (see ``kept_cause``): a redis-py client's repr lists the password, and an error
-    tracker sends the locals of every frame on a raised error's traceback (CWE-532).
+    A failed operation raises its BackendError outside the ``except`` block, from a
+    cause that keeps no redis-py frame (see ``kept_cause``), and from a frame that
+    holds no client in a local: a redis-py client's repr lists the password, and an
+    error tracker sends the locals of every frame on a raised error's traceback (CWE-532).
 
     Examples:
         Create backend with explicit redis_url (requires running Redis):

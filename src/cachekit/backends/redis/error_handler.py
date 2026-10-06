@@ -126,7 +126,7 @@ def classify_redis_error(
     # Every branch below puts only type(exc).__name__ in the message, never the raw
     # exception text: redis-py surfaces the offending key in ResponseError/NoPermission
     # text ("NOPERM ... keys used as arguments", "WRONGTYPE ... key ..."), and the
-    # message reaches log sinks via str(e) (CWE-532, LAB-304). The text is not kept on
+    # message reaches log sinks via str(e) (CWE-532). The text is not kept on
     # original_exception either (see kept_cause); the key is on the .key attribute
     # (redacted by _format_message).
     cause = exc if keep_exception else kept_cause(exc)
