@@ -239,7 +239,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 | `serializer_auto` | `AutoSerializer` round trip | 69,441 | 70,650 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,679 | 23,775 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,953,212 | 1,953,407 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 117,147 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 118,412 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 100,723 | 86,297 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 50,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
