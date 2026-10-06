@@ -41,7 +41,7 @@ def custom_function():
 
 **Architecture**: The `@cache` decorator resolves its configuration from the preset and arguments, then delegates to the wrapper factory for actual caching implementation.
 
-**Intent-Based Profiles.** On every profile below, a backend that is down or unreachable never raises: the call logs the failure and runs your function, and the result still goes to L1 unless the backend could not be built on the first call ([Connection Errors](error-codes.md#connection-errors)).
+**Intent-Based Profiles.** On every profile below, a backend that is down or unreachable never raises: the call logs the failure and runs your function. What gets cached meanwhile is in [Connection Errors](error-codes.md#connection-errors).
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
 - **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, backpressure, monitoring)
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
