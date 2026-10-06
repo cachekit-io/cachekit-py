@@ -39,6 +39,7 @@ class RedisBackend:
     cause that keeps no redis-py frame (see ``kept_cause``), and from a frame that
     holds no client in a local: a redis-py client's repr lists the password, and an
     error tracker sends the locals of every frame on a raised error's traceback (CWE-532).
+    The frame deletes its ``error`` local as the error leaves.
 
     Examples:
         Create backend with explicit redis_url (requires running Redis):
@@ -137,7 +138,10 @@ class RedisBackend:
                 original_exception=kept_cause(e),
                 operation="get_client",
             )
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def get(self, key: str) -> Optional[bytes]:
         """Retrieve value from Redis storage.
@@ -160,7 +164,10 @@ class RedisBackend:
             return value if isinstance(value, bytes) else None
         except Exception as e:
             error = _command_error("GET", "get", e, key)
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
         """Store value in Redis storage.
@@ -183,7 +190,10 @@ class RedisBackend:
             return
         except Exception as e:
             error = _command_error("SET", "set", e, key)
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def delete(self, key: str) -> bool:
         """Delete key from Redis storage.
@@ -209,7 +219,10 @@ class RedisBackend:
             return result > 0
         except Exception as e:
             error = _command_error("DELETE", "delete", e, key)
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def _delete_many(self, keys: list[str]) -> set[str]:
         """Delete many keys in one ``UNLINK`` (internal: whole-function invalidation).
@@ -228,7 +241,10 @@ class RedisBackend:
             return set()
         except Exception as e:
             error = _command_error("UNLINK", "delete", e)
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def exists(self, key: str) -> bool:
         """Check if key exists in Redis storage.
@@ -254,7 +270,10 @@ class RedisBackend:
             return result > 0
         except Exception as e:
             error = _command_error("EXISTS", "exists", e, key)
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check Redis backend health status.

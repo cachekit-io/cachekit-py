@@ -637,7 +637,17 @@ The tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`) wra
 
 5. **`UNKNOWN`**: any other exception
 
-Either backend keeps only the redis-py exception's class, never the exception: the `BackendError`'s `original_exception`, which is also its `__cause__`, is a `RedisClientError` (`cachekit.backends.redis.error_handler`) whose `exc_type` is that class. Test `issubclass(err.original_exception.exc_type, redis.exceptions.AuthenticationError)`, not `isinstance(err.original_exception, ...)`. The exception is dropped because its traceback holds the Redis password (see [SECURITY.md](../SECURITY.md#cache-key-redaction-in-logs-cwe-532)).
+For a redis-py failure, either backend keeps only the exception's class, never the exception: the `BackendError`'s `original_exception`, which is also its `__cause__`, is a `RedisClientError` (`cachekit.backends.redis.error_handler`) whose `exc_type` is that class. The exception is dropped because its traceback holds the Redis password (see [SECURITY.md](../SECURITY.md#cache-key-redaction-in-logs-cwe-532)). Two causes are kept whole instead: an exception your own code raises inside `acquire_lock` or `with_timeout`, and a `BackendError` cachekit raises itself, such as for a reply of the wrong type. So check the cause's type before reading `exc_type`:
+
+```python
+import redis
+
+from cachekit.backends.redis.error_handler import RedisClientError, classify_redis_error
+
+err = classify_redis_error(redis.exceptions.AuthenticationError("WRONGPASS"), operation="get")  # what a failed get raises
+cause = err.original_exception
+assert isinstance(cause, RedisClientError) and issubclass(cause.exc_type, redis.exceptions.AuthenticationError)
+```
 
 ### Connection Failures
 When Redis is unavailable:

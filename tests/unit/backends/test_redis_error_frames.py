@@ -9,11 +9,16 @@ or a config whose repr shows it.
 
 Each operation fails against a loopback server speaking just enough RESP: it refuses AUTH with WRONGPASS, or completes the
 handshake and drops the connection on the first command. Every frame is walked, third-party ones included.
+
+The raising frame is on the error's own traceback, so it must not keep the error, or any other exception, in a local
+either: that is a reference cycle, and the frame, the payload with it, waits for the cyclic GC.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
+import pathlib
 import pickle
 import socket
 import threading
@@ -31,7 +36,7 @@ from cachekit.backends.redis.backend import RedisBackend
 from cachekit.backends.redis.client import reset_global_pool
 from cachekit.backends.redis.error_handler import RedisClientError, classify_redis_error
 from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider
-from tests.unit.config.test_redacting_settings import _cachekit_locals_holding
+from tests.unit.config.test_redacting_settings import _CACHEKIT_SRC, _cachekit_locals_holding, _held_exception
 
 pytestmark = [pytest.mark.unit, pytest.mark.security]
 
@@ -140,14 +145,39 @@ def _url(server: _FakeRedis, password: str) -> SecretStr:
     return SecretStr(f"redis://:{password}@127.0.0.1:{server.port}/0")
 
 
-def _raised(call: Callable[[], object]) -> BackendError:
-    """The BackendError ``call`` raises, caught here so the test's own frame, which holds the password, is not on its
+def _raised(call: Callable[[], object], expected: type[Exception] = BackendError) -> Exception:
+    """The exception ``call`` raises, caught here so the test's own frame, which holds the password, is not on its
     traceback."""
     try:
         call()
-    except BackendError as exc:
+    except expected as exc:
         return exc
     pytest.fail("the operation did not fail")
+
+
+def _cachekit_frames_holding_an_exception(err: BaseException) -> list[str]:
+    """Every ``frame:local`` of a cachekit frame on the traceback of ``err``, or of the exceptions it chains, that
+    holds an exception or a failed Future: a reference cycle through the traceback, or redis-py's exception kept
+    alive."""
+    found: list[str] = []
+    pending: list[BaseException | None] = [err]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending += [current.__cause__, current.__context__, getattr(current, "original_exception", None)]
+        tb = current.__traceback__
+        while tb is not None:
+            if pathlib.Path(tb.tb_frame.f_code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC):
+                found += [
+                    f"{tb.tb_frame.f_code.co_name}:{name}"
+                    for name, value in tb.tb_frame.f_locals.items()
+                    if _held_exception(value) is not None
+                ]
+            tb = tb.tb_next
+    return found
 
 
 def _assert_class_only_cause(err: BackendError, exc_type: type[Exception]) -> None:
@@ -208,12 +238,14 @@ def test_redis_backend_failure_reaches_no_frame_holding_the_password(
         backend = RedisBackend()
 
     err = _raised(lambda: run(backend))
+    assert isinstance(err, BackendError)
 
     # Classification unchanged: RedisBackend does not classify by exception type.
     assert err.error_type == BackendErrorType.UNKNOWN
     assert err.message == f"Redis {command} failed: {err.original_exception.exc_type.__name__}"  # type: ignore[union-attr]
     _assert_class_only_cause(err, exc_type)
     assert _cachekit_locals_holding(err, password, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(err) == []
 
 
 @pytest.mark.parametrize("built_from", ["url", "env"])
@@ -228,10 +260,12 @@ def test_provider_init_failure_reaches_no_frame_holding_the_password(
     else:
         redis_env(url.get_secret_value())
         err = _raised(lambda: DefaultBackendProvider().get_backend())
+    assert isinstance(err, BackendError)
 
     assert (err.error_type, err.operation) == (BackendErrorType.AUTHENTICATION, "init")
     _assert_class_only_cause(err, redis.AuthenticationError)
     assert _cachekit_locals_holding(err, password, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(err) == []
 
 
 @pytest.mark.parametrize("failure", _FAILURES)
@@ -247,10 +281,12 @@ def test_provider_backend_failure_reaches_no_frame_holding_the_password(
         server.refuse_from_now()
 
     err = _raised(lambda: _SHARED_CALLS[call](backend))  # type: ignore[arg-type]
+    assert isinstance(err, BackendError)
 
     assert err.error_type == error_type
     _assert_class_only_cause(err, exc_type)
     assert _cachekit_locals_holding(err, password, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(err) == []
 
 
 class _BlockError(Exception):
@@ -279,11 +315,70 @@ def test_an_exception_raised_in_the_block_is_kept_whole(
     exc = _BlockError("raised in the block")
 
     err = _raised(lambda: asyncio.run(block(backend, exc)))  # type: ignore[arg-type]
+    assert isinstance(err, BackendError)
 
     assert err.error_type == BackendErrorType.UNKNOWN
     assert err.original_exception is exc
     assert err.__cause__ is exc
     assert _cachekit_locals_holding(err, password, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(err) == []
+
+
+def test_the_blocks_exception_wins_over_a_release_that_fails_after_it(
+    fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release that fails with an error redis-py did not raise (an executor shut down at exit) must not replace the
+    block's own exception: the decorator re-raises that from ``original_exception``."""
+
+    def release(self: object) -> None:
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(redis.lock.Lock, "release", release)
+    server = fake_redis(refusing=False, serving={b"SET": b"+OK\r\n"})
+    backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
+    exc = _BlockError("raised in the block")
+
+    err = _raised(lambda: asyncio.run(_raise_in_lock(backend, exc)))  # type: ignore[arg-type]
+
+    assert isinstance(err, BackendError)
+    assert err.original_exception is exc
+    assert _cachekit_frames_holding_an_exception(err) == []
+
+
+_SYNC_FAILURES: dict[str, Callable[[str], object]] = {
+    "redis-backend-set": lambda url: RedisBackend(redis_url=url).set("k", b"v" * 1_000_000),
+    "provider-backend-set": lambda url: RedisBackendProvider(url).get_shared_backend().set("k", b"v" * 1_000_000),
+}
+
+
+@pytest.mark.parametrize("call", _SYNC_FAILURES, ids=_SYNC_FAILURES.keys())
+def test_a_failed_write_is_freed_without_the_cyclic_gc(fake_redis: Callable[..., _FakeRedis], password: str, call: str) -> None:
+    """Freed by reference counting alone: its frames, and the payload they hold, do not wait for the cyclic GC while
+    Redis is down."""
+    url = _url(fake_redis(refusing=False), password)
+    gc.collect()
+    gc.disable()
+    try:
+        err = _raised(lambda: _SYNC_FAILURES[call](url.get_secret_value()))
+        assert isinstance(err, BackendError)
+        gc.set_debug(gc.DEBUG_SAVEALL)  # what collect() finds unreachable stays in gc.garbage
+        del err
+        gc.collect()
+        assert [obj for obj in gc.garbage if isinstance(obj, BackendError)] == []
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+
+
+def test_the_walk_finds_the_password_on_redis_pys_own_exception(fake_redis: Callable[..., _FakeRedis], password: str) -> None:
+    """Positive control: redis-py's exception, unwrapped, carries the password in its frames' locals, so the clean
+    walks above are a result, not a walk that cannot see it."""
+    url = _url(fake_redis(refusing=True), password)
+
+    exc = _raised(lambda: redis.Redis.from_url(url.get_secret_value()).get("k"), redis.AuthenticationError)
+
+    assert _cachekit_locals_holding(exc, password, below_caller=True) != []
 
 
 def test_a_cachekit_error_raised_inside_an_operation_is_kept_whole() -> None:

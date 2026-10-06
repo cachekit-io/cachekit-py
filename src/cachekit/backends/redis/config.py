@@ -68,8 +68,6 @@ class RedisBackendConfig(BaseBackendConfig):
         default="redis://localhost:6379",
         validation_alias=AliasChoices("CACHEKIT_REDIS_URL", "REDIS_URL"),
         description="Redis connection URL (env: CACHEKIT_REDIS_URL or REDIS_URL)",
-        # Left out of repr: the URL can carry a password, and an error tracker serialises a config held in a frame
-        # local by its repr (CWE-532).
         repr=False,
     )
     connection_pool_size: int = Field(

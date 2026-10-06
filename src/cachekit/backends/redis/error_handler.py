@@ -33,7 +33,14 @@ def kept_cause(exc: Exception) -> Exception:
     ``exc`` itself when it is a BackendError: cachekit's own, raised from a cause like this one, so it reaches no
     redis-py frame. Anything else came out of redis-py and keeps only its class (see RedisClientError). The
     BackendError is raised outside the ``except`` block that caught ``exc``, from this cause: raised inside it,
-    Python would chain ``exc`` as its ``__context__``, which ``raise ... from`` does not clear.
+    Python would chain ``exc`` as its ``__context__``, which ``raise ... from`` does not clear. The local holding it
+    is deleted in a ``finally`` around that ``raise``: the error's traceback holds the raising frame, so the local
+    would make a reference cycle, and only the cyclic GC would free the frame and the payload it holds::
+
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
     """
     return exc if isinstance(exc, BackendError) else RedisClientError(type(exc))
 
