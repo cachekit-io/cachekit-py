@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
+  "version": "1.3.0",
   "spec": "spec/interop-mode.md",
   "generator": "tools/interop-reference.py (CPython stdlib)",
   "cross_checked_by": "tools/interop-crosscheck.mjs (independent encoder + @noble/hashes blake2b + WebCrypto HKDF/AES-GCM)",
@@ -9,13 +9,14 @@
   "segment_pattern_note": "Full-string match REQUIRED (Python: re.fullmatch, not re.match \u2014 $ matches before a trailing newline). namespace additionally MUST NOT be exactly 'ns' or 'nsapi' (reserved: the server parses those key prefixes). The reservation is namespace-only; operation has no reserved values. Neither segment may contain '..' (the pattern admits it; the server rejects '..' anywhere in a key). A lone '.' stays valid.",
   "width_coverage_note": "All *16 header boundaries (uint/int widths, str8->str16, bin8->bin16, fixarray->array16, fixmap->map16, including the root argument array) are pinned by vectors. The *32 tier (str32/bin32/array32/map32, >=64 KiB or >=65536 elements) is normative and implemented by both tools but untested-by-design: fixture blobs that size would bloat the file without exercising different logic (same length-prefix code path, wider field).",
   "error_vectors_note": "The 'error' field is a human-readable reason for maintainers. Conformance means the input MUST be rejected with an error; the message text is not normative.",
+  "reader_vectors_note": "Inputs for an interop VALUE reader, as raw MessagePack. A reader MUST decode every reader_accept_vectors document without error: each is well-formed but not canonical (a padded width, unsorted keys, a float32, a non-string map key, an ext type). Where tagged JSON can carry it, 'value' is what the document decodes to. A reader MUST reject every reader_reject_vectors document.",
   "tagged_json": {
     "note": "Single-key objects with a $-prefixed key are typed input tags; all other JSON maps directly.",
     "$set": "set of tagged values (unordered)",
     "$bytes": "hex-encoded byte string",
     "$datetime": "ISO 8601 with mandatory UTC offset",
     "$uuid": "UUID string (any case on input)",
-    "$float": "decimal float literal (JSON numbers are always integers in this file). Error vectors use 'nan' (parses to NaN in Python and JS) and '1e999' (overflows to +Infinity in Python, JS, and Rust) \u2014 never 'inf', which JS parses to NaN.",
+    "$float": "decimal float literal (JSON numbers are always integers in this file). Error vectors use 'nan' (parses to NaN in Python and JS) and '1e999' (overflows to +Infinity in Python, JS, and Rust) \u2014 never 'inf', which JS parses to NaN. A JavaScript harness must wrap the parsed Number in a type of its own (tools/interop-crosscheck.mjs uses a Float class), so the SDK can tell an explicit float from a bare Number, which this file only ever uses for a safe integer: an integral $float must still reach the SDK as a float ('2.0' stays float64 in a value, and '18446744073709551616' is a float64 argument, where a bare Number that large must be rejected).",
     "$int": "decimal integer literal (for values beyond 2^53, unsafe in JS JSON.parse)"
   },
   "key_vectors": [
@@ -617,6 +618,165 @@
       "canonical_args_hex": "9101",
       "args_hash": "405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a",
       "expected_key": "app.:users.fetch.by_id:405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a"
+    },
+    {
+      "name": "segment_max_length",
+      "description": "Both segments at the 64-character limit (the longest interop key, 194 characters). The namespace starts with a digit and holds '-' and '_'; the operation starts with a digit and holds '.', '-' and '_'. A limit of 63, or a ban on a leading digit or on '-', rejects it",
+      "namespace": "9-lives_9-lives_9-lives_9-lives_9-lives_9-lives_9-lives_9-lives_",
+      "operation": "0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0",
+      "args": [
+        1
+      ],
+      "canonical_args_hex": "9101",
+      "args_hash": "405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a",
+      "expected_key": "9-lives_9-lives_9-lives_9-lives_9-lives_9-lives_9-lives_9-lives_:0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0.op-x_0:405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a"
+    },
+    {
+      "name": "map_key_sort_case_across_letters",
+      "description": "Code point order puts 'B' (0x42) before 'a' (0x61). A collator (Intl.Collator, localeCompare, with or without caseFirst 'upper') compares letters first and puts 'a' before 'B'",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "a": 1,
+          "B": 2
+        }
+      ],
+      "canonical_args_hex": "9182a14202a16101",
+      "args_hash": "363d3a1b4c2b98dd8266eeb3c050d4da2b024d56afd817f9990b157f5410fdda",
+      "expected_key": "t:op:363d3a1b4c2b98dd8266eeb3c050d4da2b024d56afd817f9990b157f5410fdda"
+    },
+    {
+      "name": "map_key_sort_punctuation",
+      "description": "Code point order puts 'a-b' ('-' is 0x2d) before 'a_b' ('_' is 0x5f). A collator puts 'a_b' first: Unicode collation orders '_' before '-'",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "a_b": 1,
+          "a-b": 2
+        }
+      ],
+      "canonical_args_hex": "9182a3612d6202a3615f6201",
+      "args_hash": "a6c20006ddbdacea9a7e0307d4f99361c90420d16a82c47407eb5f73f0a4293d",
+      "expected_key": "t:op:a6c20006ddbdacea9a7e0307d4f99361c90420d16a82c47407eb5f73f0a4293d"
+    },
+    {
+      "name": "map_key_sort_shorter_key_later",
+      "description": "Code point order puts 'ab' before the shorter 'b'. A length-first sort (shorter keys first, as canonical CBOR orders them, or by the encoded key with its header) puts 'b' first",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "b": 1,
+          "ab": 2
+        }
+      ],
+      "canonical_args_hex": "9182a2616202a16201",
+      "args_hash": "2220a1361610d10954ee0e8e100974cc47239b041ca9419f67b6ffb62b2c79dc",
+      "expected_key": "t:op:2220a1361610d10954ee0e8e100974cc47239b041ca9419f67b6ffb62b2c79dc"
+    },
+    {
+      "name": "map_key_sort_supplementary_shorter",
+      "description": "Code point order puts U+FF61 U+FF61 (6 UTF-8 bytes) before the shorter U+10000 (4 bytes). A length-first sort and a UTF-16 code-unit sort both put U+10000 first",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "\ud800\udc00": 1,
+          "\uff61\uff61": 2
+        }
+      ],
+      "canonical_args_hex": "9182a6efbda1efbda102a4f090808001",
+      "args_hash": "5b4bdc0b139d14dc7e8099efaa9d556867b3d62145a553ad6c0e9913793f98e1",
+      "expected_key": "t:op:5b4bdc0b139d14dc7e8099efaa9d556867b3d62145a553ad6c0e9913793f98e1"
+    },
+    {
+      "name": "map_key_proto",
+      "description": "'__proto__' is an ordinary string key. A JavaScript normalizer that copies keys by assignment (out[k] = v) sets the object's prototype instead, drops the key and mints the key of an empty map",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "__proto__": 1
+        }
+      ],
+      "canonical_args_hex": "9181a95f5f70726f746f5f5f01",
+      "args_hash": "f3e64f4b2df2a19ce1867746dd0a00a454fbd53aa47e0c245353b10e391174e6",
+      "expected_key": "t:op:f3e64f4b2df2a19ce1867746dd0a00a454fbd53aa47e0c245353b10e391174e6"
+    },
+    {
+      "name": "set_in_map_normalized",
+      "description": "A set inside a map value holding a tz-aware datetime and an uppercase UUID: each element is normalized before it is encoded and sorted (the int timestamp 0xce.. sorts before the str 0xd9..). The valid twin of reject_naive_datetime_nested, so a set path that rejects every datetime fails it",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "when": {
+            "$set": [
+              {
+                "$uuid": "550E8400-E29B-41D4-A716-446655440000"
+              },
+              {
+                "$datetime": "2024-01-01T00:00:00+00:00"
+              }
+            ]
+          }
+        }
+      ],
+      "canonical_args_hex": "9181a47768656e92ce65920080d92435353065383430302d653239622d343164342d613731362d343436363535343430303030",
+      "args_hash": "0e6034a1e41ef9d5b86c1931ca87b6bc28941dc8d286f5b4ff35914c8cb467a5",
+      "expected_key": "t:op:0e6034a1e41ef9d5b86c1931ca87b6bc28941dc8d286f5b4ff35914c8cb467a5"
+    },
+    {
+      "name": "int_beyond_float64_precision",
+      "description": "2^53+1, -(2^53+1) and 2^63-1, then 2^53+1 again inside a list and a map value: integers inside int64 that a float64 cannot hold. A TypeScript SDK that turns a BigInt inside int64 into a Number rounds each one and mints a different key",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$int": "9007199254740993"
+        },
+        {
+          "$int": "-9007199254740993"
+        },
+        {
+          "$int": "9223372036854775807"
+        },
+        [
+          {
+            "$int": "9007199254740993"
+          }
+        ],
+        {
+          "id": {
+            "$int": "9007199254740993"
+          }
+        }
+      ],
+      "canonical_args_hex": "95cf0020000000000001d3ffdfffffffffffffcf7fffffffffffffff91cf002000000000000181a26964cf0020000000000001",
+      "args_hash": "9b0aeb160d3eff4897861f4304f02348acb15c93b0c3d7f34f1cc923c7cadebe",
+      "expected_key": "t:op:9b0aeb160d3eff4897861f4304f02348acb15c93b0c3d7f34f1cc923c7cadebe"
+    },
+    {
+      "name": "small_int_as_bigint",
+      "description": "Small integers passed as {\"$int\": ...} (a BigInt in JavaScript) take the shortest form, the bytes the same plain integers produce. An encoder that writes every BigInt at the full 9-byte width mints a different key",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$int": "1"
+        },
+        {
+          "$int": "-1"
+        },
+        {
+          "$int": "300"
+        }
+      ],
+      "canonical_args_hex": "9301ffcd012c",
+      "args_hash": "ba16f28441500ea3ae1a8537233d44b5128111fdb629262e65a39c3b44390137",
+      "expected_key": "t:op:ba16f28441500ea3ae1a8537233d44b5128111fdb629262e65a39c3b44390137"
     }
   ],
   "value_vectors": [
@@ -659,6 +819,23 @@
         "value": "2024-01-01T12:30:45.123456+00:00"
       },
       "canonical_msgpack_hex": "82ac5f5f6461746574696d655f5fc3a576616c7565d920323032342d30312d30315431323a33303a34352e3132333435362b30303a3030"
+    },
+    {
+      "name": "proto_key_value",
+      "description": "A map whose key is '__proto__', an ordinary string key. A JavaScript reader or writer that sets keys by assignment changes the object's prototype instead and loses the entry",
+      "value": {
+        "__proto__": 1
+      },
+      "canonical_msgpack_hex": "81a95f5f70726f746f5f5f01"
+    },
+    {
+      "name": "bom_strings_value",
+      "description": "Strings that start with U+FEFF, one short and one of 300 characters: a reader keeps the character. A UTF-8 decoder left at its default (TextDecoder strips a leading BOM) drops it, and some MessagePack decoders use one only for longer strings",
+      "value": [
+        "\ufeffbom",
+        "\ufeffxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ],
+      "canonical_msgpack_hex": "92a6efbbbf626f6dda012eefbbbf7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878"
     }
   ],
   "error_vectors": [
@@ -764,6 +941,246 @@
       "operation": "x..",
       "args": [],
       "error": "operation must not contain '..': the pattern admits it, but the server rejects '..' anywhere in a key (here at the end of the segment, which a check that skips the last pair misses)"
+    },
+    {
+      "name": "reject_namespace_too_long",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "operation": "get_user",
+      "args": [],
+      "error": "namespace is 65 characters; the limit is 64 (segment_max_length pins 64 as valid)"
+    },
+    {
+      "name": "reject_operation_too_long",
+      "namespace": "users",
+      "operation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "args": [],
+      "error": "operation is 65 characters; the limit is 64"
+    },
+    {
+      "name": "reject_leading_dot_namespace",
+      "namespace": ".users",
+      "operation": "get_user",
+      "args": [],
+      "error": "a segment must start with a letter or digit, not '.'"
+    },
+    {
+      "name": "reject_leading_hyphen_operation",
+      "namespace": "users",
+      "operation": "-get_user",
+      "args": [],
+      "error": "a segment must start with a letter or digit, not '-'"
+    },
+    {
+      "name": "reject_leading_underscore_operation",
+      "namespace": "users",
+      "operation": "_get_user",
+      "args": [],
+      "error": "a segment must start with a letter or digit, not '_' (a leading \\w admits it)"
+    },
+    {
+      "name": "reject_empty_namespace",
+      "namespace": "",
+      "operation": "get_user",
+      "args": [],
+      "error": "a segment holds at least one character"
+    },
+    {
+      "name": "reject_empty_operation",
+      "namespace": "users",
+      "operation": "",
+      "args": [],
+      "error": "a segment holds at least one character"
+    },
+    {
+      "name": "reject_non_ascii_digit_namespace",
+      "namespace": "users\u0663",
+      "operation": "get_user",
+      "args": [],
+      "error": "U+0663 ARABIC-INDIC DIGIT THREE is not an ASCII digit (Unicode \\d, isdigit and isalnum admit it)"
+    },
+    {
+      "name": "reject_non_ascii_letter_operation",
+      "namespace": "users",
+      "operation": "caf\u00e9",
+      "args": [],
+      "error": "U+00E9 is not an ASCII letter (a lowercase or alphanumeric test admits it)"
+    },
+    {
+      "name": "reject_fullwidth_operation",
+      "namespace": "users",
+      "operation": "\uff47\uff45\uff54_user",
+      "args": [],
+      "error": "full-width letters are not ASCII: NFKC folds them to 'get_user', and a segment is never normalized"
+    },
+    {
+      "name": "reject_slash_namespace",
+      "namespace": "users/v2",
+      "operation": "get_user",
+      "args": [],
+      "error": "'/' is not in the segment character set"
+    },
+    {
+      "name": "reject_space_operation",
+      "namespace": "users",
+      "operation": "get user",
+      "args": [],
+      "error": "a space is not in the segment character set"
+    },
+    {
+      "name": "reject_uppercase_operation",
+      "namespace": "users",
+      "operation": "getUser",
+      "args": [],
+      "error": "operation must be lowercase"
+    },
+    {
+      "name": "reject_colon_in_namespace",
+      "namespace": "users:v2",
+      "operation": "get_user",
+      "args": [],
+      "error": "':' is not in the segment character set (it would add a key segment)"
+    },
+    {
+      "name": "reject_trailing_newline_operation",
+      "namespace": "users",
+      "operation": "get_user\n",
+      "args": [],
+      "error": "segment validation must be a FULL-string match, on the operation as on the namespace"
+    },
+    {
+      "name": "reject_naive_datetime_nested",
+      "args": [
+        {
+          "when": {
+            "$set": [
+              {
+                "$datetime": "2024-01-01T00:00:00"
+              }
+            ]
+          }
+        }
+      ],
+      "error": "naive datetime inside a set inside a map value"
+    },
+    {
+      "name": "reject_nan_nested",
+      "args": [
+        [
+          {
+            "x": {
+              "$float": "nan"
+            }
+          }
+        ]
+      ],
+      "error": "NaN inside a map value inside a list"
+    },
+    {
+      "name": "reject_int_overflow_in_list",
+      "args": [
+        [
+          1,
+          {
+            "$int": "18446744073709551616"
+          }
+        ]
+      ],
+      "error": "integer above 2^64-1 inside a list"
+    },
+    {
+      "name": "reject_int_underflow_in_map",
+      "args": [
+        {
+          "id": {
+            "$int": "-9223372036854775809"
+          }
+        }
+      ],
+      "error": "integer below -2^63 inside a map value"
+    },
+    {
+      "name": "reject_int_overflow_in_map",
+      "args": [
+        {
+          "id": {
+            "$int": "18446744073709551616"
+          }
+        }
+      ],
+      "error": "integer above 2^64-1 inside a map value (with reject_int_underflow_in_list, each bound is pinned on both paths)"
+    },
+    {
+      "name": "reject_int_underflow_in_list",
+      "args": [
+        [
+          1,
+          {
+            "$int": "-9223372036854775809"
+          }
+        ]
+      ],
+      "error": "integer below -2^63 inside a list"
+    }
+  ],
+  "reader_accept_vectors": [
+    {
+      "name": "reader_padded_int_widths",
+      "description": "Integers in wider forms than the shortest: 42 as uint16, -1 as int32, 1 as uint64",
+      "input_hex": "93cd002ad2ffffffffcf0000000000000001",
+      "value": [
+        42,
+        -1,
+        1
+      ]
+    },
+    {
+      "name": "reader_padded_headers",
+      "description": "Headers wider than needed: an array16 of 3 holding 'abc' as str8, {'a': 1} as map16 and 2 bytes as bin16",
+      "input_hex": "dc0003d903616263de0001a16101c50002dead",
+      "value": [
+        "abc",
+        {
+          "a": 1
+        },
+        {
+          "$bytes": "dead"
+        }
+      ]
+    },
+    {
+      "name": "reader_unsorted_map_keys",
+      "description": "Map keys in the reverse of code point order",
+      "input_hex": "82a16202a16101",
+      "value": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    {
+      "name": "reader_float32",
+      "description": "1.5 as a float32 (0xca), which canonical writers never emit",
+      "input_hex": "ca3fc00000",
+      "value": {
+        "$float": "1.5"
+      }
+    },
+    {
+      "name": "reader_non_string_map_key",
+      "description": "{1: 42}: a map with an integer key. No tagged-JSON value can carry it; a reader must decode it without error (msgpack-python's unpackb needs strict_map_key=False)",
+      "input_hex": "81012a"
+    },
+    {
+      "name": "reader_ext_type",
+      "description": "An application ext type (fixext1, type 1, payload 0x2a). No tagged-JSON value can carry it; a reader must decode it without error",
+      "input_hex": "d4012a"
+    }
+  ],
+  "reader_reject_vectors": [
+    {
+      "name": "reader_trailing_byte",
+      "description": "The issue_example_object value followed by one 0x00 byte: a complete document and a trailing byte, with no CK frame prefix, so only the general trailing-bytes check rejects it. A reader that strips trailing NUL padding before a strict decode accepts it, so it fails this vector too",
+      "input_hex": "82a36167651ea46e616d65a5616c69636500",
+      "error": "trailing bytes after one complete document"
     }
   ],
   "aad_vectors": [

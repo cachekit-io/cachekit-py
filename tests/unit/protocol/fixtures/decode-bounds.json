@@ -1,11 +1,12 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "spec": "spec/interop-mode.md#decode-bounds",
   "generator": "tools/decode-bounds-reference.py generate (CPython stdlib)",
   "scope": "Any untrusted MessagePack decode in any SDK: interop/v1 values, the ByteStorage envelope bytes before StorageEnvelope is materialised, auto-mode payloads after the envelope is unwrapped, invalidation events. The bytes are plain MessagePack with no envelope.",
   "rules": {
     "depth": "Readers MUST bound nesting depth. The bound MUST be >= 32 and MUST be <= 1024; every reject vector tagged 'depth' nests deeper than 1024.",
-    "overclaim": "Readers MUST NOT pre-allocate beyond what the input can back (each element or byte needs >= 1 input byte): declared slots summed over the whole document MUST NOT exceed input_len - 1, checked before anything is materialised. Checking each header against the remaining input does not satisfy this. Readers MUST reject a structurally incomplete document. Every reject vector tagged 'overclaim' has declared_slots > input_len - 1 (the root header is the only byte that is not an element). A map pair counts as two slots (key + value). Every per-header term and the running sum MUST be computed in >= 64 bits or with checked/saturating arithmetic; an overflow is itself a rejection.",
+    "overclaim": "Readers MUST NOT pre-allocate beyond what the input can back (each element or byte needs >= 1 input byte): declared slots summed over the whole document MUST NOT exceed input_len - 1, checked before anything is materialised. Checking each header against the remaining input does not satisfy this. Every reject vector tagged 'overclaim' has declared_slots > input_len - 1 (the root header is the only byte that is not an element). A map pair counts as two slots (key + value). Every per-header term and the running sum MUST be computed in >= 64 bits or with checked/saturating arithmetic; an overflow is itself a rejection.",
+    "incomplete": "Readers MUST reject a structurally incomplete document (one whose root item is not complete at the end of the input) even when its declared slots fit the budget. Every reject vector tagged 'incomplete' fits the budget and ends before its root item does.",
     "failure_mode": "Rejection MUST surface as a catchable decode error that the SDK read path turns into a cache miss (fail-closed), never an uncaught crash or an OOM abort."
   },
   "field_notes": {
@@ -288,6 +289,38 @@
       "declared_slots": 5,
       "reject_reasons": [
         "overclaim"
+      ]
+    },
+    {
+      "name": "incomplete_within_slot_budget",
+      "description": "fixarray claiming 2 elements that holds one empty array16 and nothing else: 2 declared slots against a budget of 3, and every header fits the bytes after it, so neither the sum nor a per-header check rejects it. Only a walk that finds the root still owed an element does. Any decoder rejects it at end of input, so only an SDK test asserting its guard's rejection can tell a guard that skips the completeness check apart.",
+      "construction": {
+        "repeat_hex": "92",
+        "count": 1,
+        "suffix_hex": "dc0000"
+      },
+      "input_hex": "92dc0000",
+      "input_len": 4,
+      "nesting_depth": 2,
+      "declared_slots": 2,
+      "reject_reasons": [
+        "incomplete"
+      ]
+    },
+    {
+      "name": "incomplete_map_within_slot_budget",
+      "description": "Map twin of incomplete_within_slot_budget: a fixmap claiming 2 pairs that holds one pair (an empty map16 key and a nil value) and nothing else. 4 declared slots fit the budget of 4, and every header fits the bytes after it; a completeness check that counts a pair as one owed item finds it complete.",
+      "construction": {
+        "repeat_hex": "82",
+        "count": 1,
+        "suffix_hex": "de0000c0"
+      },
+      "input_hex": "82de0000c0",
+      "input_len": 5,
+      "nesting_depth": 2,
+      "declared_slots": 4,
+      "reject_reasons": [
+        "incomplete"
       ]
     }
   ],
