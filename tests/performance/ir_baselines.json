@@ -31,7 +31,7 @@
         "serializer_auto": 70650,
         "serializer_default": 61954,
         "serializer_default_records": 1442386,
-        "serializer_encrypted": 117147,
+        "serializer_encrypted": 118412,
         "serializer_orjson": 23775
       },
       "python": "3.14.3"
