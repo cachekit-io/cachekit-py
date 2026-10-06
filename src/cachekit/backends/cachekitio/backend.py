@@ -451,18 +451,27 @@ class CachekitIOBackend:
         lease = self._own_lease()
         handled_before = sys.exc_info()[1]
         try:
-            return lease.client.request(method, url, body=body, headers=headers)
-        except Exception as exc:
-            error = classify_http_error(exc, operation=method.lower())
+            try:
+                return lease.client.request(method, url, body=body, headers=headers)
+            except Exception as exc:
+                error = classify_http_error(exc, operation=method.lower())
         except BaseException as exc:
-            # An interrupt (a worker timeout's SystemExit, KeyboardInterrupt, gevent.Timeout) propagates as itself, but
-            # its traceback, and that of anything it chained during the request, runs through urllib3's request frames,
-            # whose locals hold the Authorization header (CWE-532). Those frames have finished: clearing them drops the
-            # locals and keeps each frame's file and line. The chain stops at the caller's own handled exception.
-            chained: BaseException | None = exc
-            while chained is not None and chained is not handled_before:
+            # An interrupt (a worker timeout's SystemExit, KeyboardInterrupt, gevent.Timeout), here or in the handler
+            # above, propagates as itself, but its traceback, and those of the exceptions it chained during the request,
+            # run through urllib3's request frames, whose locals hold the Authorization header (CWE-532). clear_frames
+            # drops the locals of every finished frame below _send and keeps each frame's file and line; _send's own
+            # frame is still executing and is skipped, so it must hold no key-bearing local. The walk follows both
+            # edges, visits each exception once, and stops at the exception the caller was already handling.
+            traceback.clear_frames(exc.__traceback__)
+            seen = {id(exc), id(handled_before)}
+            pending = [exc.__cause__, exc.__context__]
+            while pending:
+                chained = pending.pop()
+                if chained is None or id(chained) in seen:
+                    continue
+                seen.add(id(chained))
                 traceback.clear_frames(chained.__traceback__)
-                chained = chained.__cause__ or chained.__context__
+                pending += [chained.__cause__, chained.__context__]
             raise
         # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's
         # exception carries a traceback through its request frames, whose locals hold the Authorization header, and

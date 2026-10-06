@@ -9,7 +9,7 @@ An interrupt raised mid-request (``SystemExit``, ``KeyboardInterrupt``) propagat
 either.
 
 Each request fails on a real loopback socket, so urllib3 leaves the frames a production failure leaves, and every frame is
-walked, third-party ones included.
+walked, third-party ones included. The exception: the last tests fake the client, to place an interrupt where a socket cannot.
 """
 
 from __future__ import annotations
@@ -22,10 +22,11 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from types import SimpleNamespace, TracebackType
+from types import SimpleNamespace
 
 import pytest
 
+from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio import config as config_module
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
@@ -158,22 +159,46 @@ def _interrupted(call: Callable[[], object], interrupt: type[BaseException]) -> 
     pytest.fail("the request was not interrupted")
 
 
-def test_interrupt_chained_during_request_reaches_no_frame_holding_the_api_key(
-    monkeypatch: pytest.MonkeyPatch, connect: Callable[..., tuple[CachekitIOBackend, str]]
-) -> None:
+# The tests below fake the client's request, to place an interrupt where a real socket cannot place it on demand.
+_API_KEY = f"ck_live_SYNTHETIC_{uuid.uuid4().hex}"
+
+
+def _make_request() -> None:
+    """Stands in for urllib3's ``_make_request``: a finished frame whose local holds the bearer key."""
+    authorization = f"Bearer {_API_KEY}"  # noqa: F841 - the local a client frame holds
+    raise TimeoutError("read timed out")
+
+
+def _faked(monkeypatch: pytest.MonkeyPatch, request: Callable[..., object]) -> CachekitIOBackend:
+    backend = CachekitIOBackend(api_key=_API_KEY)
+    monkeypatch.setattr(backend, "_own_lease", lambda: SimpleNamespace(client=SimpleNamespace(request=request)))
+    return backend
+
+
+def _make_request_locals(exc: BaseException) -> list[dict[str, object]]:
+    """The locals of every ``_make_request`` frame reachable from ``exc`` through ``__cause__`` and ``__context__``."""
+    found: list[dict[str, object]] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending += [current.__cause__, current.__context__]
+        found += [dict(f.f_locals) for f, _ in traceback.walk_tb(current.__traceback__) if f.f_code is _make_request.__code__]
+    return found
+
+
+def test_interrupt_chained_during_request_reaches_no_frame_holding_the_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """An interrupt that lands while the client handles its own failure chains that failure, whose frames hold the key too.
 
     The caller's own handled exception, which the interrupt also chains, keeps its locals: it is not the request's.
     """
-    backend, api_key = connect(1)
-
-    def make_request() -> None:
-        authorization = f"Bearer {api_key}"  # the local urllib3's _make_request holds
-        raise TimeoutError(len(authorization))
 
     def request(method: str, url: str, **kwargs: object) -> None:
         try:
-            make_request()
+            _make_request()
         except TimeoutError:
             raise KeyboardInterrupt  # noqa: B904 - chains the TimeoutError as __context__, as an interrupt does
 
@@ -181,27 +206,89 @@ def test_interrupt_chained_during_request_reaches_no_frame_holding_the_api_key(
         evidence = "caller's local"  # noqa: F841 - must survive
         raise ValueError
 
-    monkeypatch.setattr(backend, "_own_lease", lambda: SimpleNamespace(client=SimpleNamespace(request=request)))
+    backend = _faked(monkeypatch, request)
     try:
         fail_in_caller()
     except ValueError:
         exc = _interrupted(lambda: backend.get("k"), KeyboardInterrupt)
 
     assert isinstance(exc.__context__, TimeoutError)
-    request_frames = [
-        tb.tb_frame
-        for err in (exc, exc.__context__)
-        for tb in _walk(err.__traceback__)
-        if tb.tb_frame.f_code is make_request.__code__
-    ]
-    assert len(request_frames) == 1  # only on the chained failure's traceback, not the interrupt's
-    assert request_frames[0].f_locals == {}
+    assert _make_request_locals(exc) == [{}]  # only on the chained failure's traceback, not the interrupt's
     handled = exc.__context__.__context__
     assert isinstance(handled, ValueError)
     assert handled.__traceback__.tb_next.tb_frame.f_locals == {"evidence": "caller's local"}
 
 
-def _walk(tb: TracebackType | None) -> Iterator[TracebackType]:
-    while tb is not None:
-        yield tb
-        tb = tb.tb_next
+def test_interrupt_with_a_distinct_cause_clears_its_context_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``raise interrupt from other`` inside the client's handler: the failure it handled is still its ``__context__``."""
+
+    def request(method: str, url: str, **kwargs: object) -> None:
+        try:
+            _make_request()
+        except TimeoutError:
+            raise KeyboardInterrupt from RuntimeError("independent cause")
+
+    exc = _interrupted(lambda: _faked(monkeypatch, request).get("k"), KeyboardInterrupt)
+
+    assert isinstance(exc.__cause__, RuntimeError)
+    assert _make_request_locals(exc) == [{}]
+
+
+def test_interrupt_while_classifying_a_transport_failure_clears_its_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt that lands in ``_send``'s own handler for a transport failure chains that failure."""
+
+    def classify(exc: BaseException, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(backend_module, "classify_http_error", classify)
+    backend = _faked(monkeypatch, lambda method, url, **kwargs: _make_request())
+
+    exc = _interrupted(lambda: backend.get("k"), KeyboardInterrupt)
+
+    assert isinstance(exc.__context__, TimeoutError)
+    assert _make_request_locals(exc) == [{}]
+
+
+def test_interrupt_the_caller_was_already_handling_still_clears_its_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller re-raising the interrupt it is handling (a reused ``gevent.Timeout``): the chain stop is not the interrupt."""
+    reused = KeyboardInterrupt()
+
+    def request(method: str, url: str, **kwargs: object) -> None:
+        try:
+            _make_request()
+        except TimeoutError:
+            raise reused  # noqa: B904 - chains the TimeoutError as __context__, as an interrupt does
+
+    backend = _faked(monkeypatch, request)
+    try:
+        raise reused
+    except KeyboardInterrupt:
+        exc = _interrupted(lambda: backend.get("k"), KeyboardInterrupt)
+
+    assert exc is reused
+    assert _make_request_locals(exc) == [{}]
+
+
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs SIGALRM to bound a hang")
+def test_interrupt_with_a_cyclic_chain_still_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    first, second = ValueError("a"), ValueError("b")
+    first.__cause__, second.__cause__ = second, first
+
+    def request(method: str, url: str, **kwargs: object) -> None:
+        try:
+            _make_request()
+        except TimeoutError:
+            raise KeyboardInterrupt from first
+
+    def hung(signum: int, frame: object) -> None:
+        raise AssertionError("the chain walk did not terminate")
+
+    previous = signal.signal(signal.SIGALRM, hung)
+    signal.setitimer(signal.ITIMER_REAL, 5)
+    try:
+        exc = _interrupted(lambda: _faked(monkeypatch, request).get("k"), KeyboardInterrupt)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert _make_request_locals(exc) == [{}]
