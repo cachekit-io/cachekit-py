@@ -107,7 +107,7 @@ class _RedisLockingFileBackend(_LockingFileBackend):
             async with super().acquire_lock(key, timeout, blocking_timeout) as acquired:
                 yield acquired
         except Exception as exc:
-            raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+            raise classify_redis_error(exc, operation="acquire_lock", key=key, keep_exception=True) from exc
 
 
 BACKENDS = [

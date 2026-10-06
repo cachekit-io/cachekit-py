@@ -690,7 +690,7 @@ class _LockByteStore(_ByteStore):
         except Exception as exc:
             if not self._redis_shaped:
                 raise
-            raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+            raise classify_redis_error(exc, operation="acquire_lock", key=key, keep_exception=True) from exc
 
 
 async def _call(fn: Any, *args: Any) -> Any:
