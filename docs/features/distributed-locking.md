@@ -8,7 +8,7 @@
 
 ## TL;DR
 
-Distributed locking prevents "cache stampede" - when multiple pods simultaneously call an expensive function on cache miss. With locking, only one pod calls the function; others wait for the cache result.
+Distributed locking prevents "cache stampede" - when multiple pods simultaneously call an expensive function on cache miss. With locking, only one pod calls the function; others wait for the cache result. Inside one pod, concurrent misses on a key never reach the lock more than once: they share one trip ([in-process single-flight](#in-process-single-flight-before-the-lock)), so the lock only dedups across processes.
 
 ```python
 @cache(ttl=300)  # Distributed locking enabled by default (via LockableBackend)
@@ -41,8 +41,31 @@ report = await get_report("2025-01-15")
 > [!NOTE]
 > Locking requires **both** of:
 >
-> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without stampede protection.
+> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
+
+---
+
+## In-Process Single-Flight (Before the Lock)
+
+Concurrent misses on one key inside one process share one call. The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In async backed mode the shared call is the whole trip after the L1 miss (the L2 read, the lock, the function and the write), so a herd in one process costs one trip and the lock only has to dedup across processes. It is always on and costs no round trip.
+
+| Mode | Sync | Async | A caller that joins gets |
+|------|------|-------|--------------------------|
+| `@cache(backend=None)` (L1-only) | Yes | Yes | The starter's object, as a later hit does |
+| `@cache.local()` | Yes | Yes | The starter's object, as a later hit does |
+| Backed (`@cache` with a backend, `@cache.io`, `@cache.secure`, ...) | No | Yes | Its own copy, decoded from the starter's serialized value, as an L1 hit does |
+
+The sync backed path is not coalesced: each sync caller that misses reads L2 and runs the function (see [Async-only](#async-only-sync-functions-are-never-lock-protected)).
+
+- **Failure.** If the call raises, every caller waiting on it gets that exception, nothing is cached, and the next call starts a new one.
+- **Cancellation.** Cancelling an async caller (a timeout, a dropped client) cancels only its own wait: the call runs on for the callers still waiting. Once every waiting caller is cancelled, the call is cancelled too, as an unshared call would be.
+- **Statistics.** In `cache_info()`, a caller that joins and gets the value counts as an L1 hit; one whose shared call raised counts as neither. The miss is the call that ran the function.
+- **Isolation.** Callers share a call only under the same backend key prefix, so a tenant-scoped backend never shares one across tenants. A joined caller decodes its copy under its own tenant: with encryption, a caller that cannot decrypt the starter's value takes its own trip.
+- **Circuit breaker.** A joined caller makes no backend request and records no outcome. In HALF_OPEN it hands its probe slot straight back, so a herd spends one probe.
+- **Event loops.** Async callers share a call only on the event loop running it; a caller on another thread's loop runs its own.
+- **Context.** An async call runs in its own task, in a copy of the starting caller's context, so a context variable the function sets is not visible to its caller afterwards.
+- **Waiting on yourself.** A function must not wait on another thread or task that calls it with the same arguments: that would wait on its own call. A direct recursive call on the same thread or task runs on its own.
 
 ---
 
@@ -51,9 +74,10 @@ report = await get_report("2025-01-15")
 The `LockableBackend` protocol is async-only (`acquire_lock` is an async context
 manager), so **only async decorated functions get distributed locking**. The sync
 wrapper executes the function directly on cache miss — on every backend, including
-Redis and CachekitIO. Twelve concurrent sync callers on a cold key mean twelve
-recomputes and zero lock traffic; the same probe through the async wrapper means
-exactly one recompute.
+Redis and CachekitIO — and its backed path has no in-process single-flight either.
+Twelve concurrent sync callers on a cold key mean twelve recomputes and zero lock
+traffic; the same probe through the async wrapper means exactly one recompute, one
+L2 read and one lock request.
 
 If a function is expensive enough that a stampede matters, decorate the async
 variant:
@@ -133,10 +157,12 @@ Three behavioural edges to design around:
 
 1. **Waiter fallthrough at 5 s.** A waiter that can't acquire the lock within
    5 seconds re-checks the cache one last time and, if it's still empty,
-   **executes the function itself without the lock**. The bound is the full
-   waiter count: for a function slower than 5 seconds, every waiter times out
-   and recomputes, so protection is effectively nil. Keep execution time under
-   5 s for full single-flight behaviour.
+   **executes the function itself without the lock**. Only one caller per
+   process waits on the lock (the others share its trip), so the bound is one
+   recompute per waiting process: for a function slower than 5 seconds, every
+   waiting process times out and recomputes, so cross-process protection is
+   effectively nil. Keep execution time under 5 s for full single-flight
+   behaviour.
 2. **Lock self-expiry at 30 s.** If the function runs longer than 30 seconds,
    the lock expires while the winner is still computing and another pod may
    start a concurrent recompute. This applies whether the holder is slow or
@@ -145,8 +171,9 @@ Three behavioural edges to design around:
    or split the work.
 3. **Lock backend errors degrade to no lock.** If lock acquisition raises a
    backend error (lock backend outage, authentication failure), the wrapper
-   logs a warning and **executes the function without the lock** — for every
-   caller, i.e. a full stampede. A failed lock request is not retried; only a
+   logs a warning and **executes the function without the lock** — once per
+   process, since a process's concurrent callers share one trip, i.e. a
+   stampede across processes. A failed lock request is not retried; only a
    lock another caller holds is waited on. A failed release never runs the
    function again: the Redis and CachekitIO backends swallow a backend error
    on release, any other release failure is logged and the call keeps its
@@ -343,8 +370,8 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 @cache(ttl=300)  # Both enabled
 async def operation(x):
     # L2 backend down: lock acquisition fails too (the lock lives in L2),
-    # so every caller executes without the lock and the function keeps
-    # serving. Locking resumes when the backend recovers.
+    # so each process's concurrent callers share one call without the lock
+    # and the function keeps serving. Locking resumes when the backend recovers.
     return compute(x)
 ```
 
@@ -374,7 +401,7 @@ record nothing, so treat it as a proxy, not an exact miss count — see
 ## Troubleshooting
 
 **Q: Getting "Failed to acquire lock" warnings**
-A: Your function takes longer than the 5 s `blocking_timeout`, so waiters fall through and recompute. Keep execution time under 5 s for full single-flight behaviour (and under 30 s so the lock doesn't self-expire mid-computation).
+A: Your function takes longer than the 5 s `blocking_timeout`, so waiting processes fall through and recompute. Keep execution time under 5 s for full single-flight behaviour (and under 30 s so the lock doesn't self-expire mid-computation).
 
 **Q: Locking doesn't seem to be working**
 A: Two things to check:

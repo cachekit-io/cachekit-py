@@ -62,6 +62,7 @@ from ..serializers.encryption_wrapper import (
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
+from .single_flight import AsyncFlights, ThreadFlights
 from .tenant_context import TenantContextExtractor
 
 if TYPE_CHECKING:
@@ -1541,6 +1542,30 @@ def create_cache_wrapper(
     # and a later qualifying hit retries. ObjectCache does the per-key dedup.
     _l1_swr_pool = _RefreshPool(_L1_SWR_MAX_CONCURRENT_REFRESHES)
 
+    # In-process single-flight for misses (single_flight): concurrent misses on one key share one
+    # call. Keyed by cache key in L1-only mode, and by (L2 scope, cache key) in backed mode, where
+    # it holds the whole trip after the L1 miss. The sync backed path does not use it.
+    _flights = AsyncFlights()
+    _thread_flights = ThreadFlights()
+
+    def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> Any:
+        """Run the function for an L1-only miss and store its result. A miss is a call that runs it."""
+        assert _object_cache is not None  # noqa: S101 - L1-only miss path only
+        _stats.record_miss()
+        result = func(*call_args, **call_kwargs)
+        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
+        _cached_keys.add((_l2_scope(), cache_key))
+        return result
+
+    async def _l1_only_fill_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> Any:
+        """_l1_only_fill for a coroutine function."""
+        assert _object_cache is not None  # noqa: S101 - L1-only miss path only
+        _stats.record_miss()
+        result = await func(*call_args, **call_kwargs)
+        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
+        _cached_keys.add((_l2_scope(), cache_key))
+        return result
+
     def _l1_swr_acquire(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
     ) -> tuple[object, Any, Any] | None:
@@ -1713,12 +1738,16 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
                 return cached_value
 
-            # Cache miss - execute function and store raw result
-            _stats.record_miss()
+            # Cache miss: run the function once for every concurrent miss on this key. A caller
+            # that joins gets the same object, as a later hit does, and counts as a hit.
             try:
-                result = func(*args, **kwargs)
-                _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
-                _cached_keys.add((_l2_scope(), cache_key))
+                result, joined = _thread_flights.run(
+                    cache_key,
+                    functools.partial(_l1_only_fill, cache_key, args, kwargs),
+                    functools.partial(_object_cache.peek, cache_key),
+                )
+                if joined:
+                    _stats.record_l1_hit()
                 return result
             finally:
                 reset_current_function_stats(token)
@@ -2146,11 +2175,11 @@ def create_cache_wrapper(
                             refresh_task.add_done_callback(functools.partial(_l1_swr_task_done, cache_key=cache_key))
                     return cached_value
 
-                # Cache miss - execute function and store raw result
-                _stats.record_miss()
-                result = await func(*args, **kwargs)
-                _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
-                _cached_keys.add((_l2_scope(), cache_key))
+                # Cache miss: run the function once for every concurrent miss on this key, as the
+                # sync wrapper does.
+                result, joined = await _flights.run(cache_key, functools.partial(_l1_only_fill_async, cache_key, args, kwargs))
+                if joined:
+                    _stats.record_l1_hit()
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
@@ -2283,356 +2312,407 @@ def create_cache_wrapper(
             )
             operation_handler.set_cache_handler(handler)
 
-            # Try to get from Redis cache (always measure time for L2 latency tracking)
-            start_time = time.perf_counter()
-
-            # The read paths report a failed read as a miss; the probe tells the two apart, so
-            # the post-lock double-check is skipped only after a clean miss (LAB-7064).
-            _l2_read = L2MissProbe()
-            try:
-                # Route through the operation handler so corrupt/tampered entries inherit
-                # eviction + the cache_get_deserialize metric instead of persisting (#159),
-                # and fail-closed tamper errors propagate (LAB-108). A freshness-capable
-                # backend (CachekitIO) always takes the freshness read — not just when SWR
-                # is configured — so every hit carries the server's staleness label and
-                # remaining-freshness bound (LAB-381/LAB-557): a stale hit is never
-                # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
-                _l2_is_stale = False
-                _l2_fresh_for: int | None = None
-                with probe_l2_miss(_l2_read):
-                    if _l2_freshness_capable():
-                        _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
-                        cached_result = _fresh_hit[0] if _fresh_hit is not None else None
-                        _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
-                        _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
-                    else:
-                        cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
-
-                if cached_result is not None:
-                    # Cache hit: envelope is the raw serialized bytes for L1 backfill
-                    result, cached_data = cached_result.value, cached_result.envelope
-
-                    # Record cache hit (always compute for L2 latency stats)
-                    get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
-
-                    # Update L1 cache with the L2 value (serialized bytes) for subsequent
-                    # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
-                    _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for, twin=twin_key)
-
-                    # TTL refresh, never on the caller's path (LAB-7074). Decide from the
-                    # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
-                    # it only drops below the threshold after fresh_until, when the PATCH
-                    # 409s. A stale hit can't be renewed. A fresh-labelled 0 is an unhinted
-                    # tier copy (saas-api.md), so it falls back to GET /ttl like no header.
-                    if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
-                        _fresh_for = _l2_fresh_for or None
-                        if not _l2_is_stale and (_fresh_for is None or _fresh_for < ttl * ttl_refresh_threshold):
-                            _schedule_ttl_refresh(_backend, cache_key, ttl, _fresh_for)
-                    elif refresh_ttl_on_get and ttl:
-                        # Backend can't inspect TTL: warn once instead of silently ignoring
-                        # the opted-in flag (LAB-446). Still degrades gracefully.
-                        warn_ttl_refresh_unsupported(_backend)
-
-                    # SWR: stale hit — value already in hand; revalidate in the
-                    # background so no request pays the recompute at a TTL boundary.
-                    # Gated on _l2_swr_active (not just the read gate above): a
-                    # decorator without a configured stale window serves a
-                    # stale-labelled mixed-reader hit but owns no revalidation.
-                    if _l2_is_stale and _l2_swr_active:
-                        _l2_swr_schedule(cache_key, args, kwargs, is_async=True)
-
-                    return result
-
-            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                # Fail-closed tamper failure propagated from get_cached_value_async —
-                # the tamper metric, error log, evidence retention, and fail policy all
-                # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108) — or a
-                # LOCAL keyring config fault (see the sync L2 read). Either must reach
-                # the caller: the generic clause below would demote it to a fail-open
-                # "record and recompute".
-                raise
-            except Exception as e:
-                # Backend/network error - record but continue to function execution
-                get_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_get",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=get_duration_ms,
-                )
-
-            # CACHE MISS - Use distributed lock to prevent thundering herd
-            # This ensures only one request executes the function while others wait.
-            # LockableBackend protocol contract: pass the bare cache_key. Each backend
-            # owns its internal lock-namespace derivation (Redis: ``<key>:lock``; SaaS:
-            # ``POST /v1/cache/{key}/lock``). Appending here would pollute the SaaS
-            # 7-segment canonical key and 400 at the edge.
-            lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
-            blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
-
-            # Check if backend supports distributed locking
-            if supports_locking(_backend):
-                func_error: Exception | None = None
-                lock_phase = _LockPhase()
+            # Every concurrent miss on this key in this process shares one trip (single_flight). The
+            # identity carries the backend's per-context key prefix, so callers under different
+            # prefixes (tenant-scoped backends) never share one. It is taken after admission and
+            # backend resolution: a joined caller makes no backend request, records no backend
+            # outcome and hands its HALF_OPEN probe slot straight back.
+            (result, envelope), joined = await _flights.run(
+                (_l2_scope(), cache_key),
+                functools.partial(_backed_miss_async, cache_key, args, kwargs, probe_cycle, twin_key),
+                functools.partial(features.release_probe, probe_cycle),
+            )
+            if not joined:
+                return result
+            # A joined caller decodes its own copy of the trip's envelope, as an L1 hit would: every
+            # backed-mode caller gets its own object, and the decrypt checks bind to this caller's
+            # tenant. Without an envelope, or when it decodes for the starter but not for this
+            # caller, it takes its own trip, unshared.
+            if envelope is not None:
                 try:
-                    # Use backend's async lock protocol
-                    async with _phased(
-                        _fill_lock(_backend, cache_key, lock_timeout, blocking_timeout),
-                        lock_phase,
-                    ) as (lock_acquired, lock_uncontended):
-                        if not lock_acquired:
-                            # Lock timeout - double-check cache before giving up
-                            # Another request may have populated it while we waited
-                            logger().warning(
-                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
-                            )
-                            try:
-                                # Routed through the operation handler: corrupt entries evict (#159),
-                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
-                                _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
-                                if cached_result is not None:
-                                    # Cache was populated while waiting - use it
-                                    result, cached_data = cached_result.value, cached_result.envelope
-                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
-                                    return result
-                            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                                # Same as the lock-acquired double-check below.
-                                raise
-                            except Exception as e:
-                                # Cache check failed - fall through to execute function
-                                logger().warning(
-                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, "
-                                    f"executing without lock: {redact_error_for_log(e)}"
-                                )
-
-                        elif not (lock_uncontended and _l2_read.clean_miss):
-                            # Lock acquired after a wait, or after a failed primary read - double-check
-                            # cache: another request may have populated it while we waited, or the
-                            # entry may still be live. Skipped after a clean miss and an uncontended
-                            # grant (LAB-7064): this caller never waited behind another holder, so
-                            # the read would almost always miss again, and be billed as one. A fill
-                            # that completed between our read and our lock request is recomputed;
-                            # last write wins.
-                            # Routed through the operation handler: corrupt entries evict (#159),
-                            # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
-                            try:
-                                _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
-                                if cached_result is not None:
-                                    # Another request filled the cache while we waited
-                                    result, cached_data = cached_result.value, cached_result.envelope
-                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
-                                    return result
-                            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                                # Fail-closed tamper raise from get_cached_value_async
-                                # (cachekit-py#170) or a LOCAL keyring config fault (see
-                                # the sync L2 read) — must not be demoted to a recompute
-                                # by the generic clause below. The lock clause's
-                                # `except Exception` then delivers a KeyringConfigurationError:
-                                # re-raised as is from a finally-only lock, and unwrapped
-                                # through original_exception from a Redis lock's BackendError.
-                                raise
-                            except Exception as e:
-                                # If double-check fails, continue to execute function
-                                _logger.debug(
-                                    "Double-check cache failed after lock acquisition for %s: %s",
-                                    redact_cache_key(cache_key),
-                                    redact_error_for_log(e),
-                                )
-
-                        # Execute the original function (with or without lock). Its exception
-                        # is held here, outside the lock's error handling, and re-raised once
-                        # the lock is released: a Redis lock wraps whatever leaves its body in
-                        # a BackendError, and the clause below would take a function's own
-                        # BackendError for a lock failure and run the function again (LAB-5360).
-                        # A miss is a call that runs the function: a double-check hit above returned
-                        # before here, so it is never counted as one (LAB-8298).
-                        _stats.record_miss()
-                        try:
-                            result = await func(*args, **kwargs)
-                        except Exception as e:
-                            features.release_probe(probe_cycle)  # not a backend outcome (see the sync wrapper)
-                            func_error = e
-                        else:
-                            # Serialize and cache the result
-                            try:
-                                serialized_data = operation_handler.serialization_handler.serialize_data(
-                                    result, args, kwargs, cache_key=cache_key
-                                )
-
-                                # Store in Redis with TTL
-                                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                                    cache_key,
-                                    serialized_data,
-                                    ttl=ttl,
-                                    stale_ttl=_stale_ttl,
-                                )
-
-                                # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                                _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-                                if stored:
-                                    await _track_and_record_async(cache_key)
-
-                                # Record successful cache set
-                                set_duration_ms = (time.perf_counter() - start_time) * 1000
-                                features.record_success()
-
-                                if features.collect_stats:
-                                    features.record_cache_operation(
-                                        operation="set",
-                                        namespace=namespace or "default",
-                                        success=True,
-                                        duration_ms=set_duration_ms,
-                                        serializer="rust",
-                                    )
-
-                            except (InteropError, KeyringConfigurationError):
-                                # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
-                                # keyring config fault (see the sync write): fail loud. It
-                                # leaves through the lock clause below as the double-check's does.
-                                raise
-                            except Exception as e:
-                                # Caching failed but function succeeded - return result anyway
-                                set_duration_ms = (time.perf_counter() - start_time) * 1000
-                                features.handle_cache_error(
-                                    error=e,
-                                    operation="cache_set",
-                                    cache_key=cache_key or "unknown",
-                                    namespace=namespace or "default",
-                                    duration_ms=set_duration_ms,
-                                    # A value the serializer (or encryption) rejects is not a
-                                    # backend failure; the sync write does not count it either.
-                                    count_toward_breaker=not isinstance(e, SerializationError),
-                                )
-
-                            return result
-
-                except DecryptionAuthenticationError:
-                    # Fail-closed tamper failure from the lock double-check reads — must
-                    # propagate to the caller, never demote to "lock failed, execute
-                    # without lock". (The generic clause below would also re-raise it,
-                    # but only as a side effect of the BackendError check; this clause
-                    # makes the security dependency explicit.)
-                    raise
+                    value = operation_handler.serialization_handler.deserialize_data(envelope, cache_key, args, kwargs)
+                except KeyringConfigurationError:
+                    raise  # a LOCAL keyring config fault: see the L1 guard above
                 except Exception as e:
-                    # The function's exceptions never get here (held in func_error above).
-                    # What does is told apart by where it was raised (lock_phase), not by its
-                    # type: a Redis lock wraps whatever leaves its body in a BackendError.
-                    if func_error is not None:
-                        # The lock failed while releasing after the function raised. The
-                        # function's exception wins and is raised below, outside this handler:
-                        # raised in here, it would take the release error as its __context__.
-                        logger().warning(
-                            f"Lock release failed for {redact_cache_key(cache_key)} after the function raised; "
-                            f"the lock may be held until its timeout: {redact_error_for_log(e)}"
-                        )
-                    elif lock_phase.body_exited:
-                        # The body returned `result` (its every normal exit without a func_error
-                        # is a `return result`) and only the release failed. Keep it: running the
-                        # function again here would run it twice.
-                        logger().warning(
-                            f"Lock release failed for {redact_cache_key(cache_key)}; "
-                            f"the lock may be held until its timeout: {redact_error_for_log(e)}"
-                        )
-                        return result  # pyright: ignore[reportPossiblyUnboundVariable]
-                    elif lock_phase.entered:
-                        # A cache error the body re-raised on purpose: fail-closed
-                        # DecryptionAuthenticationError, InteropError, KeyringConfigurationError.
-                        # A finally-only lock lets it out as is; a Redis lock wraps it in a
-                        # BackendError, so unwrap and re-raise the original.
-                        if (
-                            isinstance(e, BackendError)
-                            and e.original_exception
-                            and not isinstance(e.original_exception, BackendError)
-                        ):
-                            raise e.original_exception from e
-                        raise
-                    elif not isinstance(e, BackendError):
-                        raise
-                    else:
-                        # Acquiring the lock failed - execute without lock (the lock is best effort)
-                        logger().warning(
-                            f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
-                        )
-                        # Fall through to execute without locking
-
-                if func_error is not None:
-                    # The function's own exception, unchanged and never recorded (as before).
-                    raise func_error
-
-            # Execute without locking (either backend doesn't support it or lock failed)
-            if not supports_locking(_backend):
-                logger().debug(
-                    f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
-                )
-
-            # The function's exception propagates unrecorded, as on the lock path (see the sync wrapper).
-            _stats.record_miss()
-            try:
-                result = await func(*args, **kwargs)
-            except Exception:
-                features.release_probe(probe_cycle)
-                raise
-
-            # Serialize and cache the result
-            try:
-                serialized_data = operation_handler.serialization_handler.serialize_data(
-                    result, args, kwargs, cache_key=cache_key
-                )
-
-                # Store in Redis with TTL
-                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                    cache_key,
-                    serialized_data,
-                    ttl=ttl,
-                    stale_ttl=_stale_ttl,
-                )
-
-                # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-                if stored:
-                    await _track_and_record_async(cache_key)
-
-                # Record successful cache set
-                set_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.record_success()
-
-                if features.collect_stats:
-                    features.record_cache_operation(
-                        operation="set",
-                        namespace=namespace or "default",
-                        success=True,
-                        duration_ms=set_duration_ms,
-                        serializer="rust",
+                    _logger.debug(
+                        "Shared miss envelope not decoded for %s, taking its own trip: %s",
+                        redact_cache_key(cache_key),
+                        redact_error_for_log(e),
                     )
-
-            except (InteropError, KeyringConfigurationError):
-                # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
-                # keyring config fault (see the sync write): fail loud.
-                raise
-            except Exception as e:
-                # Caching failed but function succeeded - return result anyway
-                set_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_set",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=set_duration_ms,
-                    count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
-                )
-
-            return result
+                else:
+                    _stats.record_l1_hit()
+                    return value
+            probe_cycle = features.admit()
+            if probe_cycle is None:
+                return _uncached_result(await func(*args, **kwargs))
+            return (await _backed_miss_async(cache_key, args, kwargs, probe_cycle, twin_key))[0]
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
+
+    async def _backed_miss_async(
+        cache_key: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        probe_cycle: int,
+        twin_key: str | None,
+    ) -> tuple[Any, bytes | None]:
+        """One async backed-mode trip after an L1 miss: L2 read, distributed lock, function, write.
+
+        Returns the value and its serialized envelope (None when there is none: a failed
+        serialization, an mmap-path hit, a lock release that failed after the body), so a caller
+        that shared this trip can decode its own copy. Runs once per concurrent miss on a key in
+        this process (_flights, in async_wrapper).
+        """
+        assert _backend is not None  # noqa: S101 - async_wrapper resolves it before any trip
+        # Try to get from Redis cache (always measure time for L2 latency tracking)
+        start_time = time.perf_counter()
+
+        # The read paths report a failed read as a miss; the probe tells the two apart, so
+        # the post-lock double-check is skipped only after a clean miss (LAB-7064).
+        _l2_read = L2MissProbe()
+        try:
+            # Route through the operation handler so corrupt/tampered entries inherit
+            # eviction + the cache_get_deserialize metric instead of persisting (#159),
+            # and fail-closed tamper errors propagate (LAB-108). A freshness-capable
+            # backend (CachekitIO) always takes the freshness read — not just when SWR
+            # is configured — so every hit carries the server's staleness label and
+            # remaining-freshness bound (LAB-381/LAB-557): a stale hit is never
+            # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
+            _l2_is_stale = False
+            _l2_fresh_for: int | None = None
+            with probe_l2_miss(_l2_read):
+                if _l2_freshness_capable():
+                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
+                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                    _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                    _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
+                else:
+                    cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
+
+            if cached_result is not None:
+                # Cache hit: envelope is the raw serialized bytes for L1 backfill
+                result, cached_data = cached_result.value, cached_result.envelope
+
+                # Record cache hit (always compute for L2 latency stats)
+                get_duration_ms = (time.perf_counter() - start_time) * 1000
+                _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
+
+                # Update L1 cache with the L2 value (serialized bytes) for subsequent
+                # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
+                _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for, twin=twin_key)
+
+                # TTL refresh, never on the caller's path (LAB-7074). Decide from the
+                # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
+                # it only drops below the threshold after fresh_until, when the PATCH
+                # 409s. A stale hit can't be renewed. A fresh-labelled 0 is an unhinted
+                # tier copy (saas-api.md), so it falls back to GET /ttl like no header.
+                if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
+                    _fresh_for = _l2_fresh_for or None
+                    if not _l2_is_stale and (_fresh_for is None or _fresh_for < ttl * ttl_refresh_threshold):
+                        _schedule_ttl_refresh(_backend, cache_key, ttl, _fresh_for)
+                elif refresh_ttl_on_get and ttl:
+                    # Backend can't inspect TTL: warn once instead of silently ignoring
+                    # the opted-in flag (LAB-446). Still degrades gracefully.
+                    warn_ttl_refresh_unsupported(_backend)
+
+                # SWR: stale hit — value already in hand; revalidate in the
+                # background so no request pays the recompute at a TTL boundary.
+                # Gated on _l2_swr_active (not just the read gate above): a
+                # decorator without a configured stale window serves a
+                # stale-labelled mixed-reader hit but owns no revalidation.
+                if _l2_is_stale and _l2_swr_active:
+                    _l2_swr_schedule(cache_key, args, kwargs, is_async=True)
+
+                return result, cached_data
+
+        except (DecryptionAuthenticationError, KeyringConfigurationError):
+            # Fail-closed tamper failure propagated from get_cached_value_async —
+            # the tamper metric, error log, evidence retention, and fail policy all
+            # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108) — or a
+            # LOCAL keyring config fault (see the sync L2 read). Either must reach
+            # the caller: the generic clause below would demote it to a fail-open
+            # "record and recompute".
+            raise
+        except Exception as e:
+            # Backend/network error - record but continue to function execution
+            get_duration_ms = (time.perf_counter() - start_time) * 1000
+            features.handle_cache_error(
+                error=e,
+                operation="cache_get",
+                cache_key=cache_key or "unknown",
+                namespace=namespace or "default",
+                duration_ms=get_duration_ms,
+            )
+
+        # CACHE MISS - Use distributed lock to prevent thundering herd
+        # This ensures only one request executes the function while others wait.
+        # LockableBackend protocol contract: pass the bare cache_key. Each backend
+        # owns its internal lock-namespace derivation (Redis: ``<key>:lock``; SaaS:
+        # ``POST /v1/cache/{key}/lock``). Appending here would pollute the SaaS
+        # 7-segment canonical key and 400 at the edge.
+        lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
+        blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
+
+        # Check if backend supports distributed locking
+        if supports_locking(_backend):
+            func_error: Exception | None = None
+            lock_phase = _LockPhase()
+            try:
+                # Use backend's async lock protocol
+                async with _phased(
+                    _fill_lock(_backend, cache_key, lock_timeout, blocking_timeout),
+                    lock_phase,
+                ) as (lock_acquired, lock_uncontended):
+                    if not lock_acquired:
+                        # Lock timeout - double-check cache before giving up
+                        # Another request may have populated it while we waited
+                        logger().warning(
+                            f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
+                        )
+                        try:
+                            # Routed through the operation handler: corrupt entries evict (#159),
+                            # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                            _dc_start = time.perf_counter()
+                            cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
+                            if cached_result is not None:
+                                # Cache was populated while waiting - use it
+                                result, cached_data = cached_result.value, cached_result.envelope
+                                _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                return result, cached_data
+                        except (DecryptionAuthenticationError, KeyringConfigurationError):
+                            # Same as the lock-acquired double-check below.
+                            raise
+                        except Exception as e:
+                            # Cache check failed - fall through to execute function
+                            logger().warning(
+                                f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, "
+                                f"executing without lock: {redact_error_for_log(e)}"
+                            )
+
+                    elif not (lock_uncontended and _l2_read.clean_miss):
+                        # Lock acquired after a wait, or after a failed primary read - double-check
+                        # cache: another request may have populated it while we waited, or the
+                        # entry may still be live. Skipped after a clean miss and an uncontended
+                        # grant (LAB-7064): this caller never waited behind another holder, so
+                        # the read would almost always miss again, and be billed as one. A fill
+                        # that completed between our read and our lock request is recomputed;
+                        # last write wins.
+                        # Routed through the operation handler: corrupt entries evict (#159),
+                        # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                        try:
+                            _dc_start = time.perf_counter()
+                            cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
+                            if cached_result is not None:
+                                # Another request filled the cache while we waited
+                                result, cached_data = cached_result.value, cached_result.envelope
+                                _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                return result, cached_data
+                        except (DecryptionAuthenticationError, KeyringConfigurationError):
+                            # Fail-closed tamper raise from get_cached_value_async
+                            # (cachekit-py#170) or a LOCAL keyring config fault (see
+                            # the sync L2 read) — must not be demoted to a recompute
+                            # by the generic clause below. The lock clause's
+                            # `except Exception` then delivers a KeyringConfigurationError:
+                            # re-raised as is from a finally-only lock, and unwrapped
+                            # through original_exception from a Redis lock's BackendError.
+                            raise
+                        except Exception as e:
+                            # If double-check fails, continue to execute function
+                            _logger.debug(
+                                "Double-check cache failed after lock acquisition for %s: %s",
+                                redact_cache_key(cache_key),
+                                redact_error_for_log(e),
+                            )
+
+                    # Execute the original function (with or without lock). Its exception
+                    # is held here, outside the lock's error handling, and re-raised once
+                    # the lock is released: a Redis lock wraps whatever leaves its body in
+                    # a BackendError, and the clause below would take a function's own
+                    # BackendError for a lock failure and run the function again (LAB-5360).
+                    # A miss is a call that runs the function: a double-check hit above returned
+                    # before here, so it is never counted as one (LAB-8298).
+                    _stats.record_miss()
+                    try:
+                        result = await func(*args, **kwargs)
+                    except Exception as e:
+                        features.release_probe(probe_cycle)  # not a backend outcome (see the sync wrapper)
+                        func_error = e
+                    else:
+                        # Serialize and cache the result
+                        serialized_data = None  # stays None if serialization fails: no envelope to share
+                        try:
+                            serialized_data = operation_handler.serialization_handler.serialize_data(
+                                result, args, kwargs, cache_key=cache_key
+                            )
+
+                            # Store in Redis with TTL
+                            stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                                cache_key,
+                                serialized_data,
+                                ttl=ttl,
+                                stale_ttl=_stale_ttl,
+                            )
+
+                            # Also store in L1 cache for fast subsequent access (using serialized bytes)
+                            _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
+                            if stored:
+                                await _track_and_record_async(cache_key)
+
+                            # Record successful cache set
+                            set_duration_ms = (time.perf_counter() - start_time) * 1000
+                            features.record_success()
+
+                            if features.collect_stats:
+                                features.record_cache_operation(
+                                    operation="set",
+                                    namespace=namespace or "default",
+                                    success=True,
+                                    duration_ms=set_duration_ms,
+                                    serializer="rust",
+                                )
+
+                        except (InteropError, KeyringConfigurationError):
+                            # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+                            # keyring config fault (see the sync write): fail loud. It
+                            # leaves through the lock clause below as the double-check's does.
+                            raise
+                        except Exception as e:
+                            # Caching failed but function succeeded - return result anyway
+                            set_duration_ms = (time.perf_counter() - start_time) * 1000
+                            features.handle_cache_error(
+                                error=e,
+                                operation="cache_set",
+                                cache_key=cache_key or "unknown",
+                                namespace=namespace or "default",
+                                duration_ms=set_duration_ms,
+                                # A value the serializer (or encryption) rejects is not a
+                                # backend failure; the sync write does not count it either.
+                                count_toward_breaker=not isinstance(e, SerializationError),
+                            )
+
+                        return result, serialized_data
+
+            except DecryptionAuthenticationError:
+                # Fail-closed tamper failure from the lock double-check reads — must
+                # propagate to the caller, never demote to "lock failed, execute
+                # without lock". (The generic clause below would also re-raise it,
+                # but only as a side effect of the BackendError check; this clause
+                # makes the security dependency explicit.)
+                raise
+            except Exception as e:
+                # The function's exceptions never get here (held in func_error above).
+                # What does is told apart by where it was raised (lock_phase), not by its
+                # type: a Redis lock wraps whatever leaves its body in a BackendError.
+                if func_error is not None:
+                    # The lock failed while releasing after the function raised. The
+                    # function's exception wins and is raised below, outside this handler:
+                    # raised in here, it would take the release error as its __context__.
+                    logger().warning(
+                        f"Lock release failed for {redact_cache_key(cache_key)} after the function raised; "
+                        f"the lock may be held until its timeout: {redact_error_for_log(e)}"
+                    )
+                elif lock_phase.body_exited:
+                    # The body returned `result` (its every normal exit without a func_error
+                    # is a `return result, envelope`) and only the release failed. Keep it: running
+                    # the function again here would run it twice. Its envelope went with the
+                    # body's return value, so a caller sharing this trip takes its own.
+                    logger().warning(
+                        f"Lock release failed for {redact_cache_key(cache_key)}; "
+                        f"the lock may be held until its timeout: {redact_error_for_log(e)}"
+                    )
+                    return result, None  # pyright: ignore[reportPossiblyUnboundVariable]
+                elif lock_phase.entered:
+                    # A cache error the body re-raised on purpose: fail-closed
+                    # DecryptionAuthenticationError, InteropError, KeyringConfigurationError.
+                    # A finally-only lock lets it out as is; a Redis lock wraps it in a
+                    # BackendError, so unwrap and re-raise the original.
+                    if (
+                        isinstance(e, BackendError)
+                        and e.original_exception
+                        and not isinstance(e.original_exception, BackendError)
+                    ):
+                        raise e.original_exception from e
+                    raise
+                elif not isinstance(e, BackendError):
+                    raise
+                else:
+                    # Acquiring the lock failed - execute without lock (the lock is best effort)
+                    logger().warning(
+                        f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
+                    )
+                    # Fall through to execute without locking
+
+            if func_error is not None:
+                # The function's own exception, unchanged and never recorded (as before).
+                raise func_error
+
+        # Execute without locking (either backend doesn't support it or lock failed)
+        if not supports_locking(_backend):
+            logger().debug(
+                f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
+            )
+
+        # The function's exception propagates unrecorded, as on the lock path (see the sync wrapper).
+        _stats.record_miss()
+        try:
+            result = await func(*args, **kwargs)
+        except Exception:
+            features.release_probe(probe_cycle)
+            raise
+
+        # Serialize and cache the result
+        serialized_data = None
+        try:
+            serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
+
+            # Store in Redis with TTL
+            stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                cache_key,
+                serialized_data,
+                ttl=ttl,
+                stale_ttl=_stale_ttl,
+            )
+
+            # Also store in L1 cache for fast subsequent access (using serialized bytes)
+            _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
+            if stored:
+                await _track_and_record_async(cache_key)
+
+            # Record successful cache set
+            set_duration_ms = (time.perf_counter() - start_time) * 1000
+            features.record_success()
+
+            if features.collect_stats:
+                features.record_cache_operation(
+                    operation="set",
+                    namespace=namespace or "default",
+                    success=True,
+                    duration_ms=set_duration_ms,
+                    serializer="rust",
+                )
+
+        except (InteropError, KeyringConfigurationError):
+            # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+            # keyring config fault (see the sync write): fail loud.
+            raise
+        except Exception as e:
+            # Caching failed but function succeeded - return result anyway
+            set_duration_ms = (time.perf_counter() - start_time) * 1000
+            features.handle_cache_error(
+                error=e,
+                operation="cache_set",
+                cache_key=cache_key or "unknown",
+                namespace=namespace or "default",
+                duration_ms=set_duration_ms,
+                count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
+            )
+
+        return result, serialized_data
 
     @contextlib.contextmanager
     def _watch_records() -> Iterator[set[tuple[str, str]]]:

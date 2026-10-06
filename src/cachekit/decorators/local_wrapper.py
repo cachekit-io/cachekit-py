@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import threading
 from collections.abc import Callable
 from typing import Any
 
+from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
 from cachekit.decorators.wrapper import CacheInfo
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.object_cache import ObjectCache
@@ -67,6 +69,20 @@ def create_local_wrapper(
     object_cache = ObjectCache(max_entries=max_entries)
     key_gen = CacheKeyGenerator()
 
+    # cache_info() counts calls, not lookups: a hit is a call served without running the function,
+    # from the cache or by a concurrent call on the same key it joined; a miss is a call that ran it.
+    # The cache counts the plain hits; these count the rest, on the miss path only.
+    runs = shared = 0
+    counts_lock = threading.Lock()
+
+    def _count(*, ran: bool) -> None:
+        nonlocal runs, shared
+        with counts_lock:
+            if ran:
+                runs += 1
+            else:
+                shared += 1
+
     def _make_key(args: tuple[Any, ...], kw: dict[str, Any]) -> str:
         if key is not None:
             return key(*args, **kw)
@@ -94,11 +110,17 @@ def create_local_wrapper(
         object_cache.clear()
 
     def cache_info() -> CacheInfo:
-        """Return cache statistics as a CacheInfo namedtuple."""
+        """Return cache statistics as a CacheInfo namedtuple.
+
+        A call that joined a concurrent call on its key counts as a hit when it gets the value,
+        and not at all when that call raised; only the call that ran the function counts a miss.
+        """
+        with counts_lock:
+            hits, misses = object_cache.hits + shared, runs
         return CacheInfo(
-            hits=object_cache.hits,
-            misses=object_cache.misses,
-            l1_hits=object_cache.hits,
+            hits=hits,
+            misses=misses,
+            l1_hits=hits,
             l2_hits=0,
             maxsize=object_cache.max_entries,
             currsize=object_cache.size,
@@ -108,8 +130,17 @@ def create_local_wrapper(
         )
 
     # --- Build sync or async wrapper ---
+    # A miss runs the function once for every concurrent miss on its key (single_flight): every
+    # caller of one call gets the same object, as a later hit does.
 
     if asyncio.iscoroutinefunction(func):
+        flights = AsyncFlights()
+
+        async def _fill_async(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
+            _count(ran=True)
+            result = await func(*args, **kw)
+            object_cache.put(cache_key, result, ttl)
+            return result
 
         @functools.wraps(func)
         async def async_wrapper(*args: Any, **kw: Any) -> Any:
@@ -117,12 +148,20 @@ def create_local_wrapper(
             found, cached_value = object_cache.get(cache_key)
             if found:
                 return cached_value
-            result = await func(*args, **kw)
-            object_cache.put(cache_key, result, ttl)
+            result, joined = await flights.run(cache_key, functools.partial(_fill_async, cache_key, args, kw))
+            if joined:
+                _count(ran=False)
             return result
 
         wrapper: Any = async_wrapper
     else:
+        thread_flights = ThreadFlights()
+
+        def _fill(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
+            _count(ran=True)
+            result = func(*args, **kw)
+            object_cache.put(cache_key, result, ttl)
+            return result
 
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kw: Any) -> Any:
@@ -130,8 +169,13 @@ def create_local_wrapper(
             found, cached_value = object_cache.get(cache_key)
             if found:
                 return cached_value
-            result = func(*args, **kw)
-            object_cache.put(cache_key, result, ttl)
+            result, joined = thread_flights.run(
+                cache_key,
+                functools.partial(_fill, cache_key, args, kw),
+                functools.partial(object_cache.peek, cache_key),
+            )
+            if joined:
+                _count(ran=False)
             return result
 
         wrapper = sync_wrapper

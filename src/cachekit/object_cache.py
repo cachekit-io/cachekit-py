@@ -241,6 +241,26 @@ class ObjectCache:
             self._hits += 1
             return True, entry.value
 
+    def peek(self, key: str) -> tuple[bool, Any]:
+        """Look up a value without counting a hit or miss or moving it in LRU order.
+
+        For a second lookup within one call, such as the single-flight re-check after a miss,
+        which the call's first lookup already counted. An expired entry reads as absent and is
+        left for ``get`` or ``put`` to remove.
+
+        Args:
+            key: Cache key to look up.
+
+        Returns:
+            A (found, value) tuple, as ``get`` returns.
+        """
+        s = self._state
+        with s.lock:
+            entry = s.store.get(key)
+            if entry is None or time.monotonic() >= entry.expires_at:
+                return False, None
+            return True, entry.value
+
     def get_with_swr(self, key: str, ttl: float) -> tuple[bool, Any, bool, int]:
         """Get value with stale-while-revalidate support.
 

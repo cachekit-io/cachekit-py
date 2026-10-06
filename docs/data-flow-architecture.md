@@ -191,6 +191,12 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  STEP 11: DISTRIBUTED LOCK (Thundering Herd Protection)                     │
 │  File: src/cachekit/decorators/wrapper.py                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
+│  Concurrent misses on one key in one process share one call                 │
+│  (decorators/single_flight.py), except on the sync backed path. In async    │
+│  backed mode that is the whole trip from the L2 read to the write: only the │
+│  caller that started it reads L2 and takes the lock, and the others decode  │
+│  their own copy of its result. In L1-only mode it is the function call.     │
+│                                                                             │
 │  lock_key = f"{cache_key}:lock"                                             │
 │  redis_lock = redis_client.lock(lock_key, timeout=30, blocking_timeout=5)   │
 │                                                                             │

@@ -740,8 +740,8 @@ scrape or external dependency required. `CacheInfo` is exported from the top-lev
 
 | Field | Type | Meaning |
 |:------|:-----|:--------|
-| `hits` | `int` | Total cache hits (L1 + L2) |
-| `misses` | `int` | Calls that ran the function because no cached value was found, sync or async. An async caller that waited on the distributed lock and then found the value counts as an L2 hit |
+| `hits` | `int` | Total cache hits (L1 + L2). A call that joined another call's miss on the same key in this process and got its value counts as an L1 hit ([in-process single-flight](features/distributed-locking.md#in-process-single-flight-before-the-lock)) |
+| `misses` | `int` | Calls that ran the function because no cached value was found, sync or async. An async caller that waited on the distributed lock and then found the value counts as an L2 hit. A call that joined another call's miss counts as neither a hit nor a miss when that call raised |
 | `l1_hits` | `int` | L1 (in-memory) hits only |
 | `l2_hits` | `int` | L2 (backend) hits only |
 | `maxsize` | `int \| None` | Always `None` for external caches |
