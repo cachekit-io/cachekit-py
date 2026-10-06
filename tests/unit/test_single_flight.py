@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import os
+import signal
 import sys
 import threading
 import time
@@ -170,13 +172,18 @@ def advance(monkeypatch: pytest.MonkeyPatch) -> Callable[[float], None]:
 async def test_cold_herd_runs_the_function_once(mode: str) -> None:
     body = _Body()
     fn = body.decorate(mode)
+    before = fn.cache_info()
 
     tasks = await body.herd(fn)
     body.release.set()
     results = await asyncio.gather(*tasks)
+    after = fn.cache_info()
 
     assert body.runs == 1
     assert results == [{"x": 1}] * HERD
+    # cache_info(): the call that ran the function is the miss; every joined caller is an L1 hit.
+    assert after.misses - before.misses == 1
+    assert (after.hits - before.hits, after.l1_hits - before.l1_hits, after.l2_hits - before.l2_hits) == (HERD - 1, HERD - 1, 0)
 
 
 @pytest.mark.parametrize("mode", ["l1_only", "l1_only_swr_off", "local"])
@@ -255,13 +262,17 @@ async def test_failure_raises_in_every_caller_and_pins_nothing(mode: str) -> Non
     error = RuntimeError("upstream down")
     body = _Body(error=error)
     fn = body.decorate(mode)
+    before = fn.cache_info()
 
     tasks = await body.herd(fn)
     body.release.set()
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    after = fn.cache_info()
 
     assert body.runs == 1
     assert all(r is error for r in results)
+    # cache_info(): one miss, and a joined caller of a call that raised counts as neither.
+    assert (after.misses - before.misses, after.hits - before.hits) == (1, 0)
 
     body.error = None  # nothing was cached, and the key is free: the next call runs the function
     assert await fn(1) == {"x": 1}
@@ -286,40 +297,6 @@ async def test_cancelling_the_starter_leaves_joined_callers_the_value(mode: str)
     assert body.runs == 1
     assert await fn(1) == {"x": 1}  # the call ran to completion and filled the cache
     assert body.runs == 1
-
-
-async def test_cancelling_the_only_caller_cancels_its_call() -> None:
-    """With nobody left waiting, the call stops as an unshared one would, and caches nothing."""
-    cancelled = asyncio.Event()
-    entered = asyncio.Event()
-    runs = 0
-
-    @cache(backend=None, ttl=60)
-    async def compute(x: int) -> int:
-        nonlocal runs
-        runs += 1
-        entered.set()
-        try:
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
-        return x
-
-    task = asyncio.create_task(compute(1))
-    await asyncio.wait_for(entered.wait(), 5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.wait_for(cancelled.wait(), 5)
-
-    entered.clear()
-    second = asyncio.create_task(compute(1))  # not joined to the cancelled call: a fresh one
-    await asyncio.wait_for(entered.wait(), 5)
-    assert runs == 2
-    second.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await second
 
 
 @pytest.mark.parametrize("mode", ASYNC_MODES)
@@ -513,20 +490,27 @@ async def test_joined_callers_run_again_when_the_shared_call_is_cancelled_under_
 
 @pytest.mark.parametrize("mode", ["l1_only", "local", "backed"])
 async def test_a_cancelled_lone_caller_returns_after_its_call_unwound(mode: str) -> None:
-    """As when the call ran inline: its cleanup (a lock release, say) runs before the caller moves on."""
+    """With nobody left waiting the call is cancelled, as an unshared one would be, and its cleanup (a lock
+    release, say) runs before the caller moves on; nothing is cached, so the next call runs again."""
     events: list[str] = []
+    runs = 0
 
     async def compute(x: int) -> int:
-        try:
-            await asyncio.sleep(60)
-        finally:
-            events.append("cleanup")
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            try:
+                await asyncio.sleep(60)
+            finally:
+                events.append("cleanup")
         return x
 
     fn = _decorator(mode)(compute)
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(fn(1), 0.05)
     assert events == ["cleanup"]
+    assert await asyncio.wait_for(fn(1), 5) == 1  # not joined to the cancelled call: a fresh one
+    assert runs == 2
 
 
 async def test_joined_callers_leave_no_half_open_probe_slot_spent(live_breakers: list[CircuitBreaker]) -> None:
@@ -561,38 +545,6 @@ def _free_probe_slots(breaker: CircuitBreaker) -> int:
     while breaker.admit() is not None and free <= breaker.config.half_open_requests:
         free += 1
     return free
-
-
-@pytest.mark.parametrize("mode", ASYNC_MODES)
-async def test_joined_caller_counts_as_an_l1_hit(mode: str) -> None:
-    body = _Body()
-    fn = body.decorate(mode)
-    before = fn.cache_info()
-
-    tasks = await body.herd(fn)
-    body.release.set()
-    await asyncio.gather(*tasks)
-    after = fn.cache_info()
-
-    assert after.misses - before.misses == 1  # the call that ran the function
-    assert after.hits - before.hits == HERD - 1
-    assert after.l1_hits - before.l1_hits == HERD - 1
-    assert after.l2_hits - before.l2_hits == 0
-
-
-@pytest.mark.parametrize("mode", ASYNC_MODES)
-async def test_joined_caller_of_a_failed_call_counts_as_neither(mode: str) -> None:
-    body = _Body(error=RuntimeError("upstream down"))
-    fn = body.decorate(mode)
-    before = fn.cache_info()
-
-    tasks = await body.herd(fn)
-    body.release.set()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    after = fn.cache_info()
-
-    assert after.misses - before.misses == 1
-    assert after.hits - before.hits == 0
 
 
 async def test_same_key_reentry_from_inside_the_call_runs_unshared() -> None:
@@ -874,6 +826,49 @@ def test_thread_flights_forked_child_starts_with_an_empty_map(monkeypatch: pytes
     finally:
         gate.set()
         parent.join(5)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.parametrize("flights_type", [AsyncFlights, ThreadFlights])
+def test_forked_child_never_waits_on_a_lock_a_parent_thread_held(flights_type: type[Any]) -> None:
+    """Every entry point checks the owner PID before taking the lock: forget() and run() in a child
+    forked while another thread held the map's lock start on a fresh one instead of hanging."""
+    flights = flights_type()
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with flights._lock:  # pyright: ignore[reportPrivateUsage]
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert held.wait(5)
+        pid = os.fork()
+        if pid == 0:  # the child: a hang is killed by the alarm, which fails the exit-code check
+            signal.alarm(5)
+            try:
+                flights.forget(["k"])
+                flights.forget(None)
+                if flights_type is ThreadFlights:
+                    flights.run(("k",), lambda: "v", lambda: (False, None))
+                else:
+                    asyncio.run(flights.run(("k",), _const_coro))
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        release.set()
+        holder.join(5)
+
+
+async def _const_coro() -> str:
+    return "v"
 
 
 def test_thread_flights_recheck_finds_a_value_stored_after_the_callers_lookup() -> None:

@@ -2276,14 +2276,7 @@ def create_cache_wrapper(
             # The outer finally resets the stats context.
             probe_cycle = features.admit()  # None when rejected; 0 is an admission too
             if probe_cycle is None:
-                features.log_cache_operation(
-                    operation="circuit_breaker_open",
-                    key=cache_key,
-                    namespace=namespace or "default",
-                    serializer="rust",
-                    error="Circuit breaker rejected the request",
-                    error_type="CircuitBreakerOpen",
-                )
+                _log_breaker_rejection(cache_key)
                 return _uncached_result(await func(*args, **kwargs))
 
             # Initialize backend only when needed (lazy init for performance)
@@ -2333,7 +2326,12 @@ def create_cache_wrapper(
             if _flight_tenant_extractor is not None:
                 try:
                     tenant = _flight_tenant_extractor.extract(args, kwargs)
-                except Exception:
+                except Exception as e:
+                    _logger.debug(
+                        "Tenant not extracted for %s, so its miss is not shared: %s",
+                        redact_cache_key(cache_key),
+                        redact_error_for_log(e),
+                    )
                     tenant = None
             if tenant is None:
                 return (await _backed_miss_async(cache_key, args, kwargs, probe_cycle, twin_key))[0]
@@ -2346,20 +2344,17 @@ def create_cache_wrapper(
                     features.release_probe(admitted_cycle)
 
             async def _start_trip() -> tuple[Any, bytes | None]:
-                cycle = admitted_cycle
-                if slot_returned:  # joined a trip that was cancelled under it, so admitted afresh
-                    cycle = features.admit()
-                    if cycle is None:
-                        return _uncached_result(await func(*args, **kwargs)), None
-                return await _backed_miss_async(cache_key, args, kwargs, cycle, twin_key)
+                if slot_returned:  # joined a trip that was cancelled under it: its slot went back
+                    return await _own_trip(cache_key, args, kwargs, twin_key)
+                return await _backed_miss_async(cache_key, args, kwargs, admitted_cycle, twin_key)
 
             (result, envelope), joined = await _flights.run((_l2_scope(), tenant, cache_key), _start_trip, _return_probe_slot)
             if not joined:
                 return result
             # A joined caller decodes its own copy of the trip's envelope, as an L1 hit would: every
             # backed-mode caller gets its own object, and the decrypt checks bind to this caller's
-            # tenant. Without an envelope, or when it decodes for the starter but not for this
-            # caller, it takes its own trip, unshared.
+            # tenant. Without an envelope, or when it does not decode for this caller, it takes its
+            # own trip, unshared: its probe slot went back on joining, so it is admitted afresh.
             if envelope is not None:
                 try:
                     value = operation_handler.serialization_handler.deserialize_data(envelope, cache_key, args, kwargs)
@@ -2374,13 +2369,32 @@ def create_cache_wrapper(
                 else:
                     _stats.record_l1_hit()
                     return value
-            probe_cycle = features.admit()
-            if probe_cycle is None:
-                return _uncached_result(await func(*args, **kwargs))
-            return (await _backed_miss_async(cache_key, args, kwargs, probe_cycle, twin_key))[0]
+            return (await _own_trip(cache_key, args, kwargs, twin_key))[0]
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
+
+    def _log_breaker_rejection(cache_key: str) -> None:
+        """Log a call the circuit breaker rejected. Never recorded as a failure: a rejection is not one."""
+        features.log_cache_operation(
+            operation="circuit_breaker_open",
+            key=cache_key,
+            namespace=namespace or "default",
+            serializer="rust",
+            error="Circuit breaker rejected the request",
+            error_type="CircuitBreakerOpen",
+        )
+
+    async def _own_trip(
+        cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any], twin_key: str | None
+    ) -> tuple[Any, bytes | None]:
+        """An unshared trip for a caller that holds no probe slot: admitted afresh, or run uncached
+        when the breaker rejects it, as the first admission does."""
+        cycle = features.admit()
+        if cycle is None:
+            _log_breaker_rejection(cache_key)
+            return _uncached_result(await func(*args, **kwargs)), None
+        return await _backed_miss_async(cache_key, args, kwargs, cycle, twin_key)
 
     async def _backed_miss_async(
         cache_key: str,

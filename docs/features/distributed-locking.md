@@ -48,7 +48,7 @@ report = await get_report("2025-01-15")
 
 ## In-Process Single-Flight (Before the Lock)
 
-Concurrent misses on one key inside one process share one call. The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In async backed mode the shared call is the whole trip after the L1 miss (the L2 read, the lock, the function and the write), so a herd in one process costs one trip and the lock only has to dedup across processes. It is always on and costs no round trip.
+Concurrent misses on one key inside one process share one call. The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In async backed mode the shared call is the whole trip after the L1 miss (the L2 read, the lock, the function and the write), so a herd in one process costs one trip and the lock only has to dedup across processes. It is always on and costs no round trip. The exception is a trip that leaves no serialized value to share: a value the serializer rejects, a hit read through the mmap fast path, or a lock release that failed after the write. Each joined caller then takes its own trip once the first one ends, so that herd costs one trip per caller, as it did before.
 
 | Mode | Sync | Async | A caller that joins gets |
 |------|------|-------|--------------------------|
@@ -65,7 +65,7 @@ The sync backed path is not coalesced: each sync caller that misses reads L2 and
 - **Isolation.** Callers share a call only under the same backend key prefix and, with multi-tenant encryption (`tenant_extractor`), the same tenant: no caller gets another tenant's value or exception. A caller whose tenant cannot be extracted shares nothing. A joined caller decodes its copy under its own tenant, and takes its own trip if that fails.
 - **Circuit breaker.** A joined caller makes no backend request and records no outcome. In HALF_OPEN it hands its probe slot straight back, so a herd spends one probe.
 - **Event loops.** Async callers share a call only on the event loop running it; a caller on another thread's loop runs its own.
-- **Context.** An async call runs in its own task, in a copy of the starting caller's context, so a context variable the function sets is not visible to its caller afterwards.
+- **Task and context.** Every async miss runs the function in its own task, a lone caller's miss included, in a copy of the starting caller's context. A context variable the function sets is not visible to its caller afterwards. Anything scoped by `asyncio.current_task()` binds to that short-lived task, not to the caller's: SQLAlchemy's `async_scoped_session(scopefunc=current_task)`, used inside the function, creates a new session per miss, which the caller's `remove()` at the end of its request never cleans up. Pass such resources in as arguments, or scope them by a context variable instead.
 - **Waiting on yourself.** A function must not wait on another thread or task that calls it with the same arguments: that would wait on its own call. A direct recursive call on the same thread or task runs on its own.
 
 ---

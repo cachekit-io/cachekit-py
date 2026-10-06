@@ -8,8 +8,9 @@ dedups inside one process, before the lock, so a herd in one process costs one t
 
 One map per decorated function: ``AsyncFlights`` for coroutine functions, ``ThreadFlights`` for
 plain ones. Both are shared by every thread and guarded by a lock, and a forked child starts with an
-empty map (owner-PID check, as ``_RefreshPool`` does). A flight key is a tuple whose last item is
-the cache key, so an invalidation can drop the key's calls in flight (``forget``).
+empty map and a fresh lock: every method that takes the lock checks the owner PID first
+(``_FlightMap._owned``), as ``_RefreshPool`` does. A flight key is a tuple whose last item is the
+cache key, so an invalidation can drop the key's calls in flight (``forget``).
 """
 
 from __future__ import annotations
@@ -21,9 +22,10 @@ import os
 import threading
 from collections.abc import Callable, Collection, Coroutine
 from types import TracebackType
-from typing import Any, TypeVar
+from typing import Any, Generic, TypeVar
 
 _T = TypeVar("_T")
+_F = TypeVar("_F")
 
 FlightKey = tuple[Any, ...]
 
@@ -34,12 +36,35 @@ def _not_cancelling() -> bool:
     return cancelling is not None and cancelling() == 0
 
 
-def _forget(flights: dict[FlightKey, Any], cache_keys: Collection[str] | None) -> None:
-    if cache_keys is None:
-        flights.clear()
-        return
-    for key in [k for k in flights if k[-1] in cache_keys]:
-        del flights[key]
+class _FlightMap(Generic[_F]):
+    """A flight map, its lock, and the PID that owns them."""
+
+    __slots__ = ("_flights", "_lock", "_pid")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._flights: dict[FlightKey, _F] = {}
+        self._pid = os.getpid()
+
+    def _owned(self) -> None:
+        """Call before taking the lock. In a forked child the parent's calls never settle, and a parent
+        thread may have held the lock at fork: the child gets an empty map and a fresh lock."""
+        if self._pid != os.getpid():
+            self._lock, self._flights, self._pid = threading.Lock(), {}, os.getpid()
+
+    def forget(self, cache_keys: Collection[str] | None) -> None:
+        """Make the next miss on these cache keys (every key, for None) start a new call.
+
+        For invalidation: a read that starts after it must not join a call that started before it.
+        Callers already waiting keep their call.
+        """
+        self._owned()
+        with self._lock:
+            if cache_keys is None:
+                self._flights.clear()
+                return
+            for key in [k for k in self._flights if k[-1] in cache_keys]:
+                del self._flights[key]
 
 
 class _AsyncFlight:
@@ -52,7 +77,7 @@ class _AsyncFlight:
         self.waiters = 0  # touched only on the task's own loop, so no lock
 
 
-class AsyncFlights:
+class AsyncFlights(_FlightMap[_AsyncFlight]):
     """One coroutine function's misses in flight: flight key -> the call running.
 
     The call runs in its own task, in a copy of the starting caller's context, and every caller,
@@ -60,8 +85,9 @@ class AsyncFlights:
     a dropped client) cancels only that caller's wait while others still wait: the call runs on and
     they get its value. When the last waiting caller is cancelled, nobody wants the call any more,
     so it is cancelled as an unshared call would be, and that caller returns once it has unwound.
-    A caller whose shared call was cancelled under it, without being cancelled itself, runs its
-    own call, unshared, as it would have run alone.
+    On Python 3.11 and later, a caller whose shared call was cancelled under it, without being
+    cancelled itself, runs its own call, unshared, as it would have run alone; 3.10 cannot tell the
+    two apart, so there it gets the ``CancelledError``.
 
     Callers share a call only on the event loop running it: a caller never awaits a task bound to
     another thread's loop. A caller that finds its key's call running on another loop runs its own
@@ -69,12 +95,7 @@ class AsyncFlights:
     pending) gives up its key to the next caller's call.
     """
 
-    __slots__ = ("_flights", "_lock", "_pid")
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._flights: dict[FlightKey, _AsyncFlight] = {}
-        self._pid = os.getpid()
+    __slots__ = ()
 
     async def run(
         self,
@@ -88,9 +109,7 @@ class AsyncFlights:
         caller that starts one. ``on_join`` runs each time a caller joins, before it waits. The
         call's exception is raised in every caller sharing it.
         """
-        if self._pid != os.getpid():
-            # Forked child: the parent's calls never settle here, and its lock may be held.
-            self._lock, self._flights, self._pid = threading.Lock(), {}, os.getpid()
+        self._owned()
         loop = asyncio.get_running_loop()
         with self._lock:
             flight = self._flights.get(key)
@@ -119,15 +138,6 @@ class AsyncFlights:
         flight.task.add_done_callback(functools.partial(self._drop, key, flight))
         return await self._wait(key, flight), False
 
-    def forget(self, cache_keys: Collection[str] | None) -> None:
-        """Make the next miss on these cache keys (every key, for None) start a new call.
-
-        For invalidation: a read that starts after it must not join a call that started before it.
-        Callers already waiting keep their call.
-        """
-        with self._lock:
-            _forget(self._flights, cache_keys)
-
     async def _wait(self, key: FlightKey, flight: _AsyncFlight) -> Any:
         flight.waiters += 1
         try:
@@ -151,6 +161,7 @@ class AsyncFlights:
             flight.task.cancel()
 
     def _drop(self, key: FlightKey, flight: _AsyncFlight, _task: object = None) -> None:
+        self._owned()
         with self._lock:
             if self._flights.get(key) is flight:  # a newer call may already hold the key
                 del self._flights[key]
@@ -171,7 +182,7 @@ class _Flight:
         self.traceback: TracebackType | None = None
 
 
-class ThreadFlights:
+class ThreadFlights(_FlightMap[_Flight]):
     """One plain function's misses in flight across threads: flight key -> the call running.
 
     A caller that finds its key's call in flight blocks until it settles, then returns its value or
@@ -179,12 +190,7 @@ class ThreadFlights:
     ``SystemExit``) did not fail, so its waiters retry and one of them starts the next call.
     """
 
-    __slots__ = ("_flights", "_lock", "_pid")
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._flights: dict[FlightKey, _Flight] = {}
-        self._pid = os.getpid()
+    __slots__ = ()
 
     def run(self, key: FlightKey, call: Callable[[], _T], recheck: Callable[[], tuple[bool, _T]]) -> tuple[_T, bool]:
         """Wait for ``key``'s call in flight, or start it: ``(value, shared)``.
@@ -196,9 +202,7 @@ class ThreadFlights:
         mine: _Flight | None = None
         try:
             while True:
-                if self._pid != os.getpid():
-                    # Forked child: the parent's calls never settle here, and its lock may be held.
-                    self._lock, self._flights, self._pid = threading.Lock(), {}, os.getpid()
+                self._owned()
                 with self._lock:
                     flight = self._flights.get(key)
                     if flight is None:
@@ -229,16 +233,8 @@ class ThreadFlights:
             raise
         finally:
             if mine is not None:
+                self._owned()
                 with self._lock:
                     if self._flights.get(key) is mine:  # forgotten, or a forked child's map never held it
                         del self._flights[key]
                 mine.settled.release()
-
-    def forget(self, cache_keys: Collection[str] | None) -> None:
-        """Make the next miss on these cache keys (every key, for None) start a new call.
-
-        For invalidation: a read that starts after it must not join a call that started before it.
-        Callers already waiting keep their call.
-        """
-        with self._lock:
-            _forget(self._flights, cache_keys)
