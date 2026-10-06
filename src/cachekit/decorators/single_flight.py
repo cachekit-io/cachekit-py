@@ -15,6 +15,7 @@ the cache key, so an invalidation can drop the key's calls in flight (``forget``
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import os
 import threading
@@ -59,7 +60,8 @@ class AsyncFlights:
     a dropped client) cancels only that caller's wait while others still wait: the call runs on and
     they get its value. When the last waiting caller is cancelled, nobody wants the call any more,
     so it is cancelled as an unshared call would be, and that caller returns once it has unwound.
-    A caller whose shared call was cancelled under it, without being cancelled itself, runs again.
+    A caller whose shared call was cancelled under it, without being cancelled itself, runs its
+    own call, unshared, as it would have run alone.
 
     Callers share a call only on the event loop running it: a caller never awaits a task bound to
     another thread's loop. A caller that finds its key's call running on another loop runs its own
@@ -86,31 +88,29 @@ class AsyncFlights:
         caller that starts one. ``on_join`` runs each time a caller joins, before it waits. The
         call's exception is raised in every caller sharing it.
         """
-        while True:
-            if self._pid != os.getpid():
-                # Forked child: the parent's calls never settle here, and its lock may be held.
-                self._lock, self._flights, self._pid = threading.Lock(), {}, os.getpid()
-            loop = asyncio.get_running_loop()
-            with self._lock:
-                flight = self._flights.get(key)
-            if flight is None or flight.task.done():
-                break
+        if self._pid != os.getpid():
+            # Forked child: the parent's calls never settle here, and its lock may be held.
+            self._lock, self._flights, self._pid = threading.Lock(), {}, os.getpid()
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            flight = self._flights.get(key)
+        if flight is not None and not flight.task.done():
             task_loop = flight.task.get_loop()
-            if task_loop is not loop or flight.task is asyncio.current_task():
-                if task_loop is loop or task_loop.is_running():
-                    # Re-entered from inside its own call, which would wait on itself; or the call
-                    # runs on another thread's loop, which this caller must not await.
-                    return await call(), False
-                break  # its loop no longer runs: start a call in its place
-            if on_join is not None:
-                on_join()
-            try:
-                return await self._wait(key, flight), True
-            except asyncio.CancelledError:
-                if not (flight.task.cancelled() and _not_cancelling()):
-                    raise
+            if task_loop is loop and flight.task is not asyncio.current_task():
+                if on_join is not None:
+                    on_join()
+                try:
+                    return await self._wait(key, flight), True
+                except asyncio.CancelledError:
+                    if not (flight.task.cancelled() and _not_cancelling()):
+                        raise
                 # The shared call was cancelled (it raised CancelledError, or something cancelled
-                # it), but nobody cancelled this caller: run again, as it would have run alone.
+                # it), but nobody cancelled this caller: it runs its own call, as it would have alone.
+                return await call(), False
+            if task_loop is loop or task_loop.is_running():
+                # Re-entered from inside its own call, which would wait on itself; or the call runs
+                # on another thread's loop, which this caller must not await.
+                return await call(), False
         # Created outside the lock: an eager task factory runs the call up to its first await
         # inside create_task, and that may be a cached call on this same function.
         flight = _AsyncFlight(loop.create_task(call()))
@@ -134,14 +134,21 @@ class AsyncFlights:
             return await asyncio.shield(flight.task)
         except asyncio.CancelledError:
             if flight.waiters == 1 and not flight.task.done():
-                # The last caller left. Out of the map first, so no caller joins a cancelled call;
-                # then unwound before this caller's cancellation goes on, as when it ran inline.
-                self._drop(key, flight)
-                flight.task.cancel()
+                # The last caller was cancelled: the call is too, and has unwound before this
+                # caller's cancellation goes on, as when it ran inline.
+                self._abandon(key, flight)
                 await asyncio.wait((flight.task,))
             raise
         finally:
             flight.waiters -= 1
+            if not flight.waiters and not flight.task.done():
+                self._abandon(key, flight)  # the last caller left another way (GeneratorExit): no wait
+
+    def _abandon(self, key: FlightKey, flight: _AsyncFlight) -> None:
+        """Cancel a call nobody waits on. Out of the map first, so no caller joins a cancelled call."""
+        self._drop(key, flight)
+        with contextlib.suppress(RuntimeError):  # its loop is closed: it never runs again anyway
+            flight.task.cancel()
 
     def _drop(self, key: FlightKey, flight: _AsyncFlight, _task: object = None) -> None:
         with self._lock:

@@ -425,6 +425,65 @@ async def test_a_read_after_invalidation_does_not_join_an_earlier_miss(mode: str
     assert await first == 1
 
 
+class _RacingDeleteBackend(_Backend):
+    """Holds its delete open, and every read issued once holding is on, so a trip can start mid-invalidation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deleting = threading.Event()
+        self.finish_delete = threading.Event()
+        self.hold_reads = False
+        self.reads_held = 0
+        self.release_reads = threading.Event()
+
+    def get(self, key: str) -> bytes | None:
+        value = super().get(key)  # read first, as a GET that left before the delete landed
+        if self.hold_reads:
+            self.reads_held += 1
+            self.release_reads.wait(5)
+        return value
+
+    def delete(self, key: str) -> bool:
+        self.deleting.set()
+        self.finish_delete.wait(5)
+        return super().delete(key)
+
+
+async def test_a_read_after_invalidation_does_not_join_a_trip_that_started_during_it() -> None:
+    """A trip that read the old L2 entry while the delete ran is forgotten once the delete is done."""
+    version = 100
+
+    async def compute(x: int) -> int:
+        return version
+
+    backend = _RacingDeleteBackend()
+    fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"sf-{uuid.uuid4().hex}")(compute)
+    assert await fn(1) == 100
+
+    version = 200
+    invalidation = asyncio.create_task(fn.ainvalidate_cache(1))
+    assert await asyncio.to_thread(backend.deleting.wait, 5)
+    backend.hold_reads = True
+    during = asyncio.create_task(fn(1))  # reads the old entry, then is held in flight
+    await _until_async(lambda: backend.reads_held == 1)
+    backend.finish_delete.set()
+    await invalidation
+
+    after = asyncio.create_task(fn(1))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    backend.release_reads.set()
+    assert await asyncio.wait_for(after, 5) == 200
+    assert await during == 100  # it overlapped the invalidation
+
+
+async def _until_async(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.005)
+
+
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="Python 3.10 cannot tell a caller's own cancellation apart")
 @pytest.mark.parametrize("mode", ASYNC_MODES)
 async def test_joined_callers_run_again_when_the_shared_call_is_cancelled_under_them(mode: str) -> None:
@@ -447,7 +506,9 @@ async def test_joined_callers_run_again_when_the_shared_call_is_cancelled_under_
 
     assert isinstance(results[0], asyncio.CancelledError)  # the starter's own call raised it, as before
     assert results[1:] == [{"x": 1}] * (HERD - 1)
-    assert body.runs == 2
+    # Each joined caller ran its own call, as it would have alone; a backed one may instead find
+    # the value another already stored.
+    assert 1 < body.runs <= HERD
 
 
 @pytest.mark.parametrize("mode", ["l1_only", "local", "backed"])

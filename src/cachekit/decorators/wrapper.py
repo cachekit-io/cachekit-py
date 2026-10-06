@@ -1499,11 +1499,11 @@ def create_cache_wrapper(
         """
         if _l1_cache is None:  # never registered without one
             return
-        _forget_flights(None if key is None else [key])
         if key is not None:
             _l1_cache.invalidate(key)
         else:
             _l1_cache.invalidate_many({cached for _, cached in set(_cached_keys)})
+        _forget_flights(None if key is None else [key])  # after the eviction: see invalidate_cache
 
     # Whether a generated key differs from its pre-0.20.0 twin: only when the serializer code is
     # not the default's. Fixed at decoration, so the default serializer pays nothing per call.
@@ -2959,9 +2959,12 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
+        # Calls in flight are forgotten before the deletes and again after them: a trip that started
+        # while they ran may have read the old entry, and a read after this returns must not join it.
         if not args and not kwargs and _func_has_params:
             _forget_flights(None)
             _drain_all()
+            _forget_flights(None)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
@@ -2969,6 +2972,7 @@ def create_cache_wrapper(
         cache_keys = _resolve_invalidation_keys(args, kwargs)
         _forget_flights(cache_keys)
         _invalidate_keys(cache_keys)
+        _forget_flights(cache_keys)
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
@@ -2989,9 +2993,10 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
-            _forget_flights(None)
+            _forget_flights(None)  # before and after the deletes, as in invalidate_cache
             # Off the event loop: every L2 call in here is a sync Redis/backend round-trip.
             await asyncio.to_thread(_drain_all)
+            _forget_flights(None)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
@@ -3002,6 +3007,7 @@ def create_cache_wrapper(
         cache_keys = _resolve_invalidation_keys(args, kwargs)
         _forget_flights(cache_keys)
         await asyncio.to_thread(_invalidate_keys, cache_keys)
+        _forget_flights(cache_keys)
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""
