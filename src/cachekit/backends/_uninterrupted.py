@@ -34,5 +34,15 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
         except asyncio.CancelledError as exc:
             cancelled = exc
     if cancelled is not None:
-        raise cancelled
-    return fut.result()
+        try:
+            # Without the traceback it was raised with: asyncio.wait's frames on it hold ``fut``, and once ``fut`` has
+            # failed, its exception's frames, whose locals can hold a credential, stay reachable from the cancel.
+            raise cancelled.with_traceback(None)
+        finally:
+            # This frame is on the cancel's traceback too: holding the cancel here is a reference cycle, and holding
+            # ``fut`` keeps it reachable again. Callers keep their own reference to ``fut``.
+            del fut, cancelled
+    try:
+        return fut.result()
+    finally:
+        del fut  # a failed ``fut``'s exception has this frame on its traceback: a reference cycle

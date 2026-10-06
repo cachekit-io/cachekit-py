@@ -53,12 +53,17 @@ class _FakeRedis:
     """A loopback Redis that fails every command.
 
     ``refusing``: AUTH is answered with WRONGPASS. Otherwise the handshake (AUTH, PING, CLIENT, SELECT) succeeds and any
-    other command drops the connection unanswered, except those ``serving`` answers.
+    other command drops the connection unanswered, except those ``serving`` answers. With ``hold``, a command about to
+    fail sets ``holding`` and waits for ``hold`` first, so the client's call is in flight until the test lets it fail.
     """
 
-    def __init__(self, *, refusing: bool, serving: dict[bytes, bytes] | None = None) -> None:
+    def __init__(
+        self, *, refusing: bool, serving: dict[bytes, bytes] | None = None, hold: threading.Event | None = None
+    ) -> None:
         self.refusing = refusing
         self._serving = serving or {}
+        self._hold = hold
+        self.holding = threading.Event()
         self._sock = socket.create_server(("127.0.0.1", 0))
         self.port = self._sock.getsockname()[1]
         self._conns: list[socket.socket] = []
@@ -78,6 +83,7 @@ class _FakeRedis:
             while command := _read_command(reader):
                 name = command[0].upper()
                 if name == b"AUTH" and self.refusing:
+                    self._wait_for_hold()
                     conn.sendall(b"-WRONGPASS invalid username-password pair or user is disabled.\r\n")
                 elif name in (b"AUTH", b"CLIENT", b"SELECT"):
                     conn.sendall(b"+OK\r\n")
@@ -86,7 +92,13 @@ class _FakeRedis:
                 elif name in self._serving:
                     conn.sendall(self._serving[name])
                 else:
+                    self._wait_for_hold()
                     return
+
+    def _wait_for_hold(self) -> None:
+        if self._hold is not None:
+            self.holding.set()
+            self._hold.wait(5)
 
     def refuse_from_now(self) -> None:
         """Refuse every later AUTH, and drop the open connections so the client has to authenticate again."""
@@ -322,6 +334,38 @@ def test_an_exception_raised_in_the_block_is_kept_whole(
     assert err.__cause__ is exc
     assert _cachekit_locals_holding(err, password, below_caller=True) == []
     assert _cachekit_frames_holding_an_exception(err) == []
+
+
+async def _cancelled_mid_attempt(backend: PerRequestRedisBackend, server: _FakeRedis, hold: threading.Event) -> BaseException:
+    """The CancelledError of an ``acquire_lock`` cancelled while its attempt is in flight, the attempt failing after."""
+    task = asyncio.ensure_future(_locked(backend))
+    await asyncio.to_thread(server.holding.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.05)  # the cancel reaches acquire_lock, which keeps draining the attempt
+    hold.set()
+    try:
+        await task
+    except asyncio.CancelledError as exc:
+        return exc
+    pytest.fail("the lock attempt was not cancelled")
+
+
+@pytest.mark.parametrize("failure", _FAILURES)
+def test_a_cancel_during_a_failing_lock_attempt_reaches_no_frame_holding_the_password(
+    fake_redis: Callable[..., _FakeRedis], password: str, failure: str
+) -> None:
+    """``acquire_lock`` drains an attempt through a cancel and re-raises the cancel once the attempt has failed: no frame
+    on that CancelledError keeps the failed attempt, whose redis-py exception holds the password in its frames."""
+    hold = threading.Event()
+    server = fake_redis(refusing=False, hold=hold)
+    backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
+    if failure == "wrongpass":
+        server.refuse_from_now()
+
+    exc = asyncio.run(_cancelled_mid_attempt(backend, server, hold))  # type: ignore[arg-type]
+
+    assert _cachekit_locals_holding(exc, password, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(exc) == []
 
 
 def test_the_blocks_exception_wins_over_a_release_that_fails_after_it(
