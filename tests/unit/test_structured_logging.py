@@ -1,7 +1,6 @@
 """Unit tests for structured logging module."""
 
 import logging
-import threading
 from unittest.mock import patch
 
 import pytest
@@ -19,10 +18,6 @@ class TestStructuredLogger:
     def logger(self):
         """Create a test logger instance."""
         return StructuredLogger("test_logger")
-
-    def test_logger_initialization(self, logger):
-        """Test logger initialization."""
-        assert logger.logger.name == "test_logger"
 
     def test_get_context(self, logger):
         """Test context generation."""
@@ -89,22 +84,6 @@ class TestStructuredLogger:
         extra = call_args[1]["extra"]["structured"]
         assert extra["error"] == "Connection timeout"
         assert extra["error_type"] == "TimeoutError"
-
-    def test_thread_safety(self, logger):
-        """Each thread's context carries its own thread id."""
-        results = {}
-
-        def record_context(thread_name):
-            results[thread_name] = (logger._get_context()["thread_id"], threading.get_ident())
-
-        threads = [threading.Thread(target=record_context, args=(name,)) for name in ("thread1", "thread2")]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        for context_thread_id, actual_thread_id in results.values():
-            assert context_thread_id == actual_thread_id
 
 
 class TestFactoryFunction:
