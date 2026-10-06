@@ -1,15 +1,17 @@
 """Byte-verification of interop mode against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/interop-mode.json, vendored from
-cachekit-io/protocol test-vectors/interop-mode.json 1.2.0
-(https://github.com/cachekit-io/protocol/pull/94)
-(sha256 702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40).
+cachekit-io/protocol test-vectors/interop-mode.json 1.3.0
+(https://github.com/cachekit-io/protocol/pull/164)
+(sha256 e1ca6c2361509f347d17f3352e0d7ab4d4b61488737bdf0056bb5769d9794e72).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 Every group is exercised through the SDK's own implementation:
-- 35 key vectors: canonical argument bytes, args hash, and full key
-- 4 value vectors: canonical plain-MessagePack value bytes (and decode round-trip)
-- 13 error vectors: inputs that MUST be rejected
+- 44 key vectors: canonical argument bytes, args hash, and full key
+- 6 value vectors: canonical plain-MessagePack value bytes (and decode round-trip)
+- 34 error vectors: inputs that MUST be rejected
+- 6 reader accept vectors: well-formed, non-canonical documents the value reader MUST decode
+- 1 reader reject vector: a document the value reader MUST reject
 - 1 AAD vector: the REAL EncryptionWrapper AAD builder over an interop key
 - 1 encryption vector: HKDF-SHA256 key derivation + AES-256-GCM decrypt through
   the REAL Rust encryption stack (cross-SDK decryption capability, not just
@@ -20,14 +22,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import msgpack
 import pytest
 
 from cachekit.interop import (
+    InteropDecodeError,
     InteropError,
     args_hash,
     canonical_args_bytes,
@@ -37,13 +44,21 @@ from cachekit.interop import (
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "interop-mode.json"
-FIXTURE_SHA256 = "702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40"  # pragma: allowlist secret
+FIXTURE_SHA256 = "e1ca6c2361509f347d17f3352e0d7ab4d4b61488737bdf0056bb5769d9794e72"  # pragma: allowlist secret
 
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 # The counts below are part of the conformance claim: a fixture update that
 # adds or removes vectors must be a conscious change, not a silent drift.
-EXPECTED_COUNTS = {"key_vectors": 35, "value_vectors": 4, "error_vectors": 13, "aad_vectors": 1, "encryption_vectors": 1}
+EXPECTED_COUNTS = {
+    "key_vectors": 44,
+    "value_vectors": 6,
+    "error_vectors": 34,
+    "reader_accept_vectors": 6,
+    "reader_reject_vectors": 1,
+    "aad_vectors": 1,
+    "encryption_vectors": 1,
+}
 
 
 class _TaggedSet:
@@ -144,6 +159,157 @@ def test_error_vectors(vector: dict[str, Any]):
             generate_interop_key(vector["namespace"], vector["operation"], vector_args(vector["args"]))
         else:
             canonical_args_bytes(vector_args(vector["args"]))
+
+
+# Decoded values for the reader accept vectors tagged JSON cannot carry (the fixture omits their "value").
+READER_VALUES_NOT_IN_FIXTURE = {
+    "reader_non_string_map_key": {1: 42},
+    "reader_ext_type": msgpack.ExtType(1, b"\x2a"),
+}
+
+
+@pytest.mark.parametrize("vector", VECTORS["reader_accept_vectors"], ids=lambda v: v["name"])
+def test_reader_accept_vectors(vector: dict[str, Any]):
+    """The value reader decodes every well-formed, non-canonical document to its value: the
+    fixture's tagged-JSON one, or ours where tagged JSON cannot carry it."""
+    expected = from_tagged(vector["value"]) if "value" in vector else READER_VALUES_NOT_IN_FIXTURE[vector["name"]]
+    assert decode_interop_value(bytes.fromhex(vector["input_hex"])) == expected
+
+
+@pytest.mark.parametrize("vector", VECTORS["reader_reject_vectors"], ids=lambda v: v["name"])
+def test_reader_reject_vectors(vector: dict[str, Any]):
+    """The value reader rejects every reader reject vector by its trailing-bytes check (message text
+    is not normative); the cause pins that it is not the CK-frame diagnostic."""
+    with pytest.raises(InteropDecodeError) as excinfo:
+        decode_interop_value(bytes.fromhex(vector["input_hex"]))
+    assert isinstance(excinfo.value.__cause__, msgpack.exceptions.ExtraData)
+
+
+def _colliding_timestamps(n: int) -> list[msgpack.Timestamp]:
+    """n distinct Timestamps with one hash, by inverting CPython's 64-bit two-item tuple hash.
+
+    Timestamp hashes (seconds, nanoseconds) with no seed, so a forged entry can do the same: without a
+    bound, 4,000 such keys made one decode take ~0.6 s (quadratic in the key count).
+    """
+    mask, p1, p2, p5 = (1 << 64) - 1, 11400714785074694791, 14029467366897019727, 2870177450012600261
+
+    def rotr(x: int, r: int) -> int:
+        return ((x >> r) | (x << (64 - r))) & mask
+
+    out, inv1, inv2, target = [], pow(p1, -1, 1 << 64), pow(p2, -1, 1 << 64), 12345
+    nanoseconds = 0
+    while len(out) < n:
+        nanoseconds += 1
+        acc1 = (rotr(target * inv1 & mask, 31) - hash(nanoseconds) * p2) & mask
+        seconds = ((rotr(acc1 * inv1 & mask, 31) - p5) * inv2) & mask
+        if seconds < (1 << 61) - 1:  # hash(seconds) == seconds below the modulus
+            out.append(msgpack.Timestamp(seconds, nanoseconds))
+    return out
+
+
+def _map_document(pairs: list[tuple[Any, Any]]) -> bytes:
+    """A map16 of the given pairs, in order, duplicates kept (packb would merge them)."""
+    return b"\xde" + len(pairs).to_bytes(2, "big") + b"".join(msgpack.packb(k) + msgpack.packb(v) for k, v in pairs)
+
+
+# One maker per key type that is neither str nor bytes: key i of that type (bool and None repeat).
+NON_STRING_KEYS = {
+    "int": int,
+    "float": float,
+    "timestamp": lambda i: msgpack.Timestamp(i, 0),
+    "ext": lambda i: msgpack.ExtType(1, bytes([i])),
+    "bool": lambda i: bool(i % 2),
+    "none": lambda i: None,
+}
+
+
+class TestReaderHashFlood:
+    """strict_map_key=False lets in keys that hash without a seed; the reader caps how many one map holds."""
+
+    @pytest.mark.parametrize("make_key", NON_STRING_KEYS.values(), ids=NON_STRING_KEYS.keys())
+    def test_non_string_keys_are_capped_per_map(self, make_key):
+        # Type-agnostic: the cap counts every key that is neither str nor bytes, whatever its hash looks like.
+        # Distinct int hashes can be chosen so that their dict probe sequences merge into one chain, so a cap
+        # on keys per hash value cannot bound the build; a cap on keys per map does.
+        keys = [make_key(i) for i in range(33)]
+        assert decode_interop_value(_map_document([(k, 0) for k in keys[:32]])) == dict.fromkeys(keys[:32], 0)
+        with pytest.raises(InteropDecodeError, match="more than 32 entries keyed by neither str nor bytes"):
+            decode_interop_value(_map_document([(k, 0) for k in keys]))
+
+    def test_str_and_bytes_keys_are_not_counted(self):
+        # Both hash under a per-process secret, so no forged entry can steer them: they stay unbounded.
+        pairs = [(f"k{i}", i) for i in range(1000)] + [(b"k%d" % i, i) for i in range(1000)] + [(i, i) for i in range(32)]
+        assert decode_interop_value(_map_document(pairs)) == dict(pairs)
+        # They exempt only themselves: one str key must not lift the cap off the colliding keys beside it.
+        with pytest.raises(InteropDecodeError, match="neither str nor bytes"):
+            decode_interop_value(_map_document(pairs[:2000] + [(i, i) for i in range(33)]))
+
+    def test_timestamp_hash_flood_is_refused_before_any_comparison(self, monkeypatch):
+        keys = _colliding_timestamps(33)
+        assert len({k.nanoseconds for k in keys}) == 33 and len({hash(k) for k in keys}) == 1
+        compared = 0
+        timestamp_eq = msgpack.Timestamp.__eq__
+
+        def counting_eq(self, other):
+            nonlocal compared
+            compared += 1
+            return timestamp_eq(self, other)
+
+        monkeypatch.setattr(msgpack.Timestamp, "__eq__", counting_eq)
+        with pytest.raises(InteropDecodeError, match="neither str nor bytes"):
+            decode_interop_value(_map_document([(k, 0) for k in keys]))
+        assert compared == 0  # refused by counting; building the dict first compares at least 0 + 1 + ... + 32 = 528 times
+
+    def test_repeated_keys_count_toward_the_cap(self):
+        # The cap counts entries, not distinct keys: a repeat still overwrites (last wins).
+        assert decode_interop_value(_map_document([(1, i) for i in range(32)])) == {1: 31}
+        with pytest.raises(InteropDecodeError, match="neither str nor bytes"):
+            decode_interop_value(_map_document([(1, i) for i in range(33)]))
+
+    def test_non_str_key_types_still_decode(self):
+        # The cap narrows no key type: ext and revived temporal keys still decode alongside str keys.
+        sentinel = {"__datetime__": True, "value": "2024-01-01T00:00:00+00:00"}
+        doc = _map_document([("a", 1), (msgpack.ExtType(1, b"*"), 2), (b"k", 3), (None, 4), (1.5, 5)])
+        assert decode_interop_value(doc) == {"a": 1, msgpack.ExtType(1, b"*"): 2, b"k": 3, None: 4, 1.5: 5}
+        revived = decode_interop_value(b"\x81" + msgpack.packb(sentinel) + b"\x01")
+        assert revived == {datetime.fromisoformat(sentinel["value"]): 1}
+
+    def test_array_key_still_raises(self):
+        # {[1]: 1}: an array key is unhashable. Its TypeError comes from building the map in _build_map.
+        with pytest.raises(InteropDecodeError) as excinfo:
+            decode_interop_value(bytes.fromhex("81910101"))
+        assert isinstance(excinfo.value.__cause__, TypeError)
+
+
+_PURE_PYTHON_CHECK = """
+import msgpack, msgpack.fallback
+assert msgpack.Unpacker is msgpack.fallback.Unpacker, "MSGPACK_PUREPYTHON did not select the fallback"
+from tests.unit.protocol import test_interop_vectors as t
+for v in t.VECTORS["value_vectors"]:
+    t.test_value_vectors(v)
+for v in t.VECTORS["reader_accept_vectors"]:
+    t.test_reader_accept_vectors(v)
+for v in t.VECTORS["reader_reject_vectors"]:
+    t.test_reader_reject_vectors(v)
+h = t.TestReaderHashFlood()
+for make_key in t.NON_STRING_KEYS.values():
+    h.test_non_string_keys_are_capped_per_map(make_key)
+h.test_str_and_bytes_keys_are_not_counted()
+h.test_repeated_keys_count_toward_the_cap()
+h.test_non_str_key_types_still_decode()
+h.test_array_key_still_raises()
+"""
+
+
+def test_reader_vectors_under_msgpacks_pure_python_unpacker():
+    """msgpack falls back to a pure-Python unpacker without its C extension (PyPy, no wheel), and that one
+    hands object_pairs_hook a one-shot generator instead of a list. Run the reader's vectors under it."""
+    env = {**os.environ, "MSGPACK_PUREPYTHON": "1"}
+    root = Path(__file__).resolve().parents[3]
+    result = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code
+        [sys.executable, "-c", _PURE_PYTHON_CHECK], env=env, cwd=root, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_lone_surrogate_rejected():

@@ -466,6 +466,17 @@ class EncryptionWrapper:
         except Exception as e:
             raise SerializationError(f"Serialization failed: {e}") from e
 
+        # The AAD's compressed component is a frozen token: exactly True or False
+        # (spec/encryption.md). str() of anything else, such as a truthy 1 from a directly
+        # built serializer, would seal the entry under a token no other SDK's reader builds.
+        # Write side only: reads keep accepting what is stored. getattr, because a custom
+        # serializer may return no metadata at all; that is refused here too, not an AttributeError.
+        compressed = getattr(raw_metadata, "compressed", None)
+        if not isinstance(compressed, bool):
+            raise EncryptionError(
+                f"Refusing to seal: serializer metadata compressed must be a bool, got {type(compressed).__name__}"
+            )
+
         # Encrypt the serialized data
         try:
             # Create Additional Authenticated Data (AAD) v0x03 with cache_key binding
@@ -628,12 +639,15 @@ class EncryptionWrapper:
                 f"key genuinely differs. Set encryption.fail_closed=True to raise instead."
             )
 
-        # Create the same AAD used during encryption (with cache_key binding)
+        # Create the same AAD used during encryption (with cache_key binding). `encrypted` is not
+        # an AAD input; it tells the base serializer it is reading decrypted plaintext, whose
+        # container the reader's configuration fixes (no legacy sniffing, spec/encryption.md).
         raw_metadata = SerializationMetadata(
             serialization_format=metadata.format,  # Preserve original wire format from base serializer
             encoding=metadata.encoding,
             compressed=metadata.compressed,
             original_type=metadata.original_type,
+            encrypted=True,
         )
 
         # AAD build sits OUTSIDE the tag-verification try: an original_type or compressed that
@@ -741,6 +755,7 @@ class EncryptionWrapper:
             encoding=metadata.encoding,
             compressed=metadata.compressed,
             original_type=metadata.original_type,
+            encrypted=True,  # Not an AAD input: marks decrypted plaintext (see deserialize)
         )
 
         # AAD build sits OUTSIDE the tag-verification try: an original_type or compressed that

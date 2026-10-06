@@ -556,3 +556,68 @@ class TestEncryptedRoundTrip:
             assert recovered == data
         finally:
             reset_settings()
+
+
+class TestCompressedAadTokenIsFrozen:
+    """The AAD's compressed component is exactly True or False (spec/encryption.md). Writes refuse
+    any other value; reads keep accepting what is stored."""
+
+    KEY = "ns:enc6:func:m.f:args:" + "0" * 64 + ":"
+
+    def test_secure_preset_write_seals_the_true_token(self) -> None:
+        from cachekit.config.decorator import DecoratorConfig
+
+        config = DecoratorConfig.secure(master_key="a" * 64)  # pragma: allowlist secret
+        wrapper = EncryptionWrapper(master_key=b"\xaa" * 32, tenant_id="t1")
+        _, meta = StandardSerializer(enable_integrity_checking=config.integrity_checking).serialize({"v": 1})
+
+        assert wrapper._parse_aad(wrapper._create_aad(meta, self.KEY))["compressed"] == "True"
+
+    def test_write_refuses_a_non_bool_compressed(self) -> None:
+        wrapper = EncryptionWrapper(
+            serializer=StandardSerializer(enable_integrity_checking=1),  # type: ignore[arg-type]
+            master_key=b"\xaa" * 32,
+            tenant_id="t1",
+        )
+        with pytest.raises(EncryptionError, match="compressed must be a bool"):
+            wrapper.serialize({"v": 1}, cache_key=self.KEY)
+
+    def test_write_refuses_metadata_without_compressed(self) -> None:
+        """A serializer returning no metadata is refused as EncryptionError, not a bare AttributeError."""
+
+        class MarkedSerializer(_UnmarkedSerializer):
+            cross_sdk_compatible = True
+
+        wrapper = EncryptionWrapper(serializer=MarkedSerializer(), master_key=b"\xaa" * 32, tenant_id="t1")
+        with pytest.raises(EncryptionError, match="compressed must be a bool"):
+            wrapper.serialize({"v": 1}, cache_key=self.KEY)
+
+    def test_handler_write_refuses_a_non_bool_compressed(self) -> None:
+        handler = CacheSerializationHandler(
+            serializer_name=StandardSerializer(enable_integrity_checking=1),  # type: ignore[arg-type]
+            encryption=True,
+            single_tenant_mode=True,
+            master_key="a" * 64,  # pragma: allowlist secret
+        )
+        with pytest.raises(SerializationError, match="compressed must be a bool"):
+            handler.serialize_data({"v": 1}, cache_key=self.KEY)
+
+    def test_an_entry_stored_with_token_1_still_reads(self) -> None:
+        """Legacy entries sealed under "1" by older writers keep decrypting: the reader renders the
+        stored value, so only the write side changed."""
+        from cachekit.serializers.base import SerializationMetadata
+
+        wrapper = EncryptionWrapper(master_key=b"\xaa" * 32, tenant_id="t1")
+        raw, meta = StandardSerializer(enable_integrity_checking=1).serialize({"v": 1})  # type: ignore[arg-type]
+        assert meta.compressed == 1 and meta.compressed is not True
+        ciphertext = wrapper.encryptor.encrypt_with_keys(raw, wrapper._create_aad(meta, self.KEY), wrapper.tenant_keys)
+        stored = SerializationMetadata(
+            serialization_format=meta.format,
+            compressed=meta.compressed,
+            original_type=meta.original_type,
+            encrypted=True,
+            tenant_id="t1",
+            encryption_algorithm="AES-256-GCM",
+            key_fingerprint=wrapper.encryption_key_fingerprint,
+        )
+        assert wrapper.deserialize(ciphertext, stored, cache_key=self.KEY) == {"v": 1}

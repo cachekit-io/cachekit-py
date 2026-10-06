@@ -220,6 +220,12 @@ class DecoratorConfig:
         if not 0.0 <= self.ttl_refresh_threshold <= 1.0:
             raise ConfigurationError(f"ttl_refresh_threshold must be 0.0-1.0, got {self.ttl_refresh_threshold}")
 
+        # Under encryption integrity_checking becomes the AAD's `compressed` component, whose
+        # tokens are frozen as exactly True / False (spec/encryption.md). A truthy 1 would seal
+        # entries under the token "1", which no other SDK's reader builds.
+        if not isinstance(self.integrity_checking, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
+            raise ConfigurationError(f"integrity_checking must be a bool, got {type(self.integrity_checking).__name__}")
+
         # Interop mode validation (interop/v1, spec/interop-mode.md): loud at
         # decoration time, never silently normalized.
         if self.interop is not None:
@@ -434,7 +440,7 @@ class DecoratorConfig:
             tenant_extractor: Optional tenant ID extractor (an object with .extract(args, kwargs)) for
                 per-tenant key derivation. Not a tenancy boundary: see docs/features/zero-knowledge-encryption.md
             **kwargs: Overrides (ttl, namespace, backend, l1, circuit_breaker, backpressure, monitoring, etc.)
-                     - integrity_checking=False is rejected, and encryption= is not an override.
+                     - integrity_checking other than True is rejected, and encryption= is not an override.
                      Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
                      auth failure / key-fingerprint mismatch instead of silently recomputing
@@ -444,7 +450,7 @@ class DecoratorConfig:
             DecoratorConfig with encryption enabled and full security features
 
         Raises:
-            ConfigurationError: If a falsy ``integrity_checking``, ``encryption=`` or a keyword that names no
+            ConfigurationError: If an ``integrity_checking`` other than ``True``, ``encryption=`` or a keyword that names no
                 field is passed.
             TypeError: If master_key is bytes: pass ``key.hex()``.
 
@@ -474,7 +480,7 @@ class DecoratorConfig:
         # SECURITY INVARIANT: integrity_checking is forced to True. A request to turn it off is
         # rejected, never silently dropped (protocol intent-presets.md § Explicit Configuration).
         integrity_checking = kwargs.pop("integrity_checking", True)
-        if not integrity_checking:
+        if integrity_checking is not True:
             raise ConfigurationError(
                 f"The secure preset does not accept integrity_checking={integrity_checking!r} — it forces "
                 "integrity checking on. Omit integrity_checking."

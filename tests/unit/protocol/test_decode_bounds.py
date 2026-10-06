@@ -3,8 +3,8 @@
 Why the bound exists and how it works: the ``unpackb_bounded`` docstring in
 ``cachekit.serializers.base`` (the canonical home). This file pins, so a
 msgpack-python bump cannot silently move it:
-- every reject vector is rejected on every decode path by the pre-decode structural guard
-  itself: the error (or one in its cause/context chain) is the guard's own
+- every reject vector (reasons depth, overclaim and incomplete) is rejected on every decode path
+  by the pre-decode structural guard itself: the error (or one in its cause/context chain) is the guard's own
   ``Unpack failed: MessagePack document ...``, which no decoder produces, so a path that
   skips the guard fails even if msgpack still rejects the bytes later; the peak stays bounded;
 - ``validate_data`` (which returns a bool) proves the same through a spy on the guard;
@@ -43,9 +43,9 @@ from cachekit.serializers.wrapper import SerializationWrapper
 from tests.utils.tracemalloc_isolation import measure_in_subprocess
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "decode-bounds.json"
-FIXTURE_SHA256 = "907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916"  # pragma: allowlist secret
+FIXTURE_SHA256 = "c52c27f724fe138e63440dc0306936b48fe389e2bd823c058b86b30d854e2e2e"  # pragma: allowlist secret
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-EXPECTED_COUNTS = {"reject_vectors": 17, "accept_vectors": 3}
+EXPECTED_COUNTS = {"reject_vectors": 19, "accept_vectors": 3}
 
 # Only check_msgpack_structure raises this. msgpack's own rejections read "Unpack failed: incomplete
 # input" and the like, and the interop wrapper's "not a single well-formed MessagePack document" wraps
@@ -148,6 +148,22 @@ class TestFixtureIsTheVendoredProtocolFile:
         assert hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest() == FIXTURE_SHA256
         assert {g: len(VECTORS[g]) for g in EXPECTED_COUNTS} == EXPECTED_COUNTS
         assert VECTORS["spec"] == "spec/interop-mode.md#decode-bounds"
+
+    @pytest.mark.parametrize("vector", VECTORS["reject_vectors"], ids=_vector_ids("reject_vectors"))
+    def test_reject_reasons_are_known_and_hold(self, vector: dict[str, Any]) -> None:
+        # The reasons are maintainer notes, but a new one is a new rule the guard may not enforce yet:
+        # an unknown reason fails here, so adopting it is a conscious change. Each known one is checked
+        # against the vector's own numbers (decode-bounds.json "rules").
+        checks = {
+            "depth": vector["nesting_depth"] > 1024,
+            "overclaim": vector["declared_slots"] > vector["input_len"] - 1,
+            "incomplete": vector["declared_slots"] <= vector["input_len"] - 1,
+        }
+        assert vector["reject_reasons"], vector["name"]
+        for reason in vector["reject_reasons"]:
+            assert reason in checks, f"{vector['name']}: unknown reject reason {reason!r}"
+            assert checks[reason], f"{vector['name']}: does not satisfy its {reason!r} reason"
+        assert len(bytes.fromhex(vector["input_hex"])) == vector["input_len"]
 
 
 @pytest.mark.parametrize("path", DECODE_PATHS)

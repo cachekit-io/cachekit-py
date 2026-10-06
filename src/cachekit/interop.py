@@ -29,6 +29,7 @@ import inspect
 import math
 import re
 import struct
+from collections.abc import Iterable
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import Enum
@@ -479,25 +480,53 @@ def _iso_utc(value: str) -> str:
     return value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
 
 
-def _revive_sentinels(obj: Any) -> Any:
-    """msgpack object_hook: revive wire-format.md temporal sentinel maps."""
-    if isinstance(obj, dict):
-        if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
-            return datetime.fromisoformat(_iso_utc(obj["value"]))
-        if obj.get("__date__") is True and isinstance(obj.get("value"), str):
-            return date.fromisoformat(obj["value"])
-        if obj.get("__time__") is True and isinstance(obj.get("value"), str):
-            return time.fromisoformat(_iso_utc(obj["value"]))
+def _revive_sentinels(obj: dict[Any, Any]) -> Any:
+    """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is."""
+    if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
+        return datetime.fromisoformat(_iso_utc(obj["value"]))
+    if obj.get("__date__") is True and isinstance(obj.get("value"), str):
+        return date.fromisoformat(obj["value"])
+    if obj.get("__time__") is True and isinstance(obj.get("value"), str):
+        return time.fromisoformat(_iso_utc(obj["value"]))
     return obj
+
+
+# Most entries one map may hold under a key that is neither str nor bytes. str and bytes hash under a
+# per-process secret; int, float and msgpack.Timestamp hash without one, so a forged entry can choose its
+# keys' hashes. Sharing one hash makes each insert compare against every earlier key. Distinct hashes chosen
+# so their dict probe sequences merge (CPython's perturbation is spent after 13 probes, and every sequence
+# then walks the same cycle) make each insert walk one shared chain. Either way the build is quadratic in the
+# key count, so the count is what is capped. The interop data model writes only string keys. At 32, a forged
+# map's decode costs at most ~3.5x an honest one of the same size (32 Timestamps on one hash).
+_MAX_NON_STRING_KEYS = 32
+
+
+def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
+    """msgpack object_pairs_hook: build one map, refusing one whose keys could make the build quadratic."""
+    # msgpack's C unpacker passes a list, its pure-Python fallback a one-shot generator: materialise it
+    # once, or the count below consumes it and the map silently decodes empty.
+    pairs = list(pairs)
+    # Entries, not distinct keys: telling keys apart needs a hash table of them, the very build being bounded.
+    if len(pairs) > _MAX_NON_STRING_KEYS and sum(type(k) not in (str, bytes) for k, _ in pairs) > _MAX_NON_STRING_KEYS:
+        raise InteropDecodeError(
+            f"stored value has a map with more than {_MAX_NON_STRING_KEYS} entries keyed by neither str nor bytes: "
+            "a hash-flood bound, not a framing error. The entry is likely forged."
+        )
+    return _revive_sentinels(dict(pairs))
 
 
 def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     """Decode one plain-MessagePack interop value document.
 
-    Readers accept any well-formed MessagePack document (canonical or not),
-    but MUST consume exactly one document — trailing bytes are rejected
-    (msgpack-python raises ExtraData). A CK v3 frame prefix gets the
-    protocol#11 diagnostic instead of decoding its magic byte as int 67.
+    Readers accept any well-formed MessagePack document (canonical or not) in
+    which no map holds more than _MAX_NON_STRING_KEYS entries keyed by neither
+    str nor bytes. The bound counts every such key, whatever its type: int,
+    float, bool, None, Timestamp, ExtType or a revived temporal. A map over it
+    raises InteropDecodeError (a hash-flood bound), which a cached read treats
+    as a miss. A hashable non-str key decodes as-is; an unhashable one raises
+    InteropDecodeError. Readers MUST consume exactly one document — trailing
+    bytes are rejected (msgpack-python raises ExtraData). A CK v3 frame prefix
+    gets the protocol#11 diagnostic instead of decoding its magic byte as int 67.
     """
     raw = bytes(data)
     if raw[: len(_CK_FRAME_MAGIC)] == _CK_FRAME_MAGIC:
@@ -506,8 +535,13 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
             "interop value. An auto-mode writer and an interop reader are sharing a key — "
             "check that every writer for this key uses @cache(interop=...)."
         )
+    # strict_map_key=False: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must
+    # accept. msgpack's default exists against hash flooding; _build_map bounds that instead, and an
+    # array/map key still fails as unhashable.
     try:
-        return unpackb_bounded(raw, raw=False, strict_map_key=True, object_hook=_revive_sentinels)
+        return unpackb_bounded(raw, raw=False, strict_map_key=False, object_pairs_hook=_build_map)
+    except InteropDecodeError:
+        raise
     except Exception as e:
         raise InteropDecodeError(f"stored value is not a single well-formed MessagePack document: {e}") from e
 

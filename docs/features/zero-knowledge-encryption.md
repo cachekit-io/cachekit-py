@@ -623,7 +623,9 @@ them (cachekit-py#170):
   An integrity-off `AutoSerializer` refuses to write the second case, so the same redacted key repeating in the
   WARNING log is another writer still storing it (see *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
-  serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
+  serializer mismatch, a deserialize failure on *already-authenticated* plaintext (including
+  plaintext in a container other than the one the serializer writes, such as Arrow IPC without
+  its checksum prefix: decrypted bytes are never sniffed for a legacy form), or a
   non-string or non-UTF-8-encodable `original_type`, or a non-UTF-8-encodable `compressed`,
   in the frame header. Such a value
   cannot be built into the AAD at all, so no tag check runs — the read is
