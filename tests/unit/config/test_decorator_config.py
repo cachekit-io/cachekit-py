@@ -10,15 +10,17 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import fields, replace
+from typing import Any
 
 import pytest
 from pydantic import SecretStr
 
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
-from cachekit.config.decorator import DecoratorConfig
+from cachekit.config.decorator import _ENCRYPTION_FLAT_KWARGS, _SECURE_ENCRYPTION_KWARGS, DecoratorConfig
 from cachekit.config.nested import (
     BackpressureConfig,
     CircuitBreakerConfig,
@@ -327,9 +329,10 @@ class TestIoPreset:
         assert isinstance(config.backend, CachekitIOBackend)
         return config.backend._config.api_key.get_secret_value()
 
-    def test_api_key_argument_builds_backend_with_that_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("key", ["ck_arg", b"ck_arg"], ids=["str", "bytes"])  # pragma: allowlist secret
+    def test_api_key_argument_builds_backend_with_that_key(self, monkeypatch: pytest.MonkeyPatch, key: str | bytes) -> None:
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
-        assert self._key_of(DecoratorConfig.io(api_key="ck_arg")) == "ck_arg"  # pragma: allowlist secret
+        assert self._key_of(DecoratorConfig.io(api_key=key)) == "ck_arg"  # type: ignore[arg-type]  # pragma: allowlist secret
 
     def test_api_key_argument_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
@@ -351,11 +354,20 @@ class TestIoPreset:
         with pytest.raises(ConfigurationError, match=r"api_key=.*CACHEKIT_API_KEY"):
             DecoratorConfig.io()
 
-    def test_empty_argument_is_an_error_not_an_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """api_key=settings.tenant_key yielding "" must not silently cache under the env tenant's key."""
+    @pytest.mark.parametrize(
+        "build",
+        [DecoratorConfig.io, lambda api_key: cache.io(api_key=api_key)(lambda: 1)],
+        ids=["config", "decorator"],
+    )
+    @pytest.mark.parametrize("key", ["", b""], ids=["str", "bytes"])
+    def test_empty_argument_is_an_error_not_an_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, build: Callable[..., object], key: str | bytes
+    ) -> None:
+        """api_key=settings.tenant_key yielding "" must not silently cache under the env tenant's key, nor b"", which
+        is falsy wrapped as a secret too."""
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
         with pytest.raises(ConfigurationError, match="requires an API key"):
-            DecoratorConfig.io(api_key="")
+            build(api_key=key)
 
     def test_two_keys_in_one_process_reach_the_wire_separately(self) -> None:
         """Regression: the per-thread HTTP client was first-wins, so a second key's backend
@@ -606,6 +618,43 @@ class TestPresetFieldOverrides:
 
         assert resolved == []
 
+    def test_bare_and_secure_fold_every_flat_encryption_keyword(self, resolved: list[DecoratorConfig]) -> None:
+        # One sample per flat keyword: a keyword added to the shared list fails here until both forms carry it.
+        class Extractor:
+            def extract(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+                return "tenant"
+
+        samples: dict[str, Any] = {
+            "master_key": _SECURE_KEY,
+            "tenant_extractor": Extractor(),
+            "single_tenant_mode": True,
+            "deployment_uuid": "00000000-0000-4000-8000-000000000001",
+            "fail_closed": True,
+        }
+        assert samples.keys() == _ENCRYPTION_FLAT_KWARGS
+        # secure()'s named parameters are the flat keywords it does not take through **kwargs. One added to its signature
+        # alone would work on DecoratorConfig.secure() and be refused by @cache.secure and bare @cache.
+        assert set(inspect.signature(DecoratorConfig.secure).parameters) - {"kwargs"} == (
+            _ENCRYPTION_FLAT_KWARGS - _SECURE_ENCRYPTION_KWARGS
+        )
+        for name, value in samples.items():
+            secure_kwargs = {"master_key": _SECURE_KEY, name: value}
+
+            @cache(**{name: value})
+            def fn() -> int:
+                return 1
+
+            for config in (resolved.pop(), DecoratorConfig.secure(**secure_kwargs)):
+                assert getattr(config.encryption, name) == value, (name, config)
+        # An explicit single_tenant_mode reaches EncryptionConfig rather than being re-derived from tenant_extractor:
+        # each of these contradicts the derived value, so EncryptionConfig refuses it.
+        for bad in ({"tenant_extractor": Extractor(), "single_tenant_mode": True}, {"single_tenant_mode": False}):
+            with pytest.raises(ConfigurationError, match="tenant"):
+                DecoratorConfig.secure(master_key=_SECURE_KEY, **bad)
+        with pytest.raises(ConfigurationError) as excinfo:
+            DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=EncryptionConfig())
+        assert all(f"{k}=" in str(excinfo.value) for k in samples.keys() - {"master_key"})
+
     def test_l1_enabled_applies_on_top_of_l1_override(self, resolved: list[DecoratorConfig]) -> None:
         @cache.production(l1=L1CacheConfig(max_size_mb=200), l1_enabled=False)
         def fn() -> int:
@@ -761,9 +810,7 @@ class TestUnsupportedKeywords:
 
     # Bare @cache folds the encryption ones into its EncryptionConfig and @cache.io takes api_key; beside config=
     # each names nothing.
-    @pytest.mark.parametrize(
-        "name", ["master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed", "api_key"]
-    )
+    @pytest.mark.parametrize("name", sorted(_ENCRYPTION_FLAT_KWARGS | {"api_key"}))
     def test_config_form_rejects_a_keyword_only_another_form_takes(self, resolved: list[DecoratorConfig], name: str) -> None:
         decorator = cache(config=DecoratorConfig.minimal(), **{name: object()})
         with pytest.raises(ConfigurationError, match=f"does not accept {name}"):

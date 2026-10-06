@@ -13,22 +13,21 @@ from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
 from ..config.decorator import (
+    _ENCRYPTION_FLAT_KWARGS,
     _FIELD_NAMES,
     _PRESET_EXTRA_KWARGS,
     _SECRET_KWARGS,
     UNSET,
     _reject_unsupported,
 )
-from ..config.validation import hide_any_secret, hide_secret, refuse_bytes_key, reveal_secret
+from ..config.validation import hide_any_secret, refuse_bytes_key, reveal_secret
 from .local_wrapper import _ALLOWED_PARAMS as _LOCAL_KWARGS
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 # The encryption keywords bare @cache folds into its EncryptionConfig.
-_ENCRYPTION_KWARGS = frozenset(
-    {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
-)
+_ENCRYPTION_KWARGS = _ENCRYPTION_FLAT_KWARGS | {"encryption"}
 # Every keyword some form of @cache takes. Each form refuses those it does not take, and every form refuses any other.
 _DECORATOR_KWARGS = _FIELD_NAMES.union(_ENCRYPTION_KWARGS, _LOCAL_KWARGS, {"l1_enabled"}, *_PRESET_EXTRA_KWARGS.values())
 
@@ -130,10 +129,9 @@ def cache(
     # Secrets stay wrapped from here down, so no frame on an error's traceback holds them raw in a local or
     # in this dict (CWE-532); each is unwrapped only where it is used. So does a value under a keyword no form takes:
     # it may be a key under a misspelt name (master_keey=), and a guard below can raise before the check that refuses it.
-    # A bytes master_key is wrapped too, as every form refuses it; a bytes api_key is taken, and stays as passed.
-    for _name in manual_overrides.keys() & _SECRET_KWARGS:
-        manual_overrides[_name] = hide_secret(manual_overrides[_name])
-    for _name in manual_overrides.keys() - (_DECORATOR_KWARGS - {"master_key"}):
+    # A bytes key is wrapped too, as SecretBytes: every form refuses a bytes master_key, and @cache.io takes a bytes api_key,
+    # which only its backend unwraps.
+    for _name in manual_overrides.keys() - (_DECORATOR_KWARGS - _SECRET_KWARGS):
         manual_overrides[_name] = hide_any_secret(manual_overrides[_name])
 
     def decorator(f: F) -> F:
@@ -223,7 +221,7 @@ def cache(
                 enc_overrides: dict[str, Any] = {}
                 if "encryption" in overrides:
                     enc_overrides["enabled"] = overrides.pop("encryption")
-                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"):
+                for _k in _ENCRYPTION_FLAT_KWARGS:
                     if _k in overrides:
                         enc_overrides[_k] = overrides.pop(_k)
                 overrides["encryption"] = replace(EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()})

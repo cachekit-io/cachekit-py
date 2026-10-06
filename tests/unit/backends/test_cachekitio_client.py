@@ -294,7 +294,7 @@ def test_discarded_backends_do_not_accumulate_clients() -> None:
     for i in range(20):
         CachekitIOBackend(api_key=f"{prefix}_rotated_{i}")  # built and dropped at once
     gc.collect()
-    mine = [lease for key, lease in client_module._own_leases().by_key.items() if key[1].startswith(prefix)]
+    mine = [lease for key, lease in client_module._own_leases().by_key.items() if key[1].get_secret_value().startswith(prefix)]
     assert mine == [live._lease]
 
 
