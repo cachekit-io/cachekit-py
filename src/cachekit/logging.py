@@ -164,9 +164,6 @@ class StructuredLogger:
         # PII patterns to mask (pre-compiled for speed)
         self._pii_keys = {"password", "token", "secret", "key", "auth"}
 
-        # Thread-local storage for trace context
-        self._context = threading.local()
-
         # Standard logger for compatibility with tests
         self.logger = logging.getLogger(name)
 
@@ -331,28 +328,12 @@ class StructuredLogger:
 
         self.log("INFO", "pool_utilization", utilization=round(utilization, 3), **kwargs)
 
-    def set_trace_id(self, trace_id: str):
-        """Set trace ID for correlation."""
-        if not hasattr(self._context, "trace_id"):
-            self._context.trace_id = None
-        self._context.trace_id = trace_id
-
-    def clear_trace_id(self):
-        """Clear trace ID."""
-        if hasattr(self._context, "trace_id"):
-            delattr(self._context, "trace_id")
-
     def _get_context(self) -> dict[str, Any]:
         """Get current logging context."""
-        context = {
+        return {
             "timestamp": time.time(),
             "thread_id": threading.get_ident(),
         }
-
-        trace_id = getattr(self._context, "trace_id", None)
-        if trace_id:
-            context["trace_id"] = trace_id
-        return context
 
     def __del__(self):
         """Cleanup on deletion."""

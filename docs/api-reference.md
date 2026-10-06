@@ -72,7 +72,7 @@ from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, Backpres
     l1=L1CacheConfig(enabled=True),
     circuit_breaker=CircuitBreakerConfig(enabled=True),
     backpressure=BackpressureConfig(max_concurrent_requests=100),
-    monitoring=MonitoringConfig(collect_stats=True, enable_tracing=True),
+    monitoring=MonitoringConfig(collect_stats=True),
 )
 def your_function(args):
     return do_expensive_computation()
@@ -110,7 +110,6 @@ def your_function(args):
 
 - **`monitoring`** (`MonitoringConfig`, default: `MonitoringConfig()`) - Observability configuration:
   - `collect_stats` (`bool`, default: `True`) - Collect cache hit/miss statistics
-  - `enable_tracing` (`bool`, default: `True`) - Enable distributed tracing
   - `enable_structured_logging` (`bool`, default: `True`) - Enable structured JSON logging
   - `enable_prometheus_metrics` (`bool`, default: `True`) - Export Prometheus metrics
 

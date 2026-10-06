@@ -173,7 +173,6 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Encryption | - | - | - | - | ✅ Required |
 | L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
 | Prometheus Metrics | - | -¹ | - | ✅ | ✅ |
-| Tracing | - | ✅ | - | ✅ | ✅ |
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 

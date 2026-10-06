@@ -306,7 +306,6 @@ class DecoratorConfig:
             "backpressure_timeout": self.backpressure.timeout,
             # Monitoring (flattened)
             "collect_stats": self.monitoring.collect_stats,
-            "enable_tracing": self.monitoring.enable_tracing,
             "enable_structured_logging": self.monitoring.enable_structured_logging,
             "enable_prometheus_metrics": self.monitoring.enable_prometheus_metrics,
             # Encryption (flattened)
@@ -362,7 +361,6 @@ class DecoratorConfig:
             "backpressure": BackpressureConfig(enabled=True),
             "monitoring": MonitoringConfig(
                 collect_stats=False,
-                enable_tracing=False,
                 enable_structured_logging=False,
                 enable_prometheus_metrics=False,
             ),
@@ -411,7 +409,6 @@ class DecoratorConfig:
             "backpressure": BackpressureConfig(enabled=True),
             "monitoring": MonitoringConfig(
                 collect_stats=True,
-                enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=True,
             ),
@@ -504,7 +501,6 @@ class DecoratorConfig:
             "backpressure": BackpressureConfig(enabled=True),
             "monitoring": MonitoringConfig(
                 collect_stats=True,
-                enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=True,
             ),
@@ -559,7 +555,6 @@ class DecoratorConfig:
             "backpressure": BackpressureConfig(enabled=True),
             "monitoring": MonitoringConfig(
                 collect_stats=True,
-                enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=False,
             ),
@@ -605,7 +600,6 @@ class DecoratorConfig:
             "backpressure": BackpressureConfig(enabled=False),
             "monitoring": MonitoringConfig(
                 collect_stats=False,
-                enable_tracing=False,
                 enable_structured_logging=False,
                 enable_prometheus_metrics=False,
             ),
@@ -689,7 +683,6 @@ class DecoratorConfig:
             "backpressure": BackpressureConfig(enabled=True),
             "monitoring": MonitoringConfig(
                 collect_stats=True,
-                enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=True,
             ),

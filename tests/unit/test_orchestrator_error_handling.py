@@ -43,21 +43,6 @@ class TestErrorHandlerOrchestration:
 
         # If we get here, test passes - no exceptions raised
 
-    def test_handle_cache_error_works_with_none_span(self):
-        """Error handler must work when span is None (common case)."""
-        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=False)
-
-        # Async wrapper often doesn't have span - must not crash
-        orchestrator.handle_cache_error(
-            error=Exception("test"),
-            operation="client_creation",
-            cache_key="unknown",
-            span=None,  # Common case in async wrapper
-            duration_ms=0.0,
-        )
-
-        # Test passes if no exception
-
     def test_handle_cache_error_uses_default_namespace(self):
         """Error handler should use orchestrator namespace when not provided."""
         orchestrator = FeatureOrchestrator(namespace="default_namespace")

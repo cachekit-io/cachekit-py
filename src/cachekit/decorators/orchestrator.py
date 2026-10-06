@@ -211,23 +211,6 @@ class FeatureOrchestrator:
 
         return status
 
-    def create_span(self, name: str, attributes: Optional[dict[str, Any]] = None):
-        """Create a tracing span (no-op if tracing not available)."""
-
-        # Simple no-op context manager for now
-        class NoOpSpan:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        return NoOpSpan()
-
-    def set_span_attributes(self, span: Any, attributes: dict[str, Any]):
-        """Set attributes on a span (no-op)."""
-        pass
-
     def log_cache_operation(self, **kwargs: Any) -> None:
         """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532)."""
         if self._enable_structured_logging and kwargs:
@@ -240,16 +223,6 @@ class FeatureOrchestrator:
                 kwargs["error"] = redact_error_for_log(kwargs["error"])
             key = kwargs.get("key", "unknown")
             self.log_structured("info", f"Cache operation: {operation}", cache_key=key, **kwargs)
-
-    def record_exception(self, span, exception: Exception):
-        """Record exception in span and metrics."""
-        if self._metrics_collector:
-            self._metrics_collector.record_cache_operation(
-                operation="exception",
-                namespace=self.namespace,
-                success=False,
-                duration_ms=0.0,
-            )
 
     def set_operation_context(self, operation: str, duration_ms: float = 0.0):
         """Set operation context for automatic tracking in record_failure.
@@ -366,7 +339,6 @@ class FeatureOrchestrator:
         operation: str,
         cache_key: str = "unknown",
         namespace: Optional[str] = None,
-        span: Optional[Any] = None,
         duration_ms: float = 0.0,
         *,
         count_toward_breaker: bool = True,
@@ -383,7 +355,6 @@ class FeatureOrchestrator:
             cache_key: Cache key involved (use "unknown" if unavailable). Pass the
                 raw key — it is redacted here before any logging (CWE-532).
             namespace: Cache namespace (defaults to orchestrator namespace)
-            span: Optional tracing span for recording
             duration_ms: Operation duration in milliseconds
             count_toward_breaker: Passed to record_failure(). False keeps the metric
                 and logs but leaves the circuit breaker untouched.
@@ -394,7 +365,6 @@ class FeatureOrchestrator:
                 error=e,
                 operation="key_generation",
                 cache_key=cache_key,
-                span=span,
                 duration_ms=0.0
             )
         """
@@ -405,17 +375,13 @@ class FeatureOrchestrator:
         # (CWE-532) — callers pass the raw key; sentinels pass through readable.
         cache_key = redact_key_for_log(cache_key)
 
-        # 1. Record exception in span and metrics
-        if span:
-            self.record_exception(span, error)
-
-        # 2. Set operation context for metrics
+        # 1. Set operation context for metrics
         self.set_operation_context(operation, duration_ms)
 
-        # 3. Record failure in circuit breaker and metrics collector
+        # 2. Record failure in circuit breaker and metrics collector
         self.record_failure(error, count_toward_breaker=count_toward_breaker)
 
-        # 4. Structured logging with full context
+        # 3. Structured logging with full context
         self.log_cache_operation(
             operation=f"{operation}_failed",
             key=cache_key,
@@ -428,7 +394,7 @@ class FeatureOrchestrator:
             **extra_context,
         )
 
-        # 5. Also log via standard logger for backwards compatibility. Redact the key
+        # 4. Also log via standard logger for backwards compatibility. Redact the key
         # inline (idempotent: it is already redacted above, but the flow-insensitive
         # architecture guard requires the wrapper on the logged expression) and keep
         # the exception text key-free with redact_error_for_log (CWE-532).

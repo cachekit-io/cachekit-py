@@ -248,14 +248,12 @@ class TestDecoratorConfigToDict:
         config = DecoratorConfig(
             monitoring=MonitoringConfig(
                 collect_stats=False,
-                enable_tracing=False,
                 enable_structured_logging=False,
                 enable_prometheus_metrics=False,
             )
         )
         d = config.to_dict()
         assert d["collect_stats"] is False
-        assert d["enable_tracing"] is False
         assert d["enable_structured_logging"] is False
         assert d["enable_prometheus_metrics"] is False
 
@@ -542,7 +540,7 @@ _NESTED_OVERRIDES: dict[str, object] = {
     "circuit_breaker": CircuitBreakerConfig(failure_threshold=3),
     "l1": L1CacheConfig(max_size_mb=200, swr_enabled=False),
     "backpressure": BackpressureConfig(max_concurrent_requests=7),
-    "monitoring": MonitoringConfig(collect_stats=False, enable_tracing=True),
+    "monitoring": MonitoringConfig(collect_stats=False),
 }
 _PRESET_OVERRIDES: dict[str, dict[str, object]] = {
     "minimal": {**_NESTED_OVERRIDES, "integrity_checking": True},

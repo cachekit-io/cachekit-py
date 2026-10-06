@@ -586,7 +586,6 @@ def create_cache_wrapper(
     max_concurrent_requests: int = 100,
     # Monitoring features
     collect_stats: bool = True,
-    enable_tracing: bool = True,
     enable_structured_logging: bool = True,
     # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
     interop: str | None = None,
@@ -646,7 +645,6 @@ def create_cache_wrapper(
         backpressure: Enable backpressure control
         max_concurrent_requests: Max concurrent requests (backpressure)
         collect_stats: Enable statistics collection
-        enable_tracing: Enable distributed tracing
         enable_structured_logging: Enable structured logging
         interop: interop/v1 cross-SDK operation name. When set, switches this
                 function to canonical {namespace}:{operation}:{args_hash} keys
@@ -711,7 +709,6 @@ def create_cache_wrapper(
 
         # Monitoring settings
         collect_stats = config.monitoring.collect_stats
-        # enable_tracing = config.monitoring.enable_tracing  # Not used after CacheConfig removal
         enable_structured_logging = config.monitoring.enable_structured_logging
 
         # Encryption settings
@@ -739,7 +736,6 @@ def create_cache_wrapper(
     use_circuit_breaker = circuit_breaker and not fast_mode
     use_backpressure = backpressure and not fast_mode
     use_collect_stats = collect_stats and not fast_mode
-    # use_enable_tracing = enable_tracing and not fast_mode  # Not used after CacheConfig removal
     use_enable_structured_logging = enable_structured_logging and not fast_mode
 
     # Initialize handler components
@@ -1644,16 +1640,6 @@ def create_cache_wrapper(
 
         cache_key = None  # Initialize to avoid UnboundLocalError
 
-        # Create tracing span for cache operation
-        span_attributes = {
-            "cache.system": "l1_memory" if _l1_only_mode else "redis",
-            "cache.operation": "get",
-            "cache.namespace": namespace or "default",
-            "cache.serializer": serializer,
-            "function.name": func.__name__,
-            "function.async": False,
-        }
-
         # Key generation - needed for both L1-only and L1+L2 modes
         try:
             cache_key = _resolve_cache_key(args, kwargs)
@@ -1859,43 +1845,37 @@ def create_cache_wrapper(
             reset_current_function_stats(token)
             return _uncached_result(func(*args, **kwargs))
 
-        with features.create_span("redis_cache", span_attributes) as span:
-            try:
-                # Add cache key to span attributes
-                if span:
-                    features.set_span_attributes(span, {"cache.key": cache_key})
+        try:
+            if _backend is None:
+                _backend = _resolve_lazy_backend()
+                _l2_scope()  # first call: the tenant check above ran before the backend existed
 
-                if _backend is None:
-                    _backend = _resolve_lazy_backend()
-                    _l2_scope()  # first call: the tenant check above ran before the backend existed
-
-                # Setup cache handler strategy on first use
-                handler = StandardCacheHandler(
-                    _backend,
-                    backpressure_controller=features.backpressure,
-                    ttl_refresh_threshold=ttl_refresh_threshold,
-                )
-                operation_handler.set_cache_handler(handler)
-            except UnsupportedTenantError:
-                # From the first-call check above, or from a provider that checks the tenant while
-                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
-                # client failure, so never degraded or counted (LAB-5713).
-                reset_current_function_stats(token)
-                raise
-            except Exception as e:
-                # Guard clause: Client creation failed - early return with fallback
-                features.handle_cache_error(
-                    error=e,
-                    operation="client_creation",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    span=span,
-                    duration_ms=0.0,
-                    serializer="rust",
-                )
-                # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
-                reset_current_function_stats(token)
-                return _uncached_result(func(*args, **kwargs))
+            # Setup cache handler strategy on first use
+            handler = StandardCacheHandler(
+                _backend,
+                backpressure_controller=features.backpressure,
+                ttl_refresh_threshold=ttl_refresh_threshold,
+            )
+            operation_handler.set_cache_handler(handler)
+        except UnsupportedTenantError:
+            # From the first-call check above, or from a provider that checks the tenant while
+            # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+            # client failure, so never degraded or counted (LAB-5713).
+            reset_current_function_stats(token)
+            raise
+        except Exception as e:
+            # Guard clause: Client creation failed - early return with fallback
+            features.handle_cache_error(
+                error=e,
+                operation="client_creation",
+                cache_key=cache_key or "unknown",
+                namespace=namespace or "default",
+                duration_ms=0.0,
+                serializer="rust",
+            )
+            # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
+            reset_current_function_stats(token)
+            return _uncached_result(func(*args, **kwargs))
 
         # First interop call: the check above had no backend to check (see there).
         if interop is not None and not interop_checked:
@@ -1939,16 +1919,6 @@ def create_cache_wrapper(
                 # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
                 result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
                 features.record_success()
-
-                # Record cache hit in span
-                if span:
-                    features.set_span_attributes(
-                        span,
-                        {
-                            "cache.hit": True,
-                            "cache.latency_ms": duration * 1000,
-                        },
-                    )
 
                 # Record cache hit with structured logging
                 features.log_cache_operation(
@@ -2007,7 +1977,6 @@ def create_cache_wrapper(
                 operation="cache_get",
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
-                span=span,
                 duration_ms=get_duration_ms,
                 serializer="rust",
             )

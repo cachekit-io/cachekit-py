@@ -103,7 +103,6 @@ class TestMinimalPreset:
 
         # Monitoring disabled
         assert config.monitoring.collect_stats is False
-        assert config.monitoring.enable_tracing is False
         assert config.monitoring.enable_structured_logging is False
         assert config.monitoring.enable_prometheus_metrics is False
 
@@ -137,7 +136,6 @@ class TestProductionPreset:
 
         # Full monitoring
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
         assert config.monitoring.enable_structured_logging is True
         assert config.monitoring.enable_prometheus_metrics is True
 
@@ -163,7 +161,6 @@ class TestSecurePreset:
 
         # Full monitoring
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
         assert config.monitoring.enable_structured_logging is True
         assert config.monitoring.enable_prometheus_metrics is True
 
@@ -211,7 +208,6 @@ class TestDevPreset:
 
         # Monitoring enabled, Prometheus disabled
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
         assert config.monitoring.enable_structured_logging is True
         assert config.monitoring.enable_prometheus_metrics is False
 
@@ -242,7 +238,6 @@ class TestTestPreset:
 
         # All monitoring disabled
         assert config.monitoring.collect_stats is False
-        assert config.monitoring.enable_tracing is False
         assert config.monitoring.enable_structured_logging is False
         assert config.monitoring.enable_prometheus_metrics is False
 

@@ -289,7 +289,6 @@ from cachekit.config.nested import MonitoringConfig
     ttl=300,
     monitoring=MonitoringConfig(
         collect_stats=False,
-        enable_tracing=False,
         enable_structured_logging=False,
         enable_prometheus_metrics=False,
     ),
