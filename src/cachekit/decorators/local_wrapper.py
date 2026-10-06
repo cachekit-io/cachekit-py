@@ -95,18 +95,30 @@ def create_local_wrapper(
             serializer_type="local",
         )
 
+    # A miss runs the function once for every concurrent miss on its key (single_flight): every
+    # caller of one call gets the same object, as a later hit does. One map is used, by kind.
+    flights = AsyncFlights()
+    thread_flights = ThreadFlights()
+
     # --- Shared helper functions (defined once, attached to either wrapper) ---
+    # Each invalidation also forgets the key's call in flight: a read that starts after it never
+    # joins a miss that started before it.
 
     def invalidate_cache(*args: Any, **kw: Any) -> None:
         """Remove a specific cached entry by regenerating its key."""
-        object_cache.delete(_make_key(args, kw))
+        cache_key = _make_key(args, kw)
+        flights.forget([cache_key])
+        thread_flights.forget([cache_key])
+        object_cache.delete(cache_key)
 
     async def ainvalidate_cache(*args: Any, **kw: Any) -> None:
         """Async variant of invalidate_cache (operation is sync but API is async for consistency)."""
-        object_cache.delete(_make_key(args, kw))
+        invalidate_cache(*args, **kw)
 
     def cache_clear() -> None:
         """Remove all entries for this function. Works for both sync and async."""
+        flights.forget(None)
+        thread_flights.forget(None)
         object_cache.clear()
 
     def cache_info() -> CacheInfo:
@@ -130,11 +142,8 @@ def create_local_wrapper(
         )
 
     # --- Build sync or async wrapper ---
-    # A miss runs the function once for every concurrent miss on its key (single_flight): every
-    # caller of one call gets the same object, as a later hit does.
 
     if asyncio.iscoroutinefunction(func):
-        flights = AsyncFlights()
 
         async def _fill_async(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)
@@ -148,14 +157,13 @@ def create_local_wrapper(
             found, cached_value = object_cache.get(cache_key)
             if found:
                 return cached_value
-            result, joined = await flights.run(cache_key, functools.partial(_fill_async, cache_key, args, kw))
+            result, joined = await flights.run((cache_key,), functools.partial(_fill_async, cache_key, args, kw))
             if joined:
                 _count(ran=False)
             return result
 
         wrapper: Any = async_wrapper
     else:
-        thread_flights = ThreadFlights()
 
         def _fill(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)
@@ -170,7 +178,7 @@ def create_local_wrapper(
             if found:
                 return cached_value
             result, joined = thread_flights.run(
-                cache_key,
+                (cache_key,),
                 functools.partial(_fill, cache_key, args, kw),
                 functools.partial(object_cache.peek, cache_key),
             )

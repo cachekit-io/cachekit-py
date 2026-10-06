@@ -1499,6 +1499,7 @@ def create_cache_wrapper(
         """
         if _l1_cache is None:  # never registered without one
             return
+        _forget_flights(None if key is None else [key])
         if key is not None:
             _l1_cache.invalidate(key)
         else:
@@ -1543,10 +1544,18 @@ def create_cache_wrapper(
     _l1_swr_pool = _RefreshPool(_L1_SWR_MAX_CONCURRENT_REFRESHES)
 
     # In-process single-flight for misses (single_flight): concurrent misses on one key share one
-    # call. Keyed by cache key in L1-only mode, and by (L2 scope, cache key) in backed mode, where
-    # it holds the whole trip after the L1 miss. The sync backed path does not use it.
+    # call. Keyed by (cache key,) in L1-only mode, and by (L2 scope, tenant, cache key) in backed
+    # mode, where it holds the whole trip after the L1 miss. The sync backed path does not use it.
     _flights = AsyncFlights()
     _thread_flights = ThreadFlights()
+    # Multi-tenant encryption: the cache key carries no tenant, so the backed-mode flight key does.
+    _flight_tenant_extractor = serialization_handler.tenant_extractor if serialization_handler.encryption else None
+
+    def _forget_flights(cache_keys: list[str] | None) -> None:
+        """For an invalidation of these keys (all, for None): a read that starts after it never joins
+        a miss that started before it."""
+        _flights.forget(cache_keys)
+        _thread_flights.forget(cache_keys)
 
     def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> Any:
         """Run the function for an L1-only miss and store its result. A miss is a call that runs it."""
@@ -1742,7 +1751,7 @@ def create_cache_wrapper(
             # that joins gets the same object, as a later hit does, and counts as a hit.
             try:
                 result, joined = _thread_flights.run(
-                    cache_key,
+                    (cache_key,),
                     functools.partial(_l1_only_fill, cache_key, args, kwargs),
                     functools.partial(_object_cache.peek, cache_key),
                 )
@@ -2177,7 +2186,9 @@ def create_cache_wrapper(
 
                 # Cache miss: run the function once for every concurrent miss on this key, as the
                 # sync wrapper does.
-                result, joined = await _flights.run(cache_key, functools.partial(_l1_only_fill_async, cache_key, args, kwargs))
+                result, joined = await _flights.run(
+                    (cache_key,), functools.partial(_l1_only_fill_async, cache_key, args, kwargs)
+                )
                 if joined:
                     _stats.record_l1_hit()
                 return result
@@ -2313,15 +2324,36 @@ def create_cache_wrapper(
             operation_handler.set_cache_handler(handler)
 
             # Every concurrent miss on this key in this process shares one trip (single_flight). The
-            # identity carries the backend's per-context key prefix, so callers under different
-            # prefixes (tenant-scoped backends) never share one. It is taken after admission and
-            # backend resolution: a joined caller makes no backend request, records no backend
-            # outcome and hands its HALF_OPEN probe slot straight back.
-            (result, envelope), joined = await _flights.run(
-                (_l2_scope(), cache_key),
-                functools.partial(_backed_miss_async, cache_key, args, kwargs, probe_cycle, twin_key),
-                functools.partial(features.release_probe, probe_cycle),
-            )
+            # identity carries the backend's per-context key prefix and, in multi-tenant encryption,
+            # the caller's tenant: callers never share another prefix's or tenant's trip, value or
+            # exception. A caller whose tenant cannot be extracted shares nothing. The join comes
+            # after admission and backend resolution: a joined caller makes no backend request,
+            # records no backend outcome and hands its HALF_OPEN probe slot straight back.
+            tenant: str | None = ""
+            if _flight_tenant_extractor is not None:
+                try:
+                    tenant = _flight_tenant_extractor.extract(args, kwargs)
+                except Exception:
+                    tenant = None
+            if tenant is None:
+                return (await _backed_miss_async(cache_key, args, kwargs, probe_cycle, twin_key))[0]
+            admitted_cycle, slot_returned = probe_cycle, False
+
+            def _return_probe_slot() -> None:
+                nonlocal slot_returned
+                if not slot_returned:
+                    slot_returned = True
+                    features.release_probe(admitted_cycle)
+
+            async def _start_trip() -> tuple[Any, bytes | None]:
+                cycle = admitted_cycle
+                if slot_returned:  # joined a trip that was cancelled under it, so admitted afresh
+                    cycle = features.admit()
+                    if cycle is None:
+                        return _uncached_result(await func(*args, **kwargs)), None
+                return await _backed_miss_async(cache_key, args, kwargs, cycle, twin_key)
+
+            (result, envelope), joined = await _flights.run((_l2_scope(), tenant, cache_key), _start_trip, _return_probe_slot)
             if not joined:
                 return result
             # A joined caller decodes its own copy of the trip's envelope, as an L1 hit would: every
@@ -2928,12 +2960,15 @@ def create_cache_wrapper(
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
         if not args and not kwargs and _func_has_params:
+            _forget_flights(None)
             _drain_all()
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288).
-        _invalidate_keys(_resolve_invalidation_keys(args, kwargs))
+        cache_keys = _resolve_invalidation_keys(args, kwargs)
+        _forget_flights(cache_keys)
+        _invalidate_keys(cache_keys)
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
@@ -2954,6 +2989,7 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
+            _forget_flights(None)
             # Off the event loop: every L2 call in here is a sync Redis/backend round-trip.
             await asyncio.to_thread(_drain_all)
             return
@@ -2963,7 +2999,9 @@ def create_cache_wrapper(
         # sync deletes run off the loop; never a backend's delete_async. The Redis provider caches one
         # async client per provider, whose pool stays bound to the first event loop that used it
         # (asyncio.run per job).
-        await asyncio.to_thread(_invalidate_keys, _resolve_invalidation_keys(args, kwargs))
+        cache_keys = _resolve_invalidation_keys(args, kwargs)
+        _forget_flights(cache_keys)
+        await asyncio.to_thread(_invalidate_keys, cache_keys)
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""

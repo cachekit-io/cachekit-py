@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import sys
 import threading
 import time
+import traceback
 import types
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -33,6 +35,7 @@ from cachekit import object_cache as object_cache_module
 from cachekit.config.nested import L1CacheConfig
 from cachekit.decorators import single_flight
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
+from cachekit.decorators.tenant_context import ContextVarExtractor
 from cachekit.l1_cache import get_l1_cache_manager
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitState
 
@@ -43,6 +46,9 @@ ASYNC_MODES = ("l1_only", "local", "backed")
 SYNC_MODES = ("l1_only", "local")
 
 _scope: contextvars.ContextVar[str] = contextvars.ContextVar("_scope", default="")
+MASTER_KEY = "61" * 32
+TENANT_A = "550e8400-e29b-41d4-a716-446655440000"
+TENANT_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 
 
 class _Backend:
@@ -356,6 +362,112 @@ async def test_backed_flight_identity_carries_the_backend_key_prefix() -> None:
     assert entered == 2
 
 
+async def test_backed_flight_identity_carries_the_tenant_in_multi_tenant_encryption() -> None:
+    """With a context tenant the cache key has no tenant: two tenants never share a call, its value or its error."""
+    extractor = ContextVarExtractor()
+    both_in = asyncio.Event()
+    entered = 0
+
+    async def compute(x: int) -> str:
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            both_in.set()
+        await asyncio.wait_for(both_in.wait(), 2)  # times out if the tenants shared one call
+        tenant = extractor.extract((), {})
+        if x == 2:
+            raise RuntimeError(f"failed for {tenant}")
+        return tenant
+
+    fn = cache.secure(
+        master_key=MASTER_KEY, backend=_Backend(), ttl=60, namespace=f"sf-{uuid.uuid4().hex}", tenant_extractor=extractor
+    )(compute)
+
+    async def as_tenant(tenant: str, x: int) -> Any:
+        ContextVarExtractor.set_tenant_id(tenant)
+        try:
+            return await fn(x)
+        except RuntimeError as e:
+            return str(e)
+
+    assert await asyncio.gather(as_tenant(TENANT_A, 1), as_tenant(TENANT_B, 1)) == [TENANT_A, TENANT_B]
+    entered = 0
+    both_in.clear()
+    assert await asyncio.gather(as_tenant(TENANT_A, 2), as_tenant(TENANT_B, 2)) == [
+        f"failed for {TENANT_A}",
+        f"failed for {TENANT_B}",
+    ]
+
+
+@pytest.mark.parametrize("mode", ASYNC_MODES)
+async def test_a_read_after_invalidation_does_not_join_an_earlier_miss(mode: str) -> None:
+    version, runs = 1, 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def compute(x: int) -> int:
+        nonlocal runs
+        runs += 1
+        seen = version
+        entered.set()
+        if runs == 1:
+            await release.wait()
+        return seen
+
+    fn = _decorator(mode)(compute)
+    first = asyncio.create_task(fn(1))
+    await asyncio.wait_for(entered.wait(), 5)
+
+    version = 2
+    await fn.ainvalidate_cache(1)
+    assert await asyncio.wait_for(fn(1), 5) == 2  # its own call, not the one that read version 1
+    release.set()
+    assert await first == 1
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="Python 3.10 cannot tell a caller's own cancellation apart")
+@pytest.mark.parametrize("mode", ASYNC_MODES)
+async def test_joined_callers_run_again_when_the_shared_call_is_cancelled_under_them(mode: str) -> None:
+    """The call raised CancelledError (something else cancelled what it awaited); no joined caller was cancelled."""
+    body = _Body()
+    error_on_first = [asyncio.CancelledError()]
+
+    async def compute(x: int) -> dict[str, int]:
+        body.runs += 1
+        body.entered.set()
+        await body.release.wait()
+        if error_on_first:
+            raise error_on_first.pop()
+        return {"x": x}
+
+    fn = _decorator(mode)(compute)
+    tasks = await body.herd(fn)
+    body.release.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert isinstance(results[0], asyncio.CancelledError)  # the starter's own call raised it, as before
+    assert results[1:] == [{"x": 1}] * (HERD - 1)
+    assert body.runs == 2
+
+
+@pytest.mark.parametrize("mode", ["l1_only", "local", "backed"])
+async def test_a_cancelled_lone_caller_returns_after_its_call_unwound(mode: str) -> None:
+    """As when the call ran inline: its cleanup (a lock release, say) runs before the caller moves on."""
+    events: list[str] = []
+
+    async def compute(x: int) -> int:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            events.append("cleanup")
+        return x
+
+    fn = _decorator(mode)(compute)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(fn(1), 0.05)
+    assert events == ["cleanup"]
+
+
 async def test_joined_callers_leave_no_half_open_probe_slot_spent(live_breakers: list[CircuitBreaker]) -> None:
     """A joined caller hands its probe slot back: the herd leaves the slots one call leaves."""
     single = _Body()
@@ -573,6 +685,55 @@ def test_sync_failure_raises_in_every_caller_and_pins_nothing(mode: str, waiting
 
 
 @pytest.mark.parametrize("mode", SYNC_MODES)
+def test_sync_failure_traceback_stays_one_callers(mode: str, waiting: list[int]) -> None:
+    """Each waiting thread raises from the saved traceback, so frames never pile up across threads."""
+    error = RuntimeError("upstream down")
+
+    @_decorator(mode)
+    def compute(x: int) -> int:
+        _until(lambda: waiting[0] == HERD - 1)
+        raise error
+
+    results = _thread_herd(compute)
+    assert all(r is error for r in results)
+    assert len(traceback.extract_tb(error.__traceback__)) < 15
+
+
+@pytest.mark.parametrize("mode", SYNC_MODES)
+def test_sync_read_after_invalidation_does_not_join_an_earlier_miss(mode: str) -> None:
+    version, runs = 1, 0
+    entered = threading.Event()
+    release = threading.Event()
+
+    @_decorator(mode)
+    def compute(x: int) -> int:
+        nonlocal runs
+        runs += 1
+        seen = version
+        if runs == 1:
+            entered.set()
+            release.wait(5)
+        return seen
+
+    first: list[int] = []
+    t = threading.Thread(target=lambda: first.append(compute(1)))
+    t.start()
+    try:
+        assert entered.wait(5)
+        version = 2
+        compute.invalidate_cache(1)
+        later: list[int] = []
+        u = threading.Thread(target=lambda: later.append(compute(1)))
+        u.start()
+        u.join(2)
+        assert later == [2]  # its own call; joining the first would block until release
+    finally:
+        release.set()
+        t.join(5)
+    assert first == [1]
+
+
+@pytest.mark.parametrize("mode", SYNC_MODES)
 def test_sync_calls_on_different_keys_run_concurrently(mode: str) -> None:
     barrier = threading.Barrier(2, timeout=2)  # breaks if the keys were serialised
 
@@ -625,10 +786,10 @@ async def test_async_flights_forked_child_starts_with_an_empty_map(monkeypatch: 
     async def child_call() -> str:
         return "child"
 
-    parent = asyncio.create_task(flights.run("k", parent_call))
+    parent = asyncio.create_task(flights.run(("k",), parent_call))
     await asyncio.sleep(0)
     monkeypatch.setattr(flights, "_pid", -1)  # as a forked child sees it
-    assert await flights.run("k", child_call) == ("child", False)
+    assert await flights.run(("k",), child_call) == ("child", False)
     gate.set()
     assert await parent == ("parent", False)
 
@@ -643,12 +804,12 @@ def test_thread_flights_forked_child_starts_with_an_empty_map(monkeypatch: pytes
         gate.wait(5)
         return "parent"
 
-    parent = threading.Thread(target=lambda: flights.run("k", parent_call, lambda: (False, None)))
+    parent = threading.Thread(target=lambda: flights.run(("k",), parent_call, lambda: (False, None)))
     parent.start()
     try:
         assert held.wait(5)
         monkeypatch.setattr(flights, "_pid", -1)
-        assert flights.run("k", lambda: "child", lambda: (False, None)) == ("child", False)
+        assert flights.run(("k",), lambda: "child", lambda: (False, None)) == ("child", False)
     finally:
         gate.set()
         parent.join(5)
@@ -661,7 +822,7 @@ def test_thread_flights_recheck_finds_a_value_stored_after_the_callers_lookup() 
     def call() -> str:
         raise AssertionError("the function ran again")
 
-    assert flights.run("k", call, lambda: (True, "stored")) == ("stored", True)
+    assert flights.run(("k",), call, lambda: (True, "stored")) == ("stored", True)
 
 
 def test_thread_flights_waiters_retry_after_an_interrupted_call() -> None:
@@ -682,7 +843,7 @@ def test_thread_flights_waiters_retry_after_an_interrupted_call() -> None:
 
     def starter() -> None:
         try:
-            flights.run("k", interrupted_call, lambda: (False, None))
+            flights.run(("k",), interrupted_call, lambda: (False, None))
         except _Interrupt as e:
             interrupted.append(e)
 
@@ -690,7 +851,7 @@ def test_thread_flights_waiters_retry_after_an_interrupted_call() -> None:
     first.start()
     assert held.wait(5)
     result: list[tuple[str, bool]] = []
-    second = threading.Thread(target=lambda: result.append(flights.run("k", lambda: "retried", lambda: (False, None))))
+    second = threading.Thread(target=lambda: result.append(flights.run(("k",), lambda: "retried", lambda: (False, None))))
     second.start()
     time.sleep(0.05)  # let the second thread wait on the first call
     gate.set()

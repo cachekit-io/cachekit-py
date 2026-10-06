@@ -134,7 +134,7 @@ assert client_a is not client_c  # Different args, different object
 
 Calls that miss the same key at the same time (a cold key, or one past its `ttl`) run the function once, and every one of them gets that call's object. This holds across threads for a sync function and across tasks on one event loop for an async one. The same-object guarantee above therefore holds for a concurrent cold herd too, not only for calls made after the first one returns.
 
-If that call raises, every caller waiting on it gets the exception, nothing is cached, and the next call runs the function again. Cancelling an async caller cancels only its own wait; once every caller waiting on a call is cancelled, the call is cancelled too. In `cache_info()`, a caller that got another call's value counts as a hit, and one whose shared call raised counts as neither. A function must not wait on another thread or task that calls it with the same arguments: that would be waiting on itself. A direct recursive call on the same thread or task is safe and runs on its own.
+If that call raises, every caller waiting on it gets the exception, nothing is cached, and the next call runs the function again. Cancelling an async caller cancels only its own wait; once every caller waiting on a call is cancelled, the call is cancelled too. A call made after `invalidate_cache()` or `cache_clear()` returns never joins a call that started before it. In `cache_info()`, a caller that got another call's value counts as a hit, and one whose shared call raised counts as neither. A function must not wait on another thread or task that calls it with the same arguments: that would be waiting on itself. A direct recursive call on the same thread or task is safe and runs on its own.
 
 ---
 
