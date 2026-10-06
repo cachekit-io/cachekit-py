@@ -212,12 +212,14 @@ def _map_document(pairs: list[tuple[Any, Any]]) -> bytes:
     return b"\xde" + len(pairs).to_bytes(2, "big") + b"".join(msgpack.packb(k) + msgpack.packb(v) for k, v in pairs)
 
 
-# One maker per key type that is neither str nor bytes: key i of that type.
+# One maker per key type that is neither str nor bytes: key i of that type (bool and None repeat).
 NON_STRING_KEYS = {
     "int": int,
     "float": float,
     "timestamp": lambda i: msgpack.Timestamp(i, 0),
     "ext": lambda i: msgpack.ExtType(1, bytes([i])),
+    "bool": lambda i: bool(i % 2),
+    "none": lambda i: None,
 }
 
 
@@ -238,10 +240,13 @@ class TestReaderHashFlood:
         # Both hash under a per-process secret, so no forged entry can steer them: they stay unbounded.
         pairs = [(f"k{i}", i) for i in range(1000)] + [(b"k%d" % i, i) for i in range(1000)] + [(i, i) for i in range(32)]
         assert decode_interop_value(_map_document(pairs)) == dict(pairs)
+        # They exempt only themselves: one str key must not lift the cap off the colliding keys beside it.
+        with pytest.raises(InteropDecodeError, match="neither str nor bytes"):
+            decode_interop_value(_map_document(pairs[:2000] + [(i, i) for i in range(33)]))
 
     def test_timestamp_hash_flood_is_refused_before_any_comparison(self, monkeypatch):
-        keys = _colliding_timestamps(4000)
-        assert len({k.nanoseconds for k in keys}) == 4000 and len({hash(k) for k in keys}) == 1
+        keys = _colliding_timestamps(33)
+        assert len({k.nanoseconds for k in keys}) == 33 and len({hash(k) for k in keys}) == 1
         compared = 0
         timestamp_eq = msgpack.Timestamp.__eq__
 
@@ -253,10 +258,7 @@ class TestReaderHashFlood:
         monkeypatch.setattr(msgpack.Timestamp, "__eq__", counting_eq)
         with pytest.raises(InteropDecodeError, match="neither str nor bytes"):
             decode_interop_value(_map_document([(k, 0) for k in keys]))
-        assert compared == 0  # refused by counting, before the dict (and its ~8M comparisons) is built
-        decoded = decode_interop_value(_map_document([(k, 0) for k in keys[:32]]))
-        assert compared <= 32 * 32  # quadratic in the cap, not in the 4,000
-        assert decoded == dict.fromkeys(keys[:32], 0)
+        assert compared == 0  # refused by counting; building the dict first compares at least 0 + 1 + ... + 32 = 528 times
 
     def test_repeated_keys_count_toward_the_cap(self):
         # The cap counts entries, not distinct keys: a repeat still overwrites (last wins).

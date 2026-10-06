@@ -518,11 +518,13 @@ def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
 def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     """Decode one plain-MessagePack interop value document.
 
-    Readers accept any well-formed MessagePack document (canonical or not):
-    a hashable non-str map key (int, float, bytes, ExtType, a revived temporal)
-    decodes as-is, and an unhashable one raises InteropDecodeError, as does a
-    map with more than _MAX_NON_STRING_KEYS entries keyed by neither str nor
-    bytes (a hash flood). Readers MUST consume exactly one document — trailing
+    Readers accept any well-formed MessagePack document (canonical or not) in
+    which no map holds more than _MAX_NON_STRING_KEYS entries keyed by neither
+    str nor bytes. The bound counts every such key, whatever its type: int,
+    float, bool, None, Timestamp, ExtType or a revived temporal. A map over it
+    raises InteropDecodeError (a hash-flood bound), which a cached read treats
+    as a miss. A hashable non-str key decodes as-is; an unhashable one raises
+    InteropDecodeError. Readers MUST consume exactly one document — trailing
     bytes are rejected (msgpack-python raises ExtraData). A CK v3 frame prefix
     gets the protocol#11 diagnostic instead of decoding its magic byte as int 67.
     """

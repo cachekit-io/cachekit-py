@@ -142,7 +142,7 @@ assert data.hex() == "82a36167651ea46e616d65a5616c696365"  # canonical: sorted k
 assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 ```
 
-`decode_interop_value` accepts any well-formed document, canonical or not: padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. Trailing bytes after the one document raise `InteropDecodeError`, and so does a map holding more than 32 entries whose key is neither a string nor bytes. Those key types (an int, a float, a MessagePack timestamp) hash without a random seed, so a forged entry could choose hashes that make one read quadratic in its key count. The data model writes only string keys.
+`decode_interop_value` accepts any well-formed document, canonical or not, in which no map holds more than 32 entries keyed by neither a string nor bytes. Padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. The bound counts every key that is not a string or bytes, whatever its type: an int, a float, a bool, `None`, a MessagePack timestamp, another ext type or a revived datetime. Some of those (an int, a float, a MessagePack timestamp) hash without a random seed, so a forged entry could choose hashes that make one read quadratic in its key count; the data model writes only string keys. A map over the bound raises `InteropDecodeError`, as do trailing bytes after the one document. Under `@cache(interop=...)` that error reads as a cache miss: the function runs and its result overwrites the entry.
 
 ## Conformance
 
