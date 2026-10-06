@@ -259,7 +259,7 @@ Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge e
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
 
-# Required env: CACHEKIT_MASTER_KEY (hex, min 32 bytes) + CACHEKIT_API_KEY
+# Required env: CACHEKIT_MASTER_KEY (hex; use exactly 32 bytes) + CACHEKIT_API_KEY
 backend = CachekitIOBackend()
 
 @cache.secure(backend=backend, ttl=3600, namespace="sensitive-data")
@@ -286,7 +286,7 @@ def get_user_profile(user_id: str) -> dict:
 **Requirements**:
 
 ```bash
-CACHEKIT_MASTER_KEY=<hex string, min 32 bytes>  # Never leaves the client
+CACHEKIT_MASTER_KEY=<hex string; use exactly 32 bytes>  # Never leaves the client
 CACHEKIT_API_KEY=ck_live_...
 ```
 

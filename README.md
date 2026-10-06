@@ -175,9 +175,12 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Prometheus Metrics | - | -¹ | - | ✅ | ✅ |
 | Tracing | - | ✅ | - | ✅ | ✅ |
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
+| Backend unreachable² | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
 > ¹ `@cache.dev` exports no Prometheus metrics except `circuit_breaker_state`, which is recorded for every function whose circuit breaker is enabled.
+>
+> ² A backend that is down or unreachable never raises to the caller, on any preset (`@cache.io` included): the call logs the failure and runs your function. What gets cached meanwhile is in [Connection Errors](docs/error-codes.md#connection-errors).
 >
 > 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`. Its encryption is fixed the same way: `encryption=` raises `ConfigurationError` on `@cache.secure` and next to `config=DecoratorConfig.secure(...)`, so pass `fail_closed=` and the other encryption options to the preset itself. `@cache.secure` also rejects `config=`; the RORO form is `@cache(config=DecoratorConfig.secure(...))`.
 >
@@ -187,12 +190,12 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 >
 > **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >
-> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
+> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a Python-only, SDK-local preset: a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
 
 <details>
 <summary><strong>Additional Presets: <code>@cache.dev</code> and <code>@cache.test</code></strong></summary>
 
-See the comparison table above for the exact feature set of each preset.
+`@cache.dev` and `@cache.test` are Python-only, SDK-local presets. See the comparison table above for the exact feature set of each preset.
 
 ```python
 # Development: verbose logging, integrity checks on, Prometheus off except circuit_breaker_state
