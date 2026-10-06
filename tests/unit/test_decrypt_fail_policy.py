@@ -22,6 +22,7 @@ import json
 import logging
 from typing import Any
 
+import msgpack
 import pytest
 
 from cachekit.cache_handler import (
@@ -37,6 +38,7 @@ from cachekit.serializers.encryption_wrapper import (
     EncryptionError,
     EncryptionWrapper,
 )
+from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 _HEX_KEY = "a" * 64
@@ -468,6 +470,42 @@ class TestArrowPostDecryptContainer:
 
         assert handler.get_cached_value("key:a") is None
         assert strategy.deleted == ["key:a"]
+
+
+class TestStandardPostDecryptContainer:
+    """After a decrypt, an integrity-off StandardSerializer decodes plain MessagePack and never probes
+    for a ByteStorage envelope: the AAD binds ``compressed``, so the stored form is already known.
+
+    The value is a valid envelope's four fields, which the plaintext probe refuses on every read."""
+
+    @pytest.fixture
+    def envelope_fields(self) -> list[Any]:
+        return msgpack.unpackb(StandardSerializer(enable_integrity_checking=True).serialize({"actual": "inner"})[0])
+
+    def test_both_encrypted_read_paths_return_an_envelope_shaped_value(self, envelope_fields):
+        wrapper = EncryptionWrapper(
+            serializer=StandardSerializer(enable_integrity_checking=False), master_key=_KEY_BYTES, tenant_id="t1"
+        )
+        sealed, meta = wrapper.serialize(envelope_fields, cache_key="key:a")
+        assert meta.compressed is False
+        assert wrapper.deserialize(sealed, meta, cache_key="key:a") == envelope_fields
+        assert wrapper.deserialize_without_key_identity(sealed, meta, cache_key="key:a") == envelope_fields
+
+    def test_handler_read_of_an_envelope_shaped_value_is_a_hit(self, envelope_fields):
+        serialization = CacheSerializationHandler(
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            enable_integrity_checking=False,
+        )
+        strategy = _DictCacheStrategy({})
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=strategy)  # type: ignore[arg-type]
+
+        strategy.store["key:a"] = serialization.serialize_data(envelope_fields, cache_key="key:a")
+        hit = handler.get_cached_value("key:a")
+        assert hit is not None
+        assert hit.value == envelope_fields
+        assert strategy.deleted == []
 
 
 class TestConfigDriftRead:

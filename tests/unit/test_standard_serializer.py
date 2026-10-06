@@ -640,6 +640,26 @@ class TestStandardSerializerIntegrityChecking:
             with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
                 off.deserialize(data, metadata)
 
+    def test_decrypted_read_skips_the_envelope_probe(self) -> None:
+        """``encrypted`` metadata means EncryptionWrapper decrypted these bytes under an AAD that binds
+        ``compressed``, so the stored form is known and nothing is sniffed: the same value the plaintext
+        read refuses comes back. A ``compressed=True`` header still refuses on either read."""
+        envelope_fields = msgpack.unpackb(_envelope(8))
+        off = StandardSerializer(enable_integrity_checking=False)
+        data, meta = off.serialize(envelope_fields)
+        decrypted = SerializationMetadata.from_dict({**meta.to_dict(), "encrypted": True})
+        spy = _RetrieveSpy(off._byte_storage)
+        off._byte_storage = spy  # type: ignore[assignment]
+
+        assert off.deserialize(data, decrypted) == envelope_fields
+        assert spy.calls == 0
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+            off.deserialize(data, meta)
+
+        enveloped = SerializationMetadata.from_dict({**decrypted.to_dict(), "compressed": True})
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+            off.deserialize(_envelope(8), enveloped)
+
     @pytest.mark.parametrize("healthy_at_decode", [True, False], ids=["rotted-after-decode", "repaired-after-decode"])
     def test_decode_and_probe_judge_one_snapshot_of_a_mutable_buffer(self, monkeypatch, healthy_at_decode) -> None:
         """A bytearray (or a view over an mmap) can change between the plain decode and the probe.

@@ -334,7 +334,7 @@ class StandardSerializer:
 
         Args:
             data: Bytes from serialize() (with or without ByteStorage envelope)
-            metadata: Optional metadata. Only ``compressed`` is read (see Raises).
+            metadata: Optional metadata. Only ``compressed`` and ``encrypted`` are read (see Raises).
 
         Returns:
             Deserialized Python object
@@ -349,7 +349,9 @@ class StandardSerializer:
                 look-alike cannot match the checksum by chance. So without a ``compressed=True``
                 header, a rotted envelope, one declaring more than 256 KiB, and one in another
                 layout come back decoded as their fields, and a value equal to a valid envelope's
-                fields (declaring at most 256 KiB) is refused on every read.
+                fields (declaring at most 256 KiB) is refused on every plaintext read. A read with
+                ``metadata.encrypted`` (decrypted by :class:`EncryptionWrapper`, whose AAD binds
+                ``compressed``) skips that probe and returns such a value; ``compressed`` still refuses.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -370,7 +372,9 @@ class StandardSerializer:
                 raise SerializationError(_CROSS_CONFIG_ERROR)
             data = immutable_buffer(data)  # the decode and the envelope probe must judge one snapshot
             value = unpackb_bounded(data, **self._msgpack_unpack_opts)
-            if self._is_verified_envelope(data, value):
+            # Decrypted bytes are never probed: the AAD binds compressed, so the writer's form is known.
+            decrypted = metadata is not None and metadata.encrypted
+            if not decrypted and self._is_verified_envelope(data, value):
                 raise SerializationError(_CROSS_CONFIG_ERROR)
             return value
         except SerializationError:
