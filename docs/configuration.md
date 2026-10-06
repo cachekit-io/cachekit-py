@@ -82,7 +82,7 @@ CACHEKIT_ARROW_COMPRESSION=zstd
 # With it set, every preset except @cache.secure and @cache.local must state its intent:
 # one with no encryption intent raises ConfigurationError at decoration (use encryption=False
 # for plaintext).
-CACHEKIT_MASTER_KEY=<64-hex-char-key-exactly-32-bytes>
+CACHEKIT_MASTER_KEY=<64-hex-char-key; use exactly 32 bytes>
 # Key rotation: decrypt-only previous master keys (comma-separated hex, max 3,
 # same per-key requirements as CACHEKIT_MASTER_KEY). Entries written under a
 # listed key stay readable through the rotation window; writes always use

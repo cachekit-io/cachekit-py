@@ -693,7 +693,7 @@ CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Encryption key for @cache.secure / encryption=True (a key source, not a switch)
-CACHEKIT_MASTER_KEY=<hex-encoded-exactly-32-bytes>
+CACHEKIT_MASTER_KEY=<hex-encoded-key; use exactly 32 bytes>
 
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0
