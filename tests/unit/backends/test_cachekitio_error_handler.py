@@ -8,6 +8,7 @@ the one a real urllib3 response or exception produces.
 from __future__ import annotations
 
 import asyncio
+import pickle
 import socket
 import ssl
 from collections.abc import Callable
@@ -17,7 +18,7 @@ from urllib3 import BaseHTTPResponse
 from urllib3 import exceptions as u3
 
 from cachekit.backends.cachekitio.backend import _rate_limit_delay
-from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from tests.utils.cachekitio_fakes import TEST_API_KEY, FakeRequest, fake_backend, response
 
@@ -31,7 +32,7 @@ _URL = "https://api.cachekit.io/v1/cache/user%3Asecret-42"
 
 def _status_error(status: int) -> tuple[HTTPStatusError, BaseHTTPResponse]:
     resp = response(status)
-    return HTTPStatusError(resp), resp
+    return HTTPStatusError(status, resp), resp
 
 
 def _send(mode: str, handler: Callable[[FakeRequest], BaseHTTPResponse]) -> BackendError:
@@ -62,6 +63,8 @@ _STATUS_RULES = [
     (404, BackendErrorType.PERMANENT, "Client error: HTTP 404"),
     (409, BackendErrorType.PERMANENT, "Client error: HTTP 409"),
     (422, BackendErrorType.PERMANENT, "Client error: HTTP 422"),
+    # No rule matches a 3xx (requests are sent with redirect=False): it is UNKNOWN, still a status with its response.
+    (302, BackendErrorType.UNKNOWN, "Unknown HTTP error: HTTPStatusError"),
 ]
 
 
@@ -89,6 +92,7 @@ class TestHTTPStatusClassification:
         """HTTPStatusError is the cause logged with the BackendError: its text carries no URL."""
         exc, resp = _status_error(500)
         assert str(exc) == "HTTP 500"
+        assert exc.status == 500
         assert exc.response is resp
 
 
@@ -103,7 +107,7 @@ class TestHTTPStatusEndToEnd:
         assert err.message == message
         assert err.operation == "put"
         assert isinstance(err.original_exception, HTTPStatusError)
-        assert err.original_exception.response.status == status
+        assert err.original_exception.status == status
 
     @pytest.mark.parametrize("mode", ["sync", "async"])
     def test_value_too_large_413_is_permanent(self, mode: str) -> None:
@@ -118,6 +122,7 @@ class TestHTTPStatusEndToEnd:
         err = _send(mode, lambda request: response(429, headers={"Retry-After": "7"}))
         assert err.error_type == BackendErrorType.TRANSIENT
         assert isinstance(err.original_exception, HTTPStatusError)
+        assert err.original_exception.response is not None
         assert err.original_exception.response.headers["Retry-After"] == "7"
         assert _rate_limit_delay(err) == 7
 
@@ -200,6 +205,16 @@ def _assert_type_only(err: BackendError) -> None:
     assert TEST_API_KEY not in text
 
 
+def _assert_class_only_cause(err: BackendError, exc: Exception) -> None:
+    """CWE-532: the error keeps urllib3's exception class, never the exception, whose traceback runs through urllib3's
+    request frames and their Authorization header (tests/unit/backends/test_cachekitio_transport_error_frames.py)."""
+    cause = err.original_exception
+    assert isinstance(cause, HTTPTransportError)
+    assert cause.exc_type is type(exc)
+    assert str(cause) == type(exc).__name__
+    assert cause.__traceback__ is None
+
+
 class TestNetworkExceptionClassification:
     """Tests for network-level exception → error type mapping."""
 
@@ -209,7 +224,7 @@ class TestNetworkExceptionClassification:
         result = classify_http_error(exc)
         assert result.error_type == error_type
         assert result.message == message
-        assert result.original_exception is exc
+        _assert_class_only_cause(result, exc)
         _assert_type_only(result)
 
     @pytest.mark.parametrize("make_exc", [_TRANSPORT_RULES[0][0], _TRANSPORT_RULES[1][0]], ids=_TRANSPORT_IDS[:2])
@@ -241,8 +256,39 @@ class TestNetworkExceptionEndToEnd:
         assert err.error_type == error_type
         assert err.message == message
         assert err.operation == "put"
-        assert err.original_exception is exc
+        _assert_class_only_cause(err, exc)
+        # Raised outside the except block: urllib3's exception is not even the implicit __context__.
+        assert err.__cause__ is err.original_exception
+        assert err.__context__ is None
         _assert_type_only(err)
+
+
+class TestErrorPickle:
+    """A classified BackendError survives pickling, as every BackendError does (a ProcessPoolExecutor worker's error)."""
+
+    @pytest.mark.parametrize(("make_exc", "error_type", "message"), _TRANSPORT_RULES, ids=_TRANSPORT_IDS)
+    def test_transport_round_trip(self, make_exc: Callable[[], Exception], error_type: BackendErrorType, message: str) -> None:
+        exc = make_exc()
+        err = pickle.loads(pickle.dumps(classify_http_error(exc, operation="put", key="k")))  # noqa: S301 (own object)
+        assert (err.error_type, err.message, err.operation, err.key) == (error_type, message, "put", "k")
+        _assert_class_only_cause(err, exc)
+
+    @pytest.mark.parametrize(("status", "error_type", "message"), _STATUS_RULES)
+    def test_status_round_trip(self, status: int, error_type: BackendErrorType, message: str) -> None:
+        """The copy keeps the status and drops the response: a live one holds its connection pool, which does not pickle."""
+        exc, resp = _status_error(status)
+        err = pickle.loads(pickle.dumps(classify_http_error(exc, response=resp, operation="put", key="k")))  # noqa: S301
+        assert (err.error_type, err.message, err.operation, err.key) == (error_type, message, "put", "k")
+        cause = err.original_exception
+        assert isinstance(cause, HTTPStatusError)
+        assert (cause.status, str(cause), cause.response) == (status, f"HTTP {status}", None)
+
+    def test_copied_rate_limit_has_no_wait(self) -> None:
+        """A copied 429 has no response to read Retry-After from, so paced invalidation does not wait on it."""
+        resp = response(429, headers={"Retry-After": "7"})
+        err = classify_http_error(HTTPStatusError(429, resp), response=resp)
+        assert _rate_limit_delay(err) == 7
+        assert _rate_limit_delay(pickle.loads(pickle.dumps(err))) is None  # noqa: S301 (own object)
 
 
 class TestContextPropagation:

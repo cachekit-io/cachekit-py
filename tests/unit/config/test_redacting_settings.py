@@ -588,8 +588,8 @@ def _holds(value: object, texts: list[str], raw: list[bytes], depth: int = 0) ->
 
 def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_caller: bool = False) -> list[str]:
     """Every ``frame:local`` under src/cachekit/ that holds ``secret`` on the traceback of ``exc`` or of any
-    exception chained to it (``__cause__``/``__context__``), or with ``below_caller`` every frame but this
-    test file's, pydantic's included.
+    exception reachable from it (``__cause__``/``__context__``, and a BackendError's ``original_exception``), or
+    with ``below_caller`` every frame but this test file's, third-party frames included.
 
     Error trackers capture frame locals by default (Sentry's ``include_local_variables``) and serialise
     containers item by item, and their scrubbers match top-level key names, so a raw key held in any local,
@@ -606,7 +606,7 @@ def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_c
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
-        pending += [current.__cause__, current.__context__]
+        pending += [current.__cause__, current.__context__, getattr(current, "original_exception", None)]
         tb = current.__traceback__
         while tb is not None:
             code = tb.tb_frame.f_code

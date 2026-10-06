@@ -63,7 +63,7 @@ class TestFreshnessRead:
         err = BackendError(
             "boom",
             error_type=BackendErrorType.TRANSIENT,
-            original_exception=HTTPStatusError(_response(500)),
+            original_exception=HTTPStatusError(500, _response(500)),
         )
         with patch.object(backend, "_request_sync", side_effect=err):
             with pytest.raises(BackendError):

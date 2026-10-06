@@ -24,7 +24,7 @@ from urllib3.exceptions import ClosedPoolError
 from cachekit.backends._uninterrupted import _await_uninterrupted
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
-from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.validation import ConfigurationError, hide_any_secret
 from cachekit.decorators.stats_context import get_current_function_stats
@@ -150,7 +150,7 @@ def _rate_limit_delay(error: BackendError) -> int | None:
     quota or balance deny (``X-CacheKit-Deny-Reason``): waiting does not clear it.
     """
     cause = error.original_exception
-    if isinstance(cause, HTTPStatusError) and cause.response.status == 429:
+    if isinstance(cause, HTTPStatusError) and cause.status == 429 and cause.response is not None:
         return _retry_after_seconds(cause.response, _MAX_RATE_LIMIT_WAIT_S)
     return None
 
@@ -450,14 +450,18 @@ class CachekitIOBackend:
         try:
             return lease.client.request(method, url, body=body, headers=headers)
         except Exception as exc:
-            raise classify_http_error(exc, operation=method.lower()) from exc
+            error = classify_http_error(exc, operation=method.lower())
+        # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's
+        # exception carries a traceback through its request frames, whose locals hold the Authorization header, and
+        # a raise in the block would chain it as __context__, which `raise ... from` does not clear.
+        raise error from error.original_exception
 
     @staticmethod
     def _checked(method: str, response: BaseHTTPResponse, miss_on_404: bool) -> BaseHTTPResponse:
         """``response`` if it is a 2xx, or a 404 that ``miss_on_404`` accepts; otherwise the classified BackendError."""
         if 200 <= response.status < 300 or (miss_on_404 and response.status == 404):
             return response
-        exc = HTTPStatusError(response)
+        exc = HTTPStatusError(response.status, response)
         raise classify_http_error(exc, response=response, operation=method.lower()) from exc
 
     def _request_sync(
@@ -1053,7 +1057,8 @@ class CachekitIOBackend:
             try:
                 self._request_sync("DELETE", path, headers=headers)
             except BackendError as exc:
-                if not isinstance(exc.__cause__, ClosedPoolError):
+                cause = exc.original_exception
+                if not (isinstance(cause, HTTPTransportError) and issubclass(cause.exc_type, ClosedPoolError)):
                     raise
                 self._request_sync("DELETE", path, headers=headers)
         except Exception as exc:
