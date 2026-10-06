@@ -29,6 +29,7 @@ import inspect
 import math
 import re
 import struct
+from collections.abc import Iterable
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import Enum
@@ -479,15 +480,14 @@ def _iso_utc(value: str) -> str:
     return value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
 
 
-def _revive_sentinels(obj: Any) -> Any:
-    """msgpack object_hook: revive wire-format.md temporal sentinel maps."""
-    if isinstance(obj, dict):
-        if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
-            return datetime.fromisoformat(_iso_utc(obj["value"]))
-        if obj.get("__date__") is True and isinstance(obj.get("value"), str):
-            return date.fromisoformat(obj["value"])
-        if obj.get("__time__") is True and isinstance(obj.get("value"), str):
-            return time.fromisoformat(_iso_utc(obj["value"]))
+def _revive_sentinels(obj: dict[Any, Any]) -> Any:
+    """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is."""
+    if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
+        return datetime.fromisoformat(_iso_utc(obj["value"]))
+    if obj.get("__date__") is True and isinstance(obj.get("value"), str):
+        return date.fromisoformat(obj["value"])
+    if obj.get("__time__") is True and isinstance(obj.get("value"), str):
+        return time.fromisoformat(_iso_utc(obj["value"]))
     return obj
 
 
@@ -496,7 +496,7 @@ def _revive_sentinels(obj: Any) -> Any:
 _MAX_KEYS_PER_HASH = 32
 
 
-def _build_map(pairs: list[tuple[Any, Any]]) -> Any:
+def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
     """msgpack object_pairs_hook: build a map without letting colliding keys make it quadratic.
 
     Non-str keys are allowed (IOP-18), but some hash without a seed: msgpack.Timestamp hashes its
@@ -505,17 +505,24 @@ def _build_map(pairs: list[tuple[Any, Any]]) -> Any:
     Counting distinct keys per hash and refusing the map past _MAX_KEYS_PER_HASH keeps every probe chain
     short, whatever the key type, so no accepted key type is narrowed.
     """
-    if all(type(k) is str for k, _ in pairs):  # SipHash-keyed: nothing to bound
-        return _revive_sentinels(dict(pairs))
-    result: dict[Any, Any] = {}
-    per_hash: dict[int, int] = {}
-    for k, v in pairs:
-        if k not in result:  # a repeated key overwrites; it adds no collider
-            h = hash(k)
-            per_hash[h] = per_hash.get(h, 0) + 1
-            if per_hash[h] > _MAX_KEYS_PER_HASH:
-                raise ValueError(f"map holds more than {_MAX_KEYS_PER_HASH} distinct keys with one hash")
-        result[k] = v
+    # msgpack's C unpacker passes a list, its pure-Python fallback a one-shot generator: materialise it
+    # once, or the checks below consume it and the map silently decodes empty.
+    pairs = list(pairs)
+    if len(pairs) <= _MAX_KEYS_PER_HASH or all(type(k) is str for k, _ in pairs):  # too few to collide / SipHash
+        result = dict(pairs)
+    else:
+        result: dict[Any, Any] = {}
+        per_hash: dict[int, int] = {}
+        for k, v in pairs:
+            if k not in result:  # a repeated key overwrites; it adds no collider
+                h = hash(k)
+                per_hash[h] = per_hash.get(h, 0) + 1
+                if per_hash[h] > _MAX_KEYS_PER_HASH:
+                    raise InteropDecodeError(
+                        f"stored value has a map with more than {_MAX_KEYS_PER_HASH} distinct keys sharing one hash "
+                        "value: a hash-flood bound, not a framing error. The entry is likely forged."
+                    )
+            result[k] = v
     return _revive_sentinels(result)
 
 
@@ -525,7 +532,7 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     Readers accept any well-formed MessagePack document (canonical or not):
     a hashable non-str map key (int, float, bytes, ExtType, a revived temporal)
     decodes as-is, and an unhashable one raises InteropDecodeError, as does a
-    map with more than 32 distinct keys sharing one hash (a hash flood). Readers
+    map with more than _MAX_KEYS_PER_HASH distinct keys sharing one hash (a hash flood). Readers
     MUST consume exactly one document — trailing bytes are rejected
     (msgpack-python raises ExtraData). A CK v3 frame prefix gets the
     protocol#11 diagnostic instead of decoding its magic byte as int 67.
@@ -542,6 +549,8 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     # array/map key still fails as unhashable.
     try:
         return unpackb_bounded(raw, raw=False, strict_map_key=False, object_pairs_hook=_build_map)
+    except InteropDecodeError:
+        raise
     except Exception as e:
         raise InteropDecodeError(f"stored value is not a single well-formed MessagePack document: {e}") from e
 

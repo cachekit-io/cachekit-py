@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -212,21 +215,33 @@ def _map_document(pairs: list[tuple[Any, Any]]) -> bytes:
 class TestReaderHashFlood:
     """strict_map_key=False lets unseeded-hash keys in; the reader must bound their collisions."""
 
-    def test_timestamp_keys_sharing_one_hash_are_bounded(self):
+    def test_timestamp_keys_sharing_one_hash_are_bounded(self, monkeypatch: pytest.MonkeyPatch):
         keys = _colliding_timestamps(4000)
-        assert len({hash(k) for k in keys}) == 1 and len(set(keys)) == 4000
+        # Distinct by nanoseconds (set(keys) would itself run the flood); one hash, a tripwire if CPython's
+        # tuple hash ever changes and the construction stops colliding.
+        assert len({k.nanoseconds for k in keys}) == 4000 and len({hash(k) for k in keys}) == 1
         assert decode_interop_value(_map_document([(k, 0) for k in keys[:32]])) == dict.fromkeys(keys[:32], 0)
-        with pytest.raises(InteropDecodeError, match="distinct keys with one hash"):
+        with pytest.raises(InteropDecodeError, match="hash-flood bound"):
             decode_interop_value(_map_document([(k, 0) for k in keys[:33]]))
-        # The 4,000-key flood is refused at the 33rd collider instead of after ~8M comparisons.
-        with pytest.raises(InteropDecodeError, match="distinct keys with one hash"):
+        # The 4,000-key flood is refused at the 33rd collider, not after ~8M comparisons: count them, so a
+        # rewrite that builds the dict before counting fails here deterministically instead of only slowly.
+        compared = [0]
+        eq = msgpack.Timestamp.__eq__
+
+        def counting_eq(self: msgpack.Timestamp, other: object) -> bool:
+            compared[0] += 1
+            return eq(self, other)
+
+        monkeypatch.setattr(msgpack.Timestamp, "__eq__", counting_eq)
+        with pytest.raises(InteropDecodeError, match="hash-flood bound"):
             decode_interop_value(_map_document([(k, 0) for k in keys]))
+        assert compared[0] <= 2 * 33 * 33, compared[0]
 
     def test_float_keys_sharing_one_hash_are_bounded(self):
         # 2.0**a hashes to 2**(a mod 61): every a in one residue class collides, 34 of them in float64's range.
         keys = [2.0**a for a in range(-1074, 1024) if a % 61 == 5]
         assert len(keys) == 34 and len({hash(k) for k in keys}) == 1
-        with pytest.raises(InteropDecodeError, match="distinct keys with one hash"):
+        with pytest.raises(InteropDecodeError, match="hash-flood bound"):
             decode_interop_value(_map_document([(k, 0) for k in keys]))
 
     def test_repeated_key_is_not_counted_as_a_collider(self):
@@ -240,6 +255,41 @@ class TestReaderHashFlood:
         assert decode_interop_value(doc) == {"a": 1, msgpack.ExtType(1, b"*"): 2, b"k": 3, None: 4, 1.5: 5}
         revived = decode_interop_value(b"\x81" + msgpack.packb(sentinel) + b"\x01")
         assert revived == {datetime.fromisoformat(sentinel["value"]): 1}
+
+    def test_array_key_still_raises(self):
+        # {[1]: 1}: an array key is unhashable. Its TypeError now comes from building the map in _build_map.
+        with pytest.raises(InteropDecodeError) as excinfo:
+            decode_interop_value(bytes.fromhex("81910101"))
+        assert isinstance(excinfo.value.__cause__, TypeError)
+
+
+_PURE_PYTHON_CHECK = """
+import msgpack, msgpack.fallback
+assert msgpack.Unpacker is msgpack.fallback.Unpacker, "MSGPACK_PUREPYTHON did not select the fallback"
+from tests.unit.protocol import test_interop_vectors as t
+for v in t.VECTORS["value_vectors"]:
+    t.test_value_vectors(v)
+for v in t.VECTORS["reader_accept_vectors"]:
+    t.test_reader_accept_vectors(v)
+for v in t.VECTORS["reader_reject_vectors"]:
+    t.test_reader_reject_vectors(v)
+h = t.TestReaderHashFlood()
+h.test_float_keys_sharing_one_hash_are_bounded()
+h.test_repeated_key_is_not_counted_as_a_collider()
+h.test_non_str_key_types_still_decode()
+h.test_array_key_still_raises()
+"""
+
+
+def test_reader_vectors_under_msgpacks_pure_python_unpacker():
+    """msgpack falls back to a pure-Python unpacker without its C extension (PyPy, no wheel), and that one
+    hands object_pairs_hook a one-shot generator instead of a list. Run the reader's vectors under it."""
+    env = {**os.environ, "MSGPACK_PUREPYTHON": "1"}
+    root = Path(__file__).resolve().parents[3]
+    result = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code
+        [sys.executable, "-c", _PURE_PYTHON_CHECK], env=env, cwd=root, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_lone_surrogate_rejected():
