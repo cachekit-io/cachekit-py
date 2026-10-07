@@ -675,6 +675,34 @@ async def test_a_task_the_call_started_shares_its_misses_once_the_call_has_ended
     assert runs == 2
 
 
+@pytest.mark.parametrize("mode", ASYNC_MODES)
+async def test_a_self_rescheduling_chain_carries_no_ended_calls(mode: str) -> None:
+    """Each call starts the next generation from a task that outlives it. A call inherits only the
+    calls still running, so what it carries stays one deep however long the chain runs."""
+    generations = 8
+    depths: list[int] = []
+    gates = [asyncio.Event() for _ in range(generations)]
+    later: list[asyncio.Task[int]] = []
+
+    @_decorator(mode)
+    async def compute(x: int) -> int:
+        depths.append(len(single_flight._inside.get()))  # pyright: ignore[reportPrivateUsage]
+        if x + 1 < generations:
+
+            async def next_generation() -> int:
+                await gates[x].wait()
+                return await compute(x + 1)
+
+            later.append(asyncio.create_task(next_generation()))  # outlives this call
+        return x
+
+    assert await compute(0) == 0
+    for x in range(generations - 1):
+        gates[x].set()  # call x has returned, so it has ended
+        assert await asyncio.wait_for(later[x], 5) == x + 1
+    assert depths == [1] * generations
+
+
 def test_a_caller_on_another_event_loop_runs_its_own_call() -> None:
     """A caller never awaits a task bound to another thread's loop."""
     started = threading.Event()

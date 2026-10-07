@@ -172,7 +172,10 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
 
     async def _call_inside(self, key: FlightKey, call: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
         call_in = _Inside(self, key)
-        _inside.set((*_inside.get(), call_in))  # in the call's own task: its context is a copy, so the caller never sees it
+        # Only the calls still running: an ended one inherited from a task that outlived it would
+        # otherwise be copied into every later generation of a chain, and scanned on every miss.
+        running = tuple(c for c in _inside.get() if c.flights is not None)
+        _inside.set((*running, call_in))  # in the call's own task: its context is a copy, so the caller never sees it
         try:
             return await call()
         finally:
