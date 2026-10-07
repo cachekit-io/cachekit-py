@@ -20,7 +20,7 @@ class RedisBackendConfig(BaseBackendConfig):
     and Redis-specific performance tuning.
 
     Attributes:
-        redis_url: Redis server connection URL
+        redis_url: Redis server connection URL; left out of the config's repr, as it can carry a password
         connection_pool_size: Maximum connections in the Redis pool. When all are
             in use, an operation waits up to socket_timeout for one to be released
         socket_timeout: Socket read/write timeout in seconds (finite so a dead
@@ -52,6 +52,11 @@ class RedisBackendConfig(BaseBackendConfig):
         'redis://myhost:6380'
         >>> custom.connection_pool_size
         25
+
+        The URL is left out of the repr:
+
+        >>> "myhost" in repr(custom)
+        False
     """
 
     model_config = SettingsConfigDict(
@@ -63,6 +68,7 @@ class RedisBackendConfig(BaseBackendConfig):
         default="redis://localhost:6379",
         validation_alias=AliasChoices("CACHEKIT_REDIS_URL", "REDIS_URL"),
         description="Redis connection URL (env: CACHEKIT_REDIS_URL or REDIS_URL)",
+        repr=False,
     )
     connection_pool_size: int = Field(
         # Above the default executor's min(32, cpu_count + 4) threads, which async

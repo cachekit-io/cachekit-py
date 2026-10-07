@@ -63,7 +63,7 @@ class _LockingBackend(_MemoryBackend):
         except Exception as exc:
             if not self._redis_shaped:
                 raise
-            raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+            raise classify_redis_error(exc, operation="acquire_lock", key=key, keep_exception=True) from exc
         finally:
             self.locks_released += 1
 

@@ -14,8 +14,19 @@ from pydantic import SecretStr
 from cachekit.backends.base import BackendError
 from cachekit.backends.provider import CacheClientProvider, PooledClientProvider
 from cachekit.backends.redis.config import RedisBackendConfig
+from cachekit.backends.redis.error_handler import kept_cause
 from cachekit.config.validation import hide_secret, reveal_secret
 from cachekit.di import DIContainer
+
+
+def _command_error(command: str, operation: str, exc: Exception, key: Optional[str] = None) -> BackendError:
+    """The BackendError for a failed Redis command: a type-only message, and the cause ``kept_cause`` keeps."""
+    return BackendError(
+        message=f"Redis {command} failed: {type(exc).__name__}",
+        original_exception=kept_cause(exc),
+        operation=operation,
+        key=key,
+    )
 
 
 class RedisBackend:
@@ -23,6 +34,12 @@ class RedisBackend:
 
     Reuses existing CacheClientProvider infrastructure for connection management.
     Implements the four required operations: get, set, delete, exists.
+
+    A failed operation raises its BackendError outside the ``except`` block, from a
+    cause that keeps no redis-py frame (see ``kept_cause``), and from a frame that
+    holds no client in a local: a redis-py client's repr lists the password, and an
+    error tracker sends the locals of every frame on a raised error's traceback (CWE-532).
+    The frame deletes its ``error`` local as the error leaves.
 
     Examples:
         Create backend with explicit redis_url (requires running Redis):
@@ -116,10 +133,15 @@ class RedisBackend:
         try:
             return self._client_provider.get_sync_client()
         except Exception as e:
-            raise BackendError(
+            error = BackendError(
                 message=f"Failed to create Redis client: {type(e).__name__}",
+                original_exception=kept_cause(e),
                 operation="get_client",
-            ) from e
+            )
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def get(self, key: str) -> Optional[bytes]:
         """Retrieve value from Redis storage.
@@ -134,19 +156,18 @@ class RedisBackend:
             BackendError: If Redis operation fails
         """
         try:
-            client = self._get_client()
-            value = client.get(key)
+            value = self._get_client().get(key)
             # The pool is configured with decode_responses=False (see redis/client.py),
             # so Redis returns raw bytes, or None for a missing key. Cached payloads are
             # binary (LZ4/Arrow/AES ciphertext) and must never be UTF-8 decoded. The
             # isinstance check enforces the bytes|None contract without any str coercion.
             return value if isinstance(value, bytes) else None
         except Exception as e:
-            raise BackendError(
-                message=f"Redis GET failed: {type(e).__name__}",
-                operation="get",
-                key=key,
-            ) from e
+            error = _command_error("GET", "get", e, key)
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
         """Store value in Redis storage.
@@ -160,19 +181,19 @@ class RedisBackend:
             BackendError: If Redis operation fails
         """
         try:
-            client = self._get_client()
             if ttl is not None and ttl > 0:
                 # Use SETEX for TTL (combines SET + EXPIRE atomically)
-                client.setex(key, ttl, value)
+                self._get_client().setex(key, ttl, value)
             else:
                 # Use SET without expiry
-                client.set(key, value)
+                self._get_client().set(key, value)
+            return
         except Exception as e:
-            raise BackendError(
-                message=f"Redis SET failed: {type(e).__name__}",
-                operation="set",
-                key=key,
-            ) from e
+            error = _command_error("SET", "set", e, key)
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def delete(self, key: str) -> bool:
         """Delete key from Redis storage.
@@ -187,8 +208,7 @@ class RedisBackend:
             BackendError: If Redis operation fails
         """
         try:
-            client = self._get_client()
-            result = client.delete(key)
+            result = self._get_client().delete(key)
             # Redis DELETE returns number of keys deleted (0 or 1 for single key)
             if not isinstance(result, int):
                 raise BackendError(
@@ -198,11 +218,11 @@ class RedisBackend:
                 )
             return result > 0
         except Exception as e:
-            raise BackendError(
-                message=f"Redis DELETE failed: {type(e).__name__}",
-                operation="delete",
-                key=key,
-            ) from e
+            error = _command_error("DELETE", "delete", e, key)
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def _delete_many(self, keys: list[str]) -> set[str]:
         """Delete many keys in one ``UNLINK`` (internal: whole-function invalidation).
@@ -218,9 +238,13 @@ class RedisBackend:
             return set()
         try:
             self._get_client().unlink(*keys)
+            return set()
         except Exception as e:
-            raise BackendError(message=f"Redis UNLINK failed: {type(e).__name__}", operation="delete") from e
-        return set()
+            error = _command_error("UNLINK", "delete", e)
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def exists(self, key: str) -> bool:
         """Check if key exists in Redis storage.
@@ -235,8 +259,7 @@ class RedisBackend:
             BackendError: If Redis operation fails
         """
         try:
-            client = self._get_client()
-            result = client.exists(key)
+            result = self._get_client().exists(key)
             # Redis EXISTS returns number of keys that exist (0 or 1 for single key)
             if not isinstance(result, int):
                 raise BackendError(
@@ -246,11 +269,11 @@ class RedisBackend:
                 )
             return result > 0
         except Exception as e:
-            raise BackendError(
-                message=f"Redis EXISTS failed: {type(e).__name__}",
-                operation="exists",
-                key=key,
-            ) from e
+            error = _command_error("EXISTS", "exists", e, key)
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check Redis backend health status.

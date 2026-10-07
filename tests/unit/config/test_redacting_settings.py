@@ -7,6 +7,8 @@ model_validate* classmethods, a pydantic.TypeAdapter and a field of the caller's
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import dataclasses
 import json
 import pathlib
@@ -586,10 +588,21 @@ def _holds(value: object, texts: list[str], raw: list[bytes], depth: int = 0) ->
     return any(t in repr(value) for t in texts)
 
 
+def _held_exception(value: object) -> BaseException | None:
+    """The exception a frame local keeps alive without a tracker serialising it: the local itself, or what a failed
+    Future holds. Its own frames are on its traceback, so they still hold whatever they held."""
+    if isinstance(value, BaseException):
+        return value
+    if isinstance(value, (asyncio.Future, concurrent.futures.Future)) and value.done() and not value.cancelled():
+        return value.exception()
+    return None
+
+
 def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_caller: bool = False) -> list[str]:
     """Every ``frame:local`` under src/cachekit/ that holds ``secret`` on the traceback of ``exc`` or of any
-    exception reachable from it (``__cause__``/``__context__``, and a BackendError's ``original_exception``), or
-    with ``below_caller`` every frame but this test file's, third-party frames included.
+    exception reachable from it (``__cause__``/``__context__``, a BackendError's ``original_exception``, and an
+    exception or failed Future held in a local of a frame walked), or with ``below_caller`` every frame but this
+    test file's, third-party frames included.
 
     Error trackers capture frame locals by default (Sentry's ``include_local_variables``) and serialise
     containers item by item, and their scrubbers match top-level key names, so a raw key held in any local,
@@ -615,6 +628,7 @@ def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_c
                 for name, value in tb.tb_frame.f_locals.items():
                     if _holds(value, texts, raw):
                         found.append(f"{code.co_name}:{name}")
+                    pending.append(_held_exception(value))
             tb = tb.tb_next
     return found
 
