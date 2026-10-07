@@ -66,7 +66,7 @@ The sync backed path is not coalesced: each sync caller that misses reads L2 and
 - **Circuit breaker.** A joined caller makes no backend request and records no outcome. In HALF_OPEN it hands its probe slot straight back, so a herd spends one probe.
 - **Event loops.** Async callers share a call only on the event loop running it; a caller on another thread's loop runs its own.
 - **Task and context.** Every async miss runs the function in its own task, a lone caller's miss included, in a copy of the starting caller's context. A context variable the function sets is not visible to its caller afterwards. Anything scoped by `asyncio.current_task()` binds to that short-lived task, not to the caller's: SQLAlchemy's `async_scoped_session(scopefunc=current_task)`, used inside the function, creates a new session per miss, which the caller's `remove()` at the end of its request never cleans up. Pass such resources in as arguments, or scope them by a context variable instead.
-- **Waiting on yourself.** A function must not wait on another thread or task that calls it with the same arguments: that would wait on its own call. A direct recursive call on the same thread or task runs on its own.
+- **Waiting on yourself.** A call that misses its own key again from inside itself runs that inner call on its own instead of waiting on itself: a recursive call, a call through other cached functions (`a(1)` awaiting `b(1)`, which awaits `a(1)`), and, in async code, a call from a task it starts. Anything else that waits on its own key's call never returns: a function must not wait on a thread it starts that calls it with the same arguments, and two calls must not miss each other's keys at once (`a(1)` awaiting `b(1)` while another caller's `b(1)` awaits `a(1)`).
 
 ---
 

@@ -606,6 +606,38 @@ async def test_same_key_reentry_from_inside_the_call_runs_unshared() -> None:
     assert await asyncio.wait_for(compute(1), 5) == 2
 
 
+@pytest.mark.parametrize("mode", ASYNC_MODES)
+async def test_same_key_reentry_through_another_cached_call_runs_unshared(mode: str) -> None:
+    """compute(1) awaits compute(2), which awaits compute(1). compute(2)'s miss runs in a task of its
+    own, but the inner compute(1) is still inside compute(1)'s call: it must not wait on that call."""
+    entered: set[int] = set()
+
+    @_decorator(mode)
+    async def compute(x: int) -> int:
+        if x in entered:  # the guard that ends the cycle
+            return 0
+        entered.add(x)
+        return await compute(3 - x) + x
+
+    assert await asyncio.wait_for(compute(1), 5) == 3
+
+
+@pytest.mark.parametrize("mode", ASYNC_MODES)
+async def test_same_key_reentry_from_a_task_the_call_starts_runs_unshared(mode: str) -> None:
+    depth = 0
+
+    @_decorator(mode)
+    async def compute(x: int) -> int:
+        nonlocal depth
+        if depth == 0:
+            depth = 1
+            (inner,) = await asyncio.gather(compute(x))  # gather runs it in a task of its own
+            return inner + 1
+        return 1
+
+    assert await asyncio.wait_for(compute(1), 5) == 2
+
+
 def test_a_caller_on_another_event_loop_runs_its_own_call() -> None:
     """A caller never awaits a task bound to another thread's loop."""
     started = threading.Event()
@@ -925,7 +957,7 @@ def test_thread_flights_recheck_finds_a_value_stored_after_the_callers_lookup() 
     assert flights.run(("k",), call, lambda: (True, "stored")) == ("stored", True)
 
 
-def test_thread_flights_waiters_retry_after_an_interrupted_call() -> None:
+def test_thread_flights_waiters_retry_after_an_interrupted_call(waiting: list[int]) -> None:
     """A call ended by a non-Exception did not fail: its waiter starts its own instead of raising."""
 
     class _Interrupt(BaseException):
@@ -953,7 +985,7 @@ def test_thread_flights_waiters_retry_after_an_interrupted_call() -> None:
     result: list[tuple[str, bool]] = []
     second = threading.Thread(target=lambda: result.append(flights.run(("k",), lambda: "retried", lambda: (False, None))))
     second.start()
-    time.sleep(0.05)  # let the second thread wait on the first call
+    _until(lambda: waiting[0] == 1)  # the second thread waits on the first call
     gate.set()
     first.join(5)
     second.join(5)
