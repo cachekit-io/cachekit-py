@@ -638,6 +638,43 @@ async def test_same_key_reentry_from_a_task_the_call_starts_runs_unshared(mode: 
     assert await asyncio.wait_for(compute(1), 5) == 2
 
 
+@pytest.mark.parametrize("mode", ASYNC_MODES)
+async def test_a_task_the_call_started_shares_its_misses_once_the_call_has_ended(mode: str) -> None:
+    """A task started inside compute(1)'s call that outlives it is no longer inside it: its later
+    miss on the same key joins the call in flight, like any other caller's."""
+    runs = 0
+    go = asyncio.Event()
+    release = asyncio.Event()
+    started: list[asyncio.Task[int]] = []
+
+    @_decorator(mode)
+    async def compute(x: int) -> int:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+
+            async def later() -> int:
+                await go.wait()
+                return await compute(x)
+
+            started.append(asyncio.create_task(later()))  # outlives this call
+            return 0
+        await release.wait()
+        return runs
+
+    assert await compute(1) == 0
+    await compute.ainvalidate_cache(1)
+    herd = asyncio.create_task(compute(1))
+    for _ in range(10):  # the herd's call is running
+        await asyncio.sleep(0)
+    go.set()
+    for _ in range(10):  # time for the later task to reach the call, or to run its own
+        await asyncio.sleep(0)
+    release.set()
+    assert await asyncio.wait_for(asyncio.gather(herd, started[0]), 5) == [2, 2]
+    assert runs == 2
+
+
 def test_a_caller_on_another_event_loop_runs_its_own_call() -> None:
     """A caller never awaits a task bound to another thread's loop."""
     started = threading.Event()

@@ -30,12 +30,22 @@ _F = TypeVar("_F")
 
 FlightKey = tuple[Any, ...]
 
-# The async calls the running code is inside, as (map, flight key) pairs. A call's task adds its own
-# pair, and a task it starts inherits them, so a miss on one of them from inside is spotted wherever
-# it runs: joining that call would wait on itself.
-_inside: contextvars.ContextVar[frozenset[tuple[AsyncFlights, FlightKey]]] = contextvars.ContextVar(
-    "cachekit_single_flight_inside", default=frozenset()
-)
+
+class _Inside:
+    """An async call as the code inside it sees it: the map and key it runs for, until it ends."""
+
+    __slots__ = ("flights", "key")
+
+    def __init__(self, flights: AsyncFlights, key: FlightKey) -> None:
+        self.flights: AsyncFlights | None = flights
+        self.key = key
+
+
+# The async calls the running code is inside. A call's task adds its own, and a task it starts
+# inherits them, so a miss on one of them from inside is spotted wherever it runs: joining that call
+# would wait on itself. A call that has ended clears its own, so a task it started that outlives it
+# shares its misses like any other caller.
+_inside: contextvars.ContextVar[tuple[_Inside, ...]] = contextvars.ContextVar("cachekit_single_flight_inside", default=())
 
 
 def _not_cancelling() -> bool:
@@ -99,11 +109,11 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
     cancelled itself, runs its own call, unshared, as it would have run alone; 3.10 cannot tell the
     two apart, so there it gets the ``CancelledError``.
 
-    A miss on a key from inside that key's own call runs unshared, since joining would wait on
-    itself: from the call's task, from a cached call it awaits (which runs in a task of its own), or
-    from a task it starts. A task started outside the call still joins it, so two calls that miss
-    each other's keys wait on each other: ``a(1)``'s call awaiting ``b(1)`` joins another caller's
-    ``b(1)``, whose call then joins ``a(1)``'s.
+    A miss on a key from inside that key's own call, while it runs, runs unshared, since joining
+    would wait on itself: from the call's task, from a cached call it awaits (which runs in a task
+    of its own), or from a task it starts. A task started outside the call still joins it, so two
+    calls that miss each other's keys wait on each other: ``a(1)``'s call awaiting ``b(1)`` joins
+    another caller's ``b(1)``, whose call then joins ``a(1)``'s.
 
     Callers share a call only on the event loop running it: a caller never awaits a task bound to
     another thread's loop. A caller that finds its key's call running on another loop runs its own
@@ -125,8 +135,7 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
         caller that starts one. ``on_join`` runs each time a caller joins, before it waits. The
         call's exception is raised in every caller sharing it.
         """
-        inside = _inside.get()
-        if (self, key) in inside:
+        if any(call_in.flights is self and call_in.key == key for call_in in _inside.get()):
             # Re-entered from inside its own call: directly, through other cached calls (each runs
             # in a task of its own), or from a task the call started. Joining would wait on itself.
             return await call(), False
@@ -154,17 +163,20 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
         # inside create_task, and that may be a cached call on this same function, or a trip's L2
         # read. A forget since the lookup (an invalidation, on any thread) may have come after that
         # read: the call then stays out of the map, so no read that starts after the forget joins it.
-        flight = _AsyncFlight(loop.create_task(self._call_inside(inside | {(self, key)}, call)))
+        flight = _AsyncFlight(loop.create_task(self._call_inside(key, call)))
         with self._lock:
             if self._forgets == forgets:
                 self._flights[key] = flight  # replaces only a settled call, or one on a loop that no longer runs
         flight.task.add_done_callback(functools.partial(self._drop, key, flight))
         return await self._wait(key, flight), False
 
-    @staticmethod
-    async def _call_inside(inside: frozenset[tuple[AsyncFlights, FlightKey]], call: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
-        _inside.set(inside)  # in the call's own task: its context is a copy, so the caller never sees it
-        return await call()
+    async def _call_inside(self, key: FlightKey, call: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
+        call_in = _Inside(self, key)
+        _inside.set((*_inside.get(), call_in))  # in the call's own task: its context is a copy, so the caller never sees it
+        try:
+            return await call()
+        finally:
+            call_in.flights = None  # ended: a task it started that outlives it is no longer inside it
 
     async def _wait(self, key: FlightKey, flight: _AsyncFlight) -> Any:
         flight.waiters += 1
