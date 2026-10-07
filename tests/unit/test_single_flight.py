@@ -488,7 +488,7 @@ async def test_a_cancelled_invalidation_still_forgets_trips_that_started_during_
     with pytest.raises(asyncio.CancelledError):
         await invalidation
     backend.finish_delete.set()
-    await _until_async(lambda: forgets == 2)  # the worker forgot again after its delete
+    await _until_async(lambda: forgets == 1)  # the worker forgot after its delete
 
     after = asyncio.create_task(fn(1))
     for _ in range(10):
@@ -945,6 +945,30 @@ def test_forked_child_never_waits_on_a_lock_a_parent_thread_held(flights_type: t
 
 async def _const_coro() -> str:
     return "v"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="asyncio.eager_task_factory is new in Python 3.12")
+async def test_async_flights_keep_out_a_call_that_ran_past_a_forget_before_its_insert() -> None:
+    """Under an eager task factory, create_task runs the call up to its first await (a trip's L2
+    read) before run() puts it in the map. An invalidation that forgets the key in that gap must
+    keep it out of the map: a read that starts afterwards never joins a call that read before it."""
+    flights = AsyncFlights()
+    loop = asyncio.get_running_loop()
+    release = asyncio.Event()
+
+    async def read_then_invalidated() -> str:
+        flights.forget(["k"])  # the invalidation lands after this call's read, before the insert
+        await release.wait()
+        return "old"
+
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        first = asyncio.ensure_future(flights.run(("k",), read_then_invalidated))
+        assert await asyncio.wait_for(flights.run(("k",), _const_coro), 5) == ("v", False)
+    finally:
+        loop.set_task_factory(None)
+        release.set()
+    assert await first == ("old", False)
 
 
 def test_thread_flights_recheck_finds_a_value_stored_after_the_callers_lookup() -> None:

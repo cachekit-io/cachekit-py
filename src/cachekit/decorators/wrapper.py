@@ -1558,10 +1558,9 @@ def create_cache_wrapper(
         _thread_flights.forget(cache_keys)
 
     def _delete_then_forget(cache_keys: list[str] | None) -> None:
-        """Delete these keys (all, for None), then forget their calls in flight again: a trip that
-        started while the delete ran may have read the old entry. One call, so the second forget
-        runs after the delete wherever the delete runs, even in a worker an async caller stopped
-        waiting for."""
+        """Delete these keys (all, for None), then forget their calls in flight: one that started
+        before the delete ended may have read the old entry. One call, so the forget runs after the
+        delete wherever the delete runs, even in a worker an async caller stopped waiting for."""
         try:
             if cache_keys is None:
                 _drain_all()
@@ -2979,17 +2978,15 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
-        # Calls in flight are forgotten before the deletes and again after them (_delete_then_forget):
-        # a read that starts after this returns must not join a miss that started before it.
+        # Calls in flight are forgotten after the deletes (_delete_then_forget): a read that starts
+        # after this returns must not join a miss that started before it.
         if not args and not kwargs and _func_has_params:
-            _forget_flights(None)
             _delete_then_forget(None)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288).
         cache_keys = _resolve_invalidation_keys(args, kwargs)
-        _forget_flights(cache_keys)
         _delete_then_forget(cache_keys)
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
@@ -3011,9 +3008,8 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
-            _forget_flights(None)  # before and after the deletes, as in invalidate_cache
             # Off the event loop: every L2 call in here is a sync Redis/backend round-trip. The worker
-            # forgets again after its deletes even if this caller is cancelled while it runs.
+            # forgets the calls in flight after its deletes even if this caller is cancelled while it runs.
             await asyncio.to_thread(_delete_then_forget, None)
             return
 
@@ -3023,7 +3019,6 @@ def create_cache_wrapper(
         # async client per provider, whose pool stays bound to the first event loop that used it
         # (asyncio.run per job).
         cache_keys = _resolve_invalidation_keys(args, kwargs)
-        _forget_flights(cache_keys)
         await asyncio.to_thread(_delete_then_forget, cache_keys)
 
     def check_health() -> dict[str, Any]:

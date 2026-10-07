@@ -45,13 +45,14 @@ def _not_cancelling() -> bool:
 
 
 class _FlightMap(Generic[_F]):
-    """A flight map, its lock, and the PID that owns them."""
+    """A flight map, its lock, the PID that owns them, and how many forgets it has seen."""
 
-    __slots__ = ("_flights", "_lock", "_pid")
+    __slots__ = ("_flights", "_forgets", "_lock", "_pid")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._flights: dict[FlightKey, _F] = {}
+        self._forgets = 0  # AsyncFlights.run inserts a call only if no forget ran since its lookup
         self._pid = os.getpid()
 
     def _owned(self) -> None:
@@ -68,6 +69,7 @@ class _FlightMap(Generic[_F]):
         """
         self._owned()
         with self._lock:
+            self._forgets += 1
             if cache_keys is None:
                 self._flights.clear()
                 return
@@ -132,6 +134,7 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
         loop = asyncio.get_running_loop()
         with self._lock:
             flight = self._flights.get(key)
+            forgets = self._forgets
         if flight is not None and not flight.task.done():
             task_loop = flight.task.get_loop()
             if task_loop is loop:
@@ -148,10 +151,13 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
             if task_loop.is_running():
                 return await call(), False  # the call runs on another thread's loop: never await it
         # Created outside the lock: an eager task factory runs the call up to its first await
-        # inside create_task, and that may be a cached call on this same function.
+        # inside create_task, and that may be a cached call on this same function, or a trip's L2
+        # read. A forget since the lookup (an invalidation, on any thread) may have come after that
+        # read: the call then stays out of the map, so no read that starts after the forget joins it.
         flight = _AsyncFlight(loop.create_task(self._call_inside(inside | {(self, key)}, call)))
         with self._lock:
-            self._flights[key] = flight  # replaces only a settled call, or one on a loop that no longer runs
+            if self._forgets == forgets:
+                self._flights[key] = flight  # replaces only a settled call, or one on a loop that no longer runs
         flight.task.add_done_callback(functools.partial(self._drop, key, flight))
         return await self._wait(key, flight), False
 
