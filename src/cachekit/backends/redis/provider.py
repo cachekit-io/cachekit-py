@@ -604,9 +604,21 @@ class PerRequestRedisBackend:
                     await _release()
             return
         except Exception as exc:
+            if body_error is not None and exc is not body_error:
+                # _release_sync logs a redis-py failure itself; anything else would vanish behind the block's exception.
+                logger.warning(
+                    "Redis lock release for %s failed (%s) after the block raised; raising the block's exception",
+                    redact_cache_key(key),
+                    redact_error_for_log(exc),
+                )
             # The block's own exception wins, even over a release that failed after it, and is kept whole.
             failed = exc if body_error is None else body_error
             error = classify_redis_error(failed, operation="acquire_lock", key=key, keep_exception=failed is body_error)
+        except BaseException:
+            # A cancel during the release after the block raised: the block's exception, on whose traceback this frame
+            # is, must not stay in a local here either.
+            attempt = body_error = None
+            raise
         try:
             raise error from error.original_exception
         finally:

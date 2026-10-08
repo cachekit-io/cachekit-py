@@ -17,11 +17,14 @@ either: that is a reference cycle, and the frame, the payload with it, waits for
 from __future__ import annotations
 
 import asyncio
+import errno
 import gc
+import logging
 import pathlib
 import pickle
 import socket
 import threading
+import types
 import uuid
 from collections.abc import Callable, Iterator
 from typing import BinaryIO
@@ -36,6 +39,7 @@ from cachekit.backends.redis.backend import RedisBackend
 from cachekit.backends.redis.client import reset_global_pool
 from cachekit.backends.redis.error_handler import RedisClientError, classify_redis_error
 from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider
+from cachekit.hash_utils import redact_cache_key
 from tests.unit.config.test_redacting_settings import _CACHEKIT_SRC, _cachekit_locals_holding, _held_exception
 
 pytestmark = [pytest.mark.unit, pytest.mark.security]
@@ -106,8 +110,11 @@ class _FakeRedis:
         for conn in self._conns:
             try:
                 conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass  # already closed
+            except OSError as exc:
+                # Closed on our side, or by the client. Anything else may leave a connection authenticated, and a
+                # ``wrongpass`` case would quietly run as a ``dropped`` one.
+                if exc.errno not in (errno.EBADF, errno.ENOTCONN):
+                    raise
 
     def close(self) -> None:
         self._sock.close()
@@ -167,6 +174,10 @@ def _raised(call: Callable[[], object], expected: type[Exception] = BackendError
     pytest.fail("the operation did not fail")
 
 
+def _in_cachekit(frame: types.FrameType) -> bool:
+    return pathlib.Path(frame.f_code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC)
+
+
 def _cachekit_frames_holding_an_exception(err: BaseException) -> list[str]:
     """Every ``frame:local`` of a cachekit frame on the traceback of ``err``, or of the exceptions it chains, that
     holds an exception or a failed Future: a reference cycle through the traceback, or redis-py's exception kept
@@ -182,7 +193,7 @@ def _cachekit_frames_holding_an_exception(err: BaseException) -> list[str]:
         pending += [current.__cause__, current.__context__, getattr(current, "original_exception", None)]
         tb = current.__traceback__
         while tb is not None:
-            if pathlib.Path(tb.tb_frame.f_code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC):
+            if _in_cachekit(tb.tb_frame):
                 found += [
                     f"{tb.tb_frame.f_code.co_name}:{name}"
                     for name, value in tb.tb_frame.f_locals.items()
@@ -190,6 +201,24 @@ def _cachekit_frames_holding_an_exception(err: BaseException) -> list[str]:
                 ]
             tb = tb.tb_next
     return found
+
+
+def _left_for_the_cyclic_gc() -> list[str]:
+    """Every cachekit frame, and every exception redis-py, cachekit or a test raised, that only the cyclic GC can free
+    now. Disable the GC before the failure: a collection in between would free them unseen. Exceptions from elsewhere are
+    left out: a thread another test left running may raise one meanwhile."""
+    gc.set_debug(gc.DEBUG_SAVEALL)  # what collect() finds unreachable stays in gc.garbage
+    try:
+        gc.collect()
+        return [
+            f"frame {obj.f_code.co_name}" if isinstance(obj, types.FrameType) else type(obj).__name__
+            for obj in gc.garbage
+            if (isinstance(obj, types.FrameType) and _in_cachekit(obj))
+            or (isinstance(obj, BaseException) and type(obj).__module__.partition(".")[0] in ("redis", "cachekit", "tests"))
+        ]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
 
 
 def _assert_class_only_cause(err: BackendError, exc_type: type[Exception]) -> None:
@@ -369,10 +398,10 @@ def test_a_cancel_during_a_failing_lock_attempt_reaches_no_frame_holding_the_pas
 
 
 def test_the_blocks_exception_wins_over_a_release_that_fails_after_it(
-    fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch
+    fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A release that fails with an error redis-py did not raise (an executor shut down at exit) must not replace the
-    block's own exception: the decorator re-raises that from ``original_exception``."""
+    block's own exception: the decorator re-raises that from ``original_exception``. The release failure is logged."""
 
     def release(self: object) -> None:
         raise RuntimeError("cannot schedule new futures after shutdown")
@@ -382,36 +411,99 @@ def test_the_blocks_exception_wins_over_a_release_that_fails_after_it(
     backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
     exc = _BlockError("raised in the block")
 
-    err = _raised(lambda: asyncio.run(_raise_in_lock(backend, exc)))  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger="cachekit.backends.redis.provider"):
+        err = _raised(lambda: asyncio.run(_raise_in_lock(backend, exc)))  # type: ignore[arg-type]
 
     assert isinstance(err, BackendError)
     assert err.original_exception is exc
     assert _cachekit_frames_holding_an_exception(err) == []
+    [record] = [r for r in caplog.records if r.name == "cachekit.backends.redis.provider"]
+    assert record.levelno == logging.WARNING
+    assert "RuntimeError" in record.getMessage()
+    assert redact_cache_key("k") in record.getMessage()
 
 
-_SYNC_FAILURES: dict[str, Callable[[str], object]] = {
-    "redis-backend-set": lambda url: RedisBackend(redis_url=url).set("k", b"v" * 1_000_000),
-    "provider-backend-set": lambda url: RedisBackendProvider(url).get_shared_backend().set("k", b"v" * 1_000_000),
-}
+async def _a_cancel_during_the_release_after_the_block_raised(
+    backend: PerRequestRedisBackend, releasing: threading.Event, release: threading.Event
+) -> list[str]:
+    """``acquire_lock`` cancelled while it releases the lock after its block raised; what only the cyclic GC can free
+    once the cancel is caught. Checked in this coroutine: ``asyncio.run`` keeps the exception it returns in a cycle."""
 
+    async def raise_in_lock() -> None:
+        async with backend.acquire_lock("k", timeout=5):
+            raise _BlockError("raised in the block")  # held in no local: that would be the test's own cycle
 
-@pytest.mark.parametrize("call", _SYNC_FAILURES, ids=_SYNC_FAILURES.keys())
-def test_a_failed_write_is_freed_without_the_cyclic_gc(fake_redis: Callable[..., _FakeRedis], password: str, call: str) -> None:
-    """Freed by reference counting alone: its frames, and the payload they hold, do not wait for the cyclic GC while
-    Redis is down."""
-    url = _url(fake_redis(refusing=False), password)
     gc.collect()
     gc.disable()
     try:
-        err = _raised(lambda: _SYNC_FAILURES[call](url.get_secret_value()))
-        assert isinstance(err, BackendError)
-        gc.set_debug(gc.DEBUG_SAVEALL)  # what collect() finds unreachable stays in gc.garbage
-        del err
-        gc.collect()
-        assert [obj for obj in gc.garbage if isinstance(obj, BackendError)] == []
+        task = asyncio.ensure_future(raise_in_lock())
+        await asyncio.to_thread(releasing.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.05)  # the cancel reaches acquire_lock, which keeps draining the release
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            pytest.fail("acquire_lock was not cancelled")
+        del task
+        await asyncio.sleep(0)  # the task step that threw the cancel in here holds it until this coroutine yields
+        return _left_for_the_cyclic_gc()
     finally:
-        gc.set_debug(0)
-        gc.garbage.clear()
+        gc.enable()
+
+
+def test_a_cancel_during_the_release_after_the_block_raised_is_freed_without_the_cyclic_gc(
+    fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    releasing, release = threading.Event(), threading.Event()
+
+    def wait_for_release(self: object) -> None:
+        releasing.set()
+        release.wait(5)
+
+    monkeypatch.setattr(redis.lock.Lock, "release", wait_for_release)
+    server = fake_redis(refusing=False, serving={b"SET": b"+OK\r\n"})
+    backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
+
+    left = asyncio.run(_a_cancel_during_the_release_after_the_block_raised(backend, releasing, release))  # type: ignore[arg-type]
+
+    assert left == []
+
+
+# Each write fails once the backend is built: the connection drops, Redis is loading its dataset after a restart, or it
+# refuses a rotated password.
+_WRITE_FAILURES: dict[str, dict[bytes, bytes]] = {
+    "dropped": {},
+    "loading": {b"SET": b"-LOADING Redis is loading the dataset in memory\r\n"},
+    "wrongpass": {},
+}
+
+_WRITERS: dict[str, Callable[[str], RedisBackend | PerRequestRedisBackend]] = {
+    "redis-backend": lambda url: RedisBackend(redis_url=url),
+    "provider-backend": lambda url: RedisBackendProvider(url).get_shared_backend(),
+}
+
+
+@pytest.mark.parametrize("failure", _WRITE_FAILURES)
+@pytest.mark.parametrize("built", _WRITERS)
+def test_a_failed_write_is_freed_without_the_cyclic_gc(
+    fake_redis: Callable[..., _FakeRedis], password: str, built: str, failure: str
+) -> None:
+    """Freed by reference counting alone: its frames, the payload they hold, and redis-py's exception do not wait for the
+    cyclic GC. redis-py raises a LOADING or WRONGPASS reply from a local, a reference cycle in its own frame, which the
+    traceback runs through."""
+    server = fake_redis(refusing=False, serving=_WRITE_FAILURES[failure])
+    backend = _WRITERS[built](_url(server, password).get_secret_value())
+    if failure == "wrongpass":
+        server.refuse_from_now()
+    gc.collect()
+    gc.disable()
+    try:
+        _raised(lambda: backend.set("k", b"v" * 1_000_000))
+        assert _left_for_the_cyclic_gc() == []
+    finally:
         gc.enable()
 
 
