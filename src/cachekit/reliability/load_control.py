@@ -199,17 +199,27 @@ class _Permit(ContextDecorator):
                 raise BackendError("Request queue full", error_type=BackendErrorType.TRANSIENT)
             c._queue_depth += 1  # We're now in the queue
 
-        # Phase 2: Try to acquire execution permit. We leave the queue however the
-        # wait ends: permit, timeout, or an exception (KeyboardInterrupt included).
+        # Phase 2: Try to acquire execution permit. Until __enter__ returns, __exit__ will
+        # not run, so any exception from here on (KeyboardInterrupt included) must undo
+        # both the queue slot and an acquired permit itself.
+        acquired = False
+        in_queue = True
         try:
             acquired = c._semaphore.acquire(timeout=c.timeout)
-        finally:
             with c._lock:
                 c._queue_depth -= 1
-        if not acquired:
-            with c._lock:
-                c._rejected_count += 1
-            raise BackendError("Failed to acquire permit", error_type=BackendErrorType.TIMEOUT)
+                in_queue = False
+                if not acquired:
+                    c._rejected_count += 1
+            if not acquired:
+                raise BackendError("Failed to acquire permit", error_type=BackendErrorType.TIMEOUT)
+        except BaseException:
+            if in_queue:
+                with c._lock:
+                    c._queue_depth -= 1
+            if acquired:
+                c._semaphore.release()
+            raise
 
     def __exit__(self, *exc_info: object) -> None:
         self._controller._semaphore.release()

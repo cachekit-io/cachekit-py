@@ -222,3 +222,41 @@ class TestPermitObject:
         assert guarded(2) == 4
         assert seen == [1, 1]
         _idle(controller)
+
+
+class _InterruptingLock:
+    """A lock whose Nth entry raises KeyboardInterrupt, as a signal landing there would."""
+
+    def __init__(self, interrupt_on: int) -> None:
+        self._lock = threading.Lock()
+        self._entries = 0
+        self._interrupt_on = interrupt_on
+
+    def __enter__(self) -> None:
+        self._entries += 1
+        if self._entries == self._interrupt_on:
+            raise KeyboardInterrupt
+        self._lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._lock.release()
+
+
+@pytest.mark.unit
+class TestInterruptAfterAcquire:
+    @CONTROLLERS
+    def test_interrupt_while_leaving_the_queue_keeps_the_permit(self, cls):
+        """An interrupt after the permit is acquired, before the block starts, must not lose the permit.
+
+        Entry 1 is queue admission; entry 2 is leaving the queue once the permit is held.
+        """
+        controller = cls(max_concurrent=1, timeout=0.05)
+        controller._lock = _InterruptingLock(interrupt_on=2)
+        with pytest.raises(KeyboardInterrupt):
+            with controller.acquire():
+                pytest.fail("entered the block after an interrupt")
+        assert controller._semaphore._value == 1, "the acquired permit leaked"
+        with controller.acquire():  # the single permit is still usable
+            pass
+        if cls is BackpressureController:
+            assert controller.queue_depth == 0  # the old generator left the queue count one too high here
