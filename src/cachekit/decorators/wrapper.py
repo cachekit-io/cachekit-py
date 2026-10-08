@@ -1800,11 +1800,13 @@ def create_cache_wrapper(
         # an encrypted entry's AAD binds the backend's key prefix, which is unknown until
         # then, so an entry another wrapper wrote here would read as tampered.
         if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
+            l1_start = time.perf_counter()
             l1_found, l1_bytes = _l1_cache.get(cache_key)
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                 try:
                     l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
+                    l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
                     # Record L1 cache hit metrics
                     if features.collect_stats:
@@ -1813,7 +1815,7 @@ def create_cache_wrapper(
                             namespace=namespace or "default",
                             serializer="l1_memory",
                             success=True,
-                            duration_ms=0.001,  # ~1μs for L1 hit
+                            duration_ms=l1_duration_ms,
                             size_bytes=len(l1_bytes),
                         )
 
@@ -1822,7 +1824,7 @@ def create_cache_wrapper(
                         key=cache_key,
                         namespace=namespace or "default",
                         serializer="l1_memory",
-                        duration_ms=0.001,
+                        duration_ms=l1_duration_ms,
                         hit=True,
                         ttl=ttl,
                     )
@@ -1934,7 +1936,7 @@ def create_cache_wrapper(
 
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
-        start_time = time.time()
+        start_time = time.perf_counter()
         try:
             refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
 
@@ -1956,7 +1958,7 @@ def create_cache_wrapper(
             else:
                 cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
 
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
 
             if cached_result is not None:
                 # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
@@ -2014,7 +2016,7 @@ def create_cache_wrapper(
             raise
         except Exception as e:
             # Cache GET failed - execute function without caching
-            get_duration_ms = (time.time() - start_time) * 1000
+            get_duration_ms = (time.perf_counter() - start_time) * 1000
             features.handle_cache_error(
                 error=e,
                 operation="cache_get",
@@ -2045,11 +2047,15 @@ def create_cache_wrapper(
                 features.release_probe(probe_cycle)
                 raise
 
-            # Serialize and cache the result
+            # Serialize and cache the result. The `set` sample times serialization plus the store,
+            # the same span as the async write: store_result serializes, and the clock stops when it
+            # returns, before the L1 put and the key-registry write.
+            set_start = time.perf_counter()
             try:
                 # Store using operation handler (pass args/kwargs for tenant extraction)
                 # Returns serialized bytes for L1 cache storage
                 outcome = operation_handler.store_result(cache_key, result, ttl, args, kwargs, stale_ttl=_stale_ttl)
+                set_duration_ms = (time.perf_counter() - set_start) * 1000
 
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
                 _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
@@ -2060,12 +2066,11 @@ def create_cache_wrapper(
                 features.record_success()
 
                 if features.collect_stats:
-                    total_latency = (time.time() - start_time) * 1000
                     features.record_cache_operation(
                         operation="set",
                         namespace=namespace or "default",
                         success=True,
-                        duration_ms=total_latency,
+                        duration_ms=set_duration_ms,
                         serializer="rust",
                     )
 
@@ -2077,7 +2082,7 @@ def create_cache_wrapper(
                 raise
             except Exception as e:
                 # Caching failed but function succeeded - return result anyway
-                set_duration_ms = (time.time() - start_time) * 1000
+                set_duration_ms = (time.perf_counter() - set_start) * 1000
                 features.handle_cache_error(
                     error=e,
                     operation="cache_set",
@@ -2189,11 +2194,13 @@ def create_cache_wrapper(
             # Before admission and recording no breaker outcome, and only once the backend is
             # resolved, as in sync_wrapper (LAB-5351).
             if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
+                l1_start = time.perf_counter()
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                     try:
                         l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
+                        l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
                         # Record L1 cache hit metrics (same labels as the sync L1 hit)
                         if features.collect_stats:
@@ -2202,7 +2209,7 @@ def create_cache_wrapper(
                                 namespace=namespace or "default",
                                 serializer="l1_memory",
                                 success=True,
-                                duration_ms=0.001,  # Sub-microsecond
+                                duration_ms=l1_duration_ms,
                                 size_bytes=len(l1_bytes),
                             )
 
@@ -2565,6 +2572,9 @@ def create_cache_wrapper(
                     else:
                         # Serialize and cache the result
                         serialized_data = None  # stays None if serialization fails: no envelope to share
+                        # `set` times serialization plus the store, as the sync write does: not the
+                        # lock wait, the double-check read or the function, nor the L1 put after it.
+                        set_start = time.perf_counter()
                         try:
                             serialized_data = operation_handler.serialization_handler.serialize_data(
                                 result, args, kwargs, cache_key=cache_key
@@ -2577,6 +2587,7 @@ def create_cache_wrapper(
                                 ttl=ttl,
                                 stale_ttl=_stale_ttl,
                             )
+                            set_duration_ms = (time.perf_counter() - set_start) * 1000
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
                             _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
@@ -2584,7 +2595,6 @@ def create_cache_wrapper(
                                 await _track_and_record_async(cache_key)
 
                             # Record successful cache set
-                            set_duration_ms = (time.perf_counter() - start_time) * 1000
                             features.record_success()
 
                             if features.collect_stats:
@@ -2603,7 +2613,7 @@ def create_cache_wrapper(
                             raise
                         except Exception as e:
                             # Caching failed but function succeeded - return result anyway
-                            set_duration_ms = (time.perf_counter() - start_time) * 1000
+                            set_duration_ms = (time.perf_counter() - set_start) * 1000
                             features.handle_cache_error(
                                 error=e,
                                 operation="cache_set",
@@ -2687,6 +2697,7 @@ def create_cache_wrapper(
 
         # Serialize and cache the result
         serialized_data = None
+        set_start = time.perf_counter()  # `set` times serialization plus the store (see the locked write)
         try:
             serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
 
@@ -2697,6 +2708,7 @@ def create_cache_wrapper(
                 ttl=ttl,
                 stale_ttl=_stale_ttl,
             )
+            set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
             _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
@@ -2704,7 +2716,6 @@ def create_cache_wrapper(
                 await _track_and_record_async(cache_key)
 
             # Record successful cache set
-            set_duration_ms = (time.perf_counter() - start_time) * 1000
             features.record_success()
 
             if features.collect_stats:
@@ -2722,7 +2733,7 @@ def create_cache_wrapper(
             raise
         except Exception as e:
             # Caching failed but function succeeded - return result anyway
-            set_duration_ms = (time.perf_counter() - start_time) * 1000
+            set_duration_ms = (time.perf_counter() - set_start) * 1000
             features.handle_cache_error(
                 error=e,
                 operation="cache_set",
