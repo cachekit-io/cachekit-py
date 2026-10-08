@@ -140,6 +140,22 @@ An operation slower than 1000 ms, or a payload larger than 256 MiB, counts only 
 that falls there reads as the top finite bound. Both histograms record one observation per operation
 whose value is above zero, whichever recording mode the collector is in.
 
+What each `cache_operation_duration_ms` series times, measured with a monotonic clock
+(`time.perf_counter`):
+
+| Series | Span |
+|---|---|
+| `operation="get"`, `serializer="l1_memory"` | The L1 lookup plus deserialization (decryption included for an encrypted cache) |
+| `operation="get"`, `serializer="rust"` | The L2 read of a hit |
+| `operation="set"` | Serialization plus the L2 write: not the miss read, the function, a lock wait, the L1 put or key tracking |
+
+> **Changed durations.** Earlier releases recorded every L1 hit as a constant 0.001 ms, and timed
+> `set` from before the L2 read, so each `set` sample also held the miss round trip and the
+> decorated function's own run time, plus the lock wait and a second read on the async locked path.
+> After upgrading, the `set` series drops by about one read round trip plus the function's time
+> (more on the locked path), and the L1 `get` series shows real values instead of the constant.
+> That step is the fix, not a regression.
+
 > **Changed `le` values.** Releases before these bounds used prometheus_client's default buckets
 > (0.005 to 10), sized for seconds, so nearly every operation and every payload landed in `+Inf`. The
 > `le` label values are now different. Re-check any dashboard panel or recording rule that selects
