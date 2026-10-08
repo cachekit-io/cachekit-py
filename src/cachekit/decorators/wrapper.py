@@ -833,6 +833,25 @@ def create_cache_wrapper(
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
+    _handler_backend = None  # the backend operation_handler's StandardCacheHandler was built for
+
+    def _install_cache_handler(resolved: BaseBackend) -> None:
+        """Install a StandardCacheHandler for the resolved backend, building it only when that backend changed.
+
+        Its other inputs (features.backpressure, ttl_refresh_threshold) are fixed per decorated
+        function, so building one per call was throwaway work on every backed call. Keyed on the
+        backend's identity, so a backend first resolved by invalidate_cache() still gets its handler.
+        """
+        nonlocal _handler_backend
+        if _handler_backend is not resolved:
+            operation_handler.set_cache_handler(
+                StandardCacheHandler(
+                    resolved,
+                    backpressure_controller=features.backpressure,
+                    ttl_refresh_threshold=ttl_refresh_threshold,
+                )
+            )
+            _handler_backend = resolved
 
     # ---- Backed-mode stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate) ----
     # Past-TTL SWR: the backend keeps serving an entry for a stale-grace window past
@@ -1893,13 +1912,7 @@ def create_cache_wrapper(
                 _backend = _resolve_lazy_backend()
                 _l2_scope()  # first call: the tenant check above ran before the backend existed
 
-            # Setup cache handler strategy on first use
-            handler = StandardCacheHandler(
-                _backend,
-                backpressure_controller=features.backpressure,
-                ttl_refresh_threshold=ttl_refresh_threshold,
-            )
-            operation_handler.set_cache_handler(handler)
+            _install_cache_handler(_backend)
         except UnsupportedTenantError:
             # From the first-call check above, or from a provider that checks the tenant while
             # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
@@ -2282,13 +2295,7 @@ def create_cache_wrapper(
                 asyncio.get_running_loop().run_in_executor(None, invalidation.start_listener, _backend)
             twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
 
-            # Update operation handler with the backend (sync or async)
-            handler = StandardCacheHandler(
-                _backend,
-                backpressure_controller=features.backpressure,
-                ttl_refresh_threshold=ttl_refresh_threshold,
-            )
-            operation_handler.set_cache_handler(handler)
+            _install_cache_handler(_backend)
 
             # Every concurrent miss on this key in this process shares one trip (single_flight). The
             # identity carries the backend's per-context key prefix and, in multi-tenant encryption,
