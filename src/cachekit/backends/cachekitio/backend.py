@@ -468,7 +468,7 @@ class CachekitIOBackend:
         """One attempt on this process's client, any status. Raises BackendError for a transport failure."""
         # Held for the whole request: a concurrent re-lease must not close this client under it.
         lease = self._own_lease()
-        handled_before = sys.exc_info()[1]
+        _, handled_before, handled_traceback = sys.exc_info()
         try:
             try:
                 return lease.client.request(method, url, body=body, headers=headers)
@@ -476,9 +476,10 @@ class CachekitIOBackend:
                 error = classify_http_error(exc, operation=method.lower())
                 # The error keeps only urllib3's exception class, so nothing needs these tracebacks. urllib3's frames on
                 # them hold its exceptions in locals, a reference cycle, and a frame holds its caller: this frame, and the
-                # request body, would wait for the cyclic GC.
+                # request body, would wait for the cyclic GC. A client re-raising the exception the caller is handling
+                # adds the request's frames to its traceback: it gets back the one it came in with.
                 for raised in _raised_during_request(exc, handled_before):
-                    raised.__traceback__ = None
+                    raised.__traceback__ = handled_traceback if raised is handled_before else None
                 raised = None  # this frame is on the error's traceback: it must hold no urllib3 exception
         except BaseException as exc:
             # An interrupt (a worker timeout's SystemExit, KeyboardInterrupt, gevent.Timeout), here or in the handler
@@ -488,7 +489,7 @@ class CachekitIOBackend:
             # frame is still executing and is skipped, so it must hold no key-bearing local.
             for raised in _raised_during_request(exc, handled_before):
                 traceback.clear_frames(raised.__traceback__)
-            raised = None
+            raised = error = None  # an interrupt in the walk above leaves the error bound: hold no exception on the way out
             raise
         # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's
         # exception carries a traceback through its request frames, whose locals hold the Authorization header, and
@@ -496,7 +497,8 @@ class CachekitIOBackend:
         try:
             raise error from error.original_exception
         finally:
-            del error  # its traceback holds this frame: the local would make a reference cycle
+            # Its traceback holds this frame: a local holding it, or the caller's exception, would make a reference cycle.
+            del error, handled_before, handled_traceback
 
     @staticmethod
     def _checked(method: str, response: BaseHTTPResponse, miss_on_404: bool) -> BaseHTTPResponse:

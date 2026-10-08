@@ -159,10 +159,11 @@ def test_a_request_failing_in_the_callers_handler_keeps_the_handled_traceback(
         raise ValueError("the caller's")
     except ValueError as exc:
         handled, kept = exc, exc.__traceback__
-        _raised(lambda: backend.get("k"))
+        err = _raised(lambda: backend.get("k"))
 
     assert kept is not None
     assert handled.__traceback__ is kept
+    assert _cachekit_frames_holding_an_exception(err) == []
 
 
 async def _locked(backend: CachekitIOBackend) -> None:
@@ -279,6 +280,24 @@ def _make_request_locals(exc: BaseException) -> list[dict[str, object]]:
     return found
 
 
+def test_a_request_re_raising_the_callers_exception_keeps_its_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client that raises the very exception the caller is handling: it leaves with the traceback it came in with."""
+    reused = ConnectionError("the caller's")
+
+    def request(method: str, url: str, **kwargs: object) -> None:
+        raise reused
+
+    backend = _faked(monkeypatch, request)
+    try:
+        raise reused
+    except ConnectionError:
+        kept = reused.__traceback__
+        _raised(lambda: backend.get("k"))
+
+    assert kept is not None
+    assert reused.__traceback__ is kept
+
+
 def test_interrupt_chained_during_request_reaches_no_frame_holding_the_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """An interrupt that lands while the client handles its own failure chains that failure, whose frames hold the key too.
 
@@ -336,6 +355,29 @@ def test_interrupt_while_classifying_a_transport_failure_clears_its_frames(monke
 
     assert isinstance(exc.__context__, TimeoutError)
     assert _make_request_locals(exc) == [{}]
+
+
+def test_interrupt_while_dropping_a_transport_failures_tracebacks_holds_no_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt that lands in ``_send``'s walk over a transport failure's chain, the error already built."""
+    walk = backend_module._raised_during_request
+    walks: list[BaseException] = []
+
+    def interrupted(exc: BaseException, handled_before: BaseException | None) -> Iterator[BaseException]:
+        walks.append(exc)
+        chain = walk(exc, handled_before)
+        yield next(chain)
+        if len(walks) == 1:  # the transport handler's walk, not the interrupt branch's
+            raise KeyboardInterrupt
+        yield from chain
+
+    monkeypatch.setattr(backend_module, "_raised_during_request", interrupted)
+    backend = _faked(monkeypatch, lambda method, url, **kwargs: _make_request())
+
+    exc = _interrupted(lambda: backend.get("k"), KeyboardInterrupt)
+
+    assert isinstance(exc.__context__, TimeoutError)
+    assert _cachekit_locals_holding(exc, _API_KEY, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(exc) == []
 
 
 def test_interrupt_the_caller_was_already_handling_still_clears_its_frames(monkeypatch: pytest.MonkeyPatch) -> None:
