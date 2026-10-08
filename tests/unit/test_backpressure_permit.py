@@ -159,7 +159,7 @@ class TestRejectionSemanticsMatchLegacy:
 
     @CONTROLLERS
     def test_contention_accounting(self, cls):
-        """Many threads, a tiny pool: every call either ran or was rejected, and nothing leaks."""
+        """Many threads, two permits: every call either ran or was rejected, and nothing leaks."""
         controller = cls(max_concurrent=2, queue_size=3, timeout=0.01)
         ran, rejected = [], []
         lock = threading.Lock()
@@ -184,7 +184,7 @@ class TestRejectionSemanticsMatchLegacy:
             t.join(30)
 
         assert len(ran) + len(rejected) == 16 * 20
-        assert rejected, "the pool was never contended; the test proves nothing"
+        assert rejected, "the permits were never contended; the test proves nothing"
         assert controller.rejected_count == len(rejected)
         _idle(controller)
 
