@@ -3,8 +3,10 @@
 # release is published and once a day. Context7 indexes the default branch, so
 # agents may see docs ahead of the last release.
 # Context7 takes one refresh per library per 10 days and answers an earlier
-# one with HTTP 400 too-early. The daily schedule asks again, so a change that
-# lands inside that window is still refreshed within 11 days.
+# one with HTTP 400 too-early. The daily schedule asks again once the window
+# reopens, so a change is usually refreshed within 11 days; GitHub runs
+# schedules best-effort, so that is not guaranteed. The schedule also spends
+# each window as it opens, so a release rarely refreshes at once.
 # Scope and agent rules live in context7.json.
 # Endpoint: https://context7.com/docs/integrations/github-actions
 name: Context7 Refresh
