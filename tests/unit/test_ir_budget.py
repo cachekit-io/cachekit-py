@@ -18,7 +18,7 @@ from tests.performance.ir_budget import PATHS, compare, main_thread_ir, per_op, 
 
 
 def test_per_op_is_the_difference_over_the_extra_iterations() -> None:
-    assert per_op(2_000_000_000, 2_000_000_000 + 2000 * 75_000) == 75_000
+    assert per_op(2_000_000_000, 2_000_000_000 + 2000 * 75_000, 1000, 3000) == 75_000
 
 
 def test_main_thread_ir_reads_thread_one_totals(tmp_path) -> None:

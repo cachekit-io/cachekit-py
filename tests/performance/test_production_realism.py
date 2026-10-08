@@ -251,10 +251,11 @@ def test_decorator_overhead_dataclass() -> None:
 @pytest.mark.performance
 @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not available")
 def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
-    """Measure decorator overhead with DataFrame (10K rows).
+    """Measure decorator overhead on an L1 hit returning a DataFrame (10K rows).
 
-    This tests the default serializer (msgpack) with DataFrames.
-    ArrowSerializer is tested separately in test_serializer_benchmarks.py.
+    L1-only (``backend=None``): the hit returns the stored frame object, so nothing is serialized
+    and ``serializer="auto"`` is never called. The serializing backend path, on real data, is
+    ``tests/unit/test_real_dataset.py``.
     """
 
     @cache(backend=None, serializer="auto", encryption=False)
@@ -276,17 +277,14 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
     )
 
     print("\n" + "=" * 80)
-    print("DECORATOR OVERHEAD - DATAFRAME (msgpack)")
+    print("DECORATOR OVERHEAD - DATAFRAME (L1-only hit)")
     print("=" * 80)
     print(result)
     print("\nContext:")
     print("  Payload: 10K row DataFrame (~400KB)")
-    print("  Serializer: msgpack (default)")
-    print("  Note: ArrowSerializer is 50-100x faster (see test_serializer_benchmarks.py)")
+    print("  L1-only hit: returns the stored object, no serializer runs")
 
-    # Target: <10ms for DataFrame with msgpack
-    # msgpack serialization of 400KB DataFrame is inherently slow (~1-5ms)
-    # This test measures decorator overhead + L1 cache behavior, not serializer performance
+    # Target: <10ms. This measures decorator overhead + L1 cache behavior; no serializer runs.
     # Raw p95 measured 13-15μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 11%.
     target_us = 10_000
     if result.exceeded_target(target_us):

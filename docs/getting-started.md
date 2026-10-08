@@ -132,7 +132,7 @@ def analyze_data():
 def get_api_response():
     return {"status": "ok", "data": "response"}
 
-# For large DataFrames (10K+ rows): ArrowSerializer (6-23x faster)
+# For DataFrames: ArrowSerializer (the default serializer refuses them)
 @cache(ttl=7200, serializer="arrow")
 def get_large_dataset():
     import pandas as pd

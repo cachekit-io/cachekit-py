@@ -370,8 +370,8 @@ Does your app need multi-language cache access (PHP/JS/Java/etc)?
     │   ├─ NumPy/UUID/set → Use AutoSerializer
     │   │   └─ Example: @cache(serializer="auto")
     │   │
-    │   └─ Large DataFrames (10K+ rows)?
-    │       └─ Use ArrowSerializer (6-23x faster)
+    │   └─ DataFrames?
+    │       └─ Use ArrowSerializer
     │       └─ Example: @cache(serializer="arrow")
     │
     └─ JSON API responses / JSON-heavy workloads?
@@ -484,14 +484,14 @@ response = fetch_api_response("/users/123")
 
 ### Using ArrowSerializer (DataFrame-Optimized)
 
-Use ArrowSerializer for large DataFrames (10K+ rows):
+Use ArrowSerializer for DataFrames:
 
 ```python notest
 from cachekit import cache
 from cachekit.serializers import ArrowSerializer
 import pandas as pd
 
-# ArrowSerializer for DataFrames (6-23x faster for large data)
+# ArrowSerializer for DataFrames
 @cache(serializer="arrow", ttl=7200, backend=None)
 def load_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")  # illustrative - file may not exist
@@ -506,10 +506,7 @@ def load_polars_data():
     return pl.read_csv("data.csv")
 ```
 
-**Performance**:
-- **10K rows**: 5.0x faster than StandardSerializer
-- **100K rows**: 9.6x faster than StandardSerializer
-- **1M rows**: 20x+ faster than StandardSerializer
+**Performance**: StandardSerializer does not accept DataFrames. For encoded sizes and instruction counts measured on a real 12,535-row dataset, see [ArrowSerializer: Performance on Real Data](serializers/arrow.md#performance-on-real-data).
 
 > [!CAUTION]
 > ArrowSerializer is **NOT PHP-compatible**. Use StandardSerializer or OrjsonSerializer if you need PHP support.

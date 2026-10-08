@@ -5,10 +5,11 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
 
 - ``import cachekit`` starts background threads (the log writer, the L1 cleanup worker) whose
   counts swing by tens of percent between identical runs. Only the MAIN thread is counted
-  (callgrind ``--separate-threads=yes``, file ``-01``).
+  (callgrind ``--separate-threads=yes``, file ``-01``). Work a library runs on its own threads
+  is not counted either: about half of the real-data Arrow round trip runs on pyarrow's threads.
 - Interpreter startup is ~2 billion instructions. Each path runs at two loop sizes and the
   per-op cost is the difference, ``(Ir[N_HI] - Ir[N_LO]) / (N_HI - N_LO)``, so startup and
-  warmup cancel.
+  warmup cancel. The real-data paths run at smaller sizes (``LOOPS``).
 - Code that observes its own wall-clock duration executes more instructions when it runs
   slower, so the measured process pins its main-thread clocks (``ir_workload.pin_main_thread_clocks``).
   Pinned clocks never let the metrics collector's 5 s mode check fire, so the collector stays
@@ -63,6 +64,11 @@ from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 
 N_LO, N_HI = 1000, 3000
+WARMUP = 50
+# The real-data paths cost about 60M main-thread Ir per op, 300 times a small path, so a run of
+# 3000 would take hours under callgrind. Fewer ops still cancel startup: it is a few hundred
+# thousand Ir of run-to-run spread against a difference of over a billion.
+LOOPS = dict.fromkeys(("serializer_arrow_usgs", "serializer_auto_usgs"), (5, 10, 30))  # path: (warmup, n_lo, n_hi)
 # Heap layout moves per-op counts: the allocators take shorter or longer paths in some heap
 # states. Any code change shifts the layout, even an edit to ir_workload.py's comments, so a single
 # run can fail an untouched path or hide a real regression. Each path runs at these layout shifts
@@ -98,6 +104,8 @@ PATHS = (
     "serializer_auto",
     "serializer_orjson",
     "serializer_arrow",
+    "serializer_arrow_usgs",
+    "serializer_auto_usgs",
     "serializer_encrypted",
     "file_set",
 )
@@ -125,8 +133,13 @@ def main_thread_ir(out_file: Path) -> int:
     raise RuntimeError(f"no totals line in {out_file}-01")
 
 
-def per_op(ir_lo: int, ir_hi: int) -> int:
-    return round((ir_hi - ir_lo) / (N_HI - N_LO))
+def loops(path: str) -> tuple[int, int, int]:
+    """Warmup and the two loop sizes a path runs at."""
+    return LOOPS.get(path, (WARMUP, N_LO, N_HI))
+
+
+def per_op(ir_lo: int, ir_hi: int, n_lo: int, n_hi: int) -> int:
+    return round((ir_hi - ir_lo) / (n_hi - n_lo))
 
 
 # Live child processes, so a failing or interrupted gate can kill every one of them. Once _stopped is
@@ -157,7 +170,7 @@ def _on_signal(signum: int, _frame: object) -> None:
 
 
 def _run(prefix: list[str], path: str, n: int, env: dict[str, str], timeout_s: float) -> None:
-    cmd = [*prefix, sys.executable, str(WORKLOAD), path, str(n)]
+    cmd = [*prefix, sys.executable, str(WORKLOAD), path, str(n), str(loops(path)[0])]
     run = f"{path} n={n} layout={env.get('IR_BUDGET_LAYOUT', '-')}"
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603 (trusted: valgrind + this file)
     with _children_lock:
@@ -225,7 +238,7 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         for path in paths:
             _run([], path, 1, env, child_timeout_s)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in (N_LO, N_HI)]
+        runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in loops(p)[1:]]
         with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
             try:
                 futures = {
@@ -249,7 +262,12 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
             if _signals[0] == signal.SIGINT:
                 raise KeyboardInterrupt from None
             raise SystemExit(128 + _signals[0]) from None
-    return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
+
+    def median(p: str) -> int:
+        _, lo, hi = loops(p)
+        return round(statistics.median(per_op(ir[(p, lo, s)], ir[(p, hi, s)], lo, hi) for s in LAYOUTS))
+
+    return {p: median(p) for p in paths}
 
 
 def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str], bool]:
@@ -324,7 +342,7 @@ def _main() -> int:
 
     measured = measure(args.path or list(PATHS), args.jobs, args.child_timeout * 60)
     lines, ok = compare(entry["budgets"], measured)
-    print(f"main-thread Ir/op on {key} ({platform.python_version()}), (Ir[{N_HI}] - Ir[{N_LO}]) / {N_HI - N_LO}")
+    print(f"main-thread Ir/op on {key} ({platform.python_version()}), (Ir[n_hi] - Ir[n_lo]) / (n_hi - n_lo)")
     print("\n".join(lines))
 
     if args.update:

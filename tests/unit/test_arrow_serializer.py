@@ -740,7 +740,8 @@ class TestDtypeAndIndexFidelity:
     """Round-trip fidelity across dtypes/indexes the audit flagged as fragile.
 
     Guards that zstd + preserve_index=None + to_pandas(self_destruct, split_blocks)
-    do not regress correctness for the realistic data-science payloads this serializer targets.
+    do not regress correctness for the dtypes data-science payloads carry. These frames are tiny;
+    ``test_real_dataset.py`` runs the same dtypes at scale on a real 12,535-row dataset.
     """
 
     @pytest.mark.parametrize(
