@@ -16,9 +16,13 @@ spec/wire-format.md, "CK v3 frame". Through the real read paths, this module pro
    refuses it as non-UTF-8. A CK frame fed to the interop reader gets its CK diagnostic.
 3. **Encrypted caches fail closed**: a reader configured for encryption, resolving its own
    tenant, refuses every ``encrypted_read_vectors`` frame with ``encryption_fail_closed``
-   off and on, whatever the frame's header claims. Two controls keep the refusals honest:
-   the reader reads its own entry, and a reader resolving the other tenant decrypts
-   ``ciphertext_other_tenant``, so that frame is refused for its tenant alone.
+   off and on, each at the check that names it: a plaintext claim or a foreign serializer,
+   a key fingerprint the reader lacks (refused before decrypting when the policy is on,
+   by AES-GCM when it is off), or a header tenant that is not the reader's. That last
+   check compares the header's tenant before any key derivation, so this module does not
+   prove the tenant is bound into the key or the AAD. Two controls keep the refusals
+   honest: the reader reads its own entry, and a reader resolving the other tenant
+   decrypts ``ciphertext_other_tenant``.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.decorators.tenant_context import CallableExtractor
 from cachekit.interop import InteropDecodeError, decode_interop_value
 from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
-from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, TenantMismatchError
 from cachekit.serializers.wrapper import SerializationWrapper
 
 pytestmark = pytest.mark.unit
@@ -49,13 +53,20 @@ ENCRYPTED_READER: dict[str, str] = _FIXTURE["encrypted_reader"]
 ENCRYPTED_READ_VECTORS: list[dict[str, Any]] = _FIXTURE["encrypted_read_vectors"]
 CACHE_KEY = ENCRYPTED_READER["cache_key"]
 
-# The refusal each encrypted read vector gets. The forged orjson frame may be refused for its serializer
-# name or its plaintext claim, whichever the reader checks first, so it pins only the common base.
-ENCRYPTED_READ_ERRORS: dict[str, type[SerializationError]] = {
-    "forged_plaintext_encrypted_false": SuspiciousCacheEntryError,
-    "forged_plaintext_orjson": SerializationError,
-    "ciphertext_key_not_in_keyring": DecryptionAuthenticationError,
-    "ciphertext_other_tenant": DecryptionAuthenticationError,
+_PLAINTEXT_CLAIM = "^Encryption is enabled but the cache entry's header claims plaintext"
+
+# The refusal (error class, message pattern) each encrypted read vector gets, keyed by encryption_fail_closed.
+# The policy changes the path only where the key fingerprint names a key the reader lacks: off warns and fails
+# AES-GCM under the current key, on refuses before decrypting.
+ENCRYPTED_READ_ERRORS: dict[str, dict[bool, tuple[type[SerializationError], str]]] = {
+    "forged_plaintext_encrypted_false": dict.fromkeys((False, True), (SuspiciousCacheEntryError, _PLAINTEXT_CLAIM)),
+    # Refused for its serializer name or its plaintext claim, whichever the reader checks first.
+    "forged_plaintext_orjson": dict.fromkeys((False, True), (SerializationError, f"^Serializer mismatch|{_PLAINTEXT_CLAIM}")),
+    "ciphertext_key_not_in_keyring": {
+        False: (DecryptionAuthenticationError, "^Decryption failed"),
+        True: (DecryptionAuthenticationError, "^Key fingerprint mismatch"),
+    },
+    "ciphertext_other_tenant": dict.fromkeys((False, True), (TenantMismatchError, "^Tenant mismatch")),
 }
 
 # The frame parser's own error for each check (src/cachekit/serializers/wrapper.py, _split_frame).
@@ -122,7 +133,7 @@ class TestFrameVectors:
         payload, metadata, serializer_name = SerializationWrapper.unwrap(frame)
 
         assert (serializer_name, metadata) == (header["s"], header["m"])
-        if "expected_payload_hex" in vector:
+        if "arrow_detection" not in vector:  # Arrow IPC bytes are not canonical; test_arrow_frame_payload_structure
             assert bytes(payload).hex() == vector["expected_payload_hex"]
         # The header's "v" is not returned by unwrap, so the writer proves it: same header, same bytes.
         assert SerializationWrapper.wrap(bytes(payload), header["m"], header["s"], header["v"]) == frame
@@ -185,5 +196,6 @@ class TestEncryptedReadVectors:
     def test_read_fails_closed(self, fail_closed: bool, vector: dict[str, Any]) -> None:
         assert vector["outcome"] == "fail_closed"
         reader = _encrypted_reader(fail_closed=fail_closed)
-        with pytest.raises(ENCRYPTED_READ_ERRORS[vector["name"]]):
+        error_type, message = ENCRYPTED_READ_ERRORS[vector["name"]][fail_closed]
+        with pytest.raises(error_type, match=message):
             reader.deserialize_data(bytes.fromhex(vector["frame_hex"]), cache_key=CACHE_KEY)

@@ -18,8 +18,8 @@ paths that:
 2. **Bin-emit**: fresh writes carry ``bin``-encoded envelopes (marker
    ``0xc4``/``0xc5``/``0xc6`` on element[0]), observed inside the CK v3 frame
    through the real decorator store path and at every width tier through the
-   real serializer path — including bin32, which the protocol pins
-   deliberately leave uncovered (spec/wire-format.md).
+   real serializer path — including bin32, which the protocol pins only in
+   ``constructed_vectors`` (``envelope_bin32_min``), not as a ``*_bin`` twin.
 3. **Re-encode identity**: the 0.4.0 writer reproduces every ``*_bin`` pin
    byte-identically from the vector inputs.
 4. **Round-trip identity** through the full stack (store → retrieve) for
@@ -287,7 +287,7 @@ class TestPayloadRejectVectors:
 
     def test_payload_reject_vector_names_are_pinned(self):
         """An emptied or renamed group fails here instead of passing on zero parametrized cases."""
-        assert {v["name"] for v in _FIXTURE.get("payload_reject_vectors", [])} == {
+        assert {v["name"] for v in _FIXTURE["payload_reject_vectors"]} == {
             "payload_array32_max_claim_alone",
             "payload_nested_array16_each_header_fits_sum_overclaims",
         }
@@ -312,7 +312,7 @@ class TestTemporalSentinelVectors:
 
     def test_temporal_sentinel_vector_names_are_pinned(self):
         """An emptied or renamed group fails here instead of passing on zero parametrized cases."""
-        assert {v["name"]: v["revives_to"]["type"] for v in _FIXTURE.get("temporal_sentinel_vectors", [])} == {
+        assert {v["name"]: v["revives_to"]["type"] for v in _FIXTURE["temporal_sentinel_vectors"]} == {
             "temporal_sentinel_datetime": "datetime",
             "temporal_sentinel_date": "date",
             "temporal_sentinel_time": "time",
@@ -330,9 +330,9 @@ class TestTemporalSentinelVectors:
 class TestBinEmitWidths:
     """Fresh writes emit bin envelopes at every header width through the real serializer path.
 
-    The protocol *_bin vectors pin bin8 and bin16 only (bin32 is a recorded
-    won't-do in spec/wire-format.md), so all three width tiers are exercised
-    here against the real writer.
+    The protocol *_bin vectors pin bin8 and bin16 only; the bin16/bin32 boundary
+    is pinned in ``constructed_vectors``, which only a reader decodes. So all
+    three width tiers are exercised here against the real writer.
     """
 
     @pytest.mark.parametrize(
