@@ -468,7 +468,10 @@ class CachekitIOBackend:
         """One attempt on this process's client, any status. Raises BackendError for a transport failure."""
         # Held for the whole request: a concurrent re-lease must not close this client under it.
         lease = self._own_lease()
-        _, handled_before, handled_traceback = sys.exc_info()
+        handled_before = sys.exc_info()[1]
+        # Off the exception, not sys.exc_info(): on Python 3.10 that keeps the traceback it was caught with after the
+        # caller clears it, and the request's failure would give a scrubbed traceback back.
+        handled_traceback = None if handled_before is None else handled_before.__traceback__
         try:
             try:
                 return lease.client.request(method, url, body=body, headers=headers)
@@ -476,19 +479,25 @@ class CachekitIOBackend:
                 error = classify_http_error(exc, operation=method.lower())
                 # The error keeps only urllib3's exception class, so nothing needs these tracebacks. urllib3's frames on
                 # them hold its exceptions in locals, a reference cycle, and a frame holds its caller: this frame, and the
-                # request body, would wait for the cyclic GC. A client re-raising the exception the caller is handling
-                # adds the request's frames to its traceback: it gets back the one it came in with.
+                # request body, would wait for the cyclic GC. A client re-raising the exception the caller is handling,
+                # as its failure or before another, adds the request's frames to its traceback: it gets back the one it
+                # came in with.
                 for raised in _raised_during_request(exc, handled_before):
-                    raised.__traceback__ = handled_traceback if raised is handled_before else None
+                    raised.__traceback__ = None
+                if handled_before is not None:
+                    handled_before.__traceback__ = handled_traceback
                 raised = None  # this frame is on the error's traceback: it must hold no urllib3 exception
         except BaseException as exc:
             # An interrupt (a worker timeout's SystemExit, KeyboardInterrupt, gevent.Timeout), here or in the handler
             # above, propagates as itself, but its traceback, and those of the exceptions it chained during the request,
             # run through urllib3's request frames, whose locals hold the Authorization header (CWE-532). clear_frames
             # drops the locals of every finished frame below _send and keeps each frame's file and line; _send's own
-            # frame is still executing and is skipped, so it must hold no key-bearing local.
+            # frame is still executing and is skipped, so it must hold no key-bearing local. The exception the caller is
+            # handling, unless it is the interrupt, gets back the traceback it came in with, as above.
             for raised in _raised_during_request(exc, handled_before):
                 traceback.clear_frames(raised.__traceback__)
+            if handled_before is not None and handled_before is not exc:
+                handled_before.__traceback__ = handled_traceback
             raised = error = None  # an interrupt in the walk above leaves the error bound: hold no exception on the way out
             raise
         # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's

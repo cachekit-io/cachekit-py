@@ -280,22 +280,50 @@ def _make_request_locals(exc: BaseException) -> list[dict[str, object]]:
     return found
 
 
-def test_a_request_re_raising_the_callers_exception_keeps_its_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A client that raises the very exception the caller is handling: it leaves with the traceback it came in with."""
+@pytest.mark.parametrize(
+    ("then", "raised"),
+    [(None, BackendError), (TimeoutError, BackendError), (KeyboardInterrupt, KeyboardInterrupt)],
+    ids=["as-its-failure", "then-a-transport-failure", "then-an-interrupt"],
+)
+def test_a_request_re_raising_the_callers_exception_keeps_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, then: type[BaseException] | None, raised: type[BaseException]
+) -> None:
+    """A client that raises the very exception the caller is handling, as its failure or before failing with another: it
+    leaves with the traceback it came in with, not one through the request's frames."""
     reused = ConnectionError("the caller's")
 
     def request(method: str, url: str, **kwargs: object) -> None:
-        raise reused
+        try:
+            raise reused
+        except ConnectionError:
+            if then is None:
+                raise
+            raise then  # noqa: B904 - chains the caller's exception as __context__, as a client's own failure does
 
     backend = _faked(monkeypatch, request)
     try:
         raise reused
     except ConnectionError:
         kept = reused.__traceback__
-        _raised(lambda: backend.get("k"))
+        with pytest.raises(raised):
+            backend.get("k")
 
     assert kept is not None
     assert reused.__traceback__ is kept
+
+
+def test_a_request_failing_in_the_callers_handler_leaves_a_cleared_traceback_cleared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller that cleared the traceback of the exception it is handling, as SECURITY.md advises, keeps it cleared. On
+    Python 3.10 ``sys.exc_info()`` still reports the traceback the exception was caught with."""
+    backend = _faked(monkeypatch, lambda method, url, **kwargs: _make_request())
+    try:
+        raise ValueError("the caller's")
+    except ValueError as exc:
+        exc.__traceback__ = None
+        handled = exc
+        _raised(lambda: backend.get("k"))
+
+    assert handled.__traceback__ is None
 
 
 def test_interrupt_chained_during_request_reaches_no_frame_holding_the_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -398,6 +426,7 @@ def test_interrupt_the_caller_was_already_handling_still_clears_its_frames(monke
 
     assert exc is reused
     assert _make_request_locals(exc) == [{}]
+    assert request.__code__ in [f.f_code for f, _ in traceback.walk_tb(exc.__traceback__)]  # still shows where it landed
 
 
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs SIGALRM to bound a hang")
