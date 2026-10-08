@@ -230,10 +230,10 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 61,218 | 62,690 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 59,065 | 60,655 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 258,401 | 256,648 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 258,278 | 252,907 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 236,193 | 237,396 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 207,501 | 207,744 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 180,763 | 175,197 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 221,607 | 213,832 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 168,711 | 167,242 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 172,675 | 168,017 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 60,843 | 61,954 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
 | `serializer_auto` | `AutoSerializer` round trip | 69,441 | 70,650 |
@@ -244,7 +244,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 118,412 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 100,723 | 86,297 |
 
-Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 50,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
+Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 5,000 to 8,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread. The gap was about 50,000 until each label tuple's Prometheus series was bound once instead of looked up per call.
 
 **Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,700 to 4,900 instructions (`l1_hit` +6.1%, `l2_hit_async_metrics` +1.5%, `miss` +1.4%) and failed the gate, while the serializer paths, which generate no key, stayed within 0.11%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 

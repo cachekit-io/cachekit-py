@@ -7,6 +7,7 @@ for maximum flexibility and testing capability.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 from cachekit.hash_utils import redact_key_for_log
@@ -63,16 +64,19 @@ class SimpleLogger:
 
     def cache_hit(self, key: str, source: str = "Redis"):
         """Log cache hits. Keys are redacted — they embed caller identifiers (CWE-532)."""
-        self._logger.debug(f"{source} cache hit for key: {redact_key_for_log(key)}")
+        if self._logger.isEnabledFor(logging.DEBUG):  # redacting and formatting cost ~1 us per call
+            self._logger.debug(f"{source} cache hit for key: {redact_key_for_log(key)}")
 
     def cache_miss(self, key: str):
         """Log cache misses. Keys are redacted — they embed caller identifiers (CWE-532)."""
-        self._logger.debug(f"Cache miss for key: {redact_key_for_log(key)}")
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(f"Cache miss for key: {redact_key_for_log(key)}")
 
     def cache_stored(self, key: str, ttl=None):
         """Log cache storage operations. Keys are redacted — they embed caller identifiers (CWE-532)."""
-        ttl_info = f" with TTL {ttl}" if ttl else ""
-        self._logger.debug(f"Cached result for key: {redact_key_for_log(key)}{ttl_info}")
+        if self._logger.isEnabledFor(logging.DEBUG):
+            ttl_info = f" with TTL {ttl}" if ttl else ""
+            self._logger.debug(f"Cached result for key: {redact_key_for_log(key)}{ttl_info}")
 
 
 class DefaultLoggerProvider(LoggerProvider):

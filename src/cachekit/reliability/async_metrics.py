@@ -40,9 +40,9 @@ SIZE_BUCKETS_BYTES = tuple(float(4**i) for i in range(2, 15))
 
 # A batched flush's cache_operations_total series: (operation, namespace, success, serializer).
 _CacheOpKey = tuple[str, str, bool, str]
-# One batched record's histogram values: (operation, namespace, serializer, duration_ms, size_bytes). None marks a
-# value the sync path would not observe.
-_CacheObservation = tuple[str, str, str, Optional[float], Optional[int]]
+# One batched record's histogram values: (operation, namespace, success, serializer, duration_ms, size_bytes). None
+# marks a value the sync path would not observe.
+_CacheObservation = tuple[str, str, bool, str, Optional[float], Optional[int]]
 
 try:
     from prometheus_client import REGISTRY, Counter, Gauge, Histogram  # type: ignore[assignment]
@@ -250,6 +250,79 @@ def circuit_breaker_gauge() -> Any:
     return _get_shared_metric(
         "circuit_breaker_state", Gauge, "Number of live circuit breakers per namespace and state", ["namespace", "state"]
     )
+
+
+_COUNTER = "cache_operations_total"
+_DURATION = "cache_operation_duration_ms"
+_SIZE = "cache_operation_size_bytes"
+
+
+class _CacheOpSeries:
+    """The three cache-operation series of one (operation, namespace, success, serializer) tuple, bound once.
+
+    ``Metric.labels()`` sorts its arguments, validates them and takes a lock on every call: three of them cost
+    about 5 us per recorded operation. Each series binds on its first update, so a tuple that never
+    counts, or never observes a duration or size, gets no empty series, exactly as per-call ``labels()`` left it.
+    The parent metrics are kept so ``_cache_op_series`` can tell when ``_metrics_cache`` holds a different metric
+    under a name (tests replace them), and rebind instead of recording into an orphan.
+    """
+
+    __slots__ = ("counter_metric", "duration_metric", "size_metric", "_success", "_labels", "_counter", "_duration", "_size")
+
+    def __init__(self, counter_metric: Any, duration_metric: Any, size_metric: Any, key: _CacheOpKey):
+        operation, namespace, success, serializer = key
+        self.counter_metric = counter_metric
+        self.duration_metric = duration_metric
+        self.size_metric = size_metric
+        self._success = str(success)
+        self._labels = {"operation": operation, "namespace": namespace, "serializer": serializer}
+        self._counter: Any = None
+        self._duration: Any = None
+        self._size: Any = None
+
+    def inc(self, amount: int = 1) -> None:
+        if self._counter is None:
+            self._counter = self.counter_metric.labels(success=self._success, **self._labels)
+        self._counter.inc(amount)
+
+    def observe_duration(self, duration_ms: float) -> None:
+        if self._duration is None:
+            self._duration = self.duration_metric.labels(**self._labels)
+        self._duration.observe(duration_ms)
+
+    def observe_size(self, size_bytes: float) -> None:
+        if self._size is None:
+            self._size = self.size_metric.labels(**self._labels)
+        self._size.observe(size_bytes)
+
+
+# Process-wide, like the metrics whose series it holds. One entry per label tuple, the same cardinality
+# prometheus_client already keeps per metric. Children survive fork: _reset_metric_locks reaches them through
+# their parent's ``_metrics``, and a racing first bind is benign because ``labels()`` returns one child per tuple.
+_cache_op_series_cache: dict[_CacheOpKey, _CacheOpSeries] = {}
+
+
+def _cache_op_series(operation: str, namespace: str, success: bool, serializer: str) -> _CacheOpSeries:
+    """Return the bound series for one cache-operation label tuple, rebinding if a parent metric was replaced."""
+    key = (operation, namespace, success, serializer)
+    series = _cache_op_series_cache.get(key)
+    if (
+        series is None
+        or series.counter_metric is not _metrics_cache.get(_COUNTER)
+        or series.duration_metric is not _metrics_cache.get(_DURATION)
+        or series.size_metric is not _metrics_cache.get(_SIZE)
+    ):
+        series = _cache_op_series_cache[key] = _CacheOpSeries(
+            _get_shared_metric(_COUNTER, Counter, "Total cache operations", ["operation", "namespace", "success", "serializer"]),
+            _get_shared_metric(
+                _DURATION, Histogram, "Cache operation duration", ["operation", "namespace", "serializer"], DURATION_BUCKETS_MS
+            ),
+            _get_shared_metric(
+                _SIZE, Histogram, "Cache operation size", ["operation", "namespace", "serializer"], SIZE_BUCKETS_BYTES
+            ),
+            key,
+        )
+    return series
 
 
 class AsyncMetricsCollector:
@@ -527,7 +600,7 @@ class AsyncMetricsCollector:
                     duration_ms = metric["duration_ms"] if metric["duration_ms"] > 0 else None
                     size_bytes = metric["size_bytes"] if metric["size_bytes"] > 0 else None
                     cache_ops[(operation, namespace, metric["success"], serializer)] += 1
-                    cache_observations.append((operation, namespace, serializer, duration_ms, size_bytes))
+                    cache_observations.append((operation, namespace, metric["success"], serializer, duration_ms, size_bytes))
 
                 elif metric["type"] == "counter":
                     value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
@@ -596,26 +669,17 @@ class AsyncMetricsCollector:
         histograms: dict[str, list[Any]],
     ):
         """Update Prometheus metrics in batch."""
-        # Get or create metric instances
-        cache_counter = self._get_metric(
-            "cache_operations_total", Counter, "Total cache operations", ["operation", "namespace", "success", "serializer"]
-        )
-
-        cache_duration = self._duration_histogram()
-        cache_size = self._size_histogram()
-
         # Batch update cache metrics
         for (operation, namespace, success, serializer), count in cache_ops.items():
-            cache_counter.labels(operation=operation, namespace=namespace, success=str(success), serializer=serializer).inc(
-                count
-            )
+            _cache_op_series(operation, namespace, success, serializer).inc(count)
 
         # One observation per record, skipping zero values as the sync path does.
-        for operation, namespace, serializer, duration_ms, size_bytes in cache_observations:
+        for operation, namespace, success, serializer, duration_ms, size_bytes in cache_observations:
+            series = _cache_op_series(operation, namespace, success, serializer)
             if duration_ms is not None:
-                cache_duration.labels(operation=operation, namespace=namespace, serializer=serializer).observe(duration_ms)
+                series.observe_duration(duration_ms)
             if size_bytes is not None:
-                cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
+                series.observe_size(size_bytes)
 
         # Update generic counters
         for name, label_values in counters.items():
@@ -669,24 +733,6 @@ class AsyncMetricsCollector:
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
         """Get or create the process-wide metric instance for ``name`` (see ``_get_shared_metric``)."""
         return _get_shared_metric(name, metric_class, description, labels)
-
-    def _duration_histogram(self) -> Any:
-        return _get_shared_metric(
-            "cache_operation_duration_ms",
-            Histogram,
-            "Cache operation duration",
-            ["operation", "namespace", "serializer"],
-            buckets=DURATION_BUCKETS_MS,
-        )
-
-    def _size_histogram(self) -> Any:
-        return _get_shared_metric(
-            "cache_operation_size_bytes",
-            Histogram,
-            "Cache operation size",
-            ["operation", "namespace", "serializer"],
-            buckets=SIZE_BUCKETS_BYTES,
-        )
 
     def get_dropped_metrics_count(self) -> int:
         """Get count of dropped metrics due to queue overflow."""
@@ -872,19 +918,12 @@ class AsyncMetricsCollector:
         if not PROMETHEUS_AVAILABLE:
             return
 
-        # Direct metric updates (≤4μs per operation)
-        cache_counter = self._get_metric(
-            "cache_operations_total", Counter, "Total cache operations", ["operation", "namespace", "success", "serializer"]
-        )
-        cache_counter.labels(operation=operation, namespace=namespace, success=str(success), serializer=serializer).inc()
-
+        series = _cache_op_series(operation, namespace, success, serializer)
+        series.inc()
         if duration_ms > 0:
-            self._duration_histogram().labels(operation=operation, namespace=namespace, serializer=serializer).observe(
-                duration_ms
-            )
-
+            series.observe_duration(duration_ms)
         if size_bytes > 0:
-            self._size_histogram().labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
+            series.observe_size(size_bytes)
 
     def _record_counter_sync(self, metric_name: str, labels: dict[str, Any], value: float):
         """Record counter directly to Prometheus (sync mode)."""

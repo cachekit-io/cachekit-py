@@ -212,8 +212,12 @@ class FeatureOrchestrator:
         return status
 
     def log_cache_operation(self, **kwargs: Any) -> None:
-        """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532)."""
-        if self._enable_structured_logging and kwargs:
+        """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532).
+
+        Returns before redacting or formatting anything unless INFO is enabled: every L1 and L2 hit calls this,
+        and at the default WARNING level ``logger.info`` would drop the record it built.
+        """
+        if self._enable_structured_logging and kwargs and logger.isEnabledFor(logging.INFO):
             operation = kwargs.get("operation", "unknown")
             # Redact in kwargs itself — it is splatted into the structured payload below.
             if "key" in kwargs:
