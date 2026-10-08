@@ -41,8 +41,15 @@ def kept_cause(exc: Exception) -> Exception:
             raise error from error.original_exception
         finally:
             del error
+
+    For the same reason it drops the traceback of a redis-py ``exc``, which no caller keeps: redis-py raises a reply
+    error (``-LOADING``, ``-WRONGPASS``) from a local, a reference cycle in its own frame, and that traceback runs
+    through the caller's raising frame.
     """
-    return exc if isinstance(exc, BackendError) else RedisClientError(type(exc))
+    if isinstance(exc, BackendError):
+        return exc
+    exc.__traceback__ = None
+    return RedisClientError(type(exc))
 
 
 def classify_redis_error(
