@@ -30,8 +30,9 @@ FIXTURE = DATA / "usgs_earthquakes_2024-01.parquet"
 MASTER_KEY = "ab" * 32
 
 # Encoded bytes per (serializer, workload) at the fixture's sha256. AutoSerializer hands a DataFrame
-# to ArrowSerializer, so their frame figures match. The band absorbs compressor drift across pyarrow
-# releases; a 20% shift fails it. A re-slice or an intended format change updates these figures.
+# to ArrowSerializer, so their frame figures match. Each size may sit at most 10% above its figure,
+# which absorbs compressor drift across pyarrow releases. A smaller encoding passes: lost data fails
+# the exact-equality check, not this one. A re-slice or an intended format change updates the figures.
 ENCODED_BYTES = {
     ("auto", "full"): 673_906,
     ("auto", "groupby"): 4_026,
@@ -93,11 +94,11 @@ def test_round_trip_is_exact_and_its_encoded_size_is_stable(
     out = serializer.deserialize(data, metadata)
 
     if isinstance(obj, np.ndarray):
-        np.testing.assert_array_equal(out, obj)
-        assert (out.dtype, out.shape) == (obj.dtype, obj.shape)
+        np.testing.assert_array_equal(out, obj, strict=True)
     else:
-        pd.testing.assert_frame_equal(out, obj)
-    assert len(data) == pytest.approx(ENCODED_BYTES[serializer_name, workload], rel=SIZE_TOLERANCE)
+        pd.testing.assert_frame_equal(out, obj, check_exact=True)
+    size, ceiling = len(data), ENCODED_BYTES[serializer_name, workload] * (1 + SIZE_TOLERANCE)
+    assert size <= ceiling
 
 
 @pytest.mark.parametrize("intent, serializer_name", [("plain", "auto"), ("plain", "arrow"), ("secure", "arrow")])
@@ -108,7 +109,7 @@ def test_decorated_aggregation_is_served_from_the_backend(
 
     The backend has two read methods: ``get`` and the mmap ``get_buffer`` the Arrow route uses.
     """
-    backend = FileBackend(FileBackendConfig(cache_dir=tmp_path, max_size_mb=64, max_value_mb=32))
+    backend = FileBackend(FileBackendConfig(cache_dir=tmp_path))
     hits: list[str] = []
     for method in ("get", "get_buffer"):
         real = getattr(backend, method)
@@ -120,7 +121,7 @@ def test_decorated_aggregation_is_served_from_the_backend(
             return value
 
         monkeypatch.setattr(backend, method, spy)
-    options = {"backend": backend, "serializer": serializer_name, "l1_enabled": False, "namespace": f"usgs-{intent}"}
+    options = {"backend": backend, "serializer": serializer_name, "l1_enabled": False}
     decorate = cache.secure(master_key=MASTER_KEY, **options) if intent == "secure" else cache(**options)
     expected = workloads["groupby"]
     runs = 0
@@ -135,8 +136,8 @@ def test_decorated_aggregation_is_served_from_the_backend(
     assert hits == []
     second = events_by_network()
 
-    pd.testing.assert_frame_equal(first, expected)
-    pd.testing.assert_frame_equal(second, expected)
+    pd.testing.assert_frame_equal(first, expected, check_exact=True)
+    pd.testing.assert_frame_equal(second, expected, check_exact=True)
     assert runs == 1
     assert len(hits) == 1
 

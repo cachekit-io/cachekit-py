@@ -484,7 +484,7 @@ response = fetch_api_response("/users/123")
 
 ### Using ArrowSerializer (DataFrame-Optimized)
 
-Use ArrowSerializer for large DataFrames (10K+ rows):
+Use ArrowSerializer for DataFrames:
 
 ```python notest
 from cachekit import cache

@@ -109,7 +109,7 @@ class MyBackend:
 |------------|:-----:|----------|
 | **StandardSerializer** | Fast | General Python types (MessagePack + LZ4); not NumPy arrays or pandas objects |
 | **OrjsonSerializer** | Fastest | JSON APIs (2-5x faster than stdlib) |
-| **ArrowSerializer** | Fastest | pandas DataFrames (columnar, exact round trip) |
+| **ArrowSerializer** | — | pandas DataFrames (columnar, exact round trip) |
 | **+ Encryption** | Fast | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
 ```python

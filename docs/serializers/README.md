@@ -15,7 +15,7 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 | [StandardSerializer](default.md) | Fast | General Python objects, cross-language SDK interop |
 | [AutoSerializer](auto.md) | Fast | Python-only — preserves sets, frozensets, datetime, UUID, NumPy, pandas |
 | [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
-| [ArrowSerializer](arrow.md) | Very Fast (DataFrames) | Large pandas/polars DataFrames (10K+ rows) |
+| [ArrowSerializer](arrow.md) | — | pandas/polars DataFrames, any size |
 | [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer: encryption needs a cross-SDK serializer) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
 | [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
 
@@ -34,7 +34,7 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 | Web session data | OrjsonSerializer | Fast JSON, cross-language |
 | DataFrames, any size | ArrowSerializer | Columnar and exact; StandardSerializer refuses DataFrames |
 | Mixed object types | StandardSerializer | Broad type support |
-| Real-time data pipelines | ArrowSerializer | Zero-copy deserialization |
+| Real-time data pipelines | ArrowSerializer | Columnar Arrow IPC |
 | Time-series analytics | ArrowSerializer | Optimized for columnar data |
 | Binary data | StandardSerializer | Only serializer supporting bytes |
 
@@ -231,7 +231,7 @@ def get_user_data_v2(user_id):
 
 ## Best Practices
 
-1. **Use ArrowSerializer for large DataFrames (10K+ rows)** - Significant performance gains
+1. **Use ArrowSerializer for DataFrames** - StandardSerializer refuses them
 2. **Use StandardSerializer for mixed types** - Broader type support
 3. **Benchmark your specific workload** - Performance varies by data characteristics
 4. **Version your cache namespaces** - Makes serializer migrations safer

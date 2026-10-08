@@ -138,7 +138,7 @@ def loops(path: str) -> tuple[int, int, int]:
     return LOOPS.get(path, (WARMUP, N_LO, N_HI))
 
 
-def per_op(ir_lo: int, ir_hi: int, n_lo: int = N_LO, n_hi: int = N_HI) -> int:
+def per_op(ir_lo: int, ir_hi: int, n_lo: int, n_hi: int) -> int:
     return round((ir_hi - ir_lo) / (n_hi - n_lo))
 
 

@@ -2,20 +2,20 @@
 
 # ArrowSerializer
 
-**DataFrame-optimized serializer** — Zero-copy serialization for pandas and polars DataFrames using Apache Arrow IPC format.
+**DataFrame-optimized serializer** — Columnar serialization for pandas and polars DataFrames using the Apache Arrow IPC format, zstd-compressed by default.
 
 ## Overview
 
 **Best for:**
-- Large pandas DataFrames (10K+ rows)
-- Large polars DataFrames
+- pandas DataFrames, any size
+- polars DataFrames
 - Data science workloads
 - Time-series data
 - High-frequency DataFrame caching
 
 **Performance characteristics:**
-- Deserialization: memory-mapped, zero-copy
-- Memory overhead: Minimal (zero-copy deserialization)
+- Payload: Arrow IPC, compressed with zstd by default (`CACHEKIT_ARROW_COMPRESSION`), so a read decompresses it
+- Zero-copy reads: only with `ArrowSerializer(compression=None)` on the File backend, where a plaintext read memory-maps the stored payload; the stored payload is then larger
 - Network overhead: Efficient columnar format
 
 StandardSerializer (MessagePack) does not accept DataFrames, so there is no MessagePack figure to compare against. Sizes and instruction counts measured on a real dataset are in [Performance on Real Data](#performance-on-real-data).
@@ -129,20 +129,13 @@ Measured on a public dataset: one month of the USGS earthquake catalogue (Januar
 
 A full-frame round trip (`serialize` then `deserialize`) costs about 60 million instructions on the calling thread, on CPython 3.12.12 and 3.14.3, x86_64 Linux (`make perf-ir`, paths `serializer_arrow_usgs` and `serializer_auto_usgs`; pyarrow runs part of the work on its own threads, which this figure leaves out). A 100-row frame costs about 2 million, so a small frame pays mostly fixed per-call cost. These are instruction counts, not wall time: see [Instruction Budgets](../performance.md#instruction-budgets).
 
-`serializer="auto"` hands a DataFrame to ArrowSerializer when pyarrow is installed, so it produces the same bytes. The default `StandardSerializer` does not accept DataFrames.
+`serializer="auto"` hands a DataFrame to ArrowSerializer when pyarrow is installed, so it produces the same bytes.
 
 For comprehensive performance analysis including decorator overhead, concurrent access, and encryption impact, see [Performance Guide](../performance.md).
 
 ### Memory Usage
 
-ArrowSerializer uses memory-mapped deserialization, which means:
-- No full copy of data into memory
-- Minimal memory allocation
-- Faster garbage collection
-
-**Example comparison (100K rows):**
-- Default deserialization: +15 MB memory allocation
-- Arrow deserialization: +2 MB memory allocation
+A read of a compressed payload (the default) decompresses it into new buffers. With `ArrowSerializer(compression=None)` on the File backend, a plaintext read memory-maps the stored file instead of copying it, at the cost of a larger stored payload. Wire backends always copy the payload in.
 
 **Writes stream on the File backend.** When the cache backend supports streaming writes
 (File backend only today) and the value is plaintext (no encryption), serialization streams
