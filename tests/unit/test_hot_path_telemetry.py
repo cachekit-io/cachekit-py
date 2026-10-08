@@ -163,3 +163,34 @@ def test_a_replaced_metric_is_rebound_not_recorded_into_the_orphan(monkeypatch):
     labels = {"operation": "get", "namespace": namespace, "success": "True", "serializer": "unknown"}
     assert replacement.labels(**labels)._value.get() == 1.0
     assert _sample("cache_operations_total", labels) == 1.0
+
+
+@needs_prometheus
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.parametrize("reset", ["clear", "remove"])
+def test_series_detached_by_clear_or_remove_are_rebound(sync_mode, reset):
+    namespace = f"prebound-reset-{uuid.uuid4().hex}"
+    series = {"operation": "get", "namespace": namespace, "serializer": "rust"}
+    counter_labels = {**series, "success": "True"}
+    names = ("cache_operations_total", "cache_operation_duration_ms", "cache_operation_size_bytes")
+
+    def record() -> None:
+        collector = AsyncMetricsCollector(sync_mode=sync_mode, auto_detect_mode=False)
+        collector.record_cache_operation(
+            operation="get", namespace=namespace, success=True, duration_ms=2.0, serializer="rust", size_bytes=10
+        )
+        collector.shutdown()  # batched mode: drain the queue
+
+    record()
+    for name in names:
+        metric = async_metrics._metrics_cache[name]
+        if reset == "clear":
+            metric.clear()
+        else:
+            labelvalues = [counter_labels[n] if n == "success" else series[n] for n in metric._labelnames]
+            metric.remove(*labelvalues)
+    record()
+
+    assert _sample("cache_operations_total", counter_labels) == 1.0
+    assert _sample("cache_operation_duration_ms_count", series) == 1.0
+    assert _sample("cache_operation_size_bytes_sum", series) == 10.0

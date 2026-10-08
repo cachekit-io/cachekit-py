@@ -261,10 +261,13 @@ class _CacheOpSeries:
     """The three cache-operation series of one (operation, namespace, success, serializer) tuple, bound once.
 
     ``Metric.labels()`` sorts its arguments, validates them and takes a lock on every call: three of them cost
-    about 5 us per recorded operation. Each series binds on its first update, so a tuple that never
-    counts, or never observes a duration or size, gets no empty series, exactly as per-call ``labels()`` left it.
-    The parent metrics are kept so ``_cache_op_series`` can tell when ``_metrics_cache`` holds a different metric
-    under a name (tests replace them), and rebind instead of recording into an orphan.
+    about 5 us per recorded operation. Each series binds on its first update, so a tuple that never counts, or
+    never observes a duration or size, gets no empty series, exactly as per-call ``labels()`` left it. A series
+    detached by the parent's ``clear()`` or ``remove()`` binds again on its next update, as per-call ``labels()``
+    would: each update checks that the child is still the one its parent exports, inline because a helper call
+    costs about 1% per operation. The parent metrics are kept so ``_cache_op_series`` can tell when
+    ``_metrics_cache`` holds a different metric under a name (tests replace them), and rebind instead of recording
+    into an orphan.
     """
 
     __slots__ = ("counter_metric", "duration_metric", "size_metric", "_success", "_labels", "_counter", "_duration", "_size")
@@ -281,19 +284,22 @@ class _CacheOpSeries:
         self._size: Any = None
 
     def inc(self, amount: int = 1) -> None:
-        if self._counter is None:
-            self._counter = self.counter_metric.labels(success=self._success, **self._labels)
-        self._counter.inc(amount)
+        child, parent = self._counter, self.counter_metric
+        if child is None or (child is not parent and parent._metrics.get(child._labelvalues) is not child):
+            child = self._counter = self.counter_metric.labels(success=self._success, **self._labels)
+        child.inc(amount)
 
     def observe_duration(self, duration_ms: float) -> None:
-        if self._duration is None:
-            self._duration = self.duration_metric.labels(**self._labels)
-        self._duration.observe(duration_ms)
+        child, parent = self._duration, self.duration_metric
+        if child is None or (child is not parent and parent._metrics.get(child._labelvalues) is not child):
+            child = self._duration = self.duration_metric.labels(**self._labels)
+        child.observe(duration_ms)
 
     def observe_size(self, size_bytes: float) -> None:
-        if self._size is None:
-            self._size = self.size_metric.labels(**self._labels)
-        self._size.observe(size_bytes)
+        child, parent = self._size, self.size_metric
+        if child is None or (child is not parent and parent._metrics.get(child._labelvalues) is not child):
+            child = self._size = self.size_metric.labels(**self._labels)
+        child.observe(size_bytes)
 
 
 # Process-wide, like the metrics whose series it holds. One entry per label tuple, the same cardinality
