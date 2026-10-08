@@ -23,6 +23,7 @@ import logging
 import pathlib
 import pickle
 import socket
+import sys
 import threading
 import types
 import uuid
@@ -204,9 +205,9 @@ def _cachekit_frames_holding_an_exception(err: BaseException) -> list[str]:
 
 
 def _left_for_the_cyclic_gc() -> list[str]:
-    """Every cachekit frame, and every exception redis-py, cachekit or a test raised, that only the cyclic GC can free
-    now. Disable the GC before the failure: a collection in between would free them unseen. Exceptions from elsewhere are
-    left out: a thread another test left running may raise one meanwhile."""
+    """Every cachekit frame, and every exception redis-py, cachekit or this module raised, that only the cyclic GC can
+    free now. Disable the GC before the failure: a collection in between would free them unseen. Exceptions from
+    elsewhere are left out: a thread another test left running may raise one meanwhile."""
     gc.set_debug(gc.DEBUG_SAVEALL)  # what collect() finds unreachable stays in gc.garbage
     try:
         gc.collect()
@@ -214,7 +215,10 @@ def _left_for_the_cyclic_gc() -> list[str]:
             f"frame {obj.f_code.co_name}" if isinstance(obj, types.FrameType) else type(obj).__name__
             for obj in gc.garbage
             if (isinstance(obj, types.FrameType) and _in_cachekit(obj))
-            or (isinstance(obj, BaseException) and type(obj).__module__.partition(".")[0] in ("redis", "cachekit", "tests"))
+            or (
+                isinstance(obj, BaseException)
+                and (type(obj).__module__ == __name__ or type(obj).__module__.partition(".")[0] in ("redis", "cachekit"))
+            )
         ]
     finally:
         gc.set_debug(0)
@@ -425,9 +429,10 @@ def test_the_blocks_exception_wins_over_a_release_that_fails_after_it(
 
 async def _a_cancel_during_the_release_after_the_block_raised(
     backend: PerRequestRedisBackend, releasing: threading.Event, release: threading.Event
-) -> list[str]:
-    """``acquire_lock`` cancelled while it releases the lock after its block raised; what only the cyclic GC can free
-    once the cancel is caught. Checked in this coroutine: ``asyncio.run`` keeps the exception it returns in a cycle."""
+) -> tuple[list[str], list[str]]:
+    """``acquire_lock`` cancelled while it releases the lock after its block raised: the cachekit frames on the cancel
+    that hold an exception, and what only the cyclic GC can free once the cancel is caught. Checked in this coroutine:
+    ``asyncio.run`` keeps the exception it returns in a cycle."""
 
     async def raise_in_lock() -> None:
         async with backend.acquire_lock("k", timeout=5):
@@ -443,18 +448,18 @@ async def _a_cancel_during_the_release_after_the_block_raised(
         release.set()
         try:
             await task
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError as exc:
+            held = _cachekit_frames_holding_an_exception(exc)
         else:
             pytest.fail("acquire_lock was not cancelled")
         del task
         await asyncio.sleep(0)  # the task step that threw the cancel in here holds it until this coroutine yields
-        return _left_for_the_cyclic_gc()
+        return held, _left_for_the_cyclic_gc()
     finally:
         gc.enable()
 
 
-def test_a_cancel_during_the_release_after_the_block_raised_is_freed_without_the_cyclic_gc(
+def test_a_cancel_during_the_release_after_the_block_raised_holds_no_exception(
     fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     releasing, release = threading.Event(), threading.Event()
@@ -467,9 +472,14 @@ def test_a_cancel_during_the_release_after_the_block_raised_is_freed_without_the
     server = fake_redis(refusing=False, serving={b"SET": b"+OK\r\n"})
     backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
 
-    left = asyncio.run(_a_cancel_during_the_release_after_the_block_raised(backend, releasing, release))  # type: ignore[arg-type]
+    held, left = asyncio.run(_a_cancel_during_the_release_after_the_block_raised(backend, releasing, release))  # type: ignore[arg-type]
 
-    assert left == []
+    assert held == []
+    # CPython 3.12 alone keeps a finished generator's frame linked to the frame that last resumed it (``f_back``): here
+    # contextlib's ``__aexit__``, whose ``value`` is the block's exception, whose traceback holds acquire_lock's frame.
+    # Any ``@asynccontextmanager`` whose cleanup raises after its block raised makes that cycle there, whatever it holds.
+    if sys.version_info[:2] != (3, 12):
+        assert left == []
 
 
 # Each write fails once the backend is built: the connection drops, Redis is loading its dataset after a restart, or it
