@@ -102,7 +102,7 @@ def expensive_function(user_id: int):
 
 ### 2. Choose the Right Serializer
 
-**For DataFrames (10K+ rows):**
+**For DataFrames:**
 ```python
 from cachekit.serializers import ArrowSerializer
 

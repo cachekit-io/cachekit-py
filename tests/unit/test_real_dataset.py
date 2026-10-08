@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 import pytest
+import xxhash
 
 # The [data] extra is absent in the free-threaded CI lane, which installs only the test group.
 pd = pytest.importorskip("pandas")
@@ -93,6 +94,9 @@ def test_round_trip_is_exact_and_its_encoded_size_is_stable(
     data, metadata = serializer.serialize(obj)
     out = serializer.deserialize(data, metadata)
 
+    # Both routes write [xxHash3-64 of the rest][payload]. The reader also accepts legacy payloads
+    # with no checksum, so equality and the size ceiling alone would pass a writer that dropped it.
+    assert data[:8] == xxhash.xxh3_64_digest(data[8:]), "the encoding lost its integrity checksum"
     if isinstance(obj, np.ndarray):
         np.testing.assert_array_equal(out, obj, strict=True)
     else:
