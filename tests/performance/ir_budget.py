@@ -6,7 +6,7 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
 - ``import cachekit`` starts background threads (the log writer, the L1 cleanup worker) whose
   counts swing by tens of percent between identical runs. Only the MAIN thread is counted
   (callgrind ``--separate-threads=yes``, file ``-01``). Work a library runs on its own threads
-  is not counted either: about half of the real-data Arrow round trip runs on pyarrow's pool.
+  is not counted either: about half of the real-data Arrow round trip runs on pyarrow's threads.
 - Interpreter startup is ~2 billion instructions. Each path runs at two loop sizes and the
   per-op cost is the difference, ``(Ir[N_HI] - Ir[N_LO]) / (N_HI - N_LO)``, so startup and
   warmup cancel. The real-data paths run at smaller sizes (``LOOPS``).
