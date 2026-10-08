@@ -1,7 +1,7 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "generator": "cachekit-py FileBackend format v1",
-  "format": "File name = BLAKE2b-128(UTF-8 key) lowercase hex; header = CK | version | reserved | flags u16 BE | expiry u64 BE | payload. reader_action is evaluated at reader_now_unix_seconds (default 0): miss_preserve for nonzero reserved/flags, miss_expired when now reaches a nonzero expiry, else return_payload. reserved defaults to 0.",
+  "format": "File name = BLAKE2b-128(UTF-8 key) lowercase hex; header = CK | version | reserved | flags u16 BE | expiry u64 BE | payload. reader_action is evaluated at reader_now_unix_seconds (default 0): miss_preserve for nonzero reserved/flags, whatever the expiry, miss_expired when now reaches a nonzero expiry, else return_payload. reserved defaults to 0.",
   "vectors": [
     {
       "name": "permanent_ascii",
@@ -59,6 +59,88 @@
       "flags": 0,
       "reader_now_unix_seconds": 1000000000,
       "reader_action": "miss_expired"
+    },
+    {
+      "name": "empty_payload",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010000000000000000000000",
+      "payload_hex": "",
+      "file_hex": "434b010000000000000000000000",
+      "expiry_unix_seconds": 0,
+      "flags": 0,
+      "reader_action": "return_payload"
+    },
+    {
+      "name": "binary_payload",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010000000000000000000000",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "file_hex": "434b010000000000000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "expiry_unix_seconds": 0,
+      "flags": 0,
+      "reader_action": "return_payload"
+    },
+    {
+      "name": "unknown_flag_high_bit",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010080000000000000000000",
+      "payload_hex": "667574757265",
+      "file_hex": "434b010080000000000000000000667574757265",
+      "expiry_unix_seconds": 0,
+      "flags": 32768,
+      "reader_action": "miss_preserve"
+    },
+    {
+      "name": "reserved_one_preserved",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010100000000000000000000",
+      "payload_hex": "7265736572766564",
+      "file_hex": "434b0101000000000000000000007265736572766564",
+      "expiry_unix_seconds": 0,
+      "flags": 0,
+      "reserved": 1,
+      "reader_action": "miss_preserve"
+    },
+    {
+      "name": "reserved_ff_preserved",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b01ff00000000000000000000",
+      "payload_hex": "7265736572766564",
+      "file_hex": "434b01ff000000000000000000007265736572766564",
+      "expiry_unix_seconds": 0,
+      "flags": 0,
+      "reserved": 255,
+      "reader_action": "miss_preserve"
+    },
+    {
+      "name": "unknown_flag_expired",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b01000001000000003b9aca00",
+      "payload_hex": "667574757265",
+      "file_hex": "434b01000001000000003b9aca00667574757265",
+      "expiry_unix_seconds": 1000000000,
+      "flags": 1,
+      "reader_now_unix_seconds": 1000000000,
+      "reader_action": "miss_preserve"
+    },
+    {
+      "name": "reserved_nonzero_expired",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b01020000000000003b9aca00",
+      "payload_hex": "7265736572766564",
+      "file_hex": "434b01020000000000003b9aca007265736572766564",
+      "expiry_unix_seconds": 1000000000,
+      "flags": 0,
+      "reserved": 2,
+      "reader_now_unix_seconds": 1000000000,
+      "reader_action": "miss_preserve"
     }
   ]
 }

@@ -1,26 +1,27 @@
 """FileBackend on-disk format against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/file-backend.json, vendored from
-cachekit-io/protocol @ 63539b42f5ed328d2b54646b999e415af8338798 (vectors 1.1.0,
-sha256 8d9d8c4709baf9ef3a8f2d71d21fb5a56207bc7a05c9bc7a967ac567f2604615).
+cachekit-io/protocol @ 4b8fddb2120b9e3355d7fc9d593130dba8a345ac (vectors 1.2.0,
+sha256 b7b0c51935a3a00ab340005ae1e091797b14938f92eecae23346bdccf0d12af4).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 spec/file-backend-format.md, "Version and flag negotiation": a nonzero reserved byte or
 flag can indicate a future payload transform, so a reader that does not implement it
 MUST return a miss and MUST NOT delete, rewrite, or return the payload. Every read path
-is checked against that, plus a derived expired-and-flagged entry: the spec checks flags
+is checked against that, including the two expired-and-flagged entries: the spec checks flags
 before expiry, and its MUST NOT delete has no expiry exception.
 
-``expired_entry`` is read with the clock frozen at its ``reader_now_unix_seconds``, which equals
+A vector carrying ``reader_now_unix_seconds`` is read with the clock frozen there, which equals
 its expiry: the spec's entry "is expired when the reader wall clock reaches that timestamp", so
-every read path must miss at that exact instant. The other vectors are read at the real wall clock.
+``expired_entry`` must miss at that exact instant and the expired-and-flagged entries must still
+be preserved. The other vectors are read at the real wall clock.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
-import struct
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -32,24 +33,12 @@ from cachekit.backends.file.backend import FileBackend
 from cachekit.backends.file.config import FileBackendConfig
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "file-backend.json"
-FIXTURE_SHA256 = "8d9d8c4709baf9ef3a8f2d71d21fb5a56207bc7a05c9bc7a967ac567f2604615"  # pragma: allowlist secret
+FIXTURE_SHA256 = "b7b0c51935a3a00ab340005ae1e091797b14938f92eecae23346bdccf0d12af4"  # pragma: allowlist secret
 
 VECTORS: dict[str, dict[str, Any]] = {v["name"]: v for v in json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["vectors"]}
 
-_PAST_EXPIRY = 1_000_000_000  # 2001-09-09; long gone at any real wall clock
-
-
-def _expired_flagged() -> dict[str, Any]:
-    """``unknown_flag_preserved`` with its expiry (bytes 6-13) set in the past."""
-    v = dict(VECTORS["unknown_flag_preserved"])
-    raw = bytearray.fromhex(v["file_hex"])
-    raw[6:14] = struct.pack(">Q", _PAST_EXPIRY)
-    v["name"] = "unknown_flag_preserved_expired"
-    v["file_hex"] = raw.hex()
-    return v
-
-
-PRESERVE = [VECTORS["unknown_flag_preserved"], VECTORS["reserved_nonzero_preserved"], _expired_flagged()]
+PRESERVE = [v for v in VECTORS.values() if v["reader_action"] == "miss_preserve"]
+RETURN_PAYLOAD = [v for v in VECTORS.values() if v["reader_action"] == "return_payload"]
 
 
 async def _refresh_ttl(b: FileBackend, k: str) -> Any:
@@ -74,6 +63,13 @@ def _place(tmp_path: Path, vector: dict[str, Any]) -> tuple[FileBackend, Path]:
     return backend, path
 
 
+def _reader_clock(vector: dict[str, Any]) -> contextlib.AbstractContextManager[Any]:
+    """The clock the vector is read at: frozen at its ``reader_now_unix_seconds``, else the real one."""
+    if "reader_now_unix_seconds" not in vector:
+        return contextlib.nullcontext()
+    return time_machine.travel(vector["reader_now_unix_seconds"], tick=False)
+
+
 def test_fixture_integrity() -> None:
     """The vendored fixture is byte-identical to the pinned protocol revision."""
     digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
@@ -91,6 +87,13 @@ def test_vector_actions() -> None:
         "unknown_flag_preserved": "miss_preserve",
         "reserved_nonzero_preserved": "miss_preserve",
         "expired_entry": "miss_expired",
+        "empty_payload": "return_payload",
+        "binary_payload": "return_payload",
+        "unknown_flag_high_bit": "miss_preserve",
+        "reserved_one_preserved": "miss_preserve",
+        "reserved_ff_preserved": "miss_preserve",
+        "unknown_flag_expired": "miss_preserve",
+        "reserved_nonzero_expired": "miss_preserve",
     }
 
 
@@ -100,9 +103,10 @@ async def test_miss_preserve(tmp_path: Path, vector: dict[str, Any], read: Calla
     backend, path = _place(tmp_path, vector)
     before = path.stat()
 
-    result = read(backend, vector["key_utf8"])
-    if hasattr(result, "__await__"):
-        result = await result
+    with _reader_clock(vector):
+        result = read(backend, vector["key_utf8"])
+        if hasattr(result, "__await__"):
+            result = await result
 
     assert result is miss
     assert path.read_bytes() == bytes.fromhex(vector["file_hex"])  # not deleted, not rewritten
@@ -110,9 +114,8 @@ async def test_miss_preserve(tmp_path: Path, vector: dict[str, Any], read: Calla
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
 
-@pytest.mark.parametrize("name", ["permanent_ascii", "future_expiry"])
-def test_return_payload(tmp_path: Path, name: str) -> None:
-    vector = VECTORS[name]
+@pytest.mark.parametrize("vector", RETURN_PAYLOAD, ids=lambda v: v["name"])
+def test_return_payload(tmp_path: Path, vector: dict[str, Any]) -> None:
     backend, _ = _place(tmp_path, vector)
     assert backend.get(vector["key_utf8"]) == bytes.fromhex(vector["payload_hex"])
 
@@ -123,7 +126,7 @@ async def test_miss_expired(tmp_path: Path, read: Callable[..., Any], miss: Any)
     assert vector["reader_now_unix_seconds"] == vector["expiry_unix_seconds"]  # the boundary instant
     backend, _ = _place(tmp_path, vector)
 
-    with time_machine.travel(vector["reader_now_unix_seconds"], tick=False):
+    with _reader_clock(vector):
         result = read(backend, vector["key_utf8"])
         if hasattr(result, "__await__"):
             result = await result
