@@ -1,6 +1,12 @@
 # Context7 serves this repo's docs to coding agents, and re-indexes on its own
 # schedule, which can lag a release by weeks. This asks it to re-index when a
-# release is published, so agents read the docs for the version users install.
+# release is published and once a day. Context7 indexes the default branch, so
+# agents may see docs ahead of the last release.
+# Context7 takes one refresh per library per 10 days and answers an earlier
+# one with HTTP 400 too-early. The daily schedule asks again once the window
+# reopens, so a change is usually refreshed within 11 days; GitHub runs
+# schedules best-effort, so that is not guaranteed. The schedule also spends
+# each window as it opens, so a release rarely refreshes at once.
 # Scope and agent rules live in context7.json.
 # Endpoint: https://context7.com/docs/integrations/github-actions
 name: Context7 Refresh
@@ -8,6 +14,8 @@ name: Context7 Refresh
 on:
   release:
     types: [published]
+  schedule:
+    - cron: "23 5 * * *"
   workflow_dispatch:
 
 permissions: {}
@@ -37,5 +45,10 @@ jobs:
           case "$status" in
             (202) echo "::warning::Context7 has not finalized this library yet (HTTP 202). Re-run this workflow later." ;;
             (2??) echo "Context7 accepted the refresh (HTTP $status)." ;;
+            (400) if jq -e '.error == "too-early"' "$RUNNER_TEMP/context7-response.json" >/dev/null 2>&1; then
+                   echo "::warning::Context7 refreshed this library less than 10 days ago (HTTP 400 too-early). The daily schedule asks again."
+                 else
+                   echo "::error::Context7 refresh failed with HTTP 400."; exit 1
+                 fi ;;
             (*) echo "::error::Context7 refresh failed with HTTP $status."; exit 1 ;;
           esac
