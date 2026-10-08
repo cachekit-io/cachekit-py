@@ -259,9 +259,9 @@ def test_cached_function():
 
 | Serializer | Speed | Use Case |
 |:-----------|:-----:|:---------|
-| **StandardSerializer** | ★★★★☆ | General Python types, NumPy, Pandas |
+| **StandardSerializer** | ★★★★☆ | General Python types; not NumPy arrays or pandas objects |
 | **OrjsonSerializer** | ★★★★★ | JSON APIs (2-5x faster than stdlib) — requires `cachekit[json]` |
-| **ArrowSerializer** | ★★★★★ | Large DataFrames (6-23x faster for 10K+ rows) |
+| **ArrowSerializer** | ★★★★★ | pandas DataFrames (columnar, exact round trip) |
 | **+ Encryption** | ★★★★☆ | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
 <details>

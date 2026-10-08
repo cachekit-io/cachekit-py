@@ -25,6 +25,12 @@ against `ir_baselines.json`. Budgets belong to the build that recorded them; on 
 interpreter, extension or C library, record a baseline on `main` first.
 See [docs/performance.md](../../docs/performance.md#instruction-budgets).
 
+**Real data.** `tests/data/` holds a pinned slice of a public dataset (provenance in its README).
+`tests/unit/test_real_dataset.py` round-trips it, and results derived from it, through the
+serializers and the decorator's backend path on every PR (`uv run pytest tests/unit/test_real_dataset.py`).
+The `serializer_arrow_usgs` and `serializer_auto_usgs` budgets measure it
+(`uv run python tests/performance/ir_budget.py --path serializer_arrow_usgs --path serializer_auto_usgs`).
+
 ---
 
 ## Test Organization

@@ -251,10 +251,11 @@ def test_decorator_overhead_dataclass() -> None:
 @pytest.mark.performance
 @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not available")
 def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
-    """Measure decorator overhead with DataFrame (10K rows).
+    """Measure decorator overhead on an L1 hit returning a DataFrame (10K rows).
 
-    This tests the default serializer (msgpack) with DataFrames.
-    ArrowSerializer is tested separately in test_serializer_benchmarks.py.
+    L1-only (``backend=None``): the hit returns the stored frame object, so nothing is serialized
+    and ``serializer="auto"`` is never called. The serializing backend path, on real data, is
+    ``tests/unit/test_real_dataset.py``.
     """
 
     @cache(backend=None, serializer="auto", encryption=False)

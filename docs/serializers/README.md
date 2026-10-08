@@ -32,8 +32,7 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 | JSON-heavy data | OrjsonSerializer | 2-5x faster than stdlib json |
 | API response caching | OrjsonSerializer | JSON-native, human-readable |
 | Web session data | OrjsonSerializer | Fast JSON, cross-language |
-| Small DataFrames (< 1K rows) | StandardSerializer | Lower overhead for small data |
-| Large DataFrames (10K+ rows) | ArrowSerializer | Significant speedup (6-23x) |
+| DataFrames, any size | ArrowSerializer | Columnar and exact; StandardSerializer refuses DataFrames |
 | Mixed object types | StandardSerializer | Broad type support |
 | Real-time data pipelines | ArrowSerializer | Zero-copy deserialization |
 | Time-series analytics | ArrowSerializer | Optimized for columnar data |
@@ -246,7 +245,7 @@ def get_user_data_v2(user_id):
 
 - [StandardSerializer (MessagePack)](default.md) — General-purpose, handles all Python types
 - [OrjsonSerializer](orjson.md) — JSON-optimized, 2-5x faster than stdlib json
-- [ArrowSerializer](arrow.md) — DataFrame-optimized, 6-23x faster for large DataFrames
+- [ArrowSerializer](arrow.md) — DataFrame-optimized columnar format
 - [Encryption Wrapper](encryption.md) — Wraps any cross-SDK serializer for zero-knowledge caching
 - [Caching Pydantic Models](pydantic.md) — Patterns and pitfalls for Pydantic model caching
 - [Custom Serializers](custom.md) — Implement your own via SerializerProtocol

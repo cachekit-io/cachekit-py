@@ -5,7 +5,7 @@ so editing it moves the heap layout the budgets were recorded at: after any chan
 the budgets on every interpreter (``ir_budget.py --update --allow-increase``). Editing the gate
 itself (thresholds, report, options, its docs) does not touch the measured process.
 
-Usage, as ``ir_budget.py`` runs it: ``python ir_workload.py <path> <n>``.
+Usage, as ``ir_budget.py`` runs it: ``python ir_workload.py <path> <n> <warmup>``.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 FILE_SET_ENTRIES = 1000
@@ -151,6 +152,10 @@ def build_workload(path: str) -> Callable[[], object]:
 
     if path == "serializer_arrow":
         return roundtrip(get_serializer("arrow"), frame)
+    if path.endswith("_usgs"):
+        # A real public dataset, 12,535 rows of mixed dtypes (tests/data/README.md).
+        usgs = pd.read_parquet(Path(__file__).parents[1] / "data" / "usgs_earthquakes_2024-01.parquet")
+        return roundtrip(get_serializer(path.removeprefix("serializer_").removesuffix("_usgs")), usgs)
     if path == "serializer_default_records":
         return roundtrip(get_serializer("default"), records)
     if path == "serializer_encrypted":
@@ -189,7 +194,7 @@ def pin_main_thread_clocks() -> None:
         setattr(time, f"{name}_ns", pinned(getattr(time, f"{name}_ns"), int(origin * 1e9), 1000))
 
 
-def run_workload(path: str, n: int) -> None:
+def run_workload(path: str, n: int, warmup: int) -> None:
     import gc
 
     # Background threads' allocations count toward the main thread's GC trigger, so when a
@@ -204,7 +209,7 @@ def run_workload(path: str, n: int) -> None:
     pin_main_thread_clocks()
     _shift = [object() for _ in range(int(os.environ.get("IR_BUDGET_LAYOUT", "0")))]  # noqa: F841 (held: see LAYOUTS in ir_budget.py)
     op = build_workload(path)
-    for _ in range(50):  # identical warmup at both N: first-call costs (L1 fill, lazy imports) cancel
+    for _ in range(warmup):  # identical warmup at both N: first-call costs (L1 fill, lazy imports) cancel
         op()
     for _ in range(n):
         op()
@@ -216,4 +221,4 @@ def run_workload(path: str, n: int) -> None:
 
 
 if __name__ == "__main__":
-    run_workload(sys.argv[1], int(sys.argv[2]))
+    run_workload(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]))

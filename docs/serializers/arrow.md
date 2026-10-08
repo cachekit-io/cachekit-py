@@ -14,16 +14,11 @@
 - High-frequency DataFrame caching
 
 **Performance characteristics:**
-- Serialization: **3-6x faster** than MessagePack for large DataFrames
-- Deserialization: **7-20x faster** (memory-mapped, zero-copy)
+- Deserialization: memory-mapped, zero-copy
 - Memory overhead: Minimal (zero-copy deserialization)
 - Network overhead: Efficient columnar format
 
-**Measured speedups:**
-- **10K rows**: 0.80ms (Arrow) vs 3.96ms (MessagePack) = **5.0x faster**
-- **100K rows**: 4.06ms (Arrow) vs 39.04ms (MessagePack) = **9.6x faster**
-
-For detailed performance analysis, see [Performance Guide](../performance.md).
+StandardSerializer (MessagePack) does not accept DataFrames, so there is no MessagePack figure to compare against. Sizes and instruction counts measured on a real dataset are in [Performance on Real Data](#performance-on-real-data).
 
 ## Basic Usage
 
@@ -121,32 +116,20 @@ except TypeError as e:
     # "... Got a dict that is not convertible to an Arrow table: value for 'key' is str, not a list or array. ..."
 ```
 
-## Performance Benchmarks
+## Performance on Real Data
 
-Real-world performance benchmarks (measured on M1 Mac):
+Measured on a public dataset: one month of the USGS earthquake catalogue (January 2024), 12,535 rows by 13 columns, 3.9 MB in memory. It mixes timezone-aware timestamps, a nullable `Int64`, categoricals and high-cardinality strings. The slice and its provenance are in the repository at `tests/data/`. `tests/unit/test_real_dataset.py` asserts each size below within 10% on every pull request, and that every round trip is exact (dtypes, index and names).
 
-**Serialization (encode to bytes):**
-| DataFrame Size | Arrow Time | Default Time | Speedup |
-|----------------|------------|--------------|---------|
-| 1K rows | 0.29ms | 0.20ms | 0.7x (overhead for small data) |
-| 10K rows | 0.48ms | 1.64ms | **3.4x** |
-| 100K rows | 2.93ms | 16.42ms | **5.6x** |
+| What is cached | Shape | Encoded bytes |
+|----------------|-------|--------------:|
+| The full frame | 12,535 × 13 | 673,906 |
+| A filtered, sorted frame indexed by event id | 2,249 × 12 | 118,938 |
+| A `groupby` with named aggregations | 15 × 4 | 4,026 |
+| A `pivot_table` of mean magnitude | 15 × 6 | 4,890 |
 
-**Deserialization (decode from bytes):**
-| DataFrame Size | Arrow Time | Default Time | Speedup |
-|----------------|------------|--------------|---------|
-| 1K rows | 0.21ms | 0.39ms | **1.8x** |
-| 10K rows | 0.32ms | 2.32ms | **7.1x** |
-| 100K rows | 1.13ms | 22.62ms | **20.1x** |
+A full-frame round trip (`serialize` then `deserialize`) costs about 60 million instructions on the calling thread, on CPython 3.12.12 and 3.14.3, x86_64 Linux (`make perf-ir`, paths `serializer_arrow_usgs` and `serializer_auto_usgs`; pyarrow runs part of the work on its own threads, which this figure leaves out). A 100-row frame costs about 2 million, so a small frame pays mostly fixed per-call cost. These are instruction counts, not wall time: see [Instruction Budgets](../performance.md#instruction-budgets).
 
-**Total Roundtrip (serialize + deserialize):**
-| DataFrame Size | Arrow Total | Default Total | Speedup |
-|----------------|-------------|---------------|---------|
-| 10K rows | 0.80ms | 3.96ms | **5.0x** |
-| 100K rows | 4.06ms | 39.04ms | **9.6x** |
-
-> [!NOTE]
-> ArrowSerializer shines for DataFrames with 10K+ rows. For smaller data (< 1K rows), StandardSerializer has lower overhead.
+`serializer="auto"` hands a DataFrame to ArrowSerializer when pyarrow is installed, so it produces the same bytes. The default `StandardSerializer` does not accept DataFrames.
 
 For comprehensive performance analysis including decorator overhead, concurrent access, and encryption impact, see [Performance Guide](../performance.md).
 

@@ -216,7 +216,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 **Method** (`tests/performance/ir_budget.py`; the measured process is `ir_workload.py`):
 - Each path runs under `valgrind --tool=callgrind --separate-threads=yes`, and only the main thread is counted. cachekit's background threads (log writer, L1 cleanup) vary by tens of percent between identical runs.
-- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped.
+- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped. The two real-data paths cost about 60 million instructions per call, so they run 10 and 30 calls after 5 warmup calls; startup still cancels, and two runs agreed within 0.03%.
 - The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day log flush and L1 cleanup interval, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
 - Nothing that runs on real time lands in the measured loop: no background thread wakes, cyclic GC is off, and the GIL switch interval is long enough that the main thread gives up the GIL only where the code releases it.
 - Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the median. Any code change moves the layout, and the allocators take shorter or longer paths in some heap states: single layouts of the orjson round trip and the minimal L1 hit sat up to 2.4% from the rest. The median ignores one or two such layouts. The cheapest layout is not used, because a lucky one can sit 1% below the rest, and a budget recorded there makes every later run look like a regression.
@@ -239,6 +239,8 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 | `serializer_auto` | `AutoSerializer` round trip | 69,441 | 70,650 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,679 | 23,775 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,953,212 | 1,953,407 |
+| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 60,350,891 | 59,871,161 |
+| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 60,354,776 | 59,877,670 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 118,412 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 100,723 | 86,297 |
 
@@ -246,10 +248,10 @@ Budgets are per interpreter (minor version, build flavour, machine); an interpre
 
 **Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,700 to 4,900 instructions (`l1_hit` +6.1%, `l2_hit_async_metrics` +1.5%, `miss` +1.4%) and failed the gate, while the serializer paths, which generate no key, stayed within 0.11%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 
-**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.3% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
+**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted, and so does part of pyarrow's work on the real-data paths: about half of their instructions run on pyarrow's threads. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.3% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
 
 ```bash
-make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 130 runs, several minutes)
+make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 150 runs, several minutes)
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 
@@ -261,6 +263,13 @@ systemd-run --user --scope -p MemoryMax=10G -p MemorySwapMax=0 -p RuntimeMaxSec=
 ```
 
 The gate does not call `systemd-run` itself, because CI runners and macOS lack it. A deliberate cost increase (a new feature on the hot path) is recorded with `uv run python tests/performance/ir_budget.py --update --allow-increase`, and the PR states why.
+
+**Real data.** `tests/data/usgs_earthquakes_2024-01.parquet` is a pinned slice of a public dataset: one month of the USGS earthquake catalogue, 12,535 rows by 13 columns, with timezone-aware timestamps, a nullable integer, categoricals and high-cardinality strings. `tests/data/README.md` records its source, licence, sha256 and the commands that made it. `tests/unit/test_real_dataset.py` runs on every pull request. It round-trips the frame and four results derived from it (a `groupby`, a `pivot_table`, a float64 array and a re-indexed filter) through `AutoSerializer` and `ArrowSerializer` with exact equality, guards each encoded size within 10%, and serves a cached aggregation from a `FileBackend` through `@cache` and `@cache.secure`. The `serializer_*_usgs` paths budget the full-frame round trip:
+
+```bash
+uv run pytest tests/unit/test_real_dataset.py
+uv run python tests/performance/ir_budget.py --path serializer_arrow_usgs --path serializer_auto_usgs
+```
 
 ---
 
