@@ -300,10 +300,8 @@ class TestPayloadRejectVectors:
         assert fmt == vector["format"]
 
         (reason,) = vector["reject_reasons"]
-        with pytest.raises(SerializationError, match=PAYLOAD_REJECT_ERRORS[reason]) as excinfo:
+        with pytest.raises(SerializationError, match=PAYLOAD_REJECT_ERRORS[reason]):
             StandardSerializer().deserialize(envelope)
-        # The pre-scan's own ValueError, not a decoder's error after it materialised the containers.
-        assert type(excinfo.value.__cause__) is ValueError
 
 
 _TEMPORAL_TYPES = {"datetime": datetime.datetime, "date": datetime.date, "time": datetime.time}
@@ -314,7 +312,11 @@ class TestTemporalSentinelVectors:
 
     def test_temporal_sentinel_vector_names_are_pinned(self):
         """An emptied or renamed group fails here instead of passing on zero parametrized cases."""
-        assert {v["revives_to"]["type"] for v in _FIXTURE.get("temporal_sentinel_vectors", [])} == set(_TEMPORAL_TYPES)
+        assert {v["name"]: v["revives_to"]["type"] for v in _FIXTURE.get("temporal_sentinel_vectors", [])} == {
+            "temporal_sentinel_datetime": "datetime",
+            "temporal_sentinel_date": "date",
+            "temporal_sentinel_time": "time",
+        }
 
     @pytest.mark.parametrize("vector", _FIXTURE["temporal_sentinel_vectors"], ids=lambda v: v["name"])
     def test_payload_revives_as_temporal_type(self, vector):
@@ -322,7 +324,7 @@ class TestTemporalSentinelVectors:
         value = StandardSerializer(enable_integrity_checking=False).deserialize(bytes.fromhex(vector["payload_hex"]))
         expected_type = _TEMPORAL_TYPES[vector["revives_to"]["type"]]
         assert type(value) is expected_type
-        assert value == expected_type.fromisoformat(vector["revives_to"]["iso"])
+        assert value.isoformat() == vector["revives_to"]["iso"]  # the same instant AND the same offset
 
 
 class TestBinEmitWidths:

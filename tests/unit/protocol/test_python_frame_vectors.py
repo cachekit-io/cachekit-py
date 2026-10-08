@@ -15,9 +15,10 @@ spec/wire-format.md, "CK v3 frame". Through the real read paths, this module pro
    magic is not a frame to cachekit-py, so it falls to the legacy base64+JSON reader, which
    refuses it as non-UTF-8. A CK frame fed to the interop reader gets its CK diagnostic.
 3. **Encrypted caches fail closed**: a reader configured for encryption, resolving its own
-   tenant, refuses every ``encrypted_read_vectors`` frame under both tamper policies,
-   whatever the frame's header claims. A positive control reads the reader's own entry, so
-   a refusal is never a broken reader.
+   tenant, refuses every ``encrypted_read_vectors`` frame with ``encryption_fail_closed``
+   off and on, whatever the frame's header claims. Two controls keep the refusals honest:
+   the reader reads its own entry, and a reader resolving the other tenant decrypts
+   ``ciphertext_other_tenant``, so that frame is refused for its tenant alone.
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ import pytest
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.decorators.tenant_context import CallableExtractor
 from cachekit.interop import InteropDecodeError, decode_interop_value
-from cachekit.serializers.base import SerializationError
+from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
 from cachekit.serializers.wrapper import SerializationWrapper
 
 pytestmark = pytest.mark.unit
@@ -47,6 +49,15 @@ ENCRYPTED_READER: dict[str, str] = _FIXTURE["encrypted_reader"]
 ENCRYPTED_READ_VECTORS: list[dict[str, Any]] = _FIXTURE["encrypted_read_vectors"]
 CACHE_KEY = ENCRYPTED_READER["cache_key"]
 
+# The refusal each encrypted read vector gets. The forged orjson frame may be refused for its serializer
+# name or its plaintext claim, whichever the reader checks first, so it pins only the common base.
+ENCRYPTED_READ_ERRORS: dict[str, type[SerializationError]] = {
+    "forged_plaintext_encrypted_false": SuspiciousCacheEntryError,
+    "forged_plaintext_orjson": SerializationError,
+    "ciphertext_key_not_in_keyring": DecryptionAuthenticationError,
+    "ciphertext_other_tenant": DecryptionAuthenticationError,
+}
+
 # The frame parser's own error for each check (src/cachekit/serializers/wrapper.py, _split_frame).
 # "magic" has none: a non-frame goes to the legacy reader, whose UTF-8 decode refuses it.
 FRAME_CHECK_ERRORS = {
@@ -56,14 +67,14 @@ FRAME_CHECK_ERRORS = {
 }
 
 
-def _encrypted_reader(*, fail_closed: bool) -> CacheSerializationHandler:
+def _encrypted_reader(*, fail_closed: bool, tenant_id: str = ENCRYPTED_READER["tenant_id"]) -> CacheSerializationHandler:
     """The fixture's encrypted reader: multi-tenant, so it resolves its tenant itself, never from the header."""
     return CacheSerializationHandler(
         "default",
         encryption=True,
         master_key=ENCRYPTED_READER["master_key_hex"],
         encryption_fail_closed=fail_closed,
-        tenant_extractor=CallableExtractor(lambda *_a, **_k: ENCRYPTED_READER["tenant_id"]),
+        tenant_extractor=CallableExtractor(lambda *_a, **_k: tenant_id),
     )
 
 
@@ -96,12 +107,7 @@ def test_vector_names() -> None:
         "plain_msgpack_fed_to_frame_reader": "magic",
         "ck_frame_fed_to_interop_reader": None,
     }
-    assert [v["name"] for v in ENCRYPTED_READ_VECTORS] == [
-        "forged_plaintext_encrypted_false",
-        "forged_plaintext_orjson",
-        "ciphertext_key_not_in_keyring",
-        "ciphertext_other_tenant",
-    ]
+    assert [v["name"] for v in ENCRYPTED_READ_VECTORS] == list(ENCRYPTED_READ_ERRORS)
     assert ENCRYPTED_READER["tenant_source"] == "reader"
 
 
@@ -168,11 +174,16 @@ class TestEncryptedReadVectors:
         value = {"user_id": 42, "name": "cachekit", "active": True}
         assert reader.deserialize_data(reader.serialize_data(value, cache_key=CACHE_KEY), cache_key=CACHE_KEY) == value
 
+    def test_other_tenants_reader_decrypts_other_tenant_frame(self, fail_closed: bool) -> None:
+        """Control: ciphertext_other_tenant authenticates for its own tenant, so the refusal below is the tenant's."""
+        (vector,) = [v for v in ENCRYPTED_READ_VECTORS if v["name"] == "ciphertext_other_tenant"]
+        (written,) = [v for v in FRAME_VECTORS if v["name"] == "default_saas_write_msgpack_bytestorage_bin"]
+        reader = _encrypted_reader(fail_closed=fail_closed, tenant_id=vector["expected_header"]["m"]["tenant_id"])
+        assert reader.deserialize_data(bytes.fromhex(vector["frame_hex"]), cache_key=CACHE_KEY) == written["value_json"]
+
     @pytest.mark.parametrize("vector", ENCRYPTED_READ_VECTORS, ids=lambda v: v["name"])
     def test_read_fails_closed(self, fail_closed: bool, vector: dict[str, Any]) -> None:
         assert vector["outcome"] == "fail_closed"
         reader = _encrypted_reader(fail_closed=fail_closed)
-        # Every read-path refusal derives from SerializationError; the forged orjson frame may be refused
-        # for its serializer name or its plaintext claim, whichever the reader checks first.
-        with pytest.raises(SerializationError):
+        with pytest.raises(ENCRYPTED_READ_ERRORS[vector["name"]]):
             reader.deserialize_data(bytes.fromhex(vector["frame_hex"]), cache_key=CACHE_KEY)
