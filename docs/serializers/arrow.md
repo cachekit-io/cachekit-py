@@ -118,7 +118,7 @@ except TypeError as e:
 
 ## Performance on Real Data
 
-Measured on a public dataset: one month of the USGS earthquake catalogue (January 2024), 12,535 rows by 13 columns, 3.9 MB in memory. It mixes timezone-aware timestamps, a nullable `Int64`, categoricals and high-cardinality strings. The slice and its provenance are in the repository at `tests/data/`. `tests/unit/test_real_dataset.py` asserts each size below within 10% on every pull request, and that every round trip is exact (dtypes, index and names).
+Measured on a public dataset: one month of the USGS earthquake catalogue (January 2024), 12,535 rows by 13 columns, 3.9 MB in memory. It mixes timezone-aware timestamps, a nullable `Int64`, categoricals and high-cardinality strings. The slice and its provenance are in the repository at `tests/data/`. `tests/unit/test_real_dataset.py` asserts on every pull request that each size stays at most 10% above the figure below, and that every round trip is exact (dtypes, index and names).
 
 | What is cached | Shape | Encoded bytes |
 |----------------|-------|--------------:|
