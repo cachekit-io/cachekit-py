@@ -54,7 +54,7 @@ class TestHandlerBuiltOnce:
     def test_sync_explicit_backend(self, built):
         backend = _Backend()
 
-        @cache(backend=backend, l1_enabled=False, namespace="lab7112_sync")
+        @cache(backend=backend, l1_enabled=False, namespace="handler_reuse_sync")
         def f(x: int) -> int:
             return x * 2
 
@@ -68,7 +68,7 @@ class TestHandlerBuiltOnce:
     async def test_async_explicit_backend(self, built):
         backend = _Backend()
 
-        @cache(backend=backend, l1_enabled=False, namespace="lab7112_async")
+        @cache(backend=backend, l1_enabled=False, namespace="handler_reuse_async")
         async def f(x: int) -> int:
             return x * 2
 
@@ -78,7 +78,7 @@ class TestHandlerBuiltOnce:
         assert built[0].backend is backend
 
     def test_sync_lazy_backend_first_resolved_by_invalidate(self, built, backend):
-        @cache(ttl=300, l1_enabled=False, namespace="lab7112_lazy_sync")
+        @cache(ttl=300, l1_enabled=False, namespace="handler_reuse_lazy_sync")
         def f(x: int) -> int:
             return x * 2
 
@@ -92,7 +92,7 @@ class TestHandlerBuiltOnce:
 
     @pytest.mark.asyncio
     async def test_async_lazy_backend_first_resolved_by_invalidate(self, built, backend):
-        @cache(ttl=300, l1_enabled=False, namespace="lab7112_lazy_async")
+        @cache(ttl=300, l1_enabled=False, namespace="handler_reuse_lazy_async")
         async def f(x: int) -> int:
             return x * 2
 
