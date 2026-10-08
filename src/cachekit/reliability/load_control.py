@@ -25,8 +25,7 @@ Example:
 """
 
 import threading
-from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ContextDecorator
 from typing import Optional
 
 from prometheus_client import Counter
@@ -128,62 +127,20 @@ class BackpressureController:
         self._rejected_count = 0  # Monitoring metric
         self._lock = threading.Lock()  # Protect queue depth counter
 
-    @contextmanager
-    def acquire(self) -> Generator[None, None, None]:
+    def acquire(self) -> "_Permit":
         """Acquire permit with backpressure protection.
 
-        This context manager implements a two-phase check:
+        Returns a context manager that implements a two-phase check on entry:
         1. Queue admission control: Reject if too many requests waiting
         2. Concurrency control: Wait for available permit (with timeout)
 
-        The finally block ensures resources are always cleaned up,
+        The permit is released on every exit from the ``with`` block,
         even if the protected operation fails.
 
-        Yields:
-            None - Caller can proceed with operation
-
-        Raises:
+        Raises (on entering the ``with`` block):
             BackendError: If queue full or timeout acquiring permit
         """
-        # Phase 1: Check if we can join the queue
-        with self._lock:
-            if self._queue_depth >= self.queue_size:
-                self._rejected_count += 1
-                cache_operations.labels(  # type: ignore[attr-defined]
-                    operation="backpressure",
-                    status="rejected",
-                    serializer="",
-                    namespace="",
-                ).inc()
-                raise BackendError("Request queue full", error_type=BackendErrorType.TRANSIENT)
-
-            self._queue_depth += 1  # We're now in the queue
-
-        acquired = False
-        try:
-            # Phase 2: Try to acquire execution permit
-            acquired = self._semaphore.acquire(timeout=self.timeout)
-            if not acquired:
-                with self._lock:
-                    self._rejected_count += 1
-                raise BackendError("Failed to acquire permit", error_type=BackendErrorType.TIMEOUT)
-
-            # Once we have the permit, we're no longer in the queue
-            with self._lock:
-                self._queue_depth -= 1
-
-            yield  # Caller executes protected operation here
-
-        except Exception:
-            # If we didn't acquire the permit but still in queue, clean up
-            if not acquired:
-                with self._lock:
-                    self._queue_depth -= 1
-            raise
-        finally:
-            # Release permit if we acquired one
-            if acquired:
-                self._semaphore.release()
+        return _Permit(self)
 
     @property
     def queue_depth(self) -> int:
@@ -212,3 +169,57 @@ class BackpressureController:
                 "queue_size": self.queue_size,
                 "healthy": self._queue_depth < self.queue_size * 0.8,
             }
+
+
+class _Permit(ContextDecorator):
+    """One ``BackpressureController.acquire()`` call.
+
+    A class, not a ``@contextmanager`` generator: this runs on every backend
+    operation, and a generator context manager costs several times the
+    semaphore it guards. It holds no permit state - ``__exit__`` runs only after
+    ``__enter__`` returned, which means a permit is held - so reuse as a
+    decorator (``ContextDecorator``) is safe across concurrent calls.
+    """
+
+    def __init__(self, controller: BackpressureController):
+        self._controller = controller
+
+    def __enter__(self) -> None:
+        c = self._controller
+        # Phase 1: Check if we can join the queue
+        with c._lock:
+            if c._queue_depth >= c.queue_size:
+                c._rejected_count += 1
+                cache_operations.labels(  # type: ignore[attr-defined]
+                    operation="backpressure",
+                    status="rejected",
+                    serializer="",
+                    namespace="",
+                ).inc()
+                raise BackendError("Request queue full", error_type=BackendErrorType.TRANSIENT)
+            c._queue_depth += 1  # We're now in the queue
+
+        # Phase 2: Try to acquire execution permit. Until __enter__ returns, __exit__ will
+        # not run, so any exception from here on (KeyboardInterrupt included) must undo
+        # both the queue slot and an acquired permit itself.
+        acquired = False
+        in_queue = True
+        try:
+            acquired = c._semaphore.acquire(timeout=c.timeout)
+            with c._lock:
+                c._queue_depth -= 1
+                in_queue = False
+                if not acquired:
+                    c._rejected_count += 1
+            if not acquired:
+                raise BackendError("Failed to acquire permit", error_type=BackendErrorType.TIMEOUT)
+        except BaseException:
+            if in_queue:
+                with c._lock:
+                    c._queue_depth -= 1
+            if acquired:
+                c._semaphore.release()
+            raise
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._controller._semaphore.release()
