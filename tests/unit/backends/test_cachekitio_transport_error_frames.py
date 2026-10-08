@@ -10,11 +10,16 @@ either.
 
 Each request fails on a real loopback socket, so urllib3 leaves the frames a production failure leaves, and every frame is
 walked, third-party ones included. The exception: the last tests fake the client, to place an interrupt where a socket cannot.
+
+A failed request is freed by reference counting, not by the cyclic GC: no cachekit frame on its error keeps an exception or a
+failed Future in a local, and urllib3's exceptions, whose tracebacks hold the backend's frames, are not left in cycles of
+their own. Either would keep the request's frames, and the body they hold, until a full collection.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import shutil
 import signal
 import socket
@@ -22,7 +27,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from types import SimpleNamespace
+from types import FrameType, SimpleNamespace
 
 import pytest
 
@@ -30,7 +35,8 @@ from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio import config as config_module
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
-from tests.unit.config.test_redacting_settings import _cachekit_locals_holding
+from tests.unit.backends.test_redis_error_frames import _cachekit_frames_holding_an_exception
+from tests.unit.config.test_redacting_settings import _CACHEKIT_SRC, _cachekit_locals_holding
 
 pytestmark = [pytest.mark.unit, pytest.mark.security]
 
@@ -119,6 +125,90 @@ def test_error_status_reaches_no_frame_holding_the_api_key(
     assert _cachekit_locals_holding(err, api_key, below_caller=True) == []
 
 
+def test_a_failed_request_is_freed_without_the_cyclic_gc(
+    peer: tuple[int, BackendErrorType], connect: Callable[[int], tuple[CachekitIOBackend, str]]
+) -> None:
+    """Freed by reference counting alone: its frames, and the body they hold, do not wait for the cyclic GC while cachekit.io
+    is unreachable. A frame holds its caller, so a urllib3 exception left in a cycle keeps the backend's frames too."""
+    port, _ = peer
+    backend, _ = connect(port)
+    gc.collect()
+    gc.disable()
+    try:
+        err = _raised(lambda: backend.set("k", b"v" * 1_000_000))
+        gc.set_debug(gc.DEBUG_SAVEALL)  # what collect() finds unreachable stays in gc.garbage
+        del err
+        gc.collect()
+        frames = [obj for obj in gc.garbage if isinstance(obj, FrameType)]
+        assert [f.f_code.co_name for f in frames if Path(f.f_code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC)] == []
+        assert [type(obj).__name__ for obj in gc.garbage if isinstance(obj, BaseException)] == []
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+
+
+def test_a_request_failing_in_the_callers_handler_keeps_the_handled_traceback(
+    peer: tuple[int, BackendErrorType], connect: Callable[[int], tuple[CachekitIOBackend, str]]
+) -> None:
+    """urllib3's exceptions chain the exception the caller is handling as ``__context__``: the backend drops their
+    tracebacks, never the caller's."""
+    port, _ = peer
+    backend, _ = connect(port)
+    try:
+        raise ValueError("the caller's")
+    except ValueError as exc:
+        handled, kept = exc, exc.__traceback__
+        err = _raised(lambda: backend.get("k"))
+
+    assert kept is not None
+    assert handled.__traceback__ is kept
+    assert _cachekit_frames_holding_an_exception(err) == []
+
+
+async def _locked(backend: CachekitIOBackend) -> None:
+    async with backend.acquire_lock("k", timeout=5):
+        pass
+
+
+async def _cancelled_mid_attempt(backend: CachekitIOBackend) -> asyncio.CancelledError:
+    """The CancelledError of an ``acquire_lock`` cancelled while its attempt is in flight, the attempt failing after."""
+    task = asyncio.ensure_future(_locked(backend))
+    await asyncio.sleep(0.1)  # the attempt's TLS handshake stalls until the backend's timeout
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError as exc:
+        return exc
+    pytest.fail("the lock attempt was not cancelled")
+
+
+def test_a_failed_lock_attempt_holds_no_exception_in_a_cachekit_frame(
+    peer: tuple[int, BackendErrorType], connect: Callable[[int], tuple[CachekitIOBackend, str]]
+) -> None:
+    """The failed attempt's Task holds the BackendError, whose traceback holds the frame holding the Task: a cycle."""
+    port, _ = peer
+    backend, _ = connect(port)
+
+    err = _raised(lambda: asyncio.run(_locked(backend)))
+
+    assert _cachekit_frames_holding_an_exception(err) == []
+
+
+def test_a_cancel_during_a_failing_lock_attempt_holds_no_exception_in_a_cachekit_frame(
+    connect: Callable[[int], tuple[CachekitIOBackend, str]],
+) -> None:
+    """``acquire_lock`` drains an attempt through a cancel and re-raises the cancel once the attempt has failed: no cachekit
+    frame on that CancelledError keeps the failed attempt or its error."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        backend, _ = connect(sock.getsockname()[1])
+        exc = asyncio.run(_cancelled_mid_attempt(backend))
+
+    assert _cachekit_frames_holding_an_exception(exc) == []
+
+
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs SIGALRM to interrupt the request")
 @pytest.mark.parametrize("interrupt", [SystemExit, KeyboardInterrupt])
 def test_interrupt_during_request_reaches_no_frame_holding_the_api_key(
@@ -190,6 +280,52 @@ def _make_request_locals(exc: BaseException) -> list[dict[str, object]]:
     return found
 
 
+@pytest.mark.parametrize(
+    ("then", "raised"),
+    [(None, BackendError), (TimeoutError, BackendError), (KeyboardInterrupt, KeyboardInterrupt)],
+    ids=["as-its-failure", "then-a-transport-failure", "then-an-interrupt"],
+)
+def test_a_request_re_raising_the_callers_exception_keeps_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, then: type[BaseException] | None, raised: type[BaseException]
+) -> None:
+    """A client that raises the very exception the caller is handling, as its failure or before failing with another: it
+    leaves with the traceback it came in with, not one through the request's frames."""
+    reused = ConnectionError("the caller's")
+
+    def request(method: str, url: str, **kwargs: object) -> None:
+        try:
+            raise reused
+        except ConnectionError:
+            if then is None:
+                raise
+            raise then  # noqa: B904 - chains the caller's exception as __context__, as a client's own failure does
+
+    backend = _faked(monkeypatch, request)
+    try:
+        raise reused
+    except ConnectionError:
+        kept = reused.__traceback__
+        with pytest.raises(raised):
+            backend.get("k")
+
+    assert kept is not None
+    assert reused.__traceback__ is kept
+
+
+def test_a_request_failing_in_the_callers_handler_leaves_a_cleared_traceback_cleared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller that cleared the traceback of the exception it is handling, as SECURITY.md advises, keeps it cleared. On
+    Python 3.10 ``sys.exc_info()`` still reports the traceback the exception was caught with."""
+    backend = _faked(monkeypatch, lambda method, url, **kwargs: _make_request())
+    try:
+        raise ValueError("the caller's")
+    except ValueError as exc:
+        exc.__traceback__ = None
+        handled = exc
+        _raised(lambda: backend.get("k"))
+
+    assert handled.__traceback__ is None
+
+
 def test_interrupt_chained_during_request_reaches_no_frame_holding_the_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """An interrupt that lands while the client handles its own failure chains that failure, whose frames hold the key too.
 
@@ -249,6 +385,29 @@ def test_interrupt_while_classifying_a_transport_failure_clears_its_frames(monke
     assert _make_request_locals(exc) == [{}]
 
 
+def test_interrupt_while_dropping_a_transport_failures_tracebacks_holds_no_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt that lands in ``_send``'s walk over a transport failure's chain, the error already built."""
+    walk = backend_module._raised_during_request
+    walks: list[BaseException] = []
+
+    def interrupted(exc: BaseException, handled_before: BaseException | None) -> Iterator[BaseException]:
+        walks.append(exc)
+        chain = walk(exc, handled_before)
+        yield next(chain)
+        if len(walks) == 1:  # the transport handler's walk, not the interrupt branch's
+            raise KeyboardInterrupt
+        yield from chain
+
+    monkeypatch.setattr(backend_module, "_raised_during_request", interrupted)
+    backend = _faked(monkeypatch, lambda method, url, **kwargs: _make_request())
+
+    exc = _interrupted(lambda: backend.get("k"), KeyboardInterrupt)
+
+    assert isinstance(exc.__context__, TimeoutError)
+    assert _cachekit_locals_holding(exc, _API_KEY, below_caller=True) == []
+    assert _cachekit_frames_holding_an_exception(exc) == []
+
+
 def test_interrupt_the_caller_was_already_handling_still_clears_its_frames(monkeypatch: pytest.MonkeyPatch) -> None:
     """A caller re-raising the interrupt it is handling (a reused ``gevent.Timeout``): the chain stop is not the interrupt."""
     reused = KeyboardInterrupt()
@@ -267,6 +426,7 @@ def test_interrupt_the_caller_was_already_handling_still_clears_its_frames(monke
 
     assert exc is reused
     assert _make_request_locals(exc) == [{}]
+    assert request.__code__ in [f.f_code for f, _ in traceback.walk_tb(exc.__traceback__)]  # still shows where it landed
 
 
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs SIGALRM to bound a hang")
