@@ -1,6 +1,7 @@
 # Context7 serves this repo's docs to coding agents, and re-indexes on its own
 # schedule, which can lag a release by weeks. This asks it to re-index when a
-# release is published, so agents read the docs for the version users install.
+# release is published and once a day. Context7 indexes the default branch, so
+# agents may see docs ahead of the last release.
 # Context7 takes one refresh per library per 10 days and answers an earlier
 # one with HTTP 400 too-early. The daily schedule asks again, so a change that
 # lands inside that window is still refreshed within 11 days.
