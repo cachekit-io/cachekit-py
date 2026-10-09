@@ -21,10 +21,8 @@ uses. Raw keys enter through ``EncryptionWrapper``'s ``master_key=`` and ``previ
 - ``keyring.configuration`` rows: decrypt-only keys from CACHEKIT_PREVIOUS_MASTER_KEYS, the current
   key from ``@cache.secure``'s ``master_key=`` and from CACHEKIT_MASTER_KEY. An accept row's keyring
   reads the entry its current key sealed; a reject row is refused when the decorator loads its
-  configuration, before any call. Two cases are strict expected failures naming ENC-9: with the
-  current key given as ``master_key=``, cachekit-py refuses the current key in the decrypt-only list
-  only on the first call, when the native keyring is built. A separate test pins that first-call refusal,
-  which the expected failures alone would not notice going away.
+  configuration, before any call. The settings refuse a CACHEKIT_MASTER_KEY at load; the decorator's
+  handler refuses a ``master_key=`` (ENC-9), on every route that builds one.
 """
 
 from __future__ import annotations
@@ -79,33 +77,21 @@ DECORATOR_REFUSAL = r"CACHEKIT_MASTER_KEY must be (hex-encoded|at least 32 bytes
 WRAPPER_REFUSAL = r"Invalid master key format|Master key must be at least 32 bytes"
 # The refusal each keyring reject row gets at decoration, from the settings validator, on both current-key routes.
 _SETTINGS_REFUSAL = r"(?s)^1 validation error for CachekitConfig\n.*Value error, "
+_REPEAT_REFUSAL = "master_key must not appear in previous_master_keys"
 KEYRING_REFUSALS = {
     "keyring_four_decrypt_only_keys": _SETTINGS_REFUSAL + "previous_master_keys accepts at most 3 decrypt-only keys, got 4",
-    "keyring_current_key_decrypt_only": _SETTINGS_REFUSAL + "master_key must not appear in previous_master_keys",
-    "keyring_current_key_decrypt_only_uppercase": _SETTINGS_REFUSAL + "master_key must not appear in previous_master_keys",
+    "keyring_current_key_decrypt_only": _SETTINGS_REFUSAL + _REPEAT_REFUSAL,
+    "keyring_current_key_decrypt_only_uppercase": _SETTINGS_REFUSAL + _REPEAT_REFUSAL,
 }
 CURRENT_KEY_ROUTES = ("master_key_argument", "cachekit_master_key")
-# Deviations: with master_key=, decoration succeeds and the first call raises KeyringConfigurationError when the
-# native keyring is built, so the repeat is refused after load, not at it.
-KEYRING_DEVIATIONS = {
-    ("keyring_current_key_decrypt_only", "master_key_argument"),
-    ("keyring_current_key_decrypt_only_uppercase", "master_key_argument"),
-}
+REPEAT_ROWS = ("keyring_current_key_decrypt_only", "keyring_current_key_decrypt_only_uppercase")
 
 
-def _keyring_params() -> list[Any]:
-    params = []
-    for vector in KEYRING_CONFIGURATION:
-        for route in CURRENT_KEY_ROUTES:
-            marks = []
-            if (vector["name"], route) in KEYRING_DEVIATIONS:
-                reason = (
-                    "ENC-9: the current key repeated in CACHEKIT_PREVIOUS_MASTER_KEYS is refused only on the first "
-                    "call when the current key is given as master_key=, not when the keyring is loaded"
-                )
-                marks.append(pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=reason))
-            params.append(pytest.param(vector, route, marks=marks, id=f"{vector['name']}-{route}"))
-    return params
+def _keyring_refusal(name: str, route: str) -> tuple[type[Exception], str]:
+    """The settings never see a master_key=, so the decorator's handler refuses its repeat, as it does a bad key."""
+    if name in REPEAT_ROWS and route == "master_key_argument":
+        return ConfigurationError, f"^{_REPEAT_REFUSAL}: "
+    return ValidationError, KEYRING_REFUSALS[name]
 
 
 def _ids(group: str) -> list[str]:
@@ -274,7 +260,8 @@ def _load_keyring_row(
     return backend, kwargs
 
 
-@pytest.mark.parametrize(("vector", "current_key_from"), _keyring_params())
+@pytest.mark.parametrize("current_key_from", CURRENT_KEY_ROUTES)
+@pytest.mark.parametrize("vector", KEYRING_CONFIGURATION, ids=[vector["name"] for vector in KEYRING_CONFIGURATION])
 def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Each keyring configuration row is accepted, or refused when the decorator loads it, as its verdict says."""
     backend, kwargs = _load_keyring_row(vector, current_key_from, monkeypatch)
@@ -283,19 +270,6 @@ def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, mo
         assert _secure_get_all(backend, **kwargs)() == ACCEPT_VALUE
         return
     # Decoration alone: a refusal here comes before any call, so before any backend read.
-    with pytest.raises(ValidationError, match=KEYRING_REFUSALS[vector["name"]]):
+    error, pattern = _keyring_refusal(vector["name"], current_key_from)
+    with pytest.raises(error, match=pattern):
         _secure_get_all(backend, **kwargs)
-
-
-@pytest.mark.parametrize(("name", "current_key_from"), sorted(KEYRING_DEVIATIONS))
-def test_keyring_deviation_refused_on_first_call(name: str, current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """ENC-9's rows are still refused, on the first call, so never read: their strict xfail alone passes if they were.
-
-    Delete with KEYRING_DEVIATIONS when ENC-9 moves the refusal to load.
-    """
-    (vector,) = (row for row in KEYRING_CONFIGURATION if row["name"] == name)
-    backend, kwargs = _load_keyring_row(vector, current_key_from, monkeypatch)
-    get_all = _secure_get_all(backend, **kwargs)
-
-    with pytest.raises(KeyringConfigurationError, match="Current key must not appear in the decrypt-only list"):
-        get_all()

@@ -27,7 +27,7 @@ from pydantic import (
 )
 from pydantic_settings import NoDecode, SettingsConfigDict
 
-from .validation import RedactingSettings
+from .validation import RedactingSettings, refuse_current_key_in_previous_keys
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
 # at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
@@ -262,33 +262,18 @@ class CachekitConfig(RedactingSettings):
                 f"drop retired keys explicitly (protocol spec/encryption.md → 'Key Rotation (Keyring)')."
             )
 
-        previous_key_bytes: list[bytes] = []
         for position, key in enumerate(self.previous_master_keys):
             try:
-                decoded = bytes.fromhex(key.get_secret_value())
+                key_length = len(bytes.fromhex(key.get_secret_value()))
             except ValueError as e:
                 raise ValueError(f"previous_master_keys[{position}] is not valid hex: {e}") from e
-            if len(decoded) < 32:
+            if key_length < 32:
                 raise ValueError(
-                    f"previous_master_keys[{position}] must be at least 32 bytes (256 bits) decoded, got {len(decoded)}"
+                    f"previous_master_keys[{position}] must be at least 32 bytes (256 bits) decoded, got {key_length}"
                 )
-            previous_key_bytes.append(decoded)
 
-        if self.master_key is not None:
-            try:
-                master_key_bytes = bytes.fromhex(self.master_key.get_secret_value())
-            except ValueError:
-                # An invalid master_key is not this validator's concern — it fails
-                # loudly at EncryptionWrapper setup, exactly as before this field
-                # existed. Only the subset check is skipped.
-                master_key_bytes = None
-            if master_key_bytes is not None and master_key_bytes in previous_key_bytes:
-                raise ValueError(
-                    "master_key must not appear in previous_master_keys: this configuration is the "
-                    "detectable signature of re-promoting a retired key to the current (encrypting) "
-                    "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
-                    "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
-                )
+        # Shared with CacheSerializationHandler, which applies it to a master_key= this validator never sees.
+        refuse_current_key_in_previous_keys(self.master_key, self.previous_master_keys)
 
         return self
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args, overload
 
 from pydantic import GetCoreSchemaHandler, SecretBytes, SecretStr, ValidationError
@@ -70,6 +70,39 @@ def refuse_bytes_key(master_key: SecretBytes | _T) -> _T:
     if isinstance(master_key, SecretBytes):
         raise TypeError(_BYTES_KEY_REFUSAL)
     return master_key
+
+
+def _hex_key_bytes(key: SecretStr) -> bytes | None:
+    try:
+        return bytes.fromhex(key.get_secret_value())
+    except ValueError:
+        return None
+
+
+def refuse_current_key_in_previous_keys(master_key: SecretStr | None, previous_master_keys: Iterable[SecretStr]) -> None:
+    """Raise ValueError when the current master key also appears in the decrypt-only list.
+
+    The detectable subset of the spec's forward-only invariant (protocol spec/encryption.md → 'Key Rotation
+    (Keyring)'): a key that ever occupied the encrypting slot is never re-promoted, because re-promotion resumes a
+    used, unknowable AES-GCM nonce budget. Keys compare as decoded bytes, so hex case cannot smuggle the current key
+    past the check. A master key that is not hex is not this check's concern: it fails loudly at its own validation.
+    Decoded keys stay temporaries, never locals (CWE-532).
+
+    >>> refuse_current_key_in_previous_keys(SecretStr("aa" * 32), [SecretStr("bb" * 32)])
+    >>> refuse_current_key_in_previous_keys(SecretStr("aa" * 32), [SecretStr("AA" * 32)])
+    Traceback (most recent call last):
+    ...
+    ValueError: master_key must not appear in previous_master_keys: ...
+    """
+    if master_key is None or _hex_key_bytes(master_key) is None:
+        return
+    if any(_hex_key_bytes(key) == _hex_key_bytes(master_key) for key in previous_master_keys):
+        raise ValueError(
+            "master_key must not appear in previous_master_keys: this configuration is the "
+            "detectable signature of re-promoting a retired key to the current (encrypting) "
+            "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
+            "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
+        )
 
 
 class ConfigurationError(Exception):

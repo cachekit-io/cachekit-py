@@ -412,6 +412,12 @@ Rules enforced at config load — rejected, never truncated or silently fixed:
 - **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, at least 32 bytes; use exactly 32).
 - **Current key not in the list**: the current master key must not re-appear in
   the decrypt-only list — the detectable signature of re-promoting a retired key.
+  Keys compare as decoded bytes, so hex case makes no difference. A
+  `CACHEKIT_MASTER_KEY` is checked when settings load (`pydantic.ValidationError`).
+  A `master_key=` given to `@cache.secure`, to an `EncryptionConfig` or to an
+  encrypting `@cache` or `CacheSerializationHandler` is checked when the cache is
+  built, against the previous keys as they stand then, before any backend call
+  (`ConfigurationError`).
 
 Operator rule, which no SDK detects: **never re-promote a key that has
 encrypted**, including by rolling back a Phase 2 deploy. Rolling back restores
@@ -674,10 +680,9 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
 raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 `cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
 passed directly that is not exactly 32 bytes, more than three previous keys, or the current
-key repeated among them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
-settings load, so this surfaces only when keys bypass that check: passed to
-`EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
-environment's previous keys. Outside config-drift reads (below), the fault never
+key repeated among them. Settings check all three at load, and an encrypting cache checks its
+current key against the previous keys when it is built, so behind the decorators this surfaces
+only when settings are assigned after that, or on a config-drift read (below). Outside config-drift reads, the fault never
 evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users
 and callers of the `CacheOperationHandler` read and write methods receive it in both fail modes. Behind
 the `@cache` decorators, a read of an existing encrypted entry raises it too, from L1 or L2 and
