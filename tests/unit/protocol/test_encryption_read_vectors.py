@@ -37,8 +37,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("isolated_keys")]
 AAD_REJECT_VECTORS: list[dict[str, Any]] = FIXTURE["aad_reject_vectors"]
 SEALED = {vector["name"]: vector for vector in FIXTURE["vectors"]}
 # A sealed row read under its own inputs by a "default" reader: its plaintext is that reader's own container
-# (python-frame.json's default write payload), so it returns the value; every other row's plaintext is not
-# StandardSerializer's, so it is refused after decryption.
+# (python-frame.json's default write payload), so it returns the value; every other row's plaintext is not the
+# integrity-checked StandardSerializer container that reader expects, so it is refused after decryption.
 SEALED_READ_VALUES = {"standard_serializer_default": {"user_id": 42, "name": "cachekit", "active": True}}
 # The cachekit-py serializer each decrypted_container reader names, and the optional package it needs (the
 # free-threaded lane installs neither); the other readers are not cachekit-py's.
