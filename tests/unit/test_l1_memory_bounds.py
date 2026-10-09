@@ -374,16 +374,17 @@ def _c_fork_child_outcome() -> object:
             manager.start_background_cleanup(interval_seconds=60)
             l1_cache._global_l1_manager = None
             born = l1_cache.get_l1_cache_manager()  # starts its cleanup unless refused
-            report(
-                w,
-                {
-                    "requested": requested,
-                    "thread": manager._cleanup_thread,
-                    "born_thread": born._cleanup_thread,
-                    "found": cache.get("k")[0],
-                    "pre_fork": cache.get("pre-fork")[0],
-                },
-            )
+            outcome: object = {
+                "requested": requested,
+                "thread": manager._cleanup_thread,
+                "born_thread": born._cleanup_thread,
+                "found": cache.get("k")[0],
+                "pre_fork": cache.get("pre-fork")[0],
+            }
+        except BaseException as e:
+            outcome = {"error": repr(e)}
+        try:
+            report(w, outcome)
         finally:
             os._exit(1)
     os.close(w)
