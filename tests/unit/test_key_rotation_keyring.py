@@ -221,6 +221,59 @@ class TestSettingsAssignment:
 
         assert settings.previous_master_keys == (SecretStr(K1.hex()),)
 
+    @pytest.mark.parametrize(
+        "make",
+        [
+            pytest.param(lambda keys: (key for key in keys), id="generator"),
+            pytest.param(lambda keys: map(str, keys), id="map"),
+        ],
+    )
+    def test_one_shot_iterable_lands_whole(self, settings, make):
+        """The guard validates the value on a copy, so the live settings must store what the copy validated: a second
+        pass over a one-shot iterable would find it empty and drop every previous key without an error."""
+        settings.previous_master_keys = make([K1.hex(), K3.hex()])
+
+        assert settings.previous_master_keys == (SecretStr(K1.hex()), SecretStr(K3.hex()))
+
+    def test_iterable_that_changes_between_passes_cannot_land_unchecked(self, settings):
+        """An iterable that yields a valid keyring once and the current key after must not reach the live settings."""
+        passes = iter([[K3.hex()], [K2.hex()]])
+
+        class _Shifting:
+            def __iter__(self):
+                return iter(next(passes))
+
+        settings.previous_master_keys = _Shifting()  # type: ignore[assignment]
+
+        assert settings.previous_master_keys == (SecretStr(K3.hex()),)
+
+    def test_validator_that_sets_a_private_attribute_does_not_deadlock(self, monkeypatch):
+        """A subclass's validator may set a private attribute while the guard holds its lock. A throwaway lock keeps a
+        regression from blocking every later assignment in this process."""
+        import threading
+
+        from pydantic import PrivateAttr, model_validator
+
+        import cachekit.config.settings as settings_module
+
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", threading.Lock())
+
+        class _Marking(CachekitConfig):
+            _validated: bool = PrivateAttr(default=False)
+
+            @model_validator(mode="after")
+            def _mark(self) -> _Marking:
+                self._validated = True
+                return self
+
+        config = _Marking()
+        assigning = threading.Thread(target=setattr, args=(config, "l1_max_size_mb", 7), daemon=True)
+        assigning.start()
+        assigning.join(timeout=5)
+
+        assert not assigning.is_alive()
+        assert config.l1_max_size_mb == 7
+
     def test_valid_assignment_lands_validated(self, settings):
         settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
         settings.master_key = K1.hex()  # type: ignore[assignment]

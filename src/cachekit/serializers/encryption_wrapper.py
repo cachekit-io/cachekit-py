@@ -316,7 +316,9 @@ class EncryptionWrapper:
         # Rust Keyring re-validates all three behind the FFI boundary for wrappers
         # constructed with explicit parameters, and as defence in depth for keys
         # read from settings. This wrapper keeps the keyring it builds: a later
-        # change to the settings reaches only wrappers built after it.
+        # change to the settings reaches only wrappers built after it, and
+        # CacheSerializationHandler builds one per tenant, on first use and after
+        # LRU eviction.
         # Keyring config errors below raise KeyringConfigurationError, NEVER
         # EncryptionError: EncryptionError is a SerializationError, which the
         # read-path policy (handle_decrypt_failure) classifies as corruption →

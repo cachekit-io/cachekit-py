@@ -657,6 +657,17 @@ class TestSettingsAssignmentRedaction:
         fragments = {_DISTINCT_KEY_HEX[i : i + 16] for i in range(len(_DISTINCT_KEY_HEX) - 15)}
         assert [fragment for fragment in fragments if fragment in rendered] == []
 
+    @pytest.mark.parametrize(
+        ("field", "value"), _SETTINGS_ASSIGNMENT_REFUSALS.values(), ids=_SETTINGS_ASSIGNMENT_REFUSALS.keys()
+    )
+    def test_refused_assignment_leaves_no_frame_local(self, field: str, value: object) -> None:
+        """Pydantic's own assignment frames hold the raw value too, so the guard must re-raise from above them: the
+        cachekit-only walk of TestEntryPointFrameLocals would pass without that."""
+        with pytest.raises(ValidationError) as exc_info:
+            setattr(singleton.get_settings(), field, value)
+
+        assert _cachekit_locals_holding(exc_info.value, _DISTINCT_KEY_HEX, below_caller=True) == []
+
 
 @pytest.mark.unit
 class TestRedactingSettingsFrameLocals:

@@ -294,12 +294,20 @@ class CachekitConfig(RedactingSettings):
         assignment would stay on the instance, readable by other threads until the error surfaces. The value
         is dropped in a finally: the raised error's traceback holds this frame (CWE-532).
         """
+        # Not a field (a subclass's private attribute, say): nothing to validate, and a validator that sets one
+        # must not re-enter the lock below.
+        if name not in type(self).model_fields:
+            super().__setattr__(name, value)
+            return
         candidate = None
         try:
             with _ASSIGNMENT_LOCK:
                 candidate = self.model_copy()
+                # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy only.
                 _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
-                super().__setattr__(name, value)
+                # The value the copy validated, never `value` again: a generator is spent by now, and an iterable
+                # may yield something else on a second pass.
+                super().__setattr__(name, getattr(candidate, name))
         finally:
             del value, candidate  # the copy holds the refused value
 
