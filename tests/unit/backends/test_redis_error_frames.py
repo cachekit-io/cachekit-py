@@ -579,12 +579,13 @@ _OPERATIONS: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]
     "provider-init": (lambda url: url, lambda url: RedisBackendProvider(url.get_secret_value())),
 }
 
-# These report a failure instead of raising it, so only an interrupt leaves them. The invalidation listener starts on the
-# caller's thread, inside a cache operation.
+# These report a failure instead of raising it, so only an interrupt leaves them. The invalidation listener starts, and
+# an invalidation is announced, on the caller's thread, inside a cache operation.
 _NEVER_RAISING: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]]] = {
     "redis-backend-health-check": (_redis_backend, lambda backend: backend.health_check()),
     "provider-backend-health-check": (_provider_backend, lambda backend: backend.health_check()),
     "invalidation-listener-start": (_provider_backend, invalidation.start_listener),
+    "invalidation-publish": (_provider_backend, lambda backend: invalidation.publish(backend, "ck:reg:ns:h", "k")),
 }
 
 
