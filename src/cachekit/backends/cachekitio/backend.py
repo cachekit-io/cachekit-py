@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -60,6 +60,25 @@ def _log_release_failure(lock_key: str, exc: BaseException) -> None:
         redact_cache_key(lock_key),
         redact_error_for_log(exc),
     )
+
+
+def _raised_during_request(exc: BaseException, handled_before: BaseException | None) -> Iterator[BaseException]:
+    """``exc``, then each exception its ``__cause__`` and ``__context__`` reach, once each, stopping at ``handled_before``.
+
+    ``handled_before`` is the exception the caller was already handling when the request began: the request's exceptions
+    chain it as ``__context__``, but its traceback is the caller's. ``exc`` itself comes first even when it is
+    ``handled_before`` (a reused ``gevent.Timeout``), because its traceback now runs through the request too.
+    """
+    yield exc
+    seen = {id(exc), id(handled_before)}
+    pending = [exc.__cause__, exc.__context__]
+    while pending:
+        chained = pending.pop()
+        if chained is None or id(chained) in seen:
+            continue
+        seen.add(id(chained))
+        yield chained
+        pending += [chained.__cause__, chained.__context__]
 
 
 # Lock capability token travels in this request header, never the query string:
@@ -450,33 +469,45 @@ class CachekitIOBackend:
         # Held for the whole request: a concurrent re-lease must not close this client under it.
         lease = self._own_lease()
         handled_before = sys.exc_info()[1]
+        # Off the exception, not sys.exc_info(): on Python 3.10 that keeps the traceback it was caught with after the
+        # caller clears it, and the request's failure would give a scrubbed traceback back.
+        handled_traceback = None if handled_before is None else handled_before.__traceback__
         try:
             try:
                 return lease.client.request(method, url, body=body, headers=headers)
             except Exception as exc:
                 error = classify_http_error(exc, operation=method.lower())
+                # The error keeps only urllib3's exception class, so nothing needs these tracebacks. urllib3's frames on
+                # them hold its exceptions in locals, a reference cycle, and a frame holds its caller: this frame, and the
+                # request body, would wait for the cyclic GC. A client re-raising the exception the caller is handling,
+                # as its failure or before another, adds the request's frames to its traceback: it gets back the one it
+                # came in with.
+                for raised in _raised_during_request(exc, handled_before):
+                    raised.__traceback__ = None
+                if handled_before is not None:
+                    handled_before.__traceback__ = handled_traceback
+                raised = None  # this frame is on the error's traceback: it must hold no urllib3 exception
         except BaseException as exc:
             # An interrupt (a worker timeout's SystemExit, KeyboardInterrupt, gevent.Timeout), here or in the handler
             # above, propagates as itself, but its traceback, and those of the exceptions it chained during the request,
             # run through urllib3's request frames, whose locals hold the Authorization header (CWE-532). clear_frames
             # drops the locals of every finished frame below _send and keeps each frame's file and line; _send's own
-            # frame is still executing and is skipped, so it must hold no key-bearing local. The walk follows both
-            # edges, visits each exception once, and stops at the exception the caller was already handling.
-            traceback.clear_frames(exc.__traceback__)
-            seen = {id(exc), id(handled_before)}
-            pending = [exc.__cause__, exc.__context__]
-            while pending:
-                chained = pending.pop()
-                if chained is None or id(chained) in seen:
-                    continue
-                seen.add(id(chained))
-                traceback.clear_frames(chained.__traceback__)
-                pending += [chained.__cause__, chained.__context__]
+            # frame is still executing and is skipped, so it must hold no key-bearing local. The exception the caller is
+            # handling, unless it is the interrupt, gets back the traceback it came in with, as above.
+            for raised in _raised_during_request(exc, handled_before):
+                traceback.clear_frames(raised.__traceback__)
+            if handled_before is not None and handled_before is not exc:
+                handled_before.__traceback__ = handled_traceback
+            raised = error = None  # an interrupt in the walk above leaves the error bound: hold no exception on the way out
             raise
         # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's
         # exception carries a traceback through its request frames, whose locals hold the Authorization header, and
         # a raise in the block would chain it as __context__, which `raise ... from` does not clear.
-        raise error from error.original_exception
+        try:
+            raise error from error.original_exception
+        finally:
+            # Its traceback holds this frame: a local holding it, or the caller's exception, would make a reference cycle.
+            del error, handled_before, handled_traceback
 
     @staticmethod
     def _checked(method: str, response: BaseHTTPResponse, miss_on_404: bool) -> BaseHTTPResponse:
@@ -955,6 +986,10 @@ class CachekitIOBackend:
             elif (won := attempt.result()) is not None:
                 await self._release_lock(lock_key, won)
             raise
+        finally:
+            # A failed attempt holds its exception, and the exception raised from here has this frame on its traceback:
+            # either local would make a reference cycle.
+            attempt = err = None
 
     async def _acquire_lock_id(self, key: str, timeout: float, blocking_timeout: Optional[float]) -> tuple[str | None, bool]:
         """Run the lock attempts. Returns ``(lock_id or None, granted on the first attempt)``.
