@@ -34,7 +34,12 @@ from cachekit.backends.provider import (
     LoggerProvider,
 )
 from cachekit.config import ConfigurationError, get_settings
-from cachekit.config.validation import hide_any_secret, refuse_bytes_key, reveal_secret
+from cachekit.config.validation import (
+    hide_any_secret,
+    refuse_bytes_key,
+    refuse_current_key_in_previous_keys,
+    reveal_secret,
+)
 from cachekit.di import DIContainer
 
 # Re-exported for backwards compatibility — redact_cache_key moved to the hash_utils
@@ -768,6 +773,18 @@ class CacheSerializationHandler:
                 )
             encryption = False
 
+        # The keyring's forward-only rule, refused here at decoration before any backend call, whichever route the
+        # current key took. Settings run the same check at load, but never see master_key= and take later assignments
+        # unvalidated; without this, the native keyring refuses only when the first read or write builds it. An
+        # encryption-disabled handler never encrypts, so it spends no nonce budget: its keyring is built only for a
+        # config-drift read, whose fault is a miss by design.
+        settings = get_settings()
+        if encryption:
+            try:
+                refuse_current_key_in_previous_keys(master_key or settings.master_key, settings.previous_master_keys)
+            except ValueError as e:
+                raise ConfigurationError(str(e)) from e
+
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor
         self.single_tenant_mode = single_tenant_mode
@@ -780,7 +797,7 @@ class CacheSerializationHandler:
         # Resolved independently of self.encryption because an encryption-disabled handler can
         # still decrypt stale encrypted entries (config-drift reads) and must honor the policy.
         if encryption_fail_closed is None:
-            encryption_fail_closed = get_settings().encryption_fail_closed
+            encryption_fail_closed = settings.encryption_fail_closed
         self.encryption_fail_closed = encryption_fail_closed
 
         # Config-drift warn-once bookkeeping: first drift read per cache_key warns,
