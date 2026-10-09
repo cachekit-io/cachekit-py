@@ -23,7 +23,8 @@ uses. Raw keys enter through ``EncryptionWrapper``'s ``master_key=`` and ``previ
   reads the entry its current key sealed; a reject row is refused when the decorator loads its
   configuration, before any call. Two cases are strict expected failures naming ENC-9: with the
   current key given as ``master_key=``, cachekit-py refuses the current key in the decrypt-only list
-  only on the first call, when the native keyring is built.
+  only on the first call, when the native keyring is built. A separate test pins that first-call refusal,
+  which the expected failures alone would not notice going away.
 """
 
 from __future__ import annotations
@@ -257,9 +258,10 @@ class TestRawRejectRows:
             )
 
 
-@pytest.mark.parametrize(("vector", "current_key_from"), _keyring_params())
-def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each keyring configuration row is accepted, or refused when the decorator loads it, as its verdict says."""
+def _load_keyring_row(
+    vector: dict[str, Any], current_key_from: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[DictBackend, dict[str, Any]]:
+    """Set the row's keys, the current one on the given route; return a backend holding the accept row's entry and the kwargs."""
     monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", ",".join(vector["decrypt_only_master_keys_hex"]))
     kwargs: dict[str, Any] = {}
     if current_key_from == "master_key_argument":
@@ -269,6 +271,13 @@ def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, mo
     reset_settings()
     backend = DictBackend()
     _plant(backend, ACCEPT)
+    return backend, kwargs
+
+
+@pytest.mark.parametrize(("vector", "current_key_from"), _keyring_params())
+def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each keyring configuration row is accepted, or refused when the decorator loads it, as its verdict says."""
+    backend, kwargs = _load_keyring_row(vector, current_key_from, monkeypatch)
 
     if vector["verdict"] == "accept":
         assert _secure_get_all(backend, **kwargs)() == ACCEPT_VALUE
@@ -276,3 +285,17 @@ def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, mo
     # Decoration alone: a refusal here comes before any call, so before any backend read.
     with pytest.raises(ValidationError, match=KEYRING_REFUSALS[vector["name"]]):
         _secure_get_all(backend, **kwargs)
+
+
+@pytest.mark.parametrize(("name", "current_key_from"), sorted(KEYRING_DEVIATIONS))
+def test_keyring_deviation_refused_on_first_call(name: str, current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ENC-9's rows are still refused, on the first call, so never read: their strict xfail alone passes if they were.
+
+    Delete with KEYRING_DEVIATIONS when ENC-9 moves the refusal to load.
+    """
+    (vector,) = (row for row in KEYRING_CONFIGURATION if row["name"] == name)
+    backend, kwargs = _load_keyring_row(vector, current_key_from, monkeypatch)
+    get_all = _secure_get_all(backend, **kwargs)
+
+    with pytest.raises(KeyringConfigurationError, match="Current key must not appear in the decrypt-only list"):
+        get_all()
