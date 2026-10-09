@@ -995,6 +995,7 @@ class TestListenerPool:
             assert backend._client.connection_pool.connection_kwargs["socket_timeout"] == 0.05  # the window's
             async with backend.with_timeout("set", 10):  # nested
                 assert backend.listener_pool().connection_kwargs["socket_timeout"] == configured
+            assert backend._client.connection_pool.connection_kwargs["socket_timeout"] == 0.05  # the outer's again
             assert backend.listener_pool().connection_kwargs["socket_timeout"] == configured
         assert backend.listener_pool().connection_kwargs["socket_timeout"] == configured
         assert backend._client.connection_pool.connection_kwargs["socket_timeout"] == configured
@@ -1006,6 +1007,35 @@ class TestListenerPool:
         configured = client.connection_pool.connection_kwargs["socket_timeout"]
         async with per_request.with_timeout("get", 50):
             assert shared.listener_pool().connection_kwargs["socket_timeout"] == configured
+
+    @pytest.mark.parametrize("configured", [5.0, None])
+    async def test_windows_closing_out_of_order_restore_the_configured_timeout(self, configured: Optional[float]) -> None:
+        """Two tasks' windows interleave: the outer one closes while the inner one is still open."""
+        pool = redis.ConnectionPool(**({} if configured is None else {"socket_timeout": configured}))
+        backend = PerRequestRedisBackend(redis.Redis(connection_pool=pool), "default")
+        outer, inner = backend.with_timeout("get", 100), backend.with_timeout("get", 200)
+        await outer.__aenter__()
+        await inner.__aenter__()
+        await outer.__aexit__(None, None, None)
+        assert pool.connection_kwargs["socket_timeout"] == 0.2  # the window still open
+        assert backend.listener_pool().connection_kwargs.get("socket_timeout") == configured
+        await inner.__aexit__(None, None, None)
+        assert pool.connection_kwargs.get("socket_timeout") == configured
+        assert ("socket_timeout" in pool.connection_kwargs) is (configured is not None)
+        assert backend.listener_pool().connection_kwargs.get("socket_timeout") == configured
+
+    async def test_concurrent_tasks_leave_the_configured_timeout(self) -> None:
+        """The interleaving two asyncio tasks produce on their own."""
+        backend = self._backend("redis://cache.example:6379/0")
+        configured = backend._client.connection_pool.connection_kwargs["socket_timeout"]
+
+        async def window(delay: float, timeout_ms: int, hold: float) -> None:
+            await asyncio.sleep(delay)
+            async with backend.with_timeout("get", timeout_ms):
+                await asyncio.sleep(hold)
+
+        await asyncio.gather(window(0, 100, 0.01), window(0.005, 200, 0.02))
+        assert backend._client.connection_pool.connection_kwargs["socket_timeout"] == configured
 
 
 @pytest.mark.unit

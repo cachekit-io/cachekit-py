@@ -16,6 +16,7 @@ import asyncio
 import functools
 import logging
 import socket
+import threading
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Iterable
@@ -36,6 +37,7 @@ from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.config.validation import hide_secret
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
+from cachekit.invalidation import _pid_lock
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +81,17 @@ return members
 _LISTENER_HEALTH_CHECK_SECONDS = 10
 _LISTENER_USER_TIMEOUT_MS = 30_000
 
-# Pool -> (the socket_timeout it had before its outermost open with_timeout() window, that window's
-# token), so listener_pool() clones the configured value, never a window's, whichever backend object
-# opened the window on the shared pool. Weak: pools come and go with their clients.
-_open_windows: weakref.WeakKeyDictionary[redis.ConnectionPool, tuple[float | None, object]] = weakref.WeakKeyDictionary()
+# Pool -> (the socket_timeout it had before its first open with_timeout() window, each open window's
+# timeout by its token, in opening order). The pool runs at the newest open window's timeout and gets
+# the configured one back when its last window closes, in whatever order the windows close, and
+# listener_pool() clones the configured value, never a window's, whichever backend object opened the
+# window on the shared pool. Weak: pools come and go with their clients.
+_open_windows: weakref.WeakKeyDictionary[redis.ConnectionPool, tuple[float | None, dict[object, float]]] = (
+    weakref.WeakKeyDictionary()
+)
+# Guards _open_windows and the socket_timeout it governs: one pool is shared by every thread, and a
+# window can open and close on any thread's event loop.
+_windows_locks: dict[int, threading.Lock] = {}  # see _pid_lock
 
 
 def _encode_tenant(tenant_id: object) -> str:
@@ -775,12 +784,13 @@ class PerRequestRedisBackend:
             (True, 10)
         """
         source = self._client.connection_pool
-        window = _open_windows.get(source)  # first: a closing window restores the kwargs before it leaves
-        kwargs = {
-            **source.connection_kwargs,
-            "health_check_interval": _LISTENER_HEALTH_CHECK_SECONDS,
-            "decode_responses": False,
-        }
+        with _pid_lock(_windows_locks):
+            window = _open_windows.get(source)
+            kwargs = {
+                **source.connection_kwargs,
+                "health_check_interval": _LISTENER_HEALTH_CHECK_SECONDS,
+                "decode_responses": False,
+            }
         if window is not None:
             kwargs["socket_timeout"] = window[0]
         if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
@@ -801,6 +811,10 @@ class PerRequestRedisBackend:
         Redis supports per-socket timeout, applied here as best-effort.
         Note: This is coarser-grained than per-operation timeout.
 
+        Windows may overlap, through any backend on the same pool: the pool runs at the newest open
+        window's timeout, and gets its configured timeout back when the last one closes, whatever
+        order they close in.
+
         Args:
             operation: Operation name (get, set, delete, etc.)
             timeout_ms: Timeout in milliseconds
@@ -813,14 +827,13 @@ class PerRequestRedisBackend:
         """
         # Redis socket timeout is set globally on client
         # This is a best-effort implementation (coarser-grained)
-        original_timeout = self._client.connection_pool.connection_kwargs.get("socket_timeout")
         timeout_sec = timeout_ms / 1000.0
         # The pool is never bound to a local: its repr lists the password (see the class docstring).
         token = object()
-        outermost = _open_windows.setdefault(self._client.connection_pool, (original_timeout, token))[1] is token
-
-        # Set socket timeout
-        self._client.connection_pool.connection_kwargs["socket_timeout"] = timeout_sec
+        with _pid_lock(_windows_locks):
+            configured = self._client.connection_pool.connection_kwargs.get("socket_timeout")
+            _open_windows.setdefault(self._client.connection_pool, (configured, {}))[1][token] = timeout_sec
+            self._client.connection_pool.connection_kwargs["socket_timeout"] = timeout_sec
         try:
             yield
         except Exception as exc:
@@ -828,13 +841,19 @@ class PerRequestRedisBackend:
             # inside the except chains nothing else.
             raise classify_redis_error(exc, operation=operation, keep_exception=True) from exc
         finally:
-            # Restore original timeout
-            if original_timeout is not None:
-                self._client.connection_pool.connection_kwargs["socket_timeout"] = original_timeout
-            else:
-                self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
-            if outermost:
-                _open_windows.pop(self._client.connection_pool, None)
+            # Restoring the value this window displaced would be wrong when windows close out of order:
+            # an inner window that outlives its outer one would leave the outer's timeout on the pool.
+            with _pid_lock(_windows_locks):
+                configured, windows = _open_windows[self._client.connection_pool]
+                del windows[token]
+                if windows:
+                    self._client.connection_pool.connection_kwargs["socket_timeout"] = next(reversed(windows.values()))
+                else:
+                    del _open_windows[self._client.connection_pool]
+                    if configured is not None:
+                        self._client.connection_pool.connection_kwargs["socket_timeout"] = configured
+                    else:
+                        self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
 
 
 class RedisBackendProvider:

@@ -1200,10 +1200,14 @@ class CachekitIOBackend:
         except BackendError:
             return False
 
-    # ==================== TimeoutConfigurableBackend Protocol ====================
+    # ==================== Timeout Override ====================
 
     def with_timeout(self, timeout: float) -> CachekitIOBackend:
         """Create new backend instance with different timeout.
+
+        A builder, not ``TimeoutConfigurableBackend``'s ``with_timeout(operation, timeout_ms)``
+        context manager, which this backend does not implement. ``isinstance`` against that
+        protocol still returns True here, because it matches by name only.
 
         Args:
             timeout: New timeout in seconds

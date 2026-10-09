@@ -10,7 +10,7 @@ enable advanced features with graceful degradation.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, BinaryIO, Optional, Protocol, runtime_checkable
 
@@ -420,6 +420,11 @@ class TimeoutConfigurableBackend(Protocol):
     - Per-socket/transaction: Redis, Memcached, SQLite
     - Global: KV, S3
 
+    ``isinstance`` against this protocol is not a safe capability probe: it
+    matches by method name only, so it is also True for ``CachekitIOBackend``,
+    whose ``with_timeout(timeout)`` is a builder that returns a new backend,
+    not this context manager.
+
     Example:
         >>> # Per-operation timeout pattern (async context):
         >>> # if hasattr(backend, 'with_timeout'):
@@ -427,16 +432,22 @@ class TimeoutConfigurableBackend(Protocol):
         >>> #         value = await backend.get("key")
     """
 
-    async def with_timeout(
+    def with_timeout(
         self,
         operation: str,
         timeout_ms: int,
-    ) -> AsyncIterator[None]:
+    ) -> AbstractAsyncContextManager[None]:
         """Set timeout for operations within context.
 
         Args:
             operation: Operation name (e.g., "get", "set", "delete")
             timeout_ms: Timeout in milliseconds
+
+        Returns:
+            An async context manager that applies the timeout while it is
+            open. Implementations are ``async`` generators wrapped in
+            ``@asynccontextmanager``, so this protocol declares the
+            *decorated* shape.
 
         Raises:
             BackendError: With error_type=TIMEOUT if timeout exceeded
