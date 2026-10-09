@@ -194,3 +194,27 @@ def test_series_detached_by_clear_or_remove_are_rebound(sync_mode, reset):
     assert _sample("cache_operations_total", counter_labels) == 1.0
     assert _sample("cache_operation_duration_ms_count", series) == 1.0
     assert _sample("cache_operation_size_bytes_sum", series) == 10.0
+
+
+@needs_prometheus
+@pytest.mark.parametrize("kind", ["Counter", "Histogram"])
+def test_prometheus_private_attributes_the_series_cache_reads(kind):
+    """``_CacheOpSeries`` reads ``parent._metrics`` and ``child._labelvalues``, both private to prometheus_client.
+
+    A release that renames either would make every recorded operation raise ``AttributeError``. This pins the
+    contract the staleness check relies on: a child is ``parent._metrics[child._labelvalues]`` until ``remove()``
+    or ``clear()`` detaches it.
+    """
+    import prometheus_client
+    from prometheus_client import CollectorRegistry
+
+    metric = getattr(prometheus_client, kind)("private_attrs", "test", ["a", "b"], registry=CollectorRegistry())
+    child = metric.labels(a="x", b=1)
+
+    assert child._labelvalues == ("x", "1")
+    assert metric._metrics[child._labelvalues] is child
+    metric.remove("x", "1")
+    assert metric._metrics.get(child._labelvalues) is None
+    child = metric.labels(a="x", b=1)
+    metric.clear()
+    assert metric._metrics.get(child._labelvalues) is None

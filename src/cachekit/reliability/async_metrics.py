@@ -148,7 +148,10 @@ def _reset_metric_locks() -> None:
     prometheus_client guards each with a plain ``Lock`` and resets none of them after a fork. A parent thread (the
     batching worker, for one) may hold one at the fork, and a child recording into that series would wait on it
     forever. These are prometheus_client's private attributes; the fork tests in
-    ``tests/unit/test_async_metrics_mode_switch.py`` fail if a release renames them. Only cachekit's own metrics
+    ``tests/unit/test_async_metrics_mode_switch.py`` fail if a release renames them. ``_CacheOpSeries`` also reads
+    two private attributes, a labelled metric's ``_metrics`` and a child's ``_labelvalues``, to tell whether a bound
+    child is still exported; ``test_prometheus_private_attributes_the_series_cache_reads`` in
+    ``tests/unit/test_hot_path_telemetry.py`` fails if a release renames either. Only cachekit's own metrics
     and the default registry are covered, not an application's metrics. In multiprocess mode
     (``PROMETHEUS_MULTIPROC_DIR``) values share one lock that this cannot reach, so a child forked while a parent
     thread holds it can still hang.
