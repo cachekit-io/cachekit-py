@@ -76,9 +76,9 @@ class TestPreviousMasterKeysConfig:
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", f" {K1.hex()} ,, ")
         assert len(CachekitConfig().previous_master_keys) == 1
 
-    def test_default_is_empty_list(self, monkeypatch):
+    def test_default_is_empty(self, monkeypatch):
         monkeypatch.delenv("CACHEKIT_PREVIOUS_MASTER_KEYS", raising=False)
-        assert CachekitConfig().previous_master_keys == []
+        assert CachekitConfig().previous_master_keys == ()
 
     def test_more_than_three_keys_raises_never_truncates(self):
         four = [SecretStr(f"{i:02x}" * 32) for i in range(1, 5)]
@@ -214,11 +214,18 @@ class TestSettingsAssignment:
         assert seen[0][0] is before[0]
         assert seen[0][1] is before[1]
 
+    def test_previous_keys_cannot_be_edited_in_place(self, settings):
+        """No validator runs on an in-place edit, so the keyring takes none: a change has to be an assignment."""
+        with pytest.raises(AttributeError):
+            settings.previous_master_keys.append(SecretStr(K2.hex().upper()))  # type: ignore[attr-defined]
+
+        assert settings.previous_master_keys == (SecretStr(K1.hex()),)
+
     def test_valid_assignment_lands_validated(self, settings):
         settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
         settings.master_key = K1.hex()  # type: ignore[assignment]
 
-        assert settings.previous_master_keys == [SecretStr(K3.hex())]
+        assert settings.previous_master_keys == (SecretStr(K3.hex()),)
         assert isinstance(settings.master_key, SecretStr)
         assert settings.master_key.get_secret_value() == K1.hex()
 

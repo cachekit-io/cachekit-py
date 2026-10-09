@@ -214,8 +214,9 @@ class CachekitConfig(RedactingSettings):
         default=None,
         description="Master encryption key (hex-encoded; use exactly 32 bytes, 64 hex characters)",
     )
-    previous_master_keys: Annotated[list[SecretStr], NoDecode] = Field(
-        default_factory=list,
+    # A tuple, so the keyring cannot be edited in place, where no validator runs: a change is an assignment.
+    previous_master_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(
+        default_factory=tuple,
         description=(
             "Decrypt-only previous master keys for key rotation (env: "
             "CACHEKIT_PREVIOUS_MASTER_KEYS, comma-separated hex). Entries written "

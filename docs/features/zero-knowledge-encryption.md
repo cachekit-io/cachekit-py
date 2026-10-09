@@ -681,7 +681,8 @@ raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 `cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
 passed directly that is not exactly 32 bytes, more than three previous keys, or the current
 key repeated among them. Settings check all three at load and refuse an assignment that breaks
-them, leaving the settings as they were, and an encrypting cache checks its current key against
+them, leaving the settings as they were (`previous_master_keys` is a tuple, so a change has to
+be an assignment), and an encrypting cache checks its current key against
 the previous keys when it is built, so behind the decorators this surfaces only on a config-drift
 read (below). A cache that has already built its encryption wrapper keeps the keyring it built:
 a key change reaches only caches built after it, and a running process applies it on restart.
