@@ -11,6 +11,7 @@ from typing import Any, Optional, Union
 import redis
 from pydantic import SecretStr
 
+from cachekit.backends._uninterrupted import _ClearedOnInterrupt
 from cachekit.backends.base import BackendError
 from cachekit.backends.provider import CacheClientProvider, PooledClientProvider
 from cachekit.backends.redis.config import RedisBackendConfig
@@ -39,7 +40,10 @@ class RedisBackend:
     cause that keeps no redis-py frame (see ``kept_cause``), and from a frame that
     holds no client in a local: a redis-py client's repr lists the password, and an
     error tracker sends the locals of every frame on a raised error's traceback (CWE-532).
-    The frame deletes its ``error`` local as the error leaves.
+    The frame deletes its ``error`` local as the error leaves. An interrupt raised while
+    redis-py is mid-call (KeyboardInterrupt, a worker timeout's SystemExit, gevent.Timeout)
+    propagates as itself, with the locals of the finished frames it ran through, redis-py's
+    included, cleared (see ``_ClearedOnInterrupt``).
 
     Examples:
         Create backend with explicit redis_url (requires running Redis):
@@ -155,15 +159,16 @@ class RedisBackend:
         Raises:
             BackendError: If Redis operation fails
         """
-        try:
-            value = self._get_client().get(key)
-            # The pool is configured with decode_responses=False (see redis/client.py),
-            # so Redis returns raw bytes, or None for a missing key. Cached payloads are
-            # binary (LZ4/Arrow/AES ciphertext) and must never be UTF-8 decoded. The
-            # isinstance check enforces the bytes|None contract without any str coercion.
-            return value if isinstance(value, bytes) else None
-        except Exception as e:
-            error = _command_error("GET", "get", e, key)
+        with _ClearedOnInterrupt():
+            try:
+                value = self._get_client().get(key)
+                # The pool is configured with decode_responses=False (see redis/client.py),
+                # so Redis returns raw bytes, or None for a missing key. Cached payloads are
+                # binary (LZ4/Arrow/AES ciphertext) and must never be UTF-8 decoded. The
+                # isinstance check enforces the bytes|None contract without any str coercion.
+                return value if isinstance(value, bytes) else None
+            except Exception as e:
+                error = _command_error("GET", "get", e, key)
         try:
             raise error from error.original_exception
         finally:
@@ -180,16 +185,17 @@ class RedisBackend:
         Raises:
             BackendError: If Redis operation fails
         """
-        try:
-            if ttl is not None and ttl > 0:
-                # Use SETEX for TTL (combines SET + EXPIRE atomically)
-                self._get_client().setex(key, ttl, value)
-            else:
-                # Use SET without expiry
-                self._get_client().set(key, value)
-            return
-        except Exception as e:
-            error = _command_error("SET", "set", e, key)
+        with _ClearedOnInterrupt():
+            try:
+                if ttl is not None and ttl > 0:
+                    # Use SETEX for TTL (combines SET + EXPIRE atomically)
+                    self._get_client().setex(key, ttl, value)
+                else:
+                    # Use SET without expiry
+                    self._get_client().set(key, value)
+                return
+            except Exception as e:
+                error = _command_error("SET", "set", e, key)
         try:
             raise error from error.original_exception
         finally:
@@ -207,18 +213,19 @@ class RedisBackend:
         Raises:
             BackendError: If Redis operation fails
         """
-        try:
-            result = self._get_client().delete(key)
-            # Redis DELETE returns number of keys deleted (0 or 1 for single key)
-            if not isinstance(result, int):
-                raise BackendError(
-                    message=f"Redis DELETE returned unexpected type: {type(result).__name__}",
-                    operation="delete",
-                    key=key,
-                )
-            return result > 0
-        except Exception as e:
-            error = _command_error("DELETE", "delete", e, key)
+        with _ClearedOnInterrupt():
+            try:
+                result = self._get_client().delete(key)
+                # Redis DELETE returns number of keys deleted (0 or 1 for single key)
+                if not isinstance(result, int):
+                    raise BackendError(
+                        message=f"Redis DELETE returned unexpected type: {type(result).__name__}",
+                        operation="delete",
+                        key=key,
+                    )
+                return result > 0
+            except Exception as e:
+                error = _command_error("DELETE", "delete", e, key)
         try:
             raise error from error.original_exception
         finally:
@@ -236,11 +243,12 @@ class RedisBackend:
         """
         if not keys:
             return set()
-        try:
-            self._get_client().unlink(*keys)
-            return set()
-        except Exception as e:
-            error = _command_error("UNLINK", "delete", e)
+        with _ClearedOnInterrupt():
+            try:
+                self._get_client().unlink(*keys)
+                return set()
+            except Exception as e:
+                error = _command_error("UNLINK", "delete", e)
         try:
             raise error from error.original_exception
         finally:
@@ -258,18 +266,19 @@ class RedisBackend:
         Raises:
             BackendError: If Redis operation fails
         """
-        try:
-            result = self._get_client().exists(key)
-            # Redis EXISTS returns number of keys that exist (0 or 1 for single key)
-            if not isinstance(result, int):
-                raise BackendError(
-                    message=f"Redis EXISTS returned unexpected type: {type(result).__name__}",
-                    operation="exists",
-                    key=key,
-                )
-            return result > 0
-        except Exception as e:
-            error = _command_error("EXISTS", "exists", e, key)
+        with _ClearedOnInterrupt():
+            try:
+                result = self._get_client().exists(key)
+                # Redis EXISTS returns number of keys that exist (0 or 1 for single key)
+                if not isinstance(result, int):
+                    raise BackendError(
+                        message=f"Redis EXISTS returned unexpected type: {type(result).__name__}",
+                        operation="exists",
+                        key=key,
+                    )
+                return result > 0
+            except Exception as e:
+                error = _command_error("EXISTS", "exists", e, key)
         try:
             raise error from error.original_exception
         finally:
@@ -291,40 +300,39 @@ class RedisBackend:
             >>> is_healthy, details = backend.health_check()  # doctest: +SKIP
             >>> print(f"Latency: {details['latency_ms']}ms")  # doctest: +SKIP
         """
-        try:
-            client = self._get_client()
+        with _ClearedOnInterrupt():
+            try:
+                # Measure ping latency
+                start = time.time()
+                self._get_client().ping()
+                latency_ms = (time.time() - start) * 1000
 
-            # Measure ping latency
-            start = time.time()
-            client.ping()
-            latency_ms = (time.time() - start) * 1000
+                # Get Redis info
+                info = self._get_client().info()
+                if not isinstance(info, dict):
+                    raise BackendError(
+                        message=f"Redis INFO returned unexpected type: {type(info).__name__}",
+                        operation="health_check",
+                        key="N/A",
+                    )
 
-            # Get Redis info
-            info = client.info()
-            if not isinstance(info, dict):
-                raise BackendError(
-                    message=f"Redis INFO returned unexpected type: {type(info).__name__}",
-                    operation="health_check",
-                    key="N/A",
+                return (
+                    True,
+                    {
+                        "backend_type": "redis",
+                        "latency_ms": round(latency_ms, 2),
+                        "version": info.get("redis_version", "unknown"),
+                        "used_memory_human": info.get("used_memory_human", "unknown"),
+                        "connected_clients": info.get("connected_clients", 0),
+                    },
                 )
-
-            return (
-                True,
-                {
-                    "backend_type": "redis",
-                    "latency_ms": round(latency_ms, 2),
-                    "version": info.get("redis_version", "unknown"),
-                    "used_memory_human": info.get("used_memory_human", "unknown"),
-                    "connected_clients": info.get("connected_clients", 0),
-                },
-            )
-        except Exception as e:
-            return (
-                False,
-                {
-                    "backend_type": "redis",
-                    "latency_ms": -1,
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                },
-            )
+            except Exception as e:
+                return (
+                    False,
+                    {
+                        "backend_type": "redis",
+                        "latency_ms": -1,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    },
+                )

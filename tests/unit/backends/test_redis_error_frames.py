@@ -10,6 +10,10 @@ or a config whose repr shows it.
 Each operation fails against a loopback server speaking just enough RESP: it refuses AUTH with WRONGPASS, or completes the
 handshake and drops the connection on the first command. Every frame is walked, third-party ones included.
 
+An interrupt raised while redis-py is mid-call (``KeyboardInterrupt``, the ``SystemExit`` a worker-timeout signal raises) is
+not a failure cachekit classifies: it propagates as itself, through redis-py's frames, so it must reach none of them holding
+the password either. The last tests place one where a signal would land, as redis-py sends a command.
+
 The raising frame is on the error's own traceback, so it must not keep the error, or any other exception, in a local
 either: that is a reference cycle, and the frame, the payload with it, waits for the cyclic GC.
 """
@@ -17,25 +21,34 @@ either: that is a reference cycle, and the frame, the payload with it, waits for
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
 import errno
 import gc
 import logging
 import pathlib
 import pickle
+import signal
 import socket
 import sys
 import threading
+import traceback
 import types
 import uuid
-from collections.abc import Callable, Iterator
-from typing import BinaryIO
+from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures.thread import _WorkItem
+from contextlib import contextmanager
+from typing import Any, BinaryIO
 
 import pytest
 import redis
 from pydantic import SecretStr
 
+from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.provider import DefaultBackendProvider
+from cachekit.backends.redis import backend as backend_module
+from cachekit.backends.redis import provider as provider_module
 from cachekit.backends.redis.backend import RedisBackend
 from cachekit.backends.redis.client import reset_global_pool
 from cachekit.backends.redis.error_handler import RedisClientError, classify_redis_error
@@ -165,7 +178,7 @@ def _url(server: _FakeRedis, password: str) -> SecretStr:
     return SecretStr(f"redis://:{password}@127.0.0.1:{server.port}/0")
 
 
-def _raised(call: Callable[[], object], expected: type[Exception] = BackendError) -> Exception:
+def _raised(call: Callable[[], object], expected: type[BaseException] = BackendError) -> BaseException:
     """The exception ``call`` raises, caught here so the test's own frame, which holds the password, is not on its
     traceback."""
     try:
@@ -543,3 +556,222 @@ def test_a_classified_error_round_trips_through_pickle() -> None:
     )
     assert isinstance(err.original_exception, RedisClientError)
     assert err.original_exception.exc_type is redis.ConnectionError
+
+
+_REDIS_PY = pathlib.Path(redis.__file__).resolve().parent
+_INTERRUPTS = [KeyboardInterrupt, SystemExit]
+
+
+def _redis_backend(url: SecretStr) -> RedisBackend:
+    return RedisBackend(redis_url=url.get_secret_value())
+
+
+def _provider_backend(url: SecretStr) -> PerRequestRedisBackend:
+    return RedisBackendProvider(url.get_secret_value()).get_shared_backend()  # type: ignore[return-value]
+
+
+# Every operation as (build, run): ``build`` runs before the failure is placed, ``run`` while it is. The provider's init
+# ping runs in ``build`` for its backends, so their operations reuse its authenticated connection; ``RedisBackend`` opens
+# its first connection in the operation.
+_OPERATIONS: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]]] = {
+    **{f"redis-backend-{name}": (_redis_backend, run) for name, (_, run) in _BACKEND_CALLS.items()},
+    **{f"provider-backend-{name}": (_provider_backend, run) for name, run in _SHARED_CALLS.items()},
+    "provider-init": (lambda url: url, lambda url: RedisBackendProvider(url.get_secret_value())),
+}
+
+# A health check reports a failure instead of raising it, so only an interrupt leaves it.
+_HEALTH_CHECKS: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]]] = {
+    "redis-backend-health-check": (_redis_backend, lambda backend: backend.health_check()),
+    "provider-backend-health-check": (_provider_backend, lambda backend: backend.health_check()),
+}
+
+
+@contextmanager
+def _interrupting_sends(interrupt: type[BaseException]) -> Iterator[None]:
+    """redis-py raises ``interrupt`` as it sends a command, a new connection's AUTH included, as a signal landing there
+    would. A pipeline sends its commands packed. The async operations run redis-py on an executor thread, which a signal
+    does not interrupt, so there it stands in for an interrupt raised in the worker (a ``gevent.Timeout``)."""
+
+    def send(self: object, *args: object, **kwargs: object) -> None:
+        raise interrupt
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redis.connection.AbstractConnection, "send_command", send)
+        patch.setattr(redis.connection.AbstractConnection, "send_packed_command", send)
+        yield
+
+
+def _assert_cleared(exc: BaseException, interrupt: type[BaseException], password: str, through: BaseException) -> None:
+    """``exc`` is the interrupt itself; the traceback of ``through``, it or an exception it chained, still runs through
+    redis-py with each frame's file and line; and no frame on any of them holds the password."""
+    assert type(exc) is interrupt  # never a BackendError
+    landed = traceback.extract_tb(through.__traceback__)
+    assert any(pathlib.Path(entry.filename).resolve().is_relative_to(_REDIS_PY) for entry in landed)
+    assert _cachekit_locals_holding(exc, password, below_caller=True) == []
+
+
+@pytest.mark.parametrize("interrupt", _INTERRUPTS)
+@pytest.mark.parametrize("operation", {**_OPERATIONS, **_HEALTH_CHECKS})
+def test_an_interrupt_mid_command_reaches_no_frame_holding_the_password(
+    fake_redis: Callable[..., _FakeRedis], password: str, interrupt: type[BaseException], operation: str
+) -> None:
+    build, run = {**_OPERATIONS, **_HEALTH_CHECKS}[operation]
+    built = build(_url(fake_redis(refusing=False), password))
+
+    with _interrupting_sends(interrupt):
+        exc = _raised(lambda: run(built), interrupt)
+
+    _assert_cleared(exc, interrupt, password, through=exc)
+
+
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="needs SIGALRM to interrupt the command")
+@pytest.mark.parametrize("interrupt", _INTERRUPTS)
+@pytest.mark.parametrize("built", _WRITERS)
+def test_a_signal_while_redis_py_waits_for_a_reply_reaches_no_frame_holding_the_password(
+    fake_redis: Callable[..., _FakeRedis], password: str, interrupt: type[BaseException], built: str
+) -> None:
+    """A real signal, raised in its handler while redis-py waits on the socket for the reply to a command the server
+    holds: the interrupt lands in redis-py's read, as a worker timeout's does."""
+
+    def handler(signum: int, frame: object) -> None:
+        raise interrupt
+
+    hold = threading.Event()
+    backend = _WRITERS[built](_url(fake_redis(refusing=False, hold=hold), password).get_secret_value())
+    previous = signal.signal(signal.SIGALRM, handler)
+    signal.setitimer(signal.ITIMER_REAL, 0.3)
+    try:
+        exc = _raised(lambda: backend.get("k"), interrupt)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        hold.set()
+
+    assert traceback.extract_tb(exc.__traceback__)[-1].name == "handler"
+    _assert_cleared(exc, interrupt, password, through=exc)
+
+
+@pytest.mark.parametrize("operation", _OPERATIONS)
+def test_an_interrupt_while_classifying_a_failure_clears_the_failures_frames_too(
+    fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """An interrupt that lands in the operation's own handler for redis-py's failure chains that failure as its
+    ``__context__``, and the failure's traceback runs through redis-py's frames, deeper than the handler's."""
+
+    def classify(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    build, run = _OPERATIONS[operation]
+    server = fake_redis(refusing=False)
+    built = build(_url(server, password))
+    server.refuse_from_now()  # the next AUTH fails
+    monkeypatch.setattr(backend_module, "_command_error", classify)
+    monkeypatch.setattr(provider_module, "classify_redis_error", classify)
+
+    exc = _raised(lambda: run(built), KeyboardInterrupt)
+
+    assert isinstance(exc.__context__, redis.AuthenticationError)
+    _assert_cleared(exc, KeyboardInterrupt, password, through=exc.__context__)
+
+
+_ASYNC_OPERATIONS: dict[str, Callable[[PerRequestRedisBackend], Awaitable[object]]] = {
+    "get-ttl": lambda backend: backend.get_ttl("k"),
+    "refresh-ttl": lambda backend: backend.refresh_ttl("k", 5),
+    "acquire-lock": _locked,
+}
+
+
+@pytest.mark.parametrize("operation", _ASYNC_OPERATIONS)
+def test_an_async_interrupt_caught_before_the_worker_leaves_its_frame_reaches_no_frame_holding_the_password(
+    fake_redis: Callable[..., _FakeRedis], password: str, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """The executor worker that raised the interrupt can still be inside the frame that caught it, on the interrupt's
+    traceback, when the operation clears the frames: ``clear_frames`` skips it as executing. That frame holds only the work
+    item, whose repr shows no client, and the interrupt. Held there while the caller walks the interrupt."""
+    release = threading.Event()
+    set_exception = concurrent.futures.Future.set_exception
+
+    def held(self: concurrent.futures.Future[object], exception: BaseException | None) -> None:
+        set_exception(self, exception)
+        if threading.current_thread() is not threading.main_thread():
+            release.wait(5)  # between the worker's set_exception and its ``self = None``
+
+    async def walked_while_held(backend: PerRequestRedisBackend, secret: SecretStr) -> list[str]:
+        try:
+            await _ASYNC_OPERATIONS[operation](backend)
+        except KeyboardInterrupt as exc:
+            try:
+                running = [frame for frame, _ in traceback.walk_tb(exc.__traceback__) if frame.f_code is _WorkItem.run.__code__]
+                assert [type(frame.f_locals["self"]) for frame in running] == [_WorkItem]  # the race, held open
+                return _cachekit_locals_holding(exc, secret.get_secret_value(), below_caller=True)
+            finally:
+                release.set()
+        pytest.fail("the operation was not interrupted")
+
+    backend = _provider_backend(_url(fake_redis(refusing=False), password))
+    monkeypatch.setattr(concurrent.futures.Future, "set_exception", held)
+    with _interrupting_sends(KeyboardInterrupt):
+        assert asyncio.run(walked_while_held(backend, SecretStr(password))) == []
+
+
+def _interrupted_while_handling(backend: RedisBackend) -> tuple[BaseException, types.TracebackType | None]:
+    """The interrupt a ``get`` raises while this caller handles its own exception, and that exception's traceback before
+    the call. A frame apart from the test's, whose ``password`` argument the handled exception's traceback would reach."""
+
+    def fail_in_caller() -> None:
+        evidence = "caller's local"
+        raise ValueError
+
+    try:
+        fail_in_caller()
+    except ValueError as caught:
+        kept = caught.__traceback__
+        with _interrupting_sends(KeyboardInterrupt):
+            return _raised(lambda: backend.get("k"), KeyboardInterrupt), kept
+    pytest.fail("the caller did not fail")
+
+
+def test_an_interrupt_leaves_the_exception_the_caller_is_handling_whole(
+    fake_redis: Callable[..., _FakeRedis], password: str
+) -> None:
+    """The interrupt chains the exception the caller was handling when the operation began: that one is the caller's, so
+    its frames keep their locals and it keeps its traceback."""
+    exc, kept = _interrupted_while_handling(_redis_backend(_url(fake_redis(refusing=False), password)))
+
+    handled = exc.__context__
+    assert isinstance(handled, ValueError)
+    assert handled.__traceback__ is kept
+    assert handled.__traceback__.tb_next.tb_frame.f_locals == {"evidence": "caller's local"}
+    _assert_cleared(exc, KeyboardInterrupt, password, through=exc)
+
+
+@pytest.mark.parametrize("interrupt", _INTERRUPTS)
+def test_an_interrupt_through_the_decorator_propagates_as_itself_and_spares_the_breaker(
+    fake_redis: Callable[..., _FakeRedis], password: str, interrupt: type[BaseException]
+) -> None:
+    def double(x: int) -> int:
+        return 2 * x
+
+    backend = _redis_backend(_url(fake_redis(refusing=False), password))
+    fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"redis-interrupt-{uuid.uuid4().hex}")(double)
+
+    with _interrupting_sends(interrupt):
+        # In a copy of the context: the interrupt cuts the call short, before the decorator restores its own context.
+        exc = _raised(lambda: contextvars.copy_context().run(fn, 1), interrupt)
+
+    _assert_cleared(exc, interrupt, password, through=exc)
+    breaker = fn.get_health_status()["circuit_breaker"]
+    assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+
+
+def test_the_walk_finds_the_password_on_an_interrupt_through_redis_py(
+    fake_redis: Callable[..., _FakeRedis], password: str
+) -> None:
+    """Positive control: an interrupt placed as above, raised through redis-py with no cachekit operation around it,
+    carries the password in its frames, so the clean walks above are a result."""
+    url = _url(fake_redis(refusing=False), password)
+
+    with _interrupting_sends(KeyboardInterrupt):
+        exc = _raised(lambda: redis.Redis.from_url(url.get_secret_value()).get("k"), KeyboardInterrupt)
+
+    assert _cachekit_locals_holding(exc, password, below_caller=True) != []
