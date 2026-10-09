@@ -892,7 +892,8 @@ class TestAsyncSWRStoppedLoop:
             """Run this loop's revalidations to the end: a store goes through a thread, and the
             task is done only once it has landed."""
             others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            await asyncio.wait(others, timeout=5)
+            if others:  # the revalidation may already have finished
+                await asyncio.wait(others, timeout=5)
 
         async def park() -> None:
             await compute()
