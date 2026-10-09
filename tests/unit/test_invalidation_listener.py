@@ -10,6 +10,7 @@ import asyncio
 import gc
 import logging
 import multiprocessing
+import multiprocessing.queues
 import os
 import queue as queue_mod
 import socket
@@ -1054,7 +1055,7 @@ class TestListenerPool:
                 async with backend.with_timeout("get", 200):
                     pass
 
-            def child(q: Any) -> None:
+            def child(q: multiprocessing.queues.Queue[tuple[Optional[float], Optional[float], Optional[float]]]) -> None:
                 at_start = pool.connection_kwargs.get("socket_timeout")
                 asyncio.run(own_window())
                 q.put(
