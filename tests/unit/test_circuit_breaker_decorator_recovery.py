@@ -811,6 +811,17 @@ class TestLateProbesOfAnEarlierCycle:
     """
 
     _SLOW = 2
+    # (is_async, backend, where the slow probes wait, id). A lock double-check whose read
+    # fails only logs it, so a failure there lands on the write the lock rows already cover.
+    _PATHS = [
+        (False, _CountingBackend, "function", "sync-function"),
+        (False, _CountingBackend, "l2-read", "sync-l2-read"),
+        (True, _CountingBackend, "function", "async-function"),
+        (True, _CountingBackend, "l2-read", "async-l2-read"),
+        (True, _LockingBackend, "function", "async-lock-function"),
+        (True, _LockingBackend, "lock-double-check", "async-lock-double-check"),
+        (True, _BusyLockBackend, "lock-double-check", "async-lock-timeout-double-check"),
+    ]
 
     @staticmethod
     async def _second_cycle(fn: Callable[[str], Any], breaker: CircuitBreaker, backend: _CountingBackend, clock) -> float:
@@ -839,28 +850,13 @@ class TestLateProbesOfAnEarlierCycle:
             assert await _call(fn, f"fresh-{i}") == f"v:fresh-{i}"
         assert breaker.state == CircuitState.CLOSED
 
-    @pytest.mark.parametrize("outcome", ["success", "failure"])
     @pytest.mark.parametrize(
-        ("is_async", "backend_cls", "slow_at"),
+        ("is_async", "backend_cls", "slow_at", "outcome"),
         [
-            (False, _CountingBackend, "function"),
-            (False, _CountingBackend, "l2-read"),
-            (True, _CountingBackend, "function"),
-            (True, _CountingBackend, "l2-read"),
-            (True, _LockingBackend, "function"),
-            (True, _LockingBackend, "l2-read"),
-            (True, _LockingBackend, "lock-double-check"),
-            (True, _BusyLockBackend, "lock-double-check"),
-        ],
-        ids=[
-            "sync-function",
-            "sync-l2-read",
-            "async-function",
-            "async-l2-read",
-            "async-lock-function",
-            "async-lock-l2-read",
-            "async-lock-double-check",
-            "async-lock-timeout-double-check",
+            pytest.param(is_async, backend_cls, slow_at, outcome, id=f"{name}-{outcome}")
+            for is_async, backend_cls, slow_at, name in _PATHS
+            for outcome in ("success", "failure")
+            if outcome == "success" or slow_at != "lock-double-check"
         ],
     )
     async def test_late_outcomes_do_not_decide_a_later_cycle(

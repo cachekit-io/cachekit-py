@@ -380,7 +380,11 @@ class CircuitBreaker:
         return False
 
     def _from_another_cycle(self, cycle: Optional[int]) -> bool:
-        """Whether a HALF_OPEN outcome comes from a call this cycle did not admit. Caller holds _lock."""
+        """Whether a HALF_OPEN outcome comes from a call this cycle did not admit. Caller holds _lock.
+
+        None (no cycle given) counts as this cycle's, so a caller that passes none keeps
+        the behaviour from before outcomes carried a cycle.
+        """
         return cycle is not None and cycle != self._half_open_cycle
 
     def _on_success(self, cycle: Optional[int] = None):
@@ -417,8 +421,9 @@ class CircuitBreaker:
                 return
 
             if self._state == CircuitState.HALF_OPEN:
-                # A probe of an earlier cycle reporting late: that cycle already ended,
-                # and this one reopens only on its own probes.
+                # A call this cycle did not admit (an earlier cycle's probe, or a call
+                # admitted while CLOSED) reporting late: this cycle reopens only on its
+                # own probes.
                 if self._from_another_cycle(cycle):
                     return
                 self._half_open_permits = max(0, self._half_open_permits - 1)

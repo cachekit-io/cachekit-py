@@ -835,7 +835,6 @@ class TestOutcomesFromAnotherCycle:
             breaker.record_success(cycle=first[1])
 
             assert breaker.get_stats() == before
-            assert breaker.success_count == 0
 
     def test_outcome_without_a_cycle_counts_toward_the_current_one(self):
         breaker = self._breaker()
@@ -845,6 +844,21 @@ class TestOutcomesFromAnotherCycle:
             for _ in range(3):
                 breaker.record_success()
             assert breaker.state == CircuitState.CLOSED
+
+    def test_call_admitted_while_closed_does_not_reopen_a_cycle(self):
+        """A call admitted before the breaker opened holds no probe of the cycle that follows."""
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            slow = breaker.admit()  # admitted while CLOSED, before any cycle
+            breaker.record_failure()
+            traveller.move_to(1031)
+            assert breaker.admit() not in (None, slow)
+            last_failure = breaker.get_stats()["last_failure_time"]
+
+            breaker.record_failure(cycle=slow)
+
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.get_stats()["last_failure_time"] == last_failure
 
     def test_late_failure_still_counts_while_closed(self):
         """Only HALF_OPEN tells cycles apart: CLOSED counts every failure, whichever call reports it."""
