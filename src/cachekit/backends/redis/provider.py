@@ -106,9 +106,15 @@ def _windows_here(pool: redis.ConnectionPool) -> tuple[float | None, dict[object
     """The pool's open-window record, if this process opened it. Caller holds the windows lock.
 
     A forked child inherits its parent's record, but not the tasks holding those windows, so none of them
-    can close here: the record is dropped and the configured timeout put back. The at-fork hook below does
-    this at fork; this check covers a fork made from C, which runs no hook (uWSGI without
-    --py-call-uwsgi-fork-hooks), on the pool's next window or listener clone.
+    can close here: the configured timeout is put back and the record dropped. The at-fork hook below does
+    this at fork. This check covers a fork made from C, which runs no hook (uWSGI without
+    --py-call-uwsgi-fork-hooks), but only once the child's pool opens a window or clones its listener
+    pool: until then, a child whose parent held a window open at the fork opens its connections at that
+    window's timeout. Checking the PID on every operation would cost each cache call a getpid(); run
+    uWSGI with --py-call-uwsgi-fork-hooks instead.
+
+    A record outlives the timeout it governs: a close restores the pool before dropping the record, so a
+    fork between the two steps leaves the hook a record to reset from.
     """
     record = _open_windows.get(pool)
     if record is None:
@@ -116,8 +122,8 @@ def _windows_here(pool: redis.ConnectionPool) -> tuple[float | None, dict[object
     pid, configured, windows = record
     if pid == os.getpid():
         return configured, windows
-    del _open_windows[pool]
     _set_socket_timeout(pool, configured)
+    del _open_windows[pool]
     return None
 
 
@@ -890,8 +896,8 @@ class PerRequestRedisBackend:
                     if windows:
                         self._client.connection_pool.connection_kwargs["socket_timeout"] = next(reversed(windows.values()))
                     else:
-                        del _open_windows[self._client.connection_pool]
                         _set_socket_timeout(self._client.connection_pool, configured)
+                        del _open_windows[self._client.connection_pool]
 
 
 class RedisBackendProvider:

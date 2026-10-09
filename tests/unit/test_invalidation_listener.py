@@ -27,6 +27,7 @@ import pytest
 import redis
 
 from cachekit import cache, hash_utils, invalidation, l1_cache
+from cachekit.backends.redis import provider
 from cachekit.backends.redis.client import create_connection_pool
 from cachekit.backends.redis.provider import PerRequestRedisBackend
 from cachekit.config import DecoratorConfig
@@ -1077,6 +1078,23 @@ class TestListenerPool:
         finally:
             await held.__aexit__(None, None, None)
         assert pool.connection_kwargs["socket_timeout"] == configured
+
+    async def test_record_outlives_the_restore_of_the_last_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A fork between the two steps of the last close must leave the at-fork hook a record to reset from."""
+        backend = self._backend("redis://cache.example:6379/0")
+        pool = backend._client.connection_pool
+        set_timeout = provider._set_socket_timeout
+        seen: list[bool] = []
+
+        def spy(target: redis.ConnectionPool, timeout: Optional[float]) -> None:
+            seen.append(target in provider._open_windows)  # what a child forked right now would inherit
+            set_timeout(target, timeout)
+
+        monkeypatch.setattr(provider, "_set_socket_timeout", spy)
+        async with backend.with_timeout("get", 100):
+            pass
+        assert seen == [True]
+        assert pool not in provider._open_windows
 
     async def test_record_inherited_without_fork_hooks_is_dropped_on_first_use(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A fork made from C (uWSGI without --py-call-uwsgi-fork-hooks) runs no at-fork hook: the record's PID catches it."""
