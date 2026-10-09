@@ -383,7 +383,7 @@ class CircuitBreaker:
         """Whether a HALF_OPEN outcome comes from a call this cycle did not admit. Caller holds _lock."""
         return cycle is not None and cycle != self._half_open_cycle
 
-    def _on_success(self, *, cycle: Optional[int] = None):
+    def _on_success(self, cycle: Optional[int] = None):
         """Handle successful operation. ``cycle``: see ``record_success``."""
         with self._lock:
             if self._state != CircuitState.HALF_OPEN or self._from_another_cycle(cycle):
@@ -394,7 +394,7 @@ class CircuitBreaker:
             if self._success_count >= self.config.success_threshold:
                 self._transition_to_closed()
 
-    def _on_failure(self, error: Exception, *, cycle: Optional[int] = None):
+    def _on_failure(self, error: Exception, cycle: Optional[int] = None):
         """Handle failed operation. ``cycle``: see ``record_failure``.
 
         Failures whose ``error_type`` is listed in ``config.excluded_error_types``
@@ -512,7 +512,7 @@ class CircuitBreaker:
                 of an earlier cycle reporting late does not reopen this one. None
                 counts the failure toward the current state.
         """
-        self._on_failure(error or Exception("Test failure"), cycle=cycle)
+        self._on_failure(error or Exception("Test failure"), cycle)
 
     def record_success(self, *, cycle: Optional[int] = None):
         """Record a successful operation.
@@ -528,7 +528,7 @@ class CircuitBreaker:
                 cannot close the breaker. None counts the success toward the
                 current state.
         """
-        self._on_success(cycle=cycle)
+        self._on_success(cycle)
 
     def release_probe(self, cycle: int):
         """Give back the probe slot of an admitted call that ends with no outcome.

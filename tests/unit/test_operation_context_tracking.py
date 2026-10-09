@@ -63,7 +63,7 @@ class TestOperationContextTracking:
         """
         orchestrator = _orchestrator(circuit_breaker_enabled=True)
         on_success_calls: list[tuple[CircuitBreaker, Optional[int]]] = []
-        monkeypatch.setattr(CircuitBreaker, "_on_success", lambda self, *, cycle=None: on_success_calls.append((self, cycle)))
+        monkeypatch.setattr(CircuitBreaker, "_on_success", lambda self, cycle=None: on_success_calls.append((self, cycle)))
 
         for kwargs in ({}, {"cycle": 0}, {"cycle": 2}):  # the admitting cycle reaches the breaker
             orchestrator.set_operation_context("get", duration_ms=1.5)

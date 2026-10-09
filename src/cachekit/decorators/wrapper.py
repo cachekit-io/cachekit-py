@@ -1262,7 +1262,7 @@ def create_cache_wrapper(
             # someone else's registry error is the same invisibility this helper exists
             # to remove.
             _stats.record_l2_hit(get_duration_ms)
-            features.record_success(cycle=cycle)
+            features.record_success(cycle)
             if features.collect_stats:
                 features.record_cache_operation(
                     operation="get",
@@ -1980,7 +1980,7 @@ def create_cache_wrapper(
             if cached_result is not None:
                 # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
                 result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
-                features.record_success(cycle=probe_cycle)
+                features.record_success(probe_cycle)
 
                 # Record cache hit with structured logging
                 features.log_cache_operation(
@@ -2081,7 +2081,7 @@ def create_cache_wrapper(
                     _track_and_record(cache_key)
 
                 # Record successful cache set
-                features.record_success(cycle=probe_cycle)
+                features.record_success(probe_cycle)
 
                 if features.collect_stats:
                     features.record_cache_operation(
@@ -2610,7 +2610,7 @@ def create_cache_wrapper(
                                 await _track_and_record_async(cache_key)
 
                             # Record successful cache set
-                            features.record_success(cycle=probe_cycle)
+                            features.record_success(probe_cycle)
 
                             if features.collect_stats:
                                 features.record_cache_operation(
@@ -2732,7 +2732,7 @@ def create_cache_wrapper(
                 await _track_and_record_async(cache_key)
 
             # Record successful cache set
-            features.record_success(cycle=probe_cycle)
+            features.record_success(probe_cycle)
 
             if features.collect_stats:
                 features.record_cache_operation(
