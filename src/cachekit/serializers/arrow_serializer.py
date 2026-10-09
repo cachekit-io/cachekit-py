@@ -191,7 +191,8 @@ class ArrowSerializer:
         SerializationError: Checksum validation failed - data corruption detected
     """
 
-    # Apache Arrow IPC is a cross-language columnar format (Python, R, Julia, Rust) — safe under encryption.
+    # Safe under encryption (ENC-2): after decryption it accepts only its fixed checksummed container,
+    # [xxHash3-64][Arrow IPC], so the configured serializer, not the bytes, decides how to decode.
     cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, return_format: str = "pandas", enable_integrity_checking: bool = True, compression: str | None = "auto"):

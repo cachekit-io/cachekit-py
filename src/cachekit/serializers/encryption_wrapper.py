@@ -1,11 +1,11 @@
 """Encryption Wrapper for Zero-Knowledge Encryption
 
-Provides client-side encryption on top of a cross-SDK SerializerProtocol implementation.
+Provides client-side encryption on top of a SerializerProtocol implementation that decodes one fixed format.
 Uses AES-256-GCM for authenticated encryption with per-tenant key derivation.
 
 Architectural Note:
     EncryptionWrapper is a Decorator pattern implementation, not a serialization format.
-    It wraps a cross-SDK serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
+    It wraps a fixed-format serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
     and adds an encryption layer. This enables zero-knowledge caching where the backend
     never sees plaintext values, regardless of data type (JSON, DataFrames, MessagePack, etc.).
 """
@@ -56,11 +56,13 @@ def require_cross_sdk_serializer(serializer: object) -> None:
     """
     if not getattr(type(serializer), "cross_sdk_compatible", False):
         raise ConfigurationError(
-            f"Encryption requires a cross-SDK-compatible serializer for cross-language interop. "
+            f"Encryption requires a serializer that decodes one fixed format after decryption (protocol ENC-2). "
             f"The serializer instance '{type(serializer).__name__}' does not declare "
             f"cross_sdk_compatible=True. Use StandardSerializer (the default), OrjsonSerializer or "
             f"ArrowSerializer. Set the cross_sdk_compatible ClassVar to True only on a custom serializer "
-            f"whose wire format other-language SDKs can read and which never inspects the bytes to choose a format."
+            f"that keeps this rule: after decryption (metadata.encrypted is true), deserialize decodes the one "
+            f"container its configuration fixes and raises when the bytes do not parse as it, never returning a "
+            f"default or the input; inspecting the bytes may only refuse, never select another decoder."
         )
 
 
@@ -101,11 +103,11 @@ class TenantMismatchError(DecryptionAuthenticationError):
 
 
 class EncryptionWrapper:
-    """Encryption wrapper that composes a cross-SDK serializer with an AES-256-GCM encryption layer.
+    """Encryption wrapper that composes a fixed-format serializer with an AES-256-GCM encryption layer.
 
     Architectural Note:
         This is a wrapper using the Decorator pattern, NOT a serialization format.
-        It delegates serialization to a cross-SDK SerializerProtocol implementation and adds
+        It delegates serialization to a fixed-format SerializerProtocol implementation and adds
         an encryption layer on top. This design allows clean separation of concerns
         (serialization vs encryption) and enables zero-knowledge caching for any data type.
 
@@ -125,7 +127,7 @@ class EncryptionWrapper:
 
     Design Pattern:
         Uses Decorator pattern to add encryption behavior without modifying the base serializer.
-        Can wrap any cross-SDK SerializerProtocol (MessagePack, JSON, Arrow) for zero-knowledge caching.
+        Can wrap any fixed-format SerializerProtocol (MessagePack, JSON, Arrow) for zero-knowledge caching.
 
     Examples:
         Basic encryption/decryption roundtrip with cache_key binding (AAD v0x03):
@@ -161,7 +163,7 @@ class EncryptionWrapper:
         >>> EncryptionWrapper(serializer=AutoSerializer(), master_key=b"a" * 32)  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        ConfigurationError: Encryption requires a cross-SDK-compatible serializer ...
+        ConfigurationError: Encryption requires a serializer that decodes one fixed format after decryption ...
 
         Encryption is always enabled (no opt-out):
 
@@ -221,7 +223,7 @@ class EncryptionWrapper:
         Args:
             serializer: SerializerProtocol implementation to wrap with encryption. Its type must
                 declare ``cross_sdk_compatible = True``. Defaults to StandardSerializer
-                (cross-language MessagePack).
+                (MessagePack).
             master_key: The raw 256-bit master key: exactly 32 bytes, else EncryptionError. Not the hex
                 string the decorators' master_key= takes; decode one with bytes.fromhex(). If None, reads
                 CACHEKIT_MASTER_KEY (hex) from the environment.
@@ -273,9 +275,8 @@ class EncryptionWrapper:
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
 
-        # Initialize base serializer — StandardSerializer (MessagePack) for cross-language
-        # compatibility. Encrypted data may be shared across SDKs via secrets manager,
-        # so the wire format must be language-agnostic.
+        # Initialize base serializer — StandardSerializer (MessagePack), the decorators' default.
+        # The default goes through the ENC-2 guard like any other serializer.
         if serializer is None:
             from cachekit.serializers.standard_serializer import StandardSerializer
 

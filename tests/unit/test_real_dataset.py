@@ -147,8 +147,8 @@ def test_decorated_aggregation_is_served_from_the_backend(
 
 
 def test_secure_refuses_the_auto_serializer(tmp_path: Path) -> None:
-    """Documented: docs/error-codes.md:103, "Single-SDK serializer under encryption". A secure
+    """Documented: docs/error-codes.md:103, "Serializer refused under encryption". A secure
     DataFrame cache uses ``serializer="arrow"``, which the test above covers."""
     backend = FileBackend(FileBackendConfig(cache_dir=tmp_path))
-    with pytest.raises(ConfigurationError, match="Encryption requires a cross-SDK-compatible serializer"):
+    with pytest.raises(ConfigurationError, match="Encryption requires a serializer that decodes one fixed format"):
         cache.secure(master_key=MASTER_KEY, backend=backend, serializer="auto")(lambda: None)
