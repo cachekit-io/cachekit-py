@@ -62,9 +62,9 @@ if TYPE_CHECKING:
     from cachekit.reliability.load_control import BackpressureController
     from cachekit.serializers.base import SerializerProtocol
 
-# Serializer string names whose wire format is language-agnostic and therefore safe to
-# use under encryption (Issue #134). 'auto' is intentionally excluded — it emits
-# Python-specific type tags that no other-language SDK can decode.
+# Serializer string names allowed under encryption (Issue #134): each decodes one fixed
+# format after decryption, as protocol ENC-2 requires. 'auto' is intentionally excluded:
+# it chooses its decoder by inspecting the bytes.
 CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
 
 # Global DI container instance with default registrations
@@ -828,20 +828,19 @@ class CacheSerializationHandler:
                     "Choose multi-tenant (tenant_extractor) OR single-tenant (single_tenant_mode=True)."
                 )
 
-            # Issue #134: Encryption requires a cross-SDK-compatible serializer so the
-            # encrypted bytes remain decodable by other-language SDKs. The user's
-            # serializer is threaded into EncryptionWrapper (see
+            # Issue #134: protocol ENC-2 requires the step after decryption to be the
+            # reader's configured serializer, never a choice made by inspecting the
+            # decrypted bytes. The user's serializer is threaded into EncryptionWrapper (see
             # _get_cached_encryption_wrapper); it is NOT silently replaced. We therefore
-            # allow any serializer that produces a language-agnostic wire format and reject
-            # the rest (notably 'auto' and unmarked custom instances) with a clear error.
+            # allow serializers that decode one fixed format and reject the rest (notably
+            # 'auto' and unmarked custom instances) with a clear error.
             if isinstance(serializer_name, str):
                 if serializer_name not in CROSS_SDK_SERIALIZER_NAMES:
                     raise ConfigurationError(
-                        f"Encryption requires a cross-SDK-compatible serializer for cross-language "
-                        f"interop, got serializer='{serializer_name}'. Allowed under encryption: "
-                        f"{', '.join(CROSS_SDK_SERIALIZER_NAMES)}. The 'auto' serializer emits "
-                        f"Python-specific types that other SDKs cannot decode, so it cannot be used "
-                        f"with encryption."
+                        f"Encryption requires a serializer that decodes one fixed format after "
+                        f"decryption (protocol ENC-2), got serializer='{serializer_name}'. Allowed under "
+                        f"encryption: {', '.join(CROSS_SDK_SERIALIZER_NAMES)}. The 'auto' serializer "
+                        f"chooses its decoder by inspecting the bytes, so it cannot be used with encryption."
                     )
             else:
                 require_cross_sdk_serializer(serializer_name)
@@ -992,8 +991,8 @@ class CacheSerializationHandler:
             # Create new EncryptionWrapper
             from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 
-            # Issue #134: thread the user's base serializer into the wrapper so a
-            # cross-SDK-compatible serializer (Arrow/orjson) is actually used under
+            # Issue #134: thread the user's base serializer into the wrapper so an
+            # allowed serializer (Arrow/orjson) is actually used under
             # encryption instead of being silently replaced by StandardSerializer.
             # The base serializer is fixed per handler instance, so the per-tenant
             # cache key (tenant_id) remains correct — every wrapper for this handler

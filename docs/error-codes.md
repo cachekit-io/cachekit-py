@@ -100,15 +100,15 @@ def get_api_keys(tenant_id: str):
 
 ---
 
-### Single-SDK serializer under encryption
+### Serializer refused under encryption
 
-**Message**: `Encryption requires a cross-SDK-compatible serializer for cross-language interop. ...`
+**Message**: `Encryption requires a serializer that decodes one fixed format after decryption (protocol ENC-2) ...`
 
 **Exception**: `ConfigurationError`, raised when the decorator is applied or when an `EncryptionWrapper` is built
 
-**Cause**: encryption was combined with a serializer that is not cross-SDK: `serializer="auto"` (or `"pythonic"`), an `AutoSerializer` instance, or a custom serializer whose class does not declare `cross_sdk_compatible = True`. The protocol requires the step after decryption to be the reader's configured serializer, never a guess from the decrypted bytes, and `AutoSerializer` picks its format by inspecting them. The decorators already refuse these. `EncryptionWrapper` built directly now refuses them too; earlier releases accepted any serializer there.
+**Cause**: encryption was combined with `serializer="auto"` (or `"pythonic"`), an `AutoSerializer` instance, or a custom serializer whose class does not declare `cross_sdk_compatible = True`. The protocol requires the step after decryption to be the reader's configured serializer, never a guess from the decrypted bytes, and `AutoSerializer` picks its format by inspecting them. The rule holds on every backend, a local file backend included. It is not about other-language readers: `cross_sdk_compatible` only declares a fixed post-decryption format, and `ArrowSerializer` passes although its envelope is not a cross-SDK wire format. The decorators already refuse these. `EncryptionWrapper` built directly now refuses them too; earlier releases accepted any serializer there.
 
-**Solution**: use `StandardSerializer` (the default), `OrjsonSerializer` or `ArrowSerializer`. Do not subclass `AutoSerializer` to set the flag. Set `cross_sdk_compatible = True` only on a custom serializer whose wire format other-language SDKs can read and which never inspects the bytes to choose a format ([Custom Serializers](serializers/custom.md#under-encryption)).
+**Solution**: use `StandardSerializer` (the default), `OrjsonSerializer` or `ArrowSerializer`. Do not subclass `AutoSerializer` to set the flag. Set `cross_sdk_compatible = True` only on a custom serializer whose `deserialize` decodes one fixed format and never inspects the bytes to choose one ([Custom Serializers](serializers/custom.md#under-encryption)).
 
 ---
 

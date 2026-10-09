@@ -8,7 +8,7 @@ For comprehensive documentation of cachekit's zero-knowledge encryption architec
 
 ## Overview
 
-EncryptionWrapper wraps a cross-SDK serializer:
+EncryptionWrapper wraps a serializer that decodes one fixed format:
 
 ```
 serialize(data) → inner.serialize(data) → encrypt(bytes) → stored bytes
@@ -66,7 +66,7 @@ def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 ```
 
-Encryption works with any cross-SDK serializer — including DataFrames:
+Encryption works with any allowed serializer — including DataFrames:
 
 ```python notest
 from cachekit import cache
@@ -80,17 +80,22 @@ def get_patient_records(hospital_id: int):
 
 ## Composability
 
-EncryptionWrapper works with any serializer whose class declares `cross_sdk_compatible = True`:
+EncryptionWrapper works with any serializer whose class declares `cross_sdk_compatible = True`.
+Despite its name, the flag does not mean other-language SDKs can read the format. It declares
+that the serializer decodes one fixed format after decryption and never picks a decoder by
+inspecting the bytes, which the protocol requires on every backend. That is why
+`ArrowSerializer` qualifies although its envelope is not a cross-SDK wire format, and why `AutoSerializer`
+does not even on a local file backend.
 
 | Inner Serializer | Use Case |
 |-----------------|---------|
-| StandardSerializer (default) | Encrypted cross-language MessagePack data |
+| StandardSerializer (default) | Encrypted MessagePack data |
 | OrjsonSerializer | Encrypted API responses, JSON data |
 | ArrowSerializer | Encrypted DataFrames (patient data, ML features) |
 | [Custom serializers](custom.md#under-encryption) that set `cross_sdk_compatible = True` | Any data type with encryption |
 
 Any other serializer, `AutoSerializer` included, raises `ConfigurationError` when the wrapper is built,
-as the decorators already do ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+as the decorators already do ([details](../error-codes.md#serializer-refused-under-encryption)).
 
 ```python
 from cachekit.config import ConfigurationError
@@ -110,7 +115,7 @@ data, meta = wrapper.serialize({"ssn": "123-45-6789"}, cache_key="users:1:ssn")
 assert wrapper.deserialize(data, meta, cache_key="users:1:ssn") == {"ssn": "123-45-6789"}
 ```
 
-EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
+EncryptionWrapper defaults to StandardSerializer (MessagePack). The `@cache.secure` preset uses this default.
 
 ## Direct Use
 

@@ -487,8 +487,8 @@ class AutoSerializer:
         {'fast': True}
     """
 
-    # AutoSerializer emits Python-specific type tags (set, frozenset, UUID, tuple) that no
-    # other-language SDK can decode — single-SDK only, so it is rejected under encryption.
+    # AutoSerializer chooses its decoder by inspecting the bytes (NumPy, Arrow or envelope), which
+    # protocol ENC-2 forbids after decryption, so it is rejected under encryption on every backend.
     cross_sdk_compatible: ClassVar[bool] = False
 
     def __init__(

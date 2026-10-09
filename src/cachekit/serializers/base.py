@@ -24,19 +24,22 @@ class SerializerProtocol(Protocol):
     The protocol is runtime-checkable to enable isinstance() validation
     without requiring explicit inheritance.
 
-    Cross-SDK contract (``cross_sdk_compatible``):
+    Encryption contract (``cross_sdk_compatible``):
         Serializers carry a class-level ``cross_sdk_compatible: bool`` attribute
-        that declares whether their wire format is language-agnostic (readable by
-        other-language CacheKit SDKs). It governs whether the serializer may be
-        used under encryption — see ``EncryptionWrapper`` and the validation in
-        ``CacheSerializationHandler.__init__``:
+        that declares whether ``deserialize`` decodes one fixed format, never
+        choosing a decoder by inspecting the bytes. Protocol ENC-2 requires that of
+        the step after decryption on every backend, so the flag governs whether the
+        serializer may be used under encryption — see ``EncryptionWrapper`` and the
+        validation in ``CacheSerializationHandler.__init__``. Despite its name, it
+        does not mean other-language SDKs can read the format: ArrowSerializer's
+        envelope is not a cross-SDK wire format and still qualifies.
 
         - ``True``  (StandardSerializer/MessagePack, OrjsonSerializer/JSON,
-          ArrowSerializer/Arrow IPC): the user's serializer is threaded into the
-          EncryptionWrapper and used as-is under encryption.
-        - ``False`` (AutoSerializer, which emits Python-specific type tags; and any
-          serializer that does not declare the flag): single-SDK only, so combining
-          it with encryption is rejected at decoration time and when an
+          ArrowSerializer/checksummed Arrow IPC): the user's serializer is threaded
+          into the EncryptionWrapper and used as-is under encryption.
+        - ``False`` (AutoSerializer, which picks its decoder by inspecting the bytes;
+          and any serializer that does not declare the flag): combining it with
+          encryption is rejected at decoration time and when an
           ``EncryptionWrapper`` is built.
 
         This attribute is intentionally NOT part of the runtime-checkable structural
@@ -44,7 +47,7 @@ class SerializerProtocol(Protocol):
         serializer to also declare it, breaking ``isinstance(x, SerializerProtocol)``
         on the plaintext path across Python 3.10-3.14. It is enforced for type
         checkers via ``CrossSDKSerializerProtocol`` below, and read at runtime via
-        ``getattr(type(s), "cross_sdk_compatible", False)`` (unmarked == single-SDK).
+        ``getattr(type(s), "cross_sdk_compatible", False)`` (unmarked == refused under encryption).
 
     Examples:
         >>> class MySerializer:
@@ -137,7 +140,7 @@ class CrossSDKSerializerProtocol(SerializerProtocol, Protocol):
 
     At runtime the flag is read defensively via
     ``getattr(type(serializer), "cross_sdk_compatible", False)``; an unmarked
-    serializer is treated as single-SDK (not safe under encryption).
+    serializer is refused under encryption.
     """
 
     cross_sdk_compatible: ClassVar[bool]

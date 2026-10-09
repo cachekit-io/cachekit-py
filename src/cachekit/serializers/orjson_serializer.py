@@ -79,7 +79,7 @@ class OrjsonSerializer:
         SerializationError: Checksum validation failed - data corruption detected
     """
 
-    # orjson emits standard JSON — a language-agnostic wire format, safe under encryption.
+    # Safe under encryption (ENC-2): it decodes one fixed JSON container, never chosen by the bytes.
     cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, option: int = orjson.OPT_SORT_KEYS, enable_integrity_checking: bool = True):

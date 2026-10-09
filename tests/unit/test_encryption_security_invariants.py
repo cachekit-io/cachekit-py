@@ -2,7 +2,7 @@
 
 Targets:
 - EncryptionWrapper.__init__ `if serializer is not None` branch (explicit serializer)
-- EncryptionWrapper.__init__ refuses a single-SDK serializer (ENC-2), as the handler does
+- EncryptionWrapper.__init__ refuses a sniffing or unmarked serializer (ENC-2), as the handler does
 - CacheSerializationHandler rejects non-default serializer with encryption=True
 - CacheSerializationHandler accepts default/std/standard aliases with encryption=True
 - deserialize_data raises SerializationError when encrypted metadata has no tenant_id
@@ -153,7 +153,7 @@ class TestEncryptionWrapperExplicitSerializer:
 
 
 class _UnmarkedSerializer:
-    """Method-only custom serializer: no cross_sdk_compatible, so single-SDK."""
+    """Method-only custom serializer: no cross_sdk_compatible, so refused under encryption."""
 
     def serialize(self, obj):
         return b"", None
@@ -166,7 +166,7 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
     """ENC-2: a direct EncryptionWrapper refuses what the handler refuses under encryption.
 
     The step after decryption must be the reader's configured serializer, never a sniff of the
-    plaintext. AutoSerializer sniffs; an unmarked custom serializer makes no cross-SDK promise.
+    plaintext. AutoSerializer sniffs; an unmarked custom serializer makes no fixed-format promise.
     """
 
     def test_auto_serializer_refused(self):
@@ -176,6 +176,32 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
     def test_unmarked_custom_serializer_refused(self):
         with pytest.raises(ConfigurationError, match="'_UnmarkedSerializer' does not declare cross_sdk_compatible=True"):
             EncryptionWrapper(serializer=_UnmarkedSerializer(), master_key=b"a" * 32)
+
+    def test_refusal_gives_the_enc2_reason(self, monkeypatch):
+        """Both refusal paths name ENC-2, not other-language readers: the rule holds on every backend."""
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        reset_settings()
+        try:
+            messages = []
+            for build in (
+                lambda: EncryptionWrapper(serializer=AutoSerializer(), master_key=b"a" * 32),
+                lambda: CacheSerializationHandler(serializer_name="auto", encryption=True, single_tenant_mode=True),
+            ):
+                with pytest.raises(ConfigurationError) as excinfo:
+                    build()
+                messages.append(str(excinfo.value))
+        finally:
+            reset_settings()
+        for message in messages:
+            assert message.startswith(
+                "Encryption requires a serializer that decodes one fixed format after decryption (protocol ENC-2)"
+            )
+            assert "inspect" in message
+            assert "cross-language" not in message
+            assert "other SDKs" not in message
+            assert "other-language" not in message
 
     def test_refused_before_key_resolution(self, monkeypatch):
         """The serializer is a config error even when the key is missing too, so it is named first."""
@@ -242,23 +268,22 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
 
 
 class TestCacheSerializationHandlerEncryptionSerializerValidation:
-    """Cover validation branches when encryption=True (Issue #134 cross-SDK contract).
+    """Cover validation branches when encryption=True (Issue #134, protocol ENC-2).
 
-    Under the cross-SDK contract, encryption ALLOWS any serializer that produces a
-    language-agnostic wire format (default/std/standard/orjson/arrow strings and
-    instances marked cross_sdk_compatible=True), and REJECTS single-SDK serializers
-    ('auto' and unmarked custom instances) so the encrypted bytes stay decodable by
-    other-language SDKs.
+    Encryption ALLOWS serializers that decode one fixed format after decryption
+    (default/std/standard/orjson/arrow strings and instances marked
+    cross_sdk_compatible=True), and REJECTS the rest ('auto', which picks its decoder
+    by inspecting the bytes, and unmarked custom instances).
     """
 
     def test_auto_string_serializer_raises(self, monkeypatch):
-        """String serializer 'auto' (single-SDK) raises ConfigurationError under encryption."""
+        """String serializer 'auto' (sniffs the bytes) raises ConfigurationError under encryption."""
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         from cachekit.config.singleton import reset_settings
 
         reset_settings()
         try:
-            with pytest.raises(ConfigurationError, match="cross-SDK-compatible"):
+            with pytest.raises(ConfigurationError, match="chooses its decoder by inspecting the bytes"):
                 CacheSerializationHandler(
                     serializer_name="auto",
                     encryption=True,
@@ -273,7 +298,7 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
         from cachekit.config.singleton import reset_settings
 
         class UnmarkedSerializer:
-            # No cross_sdk_compatible attribute -> treated as single-SDK
+            # No cross_sdk_compatible attribute -> refused under encryption
             def serialize(self, obj):
                 return b"", None
 

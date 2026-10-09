@@ -37,7 +37,7 @@ class InteropSerializer:
         {'age': 30, 'name': 'alice'}
     """
 
-    # Plain MessagePack is the cross-SDK format by definition; this flag lets
+    # Plain MessagePack, one fixed format, so it meets ENC-2; this flag lets
     # CacheSerializationHandler's encryption validation accept the serializer.
     cross_sdk_compatible: ClassVar[bool] = True
 

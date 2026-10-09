@@ -44,7 +44,7 @@ loaded from a secret store. Never a literal in source. A bytes key raises `TypeE
 
 ## What It Does
 
-**Encryption pipeline** (works with any cross-SDK serializer, see [Serializer requirement](#serializer-requirement)):
+**Encryption pipeline** (works with any allowed serializer, see [Serializer requirement](#serializer-requirement)):
 ```
 Python object (plaintext)
     ↓
@@ -281,7 +281,7 @@ if it supplies the key.
 @cache.secure(ttl=300, master_key=secret_key)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
     # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
-    # Encryption is orthogonal: wraps any cross-SDK serializer, applies to both L1 and L2
+    # Encryption is orthogonal: wraps any allowed serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined
 ```
@@ -349,7 +349,9 @@ df = get_patient_records(42)
 Encryption takes only a serializer whose class declares `cross_sdk_compatible = True`: `StandardSerializer`
 (the default), `OrjsonSerializer`, `ArrowSerializer`, or a custom serializer that sets the flag. Anything
 else, `AutoSerializer` included, raises `ConfigurationError` in the decorators and in a directly built
-`EncryptionWrapper` ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+`EncryptionWrapper` ([details](../error-codes.md#serializer-refused-under-encryption)). The reason is the
+protocol's rule that the step after decryption is chosen by the reader's configured serializer, never by
+inspecting the decrypted bytes, on every backend. `AutoSerializer` picks its decoder by inspecting them.
 
 ### Multi-Tenant Isolation
 

@@ -104,10 +104,12 @@ class CustomSerializer:
     ...
 ```
 
-Set it only when other-language SDKs can read your wire format and `deserialize` never inspects the
-bytes to choose a format: after decryption, the protocol lets only the configured serializer decide how
-to decode. A serializer that cannot promise both stays unencrypted
-([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+Despite its name, the flag is not about other-language SDKs reading your format. After decryption,
+the protocol lets only the configured serializer decide how to decode, never an inspection of the
+bytes, and that holds on every backend. Set the flag only when `deserialize` decodes one fixed format.
+A serializer that picks its decoder by inspecting the bytes (a magic-number check, a "try JSON, then
+MessagePack" fallback) must not set it, even if every SDK can read each of its formats; it stays
+unencrypted ([details](../error-codes.md#serializer-refused-under-encryption)).
 
 ## Example: Pydantic Serializer
 

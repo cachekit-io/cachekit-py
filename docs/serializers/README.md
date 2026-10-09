@@ -16,7 +16,7 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 | [AutoSerializer](auto.md) | Fast | Python-only — preserves sets, frozensets, datetime, UUID, NumPy, pandas |
 | [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
 | [ArrowSerializer](arrow.md) | — | pandas/polars DataFrames, any size |
-| [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer: encryption needs a cross-SDK serializer) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
+| [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer, which picks its decoder by inspecting the bytes) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
 | [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
 
 > **OrjsonSerializer** requires the `[json]` extra: `pip install 'cachekit[json]'` (or `uv add 'cachekit[json]'`).
@@ -246,7 +246,7 @@ def get_user_data_v2(user_id):
 - [StandardSerializer (MessagePack)](default.md) — General-purpose, handles all Python types
 - [OrjsonSerializer](orjson.md) — JSON-optimized, 2-5x faster than stdlib json
 - [ArrowSerializer](arrow.md) — DataFrame-optimized columnar format
-- [Encryption Wrapper](encryption.md) — Wraps any cross-SDK serializer for zero-knowledge caching
+- [Encryption Wrapper](encryption.md) — Wraps StandardSerializer, OrjsonSerializer or ArrowSerializer for zero-knowledge caching
 - [Caching Pydantic Models](pydantic.md) — Patterns and pitfalls for Pydantic model caching
 - [Custom Serializers](custom.md) — Implement your own via SerializerProtocol
 

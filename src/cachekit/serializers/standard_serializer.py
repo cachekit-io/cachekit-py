@@ -248,7 +248,7 @@ class StandardSerializer:
         TypeError: StandardSerializer does not support NumPy arrays...
     """
 
-    # MessagePack is a language-agnostic wire format — safe under encryption for cross-SDK reads.
+    # Safe under encryption (ENC-2): it decodes one fixed MessagePack container, never chosen by the bytes.
     cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, enable_integrity_checking: bool = True):
