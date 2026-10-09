@@ -10,7 +10,7 @@
 
 > [!TIP]
 > **Key numbers** (mean of five run medians, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03 and 2026-10-04; indicative wall clock on a shared host):
-> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (61k instructions per call, see [Instruction Budgets](#instruction-budgets))
+> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (59k instructions per call, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 5.1–5.4μs. An L1-only hit never serializes, so payload size barely matters
 > - **Decorator + L1 hit with an L2 backend configured, same dict**: 239–276μs. With a backend, L1 holds bytes and every hit deserializes them
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns
@@ -228,21 +228,21 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 61,218 | 62,690 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 59,065 | 60,655 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 59,343 | 60,490 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 56,904 | 58,486 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit | 174,661 | 167,956 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 209,277 | 200,040 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 170,632 | 169,139 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 164,443 | 158,726 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 60,843 | 61,954 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
-| `serializer_auto` | `AutoSerializer` round trip | 69,441 | 70,650 |
+| `serializer_auto` | `AutoSerializer` round trip | 68,147 | 69,040 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,679 | 23,775 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,953,212 | 1,953,407 |
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 60,350,891 | 59,871,161 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 60,354,776 | 59,877,670 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 118,412 |
-| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 100,723 | 86,297 |
+| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,556 | 73,669 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 9,000 to 10,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread. The gap was about 50,000 until each label tuple's Prometheus series was bound once instead of looked up per call.
 
