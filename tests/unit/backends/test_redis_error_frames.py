@@ -44,7 +44,7 @@ import pytest
 import redis
 from pydantic import SecretStr
 
-from cachekit import cache
+from cachekit import cache, invalidation
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.provider import DefaultBackendProvider
 from cachekit.backends.redis import backend as backend_module
@@ -579,10 +579,12 @@ _OPERATIONS: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]
     "provider-init": (lambda url: url, lambda url: RedisBackendProvider(url.get_secret_value())),
 }
 
-# A health check reports a failure instead of raising it, so only an interrupt leaves it.
-_HEALTH_CHECKS: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]]] = {
+# These report a failure instead of raising it, so only an interrupt leaves them. The invalidation listener starts on the
+# caller's thread, inside a cache operation.
+_NEVER_RAISING: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], object]]] = {
     "redis-backend-health-check": (_redis_backend, lambda backend: backend.health_check()),
     "provider-backend-health-check": (_provider_backend, lambda backend: backend.health_check()),
+    "invalidation-listener-start": (_provider_backend, invalidation.start_listener),
 }
 
 
@@ -611,11 +613,17 @@ def _assert_cleared(exc: BaseException, interrupt: type[BaseException], password
 
 
 @pytest.mark.parametrize("interrupt", _INTERRUPTS)
-@pytest.mark.parametrize("operation", {**_OPERATIONS, **_HEALTH_CHECKS})
+@pytest.mark.parametrize("operation", {**_OPERATIONS, **_NEVER_RAISING})
 def test_an_interrupt_mid_command_reaches_no_frame_holding_the_password(
-    fake_redis: Callable[..., _FakeRedis], password: str, interrupt: type[BaseException], operation: str
+    fake_redis: Callable[..., _FakeRedis],
+    password: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: type[BaseException],
+    operation: str,
 ) -> None:
-    build, run = {**_OPERATIONS, **_HEALTH_CHECKS}[operation]
+    monkeypatch.setattr(invalidation, "_listener_pid", None)  # a listener started earlier would make the start a no-op
+    monkeypatch.setattr(invalidation, "_start_retry_at", float("-inf"))
+    build, run = {**_OPERATIONS, **_NEVER_RAISING}[operation]
     built = build(_url(fake_redis(refusing=False), password))
 
     with _interrupting_sends(interrupt):
