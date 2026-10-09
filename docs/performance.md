@@ -10,7 +10,7 @@
 
 > [!TIP]
 > **Key numbers** (mean of five run medians, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03 and 2026-10-04; indicative wall clock on a shared host):
-> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (59k instructions per call, see [Instruction Budgets](#instruction-budgets))
+> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (60k instructions per call on CPython 3.14, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 5.1–5.4μs. An L1-only hit never serializes, so payload size barely matters
 > - **Decorator + L1 hit with an L2 backend configured, same dict**: 239–276μs. With a backend, L1 holds bytes and every hit deserializes them
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns
@@ -65,7 +65,7 @@ An L1-only hit takes 5.0–6.4μs across the three payloads above.
 
 With ten threads calling one function on the same key at once, each call took 5.8–6.4μs at the median once its thread was running. That is execution time after scheduling, not request latency. Each sample starts inside its thread's loop, so on a GIL build, where only one thread runs Python at a time, the time a thread waits for its turn falls outside every sample. No guard measures how long a request waits under contention.
 
-The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **61,000 instructions per call** on CPython 3.12 and 62,000 on 3.14. Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
+The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **59,000 instructions per call** on CPython 3.12 and 60,000 on 3.14. Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
 The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-only hit uses a separate object cache, whose lookup no guard times on its own.
 
