@@ -17,6 +17,8 @@ Note:
 
 from __future__ import annotations
 
+import functools
+import threading
 from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
@@ -25,15 +27,20 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from .validation import RedactingSettings, refuse_current_key_in_previous_keys
+from .validation import RedactingSettings, _redacting, refuse_current_key_in_previous_keys
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
 # at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
 # rejected at load — never silently truncated. Mirrors cachekit-core's
 # MAX_DECRYPT_ONLY_KEYS, which re-validates behind the FFI boundary.
 MAX_PREVIOUS_MASTER_KEYS = 3
+
+# Serializes CachekitConfig assignments: each validates the whole state it would leave, so two
+# assignments that are each valid alone (a new master_key, and that key added to previous_master_keys)
+# cannot land together unchecked.
+_ASSIGNMENT_LOCK = threading.Lock()
 
 
 class CachekitConfig(RedactingSettings):
@@ -122,6 +129,8 @@ class CachekitConfig(RedactingSettings):
         # logs. errors()/json() ignore this flag; RedactingSettings sanitizes
         # those surfaces.
         hide_input_in_errors=True,
+        # Assignment after load runs every field and model validator; __setattr__ makes a refusal write nothing.
+        validate_assignment=True,
     )
 
     # Generic cache configuration (backend-agnostic)
@@ -276,6 +285,22 @@ class CachekitConfig(RedactingSettings):
         refuse_current_key_in_previous_keys(self.master_key, self.previous_master_keys)
 
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Validate an assignment on a copy first, and write it only if the copy passes.
+
+        validate_assignment alone writes the new value before the model validator runs, so a refused keyring
+        assignment would stay on the instance, readable by other threads until the error surfaces. The value
+        is dropped in a finally: the raised error's traceback holds this frame (CWE-532).
+        """
+        candidate = None
+        try:
+            with _ASSIGNMENT_LOCK:
+                candidate = self.model_copy()
+                _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
+                super().__setattr__(name, value)
+        finally:
+            del value, candidate  # the copy holds the refused value
 
     def __repr__(self) -> str:
         """Return string representation with sensitive information masked.

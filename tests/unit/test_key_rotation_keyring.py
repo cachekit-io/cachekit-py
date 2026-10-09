@@ -152,6 +152,77 @@ class TestPreviousMasterKeysConfig:
                 monkeypatch.delenv(key)
 
 
+_REFUSED_ASSIGNMENTS = {
+    "previous-is-current": ("previous_master_keys", [SecretStr(K2.hex())], "must not appear in previous_master_keys"),
+    "previous-is-current-uppercase": (
+        "previous_master_keys",
+        [SecretStr(K2.hex().upper())],
+        "must not appear in previous_master_keys",
+    ),
+    "current-is-previous": ("master_key", SecretStr(K1.hex()), "must not appear in previous_master_keys"),
+    "fourth-previous": (
+        "previous_master_keys",
+        [SecretStr(f"{i:02x}" * 32) for i in range(4, 8)],
+        f"at most {MAX_PREVIOUS_MASTER_KEYS}",
+    ),
+    "previous-not-hex": ("previous_master_keys", [SecretStr("zz" * 32)], "not valid hex"),
+    "previous-short": ("previous_master_keys", [SecretStr("aa" * 31)], "at least 32 bytes"),
+}
+
+
+class TestSettingsAssignment:
+    """An assignment to the loaded settings runs the load-time rules, and a refused one writes nothing."""
+
+    @pytest.fixture
+    def settings(self, monkeypatch) -> CachekitConfig:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", K2.hex())
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", K1.hex())
+        reset_settings()
+        return get_settings()
+
+    @pytest.mark.parametrize(("field", "value", "reason"), _REFUSED_ASSIGNMENTS.values(), ids=_REFUSED_ASSIGNMENTS.keys())
+    def test_refused_assignment_leaves_settings_as_they_were(self, settings, field, value, reason):
+        before = getattr(settings, field)
+
+        with pytest.raises(ValidationError, match=reason):
+            setattr(settings, field, value)
+
+        assert getattr(settings, field) is before
+
+    @pytest.mark.parametrize("case", ["previous-is-current", "previous-is-current-uppercase", "current-is-previous"])
+    def test_refused_value_is_never_written(self, settings, monkeypatch, case):
+        """The keyring rules run in the model validator, which pydantic's validate_assignment calls only after it has
+        written the new value. The repeat check is the last of them, so a spy there sees what a concurrent reader of
+        the live settings would see while they run: the old values."""
+        import cachekit.config.settings as settings_module
+
+        field, value, reason = _REFUSED_ASSIGNMENTS[case]
+        before = (settings.master_key, settings.previous_master_keys)
+        seen: list[tuple[Any, Any]] = []
+        refuse = settings_module.refuse_current_key_in_previous_keys
+
+        def spy(*args: Any) -> None:
+            seen.append((settings.master_key, settings.previous_master_keys))
+            refuse(*args)
+
+        monkeypatch.setattr(settings_module, "refuse_current_key_in_previous_keys", spy)
+
+        with pytest.raises(ValidationError, match=reason):
+            setattr(settings, field, value)
+
+        assert len(seen) == 1
+        assert seen[0][0] is before[0]
+        assert seen[0][1] is before[1]
+
+    def test_valid_assignment_lands_validated(self, settings):
+        settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
+        settings.master_key = K1.hex()  # type: ignore[assignment]
+
+        assert settings.previous_master_keys == [SecretStr(K3.hex())]
+        assert isinstance(settings.master_key, SecretStr)
+        assert settings.master_key.get_secret_value() == K1.hex()
+
+
 class _CallRecordingBackend:
     """Backend that records every call, to prove a refusal came before any."""
 
@@ -220,7 +291,8 @@ class TestRepeatRefusedAtDecoration:
         assert backend.calls == []
 
     def test_reads_previous_keys_as_they_stand_at_decoration(self, monkeypatch):
-        """Settings validate no assignment, so a check made only at load would miss this one."""
+        """Settings hold no current key here, so they accept this assignment; only a check made when the cache is
+        built sees it repeat the master_key= argument."""
         backend = _CallRecordingBackend()
         cache.secure(backend=backend, master_key=KA.hex())(lambda: None)  # accepted: no previous keys yet
 
@@ -229,18 +301,22 @@ class TestRepeatRefusedAtDecoration:
             cache.secure(backend=backend, master_key=KA.hex())(lambda: None)
         assert backend.calls == []
 
-    def test_reads_an_assigned_settings_master_key(self, monkeypatch):
-        """The same holds for the current key itself, when it comes from settings assigned after load."""
-        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", KA.hex())
-        reset_settings()
-        monkeypatch.setattr(get_settings(), "master_key", SecretStr(KA.hex()))
+    def test_reads_the_settings_master_key_as_it_stands_at_build(self, monkeypatch):
+        """The same holds for the current key itself, when it comes from settings. Settings refuse the repeat at load
+        and on assignment, so unvalidated settings stand in for it: the handler's check stays as defence in depth."""
+        import cachekit.cache_handler as cache_handler
+
+        unvalidated = CachekitConfig.model_construct(
+            master_key=SecretStr(KA.hex()), previous_master_keys=[SecretStr(KA.hex())], encryption_fail_closed=False
+        )
+        monkeypatch.setattr(cache_handler, "get_settings", lambda: unvalidated)
 
         with pytest.raises(ConfigurationError, match=REPEAT_REFUSAL):
             CacheSerializationHandler(encryption=True, single_tenant_mode=True)
 
-    def test_plaintext_handler_reads_no_settings(self, monkeypatch):
-        """A handler that neither encrypts nor defers fail-closed to settings never loads them, so a malformed
-        keyring setting cannot stop it being built."""
+    def test_plaintext_handler_construction_reads_no_settings(self, monkeypatch):
+        """Building a handler that neither encrypts nor defers fail-closed to settings never loads them, so a malformed
+        keyring setting cannot stop it being built. Its later operations may still read settings."""
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", "not-hex")
         reset_settings()
 
@@ -575,8 +651,8 @@ class TestDecryptErrorTaxonomy:
 
 
 def _settings_previous_keys(monkeypatch: pytest.MonkeyPatch, keys: list[bytes]) -> None:
-    """Hand the wrapper previous keys that skip settings-load validation, as a settings
-    object assigned to after load does (it validates no assignment). A key passed
+    """Hand the wrapper previous keys that skip settings validation, which settings refuse at
+    load and on assignment: the wrapper's own check is defence in depth. A key passed
     explicitly never gets this far: __init__ holds it to exactly 32 bytes."""
     import cachekit.serializers.encryption_wrapper as ew
 

@@ -311,10 +311,12 @@ class EncryptionWrapper:
         # Decrypt-only previous keys from settings if not provided (key rotation,
         # spec/encryption.md → "Key Rotation (Keyring)"). Settings enforce the cap
         # of 3, per-key hex/length validation, and the forward-only subset check
-        # at load, and CacheSerializationHandler repeats the subset check for an
-        # encrypting cache's master_key= when it is built; the Rust Keyring
-        # re-validates all three behind the FFI boundary for wrappers constructed
-        # with explicit parameters and for settings assigned after those checks.
+        # at load and on every assignment, and CacheSerializationHandler repeats the
+        # subset check for an encrypting cache's master_key= when it is built; the
+        # Rust Keyring re-validates all three behind the FFI boundary for wrappers
+        # constructed with explicit parameters, and as defence in depth for keys
+        # read from settings. This wrapper keeps the keyring it builds: a later
+        # change to the settings reaches only wrappers built after it.
         # Keyring config errors below raise KeyringConfigurationError, NEVER
         # EncryptionError: EncryptionError is a SerializationError, which the
         # read-path policy (handle_decrypt_failure) classifies as corruption →
@@ -331,8 +333,8 @@ class EncryptionWrapper:
             settings = get_settings()
             previous_master_keys = [SecretBytes(bytes.fromhex(key.get_secret_value())) for key in settings.previous_master_keys]
 
-        # The hex rule again, for keys read from settings: settings validate them at load, but the settings
-        # object takes later assignments unvalidated, and the Rust Keyring below checks only 16 bytes.
+        # The hex rule again, for keys read from settings: settings validate them at load and on assignment, and
+        # this stays as defence in depth because the Rust Keyring below checks only 16 bytes.
         for position, previous_key in enumerate(previous_master_keys):
             if len(previous_key) < 32:
                 raise KeyringConfigurationError(

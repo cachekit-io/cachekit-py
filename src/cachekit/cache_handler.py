@@ -698,8 +698,9 @@ class CacheSerializationHandler:
                                None: no prefix, for a handler with no backend behind it.
 
         Raises:
-            ConfigurationError: If encryption config is invalid (missing mode or both modes), or a
-                master key is present while encryption is None.
+            ConfigurationError: If encryption config is invalid (missing mode or both modes), a
+                master key is present while encryption is None, or an encrypting handler's current key
+                (master_key= or CACHEKIT_MASTER_KEY) is also among the previous master keys.
             TypeError: If serializer_name is not a string or SerializerProtocol instance, or master_key is
                 bytes (pass ``key.hex()``).
 
@@ -774,11 +775,10 @@ class CacheSerializationHandler:
             encryption = False
 
         # The keyring's forward-only rule, refused here at decoration before any backend call, whichever route the
-        # current key took. Settings run the same check at load, but never see master_key= and take later assignments
-        # unvalidated; without this, the native keyring refuses only when the first read or write builds it. An
-        # encryption-disabled handler never encrypts, so it spends no nonce budget: its keyring is built only for a
-        # config-drift read, whose fault is a miss by design. Nor does it load settings here: a plaintext handler must
-        # not fail on a malformed keyring setting it never uses.
+        # current key took. Settings run the same check at load and on assignment, but never see master_key=; without
+        # this, the native keyring refuses only when the first read or write builds it. An encryption-disabled handler
+        # never encrypts, so it spends no nonce budget: its keyring is built only for a config-drift read, whose fault
+        # is a miss by design. This check loads no settings for a plaintext handler.
         if encryption:
             settings = get_settings()
             try:

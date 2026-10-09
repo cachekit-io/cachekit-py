@@ -406,7 +406,7 @@ export CACHEKIT_MASTER_KEY=<new-key-hex>
 export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
 ```
 
-Rules enforced at config load — rejected, never truncated or silently fixed:
+Rules enforced at config load or cache build — rejected, never truncated or silently fixed:
 
 - **Cap**: at most 3 decrypt-only keys.
 - **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, at least 32 bytes; use exactly 32).
@@ -680,9 +680,12 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
 raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 `cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
 passed directly that is not exactly 32 bytes, more than three previous keys, or the current
-key repeated among them. Settings check all three at load, and an encrypting cache checks its
-current key against the previous keys when it is built, so behind the decorators this surfaces
-only when settings are assigned after that, or on a config-drift read (below). Outside config-drift reads, the fault never
+key repeated among them. Settings check all three at load and refuse an assignment that breaks
+them, leaving the settings as they were, and an encrypting cache checks its current key against
+the previous keys when it is built, so behind the decorators this surfaces only on a config-drift
+read (below). A cache that has already built its encryption wrapper keeps the keyring it built:
+a key change reaches only caches built after it, and a running process applies it on restart.
+Outside config-drift reads, the fault never
 evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users
 and callers of the `CacheOperationHandler` read and write methods receive it in both fail modes. Behind
 the `@cache` decorators, a read of an existing encrypted entry raises it too, from L1 or L2 and

@@ -42,6 +42,14 @@ from cachekit.config.validation import _BYTES_KEY_REFUSAL
 from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 
 _KEY_HEX = "ab" * 32
+# No two 16-character windows of it are alike, so a truncated rendering of it is still found.
+_DISTINCT_KEY_HEX = bytes(range(32)).hex()
+
+# Post-load assignments to the settings that are refused: one per field, one by the model validator.
+_SETTINGS_ASSIGNMENT_REFUSALS: dict[str, tuple[str, object]] = {
+    "field-level": ("previous_master_keys", {_DISTINCT_KEY_HEX: 1}),
+    "model-level": ("previous_master_keys", [_DISTINCT_KEY_HEX, "01" * 32, "02" * 32, "03" * 32]),
+}
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
     RedisBackendConfig,
@@ -634,6 +642,23 @@ def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_c
 
 
 @pytest.mark.unit
+class TestSettingsAssignmentRedaction:
+    """A refused assignment to the loaded settings carries no route to the key it was given, whole or truncated."""
+
+    @pytest.mark.parametrize(
+        ("field", "value"), _SETTINGS_ASSIGNMENT_REFUSALS.values(), ids=_SETTINGS_ASSIGNMENT_REFUSALS.keys()
+    )
+    def test_refused_assignment_redacts_the_key(self, field: str, value: object) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            setattr(singleton.get_settings(), field, value)
+
+        _assert_no_route_to(exc_info.value, _DISTINCT_KEY_HEX)
+        rendered = str(exc_info.value) + repr(exc_info.value.errors()) + exc_info.value.json()
+        fragments = {_DISTINCT_KEY_HEX[i : i + 16] for i in range(len(_DISTINCT_KEY_HEX) - 15)}
+        assert [fragment for fragment in fragments if fragment in rendered] == []
+
+
+@pytest.mark.unit
 class TestRedactingSettingsFrameLocals:
     """No cachekit frame on a raised config error's traceback keeps the raw input (CWE-532)."""
 
@@ -1073,6 +1098,15 @@ _ENTRY_POINT_ROWS: dict[str, _EntryPointRow] = {
         ConfigurationError,
         _SHORT_KEY_HEX,
     ),
+    **{
+        f"settings-assignment-{name}": (
+            {},
+            lambda field=field, value=value: setattr(singleton.get_settings(), field, value),
+            ValidationError,
+            _DISTINCT_KEY_HEX,
+        )
+        for name, (field, value) in _SETTINGS_ASSIGNMENT_REFUSALS.items()
+    },
 }
 
 
