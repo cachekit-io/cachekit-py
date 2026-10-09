@@ -1,8 +1,8 @@
 {
-  "version": "1.1.0",
-  "generator": "cachekit-py v0.20.0",
+  "version": "1.3.0",
+  "generator": "cachekit-py v0.20.0 (vectors added in 1.2.0 and 1.3.0: cachekit-py 0.22.0)",
   "ci_verification": "Vendored (sha256-pinned) and byte-verified against CacheKeyGenerator in cachekit-py default CI: tests/unit/protocol/test_cache_key_vectors.py",
-  "note": "Python-SDK-only conformance vectors. The 7-segment auto-mode key embeds a language-specific func: segment (__main__ here because the vectors were generated at top level), so no other SDK can reproduce these keys or share the cache entries they name; cross-SDK validation uses test-vectors/interop-mode.json (Interop Mode). The 7-segment shape is SDK-internal convention: the CachekitIO server accepts any key passing its security-only checks (length, charset, namespace prefix shape), including TS/Rust {ns}:{hash} and interop-mode keys.",
+  "note": "Python-SDK-only conformance vectors. The 7-segment auto-mode key embeds a language-specific func: segment (__main__ here because the vectors were generated at top level), so no other SDK can reproduce these keys or share the cache entries they name; cross-SDK validation uses test-vectors/interop-mode.json (Interop Mode). The 7-segment shape is SDK-internal convention: the CachekitIO server accepts any key passing its security-only checks (length, charset, namespace prefix shape), including TS/Rust {ns}:{hash} and interop-mode keys. error_vectors give identities a key generator MUST refuse with an error (spec/cache-key-format.md: an empty or non-string identity is never mapped to a code). serializer_object_vectors give a serializer by its class instead of a string: a test instantiates serializer_class, the SDK's own class of that name (defined_by sdk) or a class the test defines with that name and the SDK's serializer interface (defined_by test), configures a cache with the instance and keys the call through it.",
   "key_format": "ns:{namespace}:func:{module}.{qualname}:args:{blake2b_256_hex}:{ic_flag}{serializer_code} (Python SDK convention — server validates security-only, see spec/cache-key-format.md#server-side-requirements)",
   "hash_algorithm": "blake2b-256 of msgpack([normalized_args, sorted_kwargs])",
   "vectors": [
@@ -239,6 +239,184 @@
       "integrity_checking": true,
       "serializer_type": "<custom>:ArrowSerializer",
       "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x2263"
+    },
+    {
+      "name": "serializer_derived_spec_example",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "cbor",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x23d5"
+    },
+    {
+      "name": "serializer_derived_leading_zero",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "toml",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x0c41"
+    },
+    {
+      "name": "serializer_custom_identity_orjson",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "<custom>:OrjsonSerializer",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x8f72"
+    },
+    {
+      "name": "serializer_custom_identity_non_ascii",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "<custom>:Café",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x2f62"
+    }
+  ],
+  "error_vectors": [
+    {
+      "name": "serializer_type_empty",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "",
+      "error": "an empty serializer identity is an error, never a code: a key generator that falls back to a default code, or derives one from the empty string, names an entry nothing wrote"
+    },
+    {
+      "name": "serializer_type_null",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": null,
+      "error": "a serializer identity that is not a string is an error: one that falls back to a default code for null, or derives a code from its text (\"None\", \"null\"), names an entry nothing wrote"
+    },
+    {
+      "name": "serializer_type_integer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": 0,
+      "error": "a serializer identity that is not a string is an error: one that falls back to a default code for a falsy value, or derives a code from its text (\"0\"), names an entry nothing wrote"
+    },
+    {
+      "name": "serializer_type_truthy_integer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": 1,
+      "error": "a serializer identity that is not a string is an error, truthy or not: one that refuses only falsy values and derives a code from the text of the rest (\"1\") names an entry nothing wrote"
+    }
+  ],
+  "serializer_object_vectors": [
+    {
+      "name": "object_arrow_serializer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_class": "ArrowSerializer",
+      "defined_by": "sdk",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x2263"
+    },
+    {
+      "name": "object_class_named_auto",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_class": "auto",
+      "defined_by": "test",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1xf932"
+    },
+    {
+      "name": "object_standard_serializer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_class": "StandardSerializer",
+      "defined_by": "sdk",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x8542"
+    },
+    {
+      "name": "object_orjson_serializer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_class": "OrjsonSerializer",
+      "defined_by": "sdk",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x8f72"
+    },
+    {
+      "name": "object_auto_serializer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_class": "AutoSerializer",
+      "defined_by": "sdk",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x4874"
     }
   ]
 }
