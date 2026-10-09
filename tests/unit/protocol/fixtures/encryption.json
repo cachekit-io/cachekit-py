@@ -1,6 +1,6 @@
 {
-  "version": "1.3.0",
-  "generator": "extracted from cachekit-rs v0.5.1 + cachekit-ts v0.1.0 (Python ground truth); arrow/orjson/original_type vectors generated with cryptography/OpenSSL (fixed nonces) matching real cachekit-py serializer metadata, verified by tools/encryption-verify.py; master_key_input rows hand-written from one key, the sealed row sealed with the stdlib HKDF + cryptography AES-GCM (fixed nonce)",
+  "version": "1.5.0",
+  "generator": "extracted from cachekit-rs v0.5.1 + cachekit-ts v0.1.0 (Python ground truth); arrow/orjson/original_type and standard_serializer vectors generated with cryptography/OpenSSL (fixed nonces) matching real cachekit-py serializer metadata (the standard_serializer plaintexts are cachekit-py 0.22.0's own: python-frame.json's default and integrity-off payloads), verified by tools/encryption-verify.py; master_key_input rows hand-written from one key, the sealed rows sealed with the stdlib HKDF + cryptography AES-GCM (fixed nonce)",
   "algorithm": "AES-256-GCM",
   "key_derivation": "HKDF-SHA256 with cachekit_v1_ salt prefix",
   "nonce_size": 12,
@@ -49,7 +49,56 @@
         "ciphertext_hex": "020202020202020202020202c9e7a0e25b70e67fc71a191af2d8ec795ce7fa3bf69d06e291ec1bce",
         "key_fingerprint_hex": "e066ffdacfb5fb11a6ecc44c7a0ecb4e"
       }
-    ]
+    ],
+    "configuration": {
+      "note": "spec/encryption.md \u00a7 Key Rotation (Keyring). Configurations a keyring is loaded from: a current master key and a list of decrypt-only master keys, as CACHEKIT_MASTER_KEY and CACHEKIT_PREVIOUS_MASTER_KEYS (comma-separated) or an SDK's own parameters give them. A conforming SDK accepts each accept row and refuses each reject row when the keyring is loaded, before any entry is read. No row's verdict depends on what the spec leaves open: uppercase hex (intent-presets.md \u00a7 Master Key Input rule 1) or a key repeated within the decrypt-only list. Each note names mistakes its row catches; tools/encryption-verify.py checks that each one misjudges its row.",
+      "vectors": [
+        {
+          "name": "keyring_three_decrypt_only_keys",
+          "current_master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+          "decrypt_only_master_keys_hex": [
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "6161616161616161616161616161616161616161616161616161616161616161"
+          ],
+          "verdict": "accept",
+          "note": "One current key and three decrypt-only keys, the cap, each a valid 32-byte key and none repeated. A conforming SDK accepts it at load. One whose cap is below three refuses it."
+        },
+        {
+          "name": "keyring_four_decrypt_only_keys",
+          "current_master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+          "decrypt_only_master_keys_hex": [
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "6161616161616161616161616161616161616161616161616161616161616161",
+            "3333333333333333333333333333333333333333333333333333333333333333"
+          ],
+          "verdict": "reject",
+          "note": "One current key and four decrypt-only keys, one over the cap, each a valid 32-byte key and none repeated, so nothing but the count can refuse it. A conforming SDK refuses it at load. One with no cap accepts it, and so does one that keeps the first three keys and drops the rest."
+        },
+        {
+          "name": "keyring_current_key_decrypt_only",
+          "current_master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+          "decrypt_only_master_keys_hex": [
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "verdict": "reject",
+          "note": "The current key repeated, as given, between two other decrypt-only keys. A conforming SDK refuses it at load. One that does not compare the current key with the decrypt-only keys accepts it, and so does one that compares it only with the first or only with the last."
+        },
+        {
+          "name": "keyring_current_key_decrypt_only_uppercase",
+          "current_master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+          "decrypt_only_master_keys_hex": [
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "007F80FFA55AC33C1EE12DD24BB469968778F00F01102332455467768998ABBA"
+          ],
+          "verdict": "reject",
+          "note": "The current key repeated in the decrypt-only list in uppercase hex. Its verdict does not depend on uppercase handling, which spec/intent-presets.md \u00a7 Master Key Input rule 1 leaves open: an SDK that refuses uppercase hex refuses the list, and one that reads it as the same bytes finds the repeat. One that accepts uppercase hex and compares the keys as strings accepts it, and so does one that accepts uppercase hex and does not compare the current key with the decrypt-only keys."
+        }
+      ]
+    }
   },
   "vectors": [
     {
@@ -118,8 +167,214 @@
       "original_type": "numpy",
       "aad_hex": "030000000e63726f73732d73646b2d7465737400000018746573743a6f726967696e616c2d747970653a6e756d7079000000076d73677061636b0000000546616c7365000000056e756d7079",
       "ciphertext_hex": "0a0b0c0d0e0f101100000003657e765491f9790882c0543d98ab280c5951a1ed"
+    },
+    {
+      "name": "standard_serializer_default",
+      "plaintext_hex": "94c422f01183a7757365725f69642aa46e616d65a863616368656b6974a6616374697665c398ccdaccf46861cc8e624bccfe20a76d73677061636b",
+      "cache_key": "test:standard:default",
+      "format": "msgpack",
+      "compressed": true,
+      "original_type": "msgpack",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000015746573743a7374616e646172643a64656661756c74000000076d73677061636b0000000454727565000000076d73677061636b",
+      "ciphertext_hex": "0a0b0c0d0e0f1011000000042ed1d29248afcf662d0cf30bf6bc9b4857c1228517788144c0720dff2ed5eef362bda2c356b02d0da6b6653230e63aa5fd436a417d42142c1ce305bad39af86dbf0c88cb4b8f2d8f2c6f29"
+    },
+    {
+      "name": "standard_serializer_integrity_off",
+      "plaintext_hex": "83a7757365725f69642aa46e616d65a863616368656b6974a6616374697665c3",
+      "cache_key": "test:standard:integrity-off",
+      "format": "msgpack",
+      "compressed": false,
+      "original_type": "msgpack",
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000001b746573743a7374616e646172643a696e746567726974792d6f6666000000076d73677061636b0000000546616c7365000000076d73677061636b",
+      "ciphertext_hex": "0a0b0c0d0e0f101100000005275a8abbe4e2c89ffd42723b89608fe7132ba8aca55b350621e6792789e510f88f9a47783090d2fa823c07bf81984708"
     }
   ],
+  "aad_reject_vectors": [
+    {
+      "name": "aad_compressed_false_sealed_true",
+      "sealed_as": "compressed_basic",
+      "cache_key": "test:compressed:vector",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000016746573743a636f6d707265737365643a766563746f72000000076d73677061636b0000000546616c7365",
+      "ciphertext_hex": "44cc06e600000000000000000eb8450c4aac2337265323f7f1b03fc3966deaa515f7",
+      "note": "compressed_basic's ciphertext, sealed with compressed True, presented with compressed False, as a reader configured without compression builds it. A reader that retries with the other compressed value decrypts it, to deadbeefcafe, which no container reads, so the retry still ends with no value and only a test that asserts the authentication failure itself tells it apart."
+    },
+    {
+      "name": "aad_compressed_true_sealed_false",
+      "sealed_as": "basic_bytes",
+      "cache_key": "test:vector:1",
+      "format": "msgpack",
+      "compressed": true,
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000000d746573743a766563746f723a31000000076d73677061636b0000000454727565",
+      "ciphertext_hex": "f8f69c70000000000000000087d9ec09f2c2347a4b37d5330ccf50e3c31e69642801bef5",
+      "note": "basic_bytes's ciphertext, sealed with compressed False, presented with compressed True, as a reader configured with compression builds it. A reader that retries with the other compressed value, as one that falls back to compressed False for entries it takes for legacy ones does, decrypts it, to bytes that are no ByteStorage envelope, so the envelope reader still ends with no value and only a test that asserts the authentication failure itself tells the retry apart."
+    },
+    {
+      "name": "aad_format_msgpack_sealed_arrow",
+      "sealed_as": "arrow_uncompressed",
+      "cache_key": "test:arrow:uncompressed",
+      "format": "msgpack",
+      "compressed": false,
+      "original_type": "arrow",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000017746573743a6172726f773a756e636f6d70726573736564000000076d73677061636b0000000546616c7365000000056172726f77",
+      "ciphertext_hex": "0a0b0c0d0e0f10110000000066ee6349733c18b89159de7db35910d6b996bdb9150d5f1d",
+      "note": "arrow_uncompressed's ciphertext, sealed with the format token arrow, presented with msgpack and the same original_type, as cachekit-py builds it from a frame header claiming msgpack. A reader that retries with the other registry format tokens, an Arrow reader's own arrow among them, decrypts it, to eight bytes that hold no Arrow IPC file, so the Arrow reader still ends with no value and only a test that asserts the authentication failure itself tells the retry apart."
+    },
+    {
+      "name": "aad_without_original_type_sealed_with",
+      "sealed_as": "original_type_numpy",
+      "cache_key": "test:original-type:numpy",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000018746573743a6f726967696e616c2d747970653a6e756d7079000000076d73677061636b0000000546616c7365",
+      "ciphertext_hex": "0a0b0c0d0e0f101100000003657e765491f9790882c0543d98ab280c5951a1ed",
+      "note": "original_type_numpy's ciphertext, sealed with the fifth component original_type numpy, presented with four components, as a reader that never adds original_type (cachekit-ts, cachekit-rs, interop mode) or a cachekit-py frame header without one presents it. A reader that retries with each original_type value cachekit-py emits decrypts it, to [1, 2, 3], one MessagePack document, which the plain-MessagePack reader that presents this AAD returns as a value."
+    },
+    {
+      "name": "aad_with_original_type_sealed_without",
+      "sealed_as": "basic_bytes",
+      "cache_key": "test:vector:1",
+      "format": "msgpack",
+      "compressed": false,
+      "original_type": "msgpack",
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000000d746573743a766563746f723a31000000076d73677061636b0000000546616c7365000000076d73677061636b",
+      "ciphertext_hex": "f8f69c70000000000000000087d9ec09f2c2347a4b37d5330ccf50e3c31e69642801bef5",
+      "note": "basic_bytes's ciphertext, sealed with four components, presented with the fifth component original_type msgpack, as cachekit-py's StandardSerializer with integrity checking off builds it. A reader that retries without original_type after a five-component attempt fails, to read entries cachekit-ts, cachekit-rs or interop mode wrote, decrypts it, to 01 and seven more bytes: one MessagePack document with bytes after it. A plain-MessagePack reader that refuses those bytes still ends with no value, and one that ignores them returns 1. Only an interop reader must refuse them (spec/interop-mode.md), so a test tells a retry apart only by asserting the authentication failure itself."
+    },
+    {
+      "name": "aad_key_with_prefix_sealed_without",
+      "sealed_as": "basic_bytes",
+      "cache_key": "app:test:vector:1",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d74657374000000116170703a746573743a766563746f723a31000000076d73677061636b0000000546616c7365",
+      "ciphertext_hex": "f8f69c70000000000000000087d9ec09f2c2347a4b37d5330ccf50e3c31e69642801bef5",
+      "note": "basic_bytes's ciphertext, sealed under the cache_key test:vector:1, presented under app:test:vector:1, the key with a prefix in front. A reader whose cache_key carries a namespace or key prefix and that retries with the key stripped of it decrypts it, to 01 and seven more bytes: one MessagePack document with bytes after it. A plain-MessagePack reader that refuses those bytes still ends with no value, and one that ignores them returns 1. Only an interop reader must refuse them (spec/interop-mode.md), so a test tells a retry apart only by asserting the authentication failure itself."
+    },
+    {
+      "name": "aad_compressed_false_sealed_true_five_components",
+      "sealed_as": "standard_serializer_default",
+      "cache_key": "test:standard:default",
+      "format": "msgpack",
+      "compressed": false,
+      "original_type": "msgpack",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000015746573743a7374616e646172643a64656661756c74000000076d73677061636b0000000546616c7365000000076d73677061636b",
+      "ciphertext_hex": "0a0b0c0d0e0f1011000000042ed1d29248afcf662d0cf30bf6bc9b4857c1228517788144c0720dff2ed5eef362bda2c356b02d0da6b6653230e63aa5fd436a417d42142c1ce305bad39af86dbf0c88cb4b8f2d8f2c6f29",
+      "note": "standard_serializer_default's ciphertext, cachekit-py's default AAD shape sealed with compressed True, presented with compressed False, as cachekit-py's StandardSerializer with integrity checking off builds it. A reader that retries with the other compressed value, or flips the flag only on five-component AADs, the shape of every cachekit-py entry, decrypts it, to a ByteStorage envelope, one MessagePack document, whose 4-element array the plain-MessagePack reader that presents this AAD may return as a value; one that also takes its container from the flag unwraps it to the value."
+    },
+    {
+      "name": "aad_compressed_true_sealed_false_five_components",
+      "sealed_as": "standard_serializer_integrity_off",
+      "cache_key": "test:standard:integrity-off",
+      "format": "msgpack",
+      "compressed": true,
+      "original_type": "msgpack",
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000001b746573743a7374616e646172643a696e746567726974792d6f6666000000076d73677061636b0000000454727565000000076d73677061636b",
+      "ciphertext_hex": "0a0b0c0d0e0f101100000005275a8abbe4e2c89ffd42723b89608fe7132ba8aca55b350621e6792789e510f88f9a47783090d2fa823c07bf81984708",
+      "note": "standard_serializer_integrity_off's ciphertext, sealed with compressed False and five components, presented with compressed True, as cachekit-py's StandardSerializer with integrity checking on builds it. A reader that retries with the other compressed value, or flips the flag only on five-component AADs, decrypts it, to plain MessagePack, which the envelope reader that presents this AAD still reads as no value, so only a test that asserts the authentication failure itself tells the retry apart, unless that reader also takes its container from the flag and returns the map."
+    },
+    {
+      "name": "aad_without_original_type_sealed_with_msgpack",
+      "sealed_as": "standard_serializer_default",
+      "cache_key": "test:standard:default",
+      "format": "msgpack",
+      "compressed": true,
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000015746573743a7374616e646172643a64656661756c74000000076d73677061636b0000000454727565",
+      "ciphertext_hex": "0a0b0c0d0e0f1011000000042ed1d29248afcf662d0cf30bf6bc9b4857c1228517788144c0720dff2ed5eef362bda2c356b02d0da6b6653230e63aa5fd436a417d42142c1ce305bad39af86dbf0c88cb4b8f2d8f2c6f29",
+      "note": "standard_serializer_default's ciphertext, sealed with the fifth component original_type msgpack, presented with four components, as a reader configured for a ByteStorage envelope that never adds original_type (cachekit-ts with compression on) builds it. A reader that retries with each original_type value cachekit-py emits, or only with msgpack, its own serializer's, decrypts it, to the envelope, which that reader unwraps to the value."
+    },
+    {
+      "name": "aad_format_arrow_sealed_msgpack",
+      "sealed_as": "standard_serializer_default",
+      "cache_key": "test:standard:default",
+      "format": "arrow",
+      "compressed": true,
+      "original_type": "msgpack",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000015746573743a7374616e646172643a64656661756c74000000056172726f770000000454727565000000076d73677061636b",
+      "ciphertext_hex": "0a0b0c0d0e0f1011000000042ed1d29248afcf662d0cf30bf6bc9b4857c1228517788144c0720dff2ed5eef362bda2c356b02d0da6b6653230e63aa5fd436a417d42142c1ce305bad39af86dbf0c88cb4b8f2d8f2c6f29",
+      "note": "standard_serializer_default's ciphertext, sealed with the format token msgpack, presented with arrow and the same compressed value and original_type, as cachekit-py builds it from a frame header claiming arrow. A reader that retries with the other registry format tokens, or only with msgpack, its own serializer's, decrypts it, to the envelope, which a StandardSerializer reader unwraps to the value."
+    }
+  ],
+  "decrypted_container": {
+    "note": "spec/encryption.md \u00a7 AAD v0x03 Format, ENC-2 and ENC-3: after decryption the container is the one the reader is configured for, never one picked by looking at the bytes or tried after another fails, and a parse mismatch hard-fails. Each row is sealed under the main master key and tenant_id with the AAD of the reader it names: plain_msgpack (four components, compressed False; cachekit-ts with compression off, cachekit-rs, interop mode), interop (the same AAD under one of interop-mode.json's keys, for interop mode's reader, which MUST consume exactly one document), bytestorage_envelope (four components, compressed True; cachekit-ts with compression on), arrow_checksummed (format and original_type arrow, compressed False over uncompressed IPC; cachekit-py's ArrowSerializer) or orjson_checksummed (format and original_type orjson, compressed False; cachekit-py's OrjsonSerializer with integrity checking on). Its plaintext is a container that reader is not configured for, or one it must not unwrap. outcome is what a conforming read returns: error, no value (an error, or a miss under the SDK's fail-open policy), or not_unwrapped, anything but the value inside the plaintext's container: the plaintext decoded as one MessagePack document, or no value. Each note names mistakes its row catches; tools/encryption-verify.py checks that each one returns a value its row's outcome forbids.",
+    "vectors": [
+      {
+        "name": "container_envelope_to_plain_reader",
+        "reader": "plain_msgpack",
+        "cache_key": "test:container:envelope",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "030000000e63726f73732d73646b2d7465737400000017746573743a636f6e7461696e65723a656e76656c6f7065000000076d73677061636b0000000546616c7365",
+        "plaintext_hex": "94c422f01183a7757365725f69642aa46e616d65a863616368656b6974a6616374697665c398ccdaccf46861cc8e624bccfe20a76d73677061636b",
+        "ciphertext_hex": "0a0b0c0d0e0f101100000006e56a19473b4920391a28a7b679f5d6b0116f3849bae902d114d15c5a8ebd0349e90425ec8510ee508708cea821b0a3e17365dd19081b1acf8b3d29c1c2fed074680628976f261f4cf7807e",
+        "outcome": "not_unwrapped",
+        "note": "A valid ByteStorage envelope, python-frame.json's default write payload, whose inner value is the map {user_id: 42, name: cachekit, active: true}, sealed under the AAD a plain-MessagePack reader builds. The reader must not return the map inside it: it decodes the plaintext as one MessagePack document, the envelope's 4-element array, or returns no value. A reader that unwraps a plaintext which parses as an envelope returns the map."
+      },
+      {
+        "name": "container_trailing_byte_to_interop_reader",
+        "reader": "interop",
+        "cache_key": "t:op:1e364f6582ca4dc93b8bed0ff4413162cddafd52407517bff6248286cb863ac1",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "030000000e63726f73732d73646b2d7465737400000045743a6f703a31653336346636353832636134646339336238626564306666343431333136326364646166643532343037353137626666363234383238366362383633616331000000076d73677061636b0000000546616c7365",
+        "plaintext_hex": "82a36167651ea46e616d65a5616c69636500",
+        "ciphertext_hex": "0a0b0c0d0e0f10110000000dbf9fae68d68107a660c2eeeeab78227cc9495dd6fa095825d63701b17c92176ce530",
+        "outcome": "error",
+        "note": "interop-mode.json's issue_example_object value followed by one 00 byte, the input of its reader_trailing_byte reject vector, sealed under the AAD an interop reader builds for interop-mode.json's bool_null key. An interop reader MUST consume exactly one document (spec/interop-mode.md), after a decrypt as before one, so the read returns no value. A reader that ignores bytes after the first document, as one that checks for them only on plaintext entries does after a decrypt, returns the value, and so does one that strips trailing NUL bytes before a strict decode."
+      },
+      {
+        "name": "container_plain_to_envelope_reader",
+        "reader": "bytestorage_envelope",
+        "cache_key": "test:container:plain",
+        "format": "msgpack",
+        "compressed": true,
+        "aad_hex": "030000000e63726f73732d73646b2d7465737400000014746573743a636f6e7461696e65723a706c61696e000000076d73677061636b0000000454727565",
+        "plaintext_hex": "83a7757365725f69642aa46e616d65a863616368656b6974a6616374697665c3",
+        "ciphertext_hex": "0a0b0c0d0e0f101100000008b1cc384b53cab414c9b6b60e18cb5f20bfcbf47555f53150a3a5b7c21d5de70e1cac21d16031b17794fa32510187df1a",
+        "outcome": "error",
+        "note": "The same map's plain MessagePack, sealed under the AAD an envelope reader builds. It is not a ByteStorage envelope, so the read returns no value. A reader that falls back to plain MessagePack when the envelope does not parse returns the map."
+      },
+      {
+        "name": "container_bare_arrow_to_arrow_reader",
+        "reader": "arrow_checksummed",
+        "cache_key": "test:container:bare-arrow",
+        "format": "arrow",
+        "compressed": false,
+        "original_type": "arrow",
+        "aad_hex": "030000000e63726f73732d73646b2d7465737400000019746573743a636f6e7461696e65723a626172652d6172726f77000000056172726f770000000546616c7365000000056172726f77",
+        "plaintext_hex": "4152524f57310000ffffffff080300001000000000000a000e000600050008000a000000000104001000000000000a000c000000040008000a0000005c02000004000000010000000c00000008000c0004000800080000003402000004000000260200007b22696e6465785f636f6c756d6e73223a205b7b226b696e64223a202272616e6765222c20226e616d65223a206e756c6c2c20227374617274223a20302c202273746f70223a20322c202273746570223a20317d5d2c2022636f6c756d6e5f696e6465786573223a205b7b226e616d65223a206e756c6c2c20226669656c645f6e616d65223a206e756c6c2c202270616e6461735f74797065223a2022756e69636f6465222c20226e756d70795f74797065223a2022737472222c20226d65746164617461223a207b22656e636f64696e67223a20225554462d38227d7d5d2c2022636f6c756d6e73223a205b7b226e616d65223a20226964222c20226669656c645f6e616d65223a20226964222c202270616e6461735f74797065223a2022696e743634222c20226e756d70795f74797065223a2022696e743634222c20226d65746164617461223a206e756c6c7d2c207b226e616d65223a202273636f7265222c20226669656c645f6e616d65223a202273636f7265222c202270616e6461735f74797065223a2022666c6f61743634222c20226e756d70795f74797065223a2022666c6f61743634222c20226d65746164617461223a206e756c6c7d5d2c202261747472696275746573223a207b7d2c202263726561746f72223a207b226c696272617279223a202270796172726f77222c202276657273696f6e223a202232352e302e30227d2c202270616e6461735f76657273696f6e223a2022332e302e33227d00000600000070616e6461730000020000004800000004000000d0ffffff00000103100000001c00000004000000000000000500000073636f7265000600080006000600000000000200100014000800060007000c00000010001000000000000102100000001c0000000400000000000000020000006964000008000c0008000700080000000000000140000000ffffffffb800000014000000000000000c0016000600050008000c000c0000000003040018000000200000000000000000000a0018000c00040008000a0000005c0000001000000002000000000000000000000004000000000000000000000000000000000000000000000000000000100000000000000010000000000000000000000000000000100000000000000010000000000000000000000002000000020000000000000000000000000000000200000000000000000000000000000001000000000000000200000000000000000000000000f83f0000000000000440ffffffff00000000100000000c001400060008000c0010000c00000000000400380000002400000004000000010000001803000000000000c00000000000000020000000000000000000000000000a000c000000040008000a0000005c02000004000000010000000c00000008000c0004000800080000003402000004000000260200007b22696e6465785f636f6c756d6e73223a205b7b226b696e64223a202272616e6765222c20226e616d65223a206e756c6c2c20227374617274223a20302c202273746f70223a20322c202273746570223a20317d5d2c2022636f6c756d6e5f696e6465786573223a205b7b226e616d65223a206e756c6c2c20226669656c645f6e616d65223a206e756c6c2c202270616e6461735f74797065223a2022756e69636f6465222c20226e756d70795f74797065223a2022737472222c20226d65746164617461223a207b22656e636f64696e67223a20225554462d38227d7d5d2c2022636f6c756d6e73223a205b7b226e616d65223a20226964222c20226669656c645f6e616d65223a20226964222c202270616e6461735f74797065223a2022696e743634222c20226e756d70795f74797065223a2022696e743634222c20226d65746164617461223a206e756c6c7d2c207b226e616d65223a202273636f7265222c20226669656c645f6e616d65223a202273636f7265222c202270616e6461735f74797065223a2022666c6f61743634222c20226e756d70795f74797065223a2022666c6f61743634222c20226d65746164617461223a206e756c6c7d5d2c202261747472696275746573223a207b7d2c202263726561746f72223a207b226c696272617279223a202270796172726f77222c202276657273696f6e223a202232352e302e30227d2c202270616e6461735f76657273696f6e223a2022332e302e33227d00000600000070616e6461730000020000004800000004000000d0ffffff00000103100000001c00000004000000000000000500000073636f7265000600080006000600000000000200100014000800060007000c00000010001000000000000102100000001c0000000400000000000000020000006964000008000c0008000700080000000000000140000000300300004152524f5731",
+        "ciphertext_hex": "0a0b0c0d0e0f101100000009c4be841afabc8724fed2fd8b198d00d123135e291dd953231b086a1a21a6a4f2dc6c6fb953c3b171d29c7664ed6385378c63d3faea093e545d4cb23c7f2b7b4430220fcfa6f8b37091cb3a08f4dd56945396fe3a185fc8f6c9e3f6cffcdd9576d9bf086d586cb67b1887adcbc4e48e3f56612b20106ab51aa7004731d07f46d63291668c4ffa4e90b9373c921ddf5a153e8ccf5027f39b5d1db296bec80caecfdd3358c2390c6d6039995f3f945608478f44225e4f9be4c5d87d561b3b01c0315ed23ab645587f646c05cf6702beb76b9ce923c3d7829984f4519d8912a1d01ec03319d318a43ecf31d1b59df33b95420845bca04bbe88f4bc93a9cc1b62b7158cd42d9d526407fdda5794a57fd472e1b463b5f63561d586c2b3d89345ae1fb1eb91ac4a6bafc7771a1bcc33994391180004198c67eb3971cc93a0a43463b576b5bcc71ac587058613fa9b01bc92fbcb85eaad0efa2acec9b7b7d85c8e8efaa20f6c44e7926099773f107118c4a5ddaeb086ce081c2e88514e7b6de3d4400f28739038c97f008c127046e0643edce0085472fa1259414f7abb2a1349c1e053e39878ecf45e34783e654b1a25ff1e6db6120d04ac343ae96454e6ae59021106093862100890bdc5ad137b648ba122ce32926b5f516bf44cb798a655c3f2765d88114edd881ba09eb2fc68719e9feae447118bcd87a98b7337b5e67e954bba6466d749f21f4f9dbd3956f61e6b473485b2fec822a3dc980b72c0ed2db57e43e88e4548001696f14ea4fee9742e924d04877472c96a947d8fa7486b7db68bdc31bdc449f2df62cd0755c646865899f54f85a1e0b94c03e76119b450b1b9f46738c5722a7f5cf14730c2bbf0371e552584eeb407731da8b06082ba9c6f0ed0735cad4d35e38f37d0719b75a711b9c4303a307ef24a93b1e57592d8c927bba149295b3054dc77a2f4edaccc24117c084837ae9aafb22440856dcda905b77998c1c6f777caa54afdcfa9ad88880fc8a23b5150bea1ea2e48c591c5a4d7c76c071ea925f3fde9fb81c8c79bd2fb9c9ee3548fc59e05999bb373d331ef61d13d649bd5f3d1f8f9b1d49cce3aec847e6ea6887b7d8b9dbf4c8659cd33b07fa57e484661f964bd51fafa917d75b1a9869cff718fc3a3ddcb6526e1f0463bb140e55ef5a94e304623f2474802000bdbb25c35d6a328ae1a7f4769c9fd84f16001e47075a17def666e7a7958b911b81dd4bf99be0dead143f8152c82c08fcdc33ea5eb0c871abb1b22659c4efb04a8e1201300de0de56f2966c27474ae4575b5a3225a02a11b58ef9a579a6ccc6bf76fa6d1906ba5fb4dbe947e628185381706a9e565d49b7cd88fb564f4c0d68a875c47d167e42f0f84c8f9504394bec7b1cb754904e044d0bef0dce9efea3e645c8d6ea954b6dbb0667b38bac97d68cfa57ff97f64f80efa3593f024361f1f3f305ba5e72a3f4239a2d55c52bca14abaa0f2eea54e5c1d06bd2ea1ee3422551345ebf12c40dff9f2c9251fe55ce4137a74b5e08eca1c480b68a77e77be74e53cf686dede7c6bc7871eaae757c7918544d3c32b2814d72b29d98a1ebe59155521df8a9e91edec776fb0a244e9771f02c10d4531678f14fc27394a3ef65edcaef97964769b2e7ab4529e0e1281e0f6190fc938cd21860e9f5adeadd8f9c9d7d8a0bca1835d52957227ff592625cccc52cb6950d46c6851f70a03f9b5a1e30e83c86cd175ad8c5ac9ae1c71a66c9e71036aaefff785e6f87718d80ce137fb3df46e395ce1873746861dcada1a3df4f6ad3ec56e67cafe48b4aa176f5de54c195e8e8004b0152ff1cf2fc7c6f5ab03f9d3e9685830f638ef821c97971e46a28f340b26bd26f4a948b6b26ebbdbbbf751e3e0981f5278a984b319c98da42c3ed3811fd1b8017496a0a521d110ff90ff3344b08afdb698839d01bc013c61ab8710aaf8782937dbf21045dd964e65e0d08b242b8c0c68fadde9edff5b527ef5d044098ea155612f7266fda2875ff7ab71f2b49a08224de33b65b0ec0960eb4e27d58978b66c8f159b50e3836987ff6f3de70f92898a7556518c70d058f464ac190e7e543fc688b8a97ba44919c111ade226c736d84bb3e09aa3c146dbe4edacf8345575843dd5e906a8cb3116724e65d22b33ea1b4604cbf1220d509f011d4210e1567cce8c7caae58afc66a3757e4b6de2eaba7187042d17319faa859fece134a260b175b5c8070d833e3a4112896b6d74b33763df0622ad50c3e430d9ba22dacad0f6d5769f9b9fc48a43361f643c27dd15d360faa28050f1173e2799484ef5321be03739ecbe18cbce46065389121f8e20a5378803516b5529690f30c75eedaf4d00112da8af6d8a566cd14fc56f828eaa4775613bd975bd7ac888b09819756f2a541a97018ec21b950fc8ff7de6fd9d5bc5fc7f9375ac491e464f270d06a2e321e49443dc55d8ab6426ba0676a0628a05f82819b8bc1ba5baf6bd1e44658cd05e708a2a89d0fdee6203a8fd798e6f6ec0531bf645a8dc46628abd88d7674d11f0d6cc49fb91025c1163133ac5306d41474784466576bbee504a4ba2678e09d9b4e414fa82e8ae30e365461e0069131d212eafa8b2ad54f806633d29469fe5cc086ff32e",
+        "outcome": "error",
+        "note": "python-frame.json's arrow_compression_off_write payload without its 8-byte xxHash3-64 checksum: a bare Arrow IPC file, sealed under the AAD cachekit-py's ArrowSerializer builds for that write. The arrow container is [checksum][Arrow IPC file], so the read returns no value. A reader that accepts Arrow IPC with no checksum prefix returns the table."
+      },
+      {
+        "name": "container_plain_json_to_orjson_reader",
+        "reader": "orjson_checksummed",
+        "cache_key": "test:container:plain-json",
+        "format": "orjson",
+        "compressed": false,
+        "original_type": "orjson",
+        "aad_hex": "030000000e63726f73732d73646b2d7465737400000019746573743a636f6e7461696e65723a706c61696e2d6a736f6e000000066f726a736f6e0000000546616c7365000000066f726a736f6e",
+        "plaintext_hex": "7b22616374697665223a747275652c226e616d65223a2263616368656b6974222c22757365725f6964223a34327d",
+        "ciphertext_hex": "0a0b0c0d0e0f10110000000b2c0dfe92f72ad368c94c23d95795be94330d48224efe0e88f727911d2a1ad35f6d7aefba374f80b8763ca5fc17cf0713609e41f10329a94e9321505af0f1",
+        "outcome": "error",
+        "note": "python-frame.json's forged_plaintext_orjson payload without its 8-byte xxHash3-64 checksum: plain JSON, sealed under the AAD cachekit-py's OrjsonSerializer builds. A reader with integrity checking on reads [checksum][JSON], so the read returns no value. A reader that falls back to plain JSON when the checksum layout does not parse returns the map."
+      },
+      {
+        "name": "container_incomplete_tail_to_interop_reader",
+        "reader": "interop",
+        "cache_key": "t:op:03a0edbae0c1b5816c431652268d1527730175cdc0b45807cb07e1025ff971f6",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "030000000e63726f73732d73646b2d7465737400000045743a6f703a30336130656462616530633162353831366334333136353232363864313532373733303137356364633062343538303763623037653130323566663937316636000000076d73677061636b0000000546616c7365",
+        "plaintext_hex": "82a36167651ea46e616d65a5616c69636591",
+        "ciphertext_hex": "0a0b0c0d0e0f10110000000eb576a53a34bfd9a8c0103a5d626967fbc8461f03b7393507faba7e59581493c81d58",
+        "outcome": "error",
+        "note": "The same value followed by 91, the header of a one-element array with no element: an incomplete second document, sealed under the AAD an interop reader builds for interop-mode.json's issue_example_mixed key. An interop reader returns no value. One that ignores bytes after the first document returns the value, and so does one that refuses only a second complete document, as container_trailing_byte_to_interop_reader's 00 is."
+      }
+    ]
+  },
   "default_tenant": {
     "note": "spec/intent-presets.md \u00a7 Master Key Input rule 5: with no caller-supplied tenant every SDK MUST derive keys and build AAD with the literal \"default\". Same master key as the main set; sealed with the stdlib HKDF + cryptography AES-GCM reference (fixed nonce), verified by tools/encryption-verify.py. The cache_key is interop-mode.json key_vectors[single_int].expected_key and the plaintext is value_vectors[issue_example_object] \u2014 the vector is directly loadable as an interop-mode entry.",
     "tenant_id": "default",
@@ -137,7 +392,7 @@
     ]
   },
   "master_key_input": {
-    "note": "spec/intent-presets.md \u00a7 Master Key Input. Rules 1 and 3: the secure preset takes the master key as a hex string, derives the key bytes as hex_decode(string), the same in every SDK, accepts 32 bytes and refuses fewer. Rule 4: an entry point that takes raw key bytes takes exactly 32. Every row comes from one key. A conforming SDK passes every row (they are necessary, not sufficient): a hex entry point given an accept row's master_key_hex and no tenant derives the pinned fingerprint and decrypts the sealed entry, every hex entry point refuses each reject row's master_key_hex, and every raw-bytes entry point refuses each raw reject row's bytes (raw_key_hex decoded). The accept row is lowercase hex, which is what openssl rand -hex 32, the key generator encryption.md gives, prints. Rule 1 does not say whether a key may hold uppercase letters, white space or a 0x prefix, so no row's verdict depends on it: a row that holds white space or a 0x prefix is refused whether a decoder drops those characters or refuses them. Each row also gets the same verdict whether an SDK accepts exactly 32 bytes or 32 and more, as rule 3 allows either. Each note names the mistakes its row catches. Sealed with the stdlib HKDF and cryptography's AES-GCM (fixed nonce); verified by tools/encryption-verify.py, which also checks that each mistake a note names misjudges its row.",
+    "note": "spec/intent-presets.md \u00a7 Master Key Input. Rules 1 and 3: the secure preset takes the master key as a hex string, derives the key bytes as hex_decode(string), the same in every SDK, accepts 32 bytes and refuses fewer. Rule 4: an entry point that takes raw key bytes takes exactly 32. Every row comes from one key, master_key_every_hex_digit's, which is the accept row the other notes name: master_key_first_byte_80 is that key with its first byte, 00, replaced by 80, and each reject row cuts or alters it. A conforming SDK passes every row (they are necessary, not sufficient): a hex entry point given an accept row's master_key_hex and no tenant derives the pinned fingerprint and decrypts the sealed entry, every hex entry point refuses each reject row's master_key_hex, and every raw-bytes entry point refuses each raw reject row's bytes (raw_key_hex decoded). The accept rows are lowercase hex, which is what openssl rand -hex 32, the key generator encryption.md gives, prints. Rule 1 does not say whether a key may hold uppercase letters, white space or a 0x prefix, so no row's verdict depends on it: a row that holds white space or a 0x prefix is refused whether a decoder drops those characters or refuses them. Each row also gets the same verdict whether an SDK accepts exactly 32 bytes or 32 and more, as rule 3 allows either. Each note names mistakes its row catches. Sealed with the stdlib HKDF and cryptography's AES-GCM (fixed nonce); verified by tools/encryption-verify.py, which also checks that each mistake a note names misjudges its row.",
     "tenant_id": "default",
     "accept_vectors": [
       {
@@ -151,6 +406,18 @@
         "aad_hex": "030000000764656661756c740000004e75736572733a6765745f616c6c3a38303634626635663934356462613532316230313762623366333262333161323933613665313639343438333864313731656139653737666162303835653865000000076d73677061636b0000000546616c7365",
         "ciphertext_hex": "3a3b3c3d3e3f404142434445d282555c393cc14a53d488e005e6db441d92e9fe089e97b3ecc99a86014810c745",
         "note": "32 distinct bytes: a leading 00 byte, 14 bytes above 7f, and every hex digit, in lowercase, in both places of a byte. A decoder that reverses the bytes, swaps the two digits of each byte or misreads a letter derives another key: its fingerprint differs and the entry does not decrypt. One that passes the bytes through a text string (a str-typed boundary, where each byte above 7f becomes two) reads 46 bytes, so it refuses the key or derives another. A validator that admits only digits or only uppercase letters, a table for a byte's first digit that holds only 0-9, or a signed-byte parser that refuses a pair above 7f refuses the key; so does a big-integer decoder, unsigned or two's complement (BigInteger.toByteArray(), to_signed_bytes_be), whose bytes are checked for 32 without padding: it drops the leading 00 byte, and byte 1 is below 80, so no sign byte restores it. Fed as raw bytes, it catches a raw-bytes entry point that passes them through a text string. The entry is interop-mode.json's empty_args key holding its mixed_array value, sealed under this key and the tenant \"default\". It shares neither cache_key nor plaintext with default_tenant_interop, so a test can plant both in one backend and tell them apart, as reading with one key current and the other previous needs."
+      },
+      {
+        "name": "master_key_first_byte_80",
+        "master_key_hex": "807f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+        "derived_key_fingerprint_hex": "2948ef83d7f97ff9463cddf7ccd951d2",
+        "plaintext_hex": "cb4000000000000000",
+        "cache_key": "users:get_by_uuid:14821dfe8848465aa23db43cb83be508f51d9ac556479bcc78b8a522e268a62a",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "030000000764656661756c740000005275736572733a6765745f62795f757569643a31343832316466653838343834363561613233646234336362383362653530386635316439616335353634373962636337386238613532326532363861363261000000076d73677061636b0000000546616c7365",
+        "ciphertext_hex": "464748494a4b4c4d4e4f5051cdc95c5f42466d32bdc068c9004c78072ac292fb1a6a93dcbd",
+        "note": "The accept row's key with its first byte, 00, replaced by 80, so the key's top bit is set. A two's-complement big-integer decoder padded to 32 bytes reads every key whose first byte is below 80 correctly, the accept row's included, but this key needs a 33rd byte for its sign: Python's int(key, 16).to_bytes(32, \"big\", signed=True) behind a strict hex check refuses it, and Java's BigInteger.toByteArray() left-padded to 32 bytes behind a 64-character check returns 33 bytes, which a check that the key is exactly 32 bytes refuses and a check for 32 bytes or more reads as another key. The entry is interop-mode.json's uuid_lowercased key holding its float_value_stays_float64 value, sealed under this key and the tenant \"default\". It shares neither cache_key nor plaintext with the accept row or default_tenant_interop, so a test can plant all three in one backend and tell them apart."
       }
     ],
     "reject_vectors": [
@@ -234,7 +501,7 @@
       {
         "name": "raw_key_ascii_hex_string",
         "raw_key_hex": "30303766383066666135356163333363316565313264643234626234363939363837373866303066303131303233333234353534363737363839393861626261",
-        "note": "Raw key bytes: the 64 ASCII bytes of the accept row's hex string. A raw-bytes entry point that admits 32 bytes or more accepts them and derives a key no hex entry point derives; one that hex-decodes 64 hex digits first accepts them as the accept row's key. Both break the rule that a raw-bytes entry point takes exactly 32 bytes."
+        "note": "Raw key bytes: the 64 ASCII bytes of the accept row's hex string. A raw-bytes entry point that admits 32 bytes or more accepts them and derives a key other than the accept row's; one that hex-decodes 64 hex digits first accepts them as the accept row's key. Both break the rule that a raw-bytes entry point takes exactly 32 bytes."
       }
     ]
   }

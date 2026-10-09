@@ -1,27 +1,38 @@
 """Master key input against the protocol test vectors (spec/intent-presets.md § Master Key Input).
 
 Fixture: tests/unit/protocol/fixtures/encryption.json, vendored from
-cachekit-io/protocol @ 4b34c015878ccdaf48005251a97b406a5f2060db (vectors 1.3.0,
+cachekit-io/protocol @ b4ae567a402051752dabf040bd16e870657d3dec (vectors 1.5.0,
 sha256 pinned below). Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
-This file drives the ``master_key_input`` block. Rows go through every place a key enters, not
-a shared decoder. Hex keys enter through ``@cache.secure``'s ``master_key=``, CACHEKIT_MASTER_KEY
-(read by the decorator, and by ``EncryptionWrapper`` when it is given no key) and
-CACHEKIT_PREVIOUS_MASTER_KEYS. Raw keys enter through ``EncryptionWrapper``'s ``master_key=`` and
-``previous_master_keys=`` (a bytes ``master_key=`` on ``@cache.secure`` is a TypeError, so it is
-not a raw-bytes entry point).
+This file drives the ``master_key_input`` and ``keyring.configuration`` blocks;
+test_encryption_read_vectors.py drives ``aad_reject_vectors`` and ``decrypted_container``.
+Rows go through the SDK's own entry points, not a shared decoder; each row group names the ones it
+uses. Raw keys enter through ``EncryptionWrapper``'s ``master_key=`` and ``previous_master_keys=``
+(a bytes ``master_key=`` on ``@cache.secure`` is a TypeError, so it is not a raw-bytes entry point).
 
-The accept row's entry is planted in the backend and must be read as a hit, alone and next to
-``default_tenant_interop`` with that row's key as a previous key: the functions return a sentinel,
-so a recompute (the key or the tenant derived wrongly) fails the value assertion. Its raw bytes
-must derive the row's pinned fingerprint. Every reject row must be refused at each entry point.
+- Accept rows: ``@cache.secure``'s ``master_key=`` and CACHEKIT_MASTER_KEY, with no tenant, each
+  reading the row's planted entry as a hit (the functions return a sentinel, so a recompute, the key
+  or the tenant derived wrongly, fails the value assertion), and the raw-bytes ``master_key=``,
+  which must derive the row's pinned fingerprint. The first row's key is also read as the current
+  key next to ``default_tenant_interop``'s as a previous one.
+- Hex reject rows: ``@cache.secure``'s ``master_key=``, CACHEKIT_MASTER_KEY (read by the decorator,
+  and by ``EncryptionWrapper`` when it is given no key) and CACHEKIT_PREVIOUS_MASTER_KEYS.
+- Raw reject rows: the raw-bytes ``master_key=`` and ``previous_master_keys=``.
+- ``keyring.configuration`` rows: decrypt-only keys from CACHEKIT_PREVIOUS_MASTER_KEYS, the current
+  key from ``@cache.secure``'s ``master_key=`` and from CACHEKIT_MASTER_KEY. An accept row's keyring
+  reads the entry its current key sealed; a reject row is refused when the decorator loads its
+  configuration, before any call. Two cases are strict expected failures naming ENC-9: with the
+  current key given as ``master_key=``, cachekit-py refuses the current key in the decrypt-only list
+  only on the first call, when the native keyring is built. A separate test pins that first-call refusal,
+  which the expected failures alone would not notice going away.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,19 +43,33 @@ from cachekit import cache
 from cachekit._rust_serializer import KeyringConfigurationError
 from cachekit.config.singleton import reset_settings
 from cachekit.config.validation import ConfigurationError
-from cachekit.l1_cache import get_l1_cache_manager
 from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 from tests.unit.protocol.test_interop_decorator import DictBackend
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "encryption.json"
-FIXTURE_SHA256 = "f701951147a47c42a968850fe6cb73a544313728e46f45fec3d811c20ed4b377"  # pragma: allowlist secret
+FIXTURE_SHA256 = "1a8a3735408675bf9660ce1372f77723a9ffda8084010fa52eb756a330961589"  # pragma: allowlist secret
 FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 MASTER_KEY_INPUT = FIXTURE["master_key_input"]
-EXPECTED_COUNTS = {"accept_vectors": 1, "reject_vectors": 11, "raw_reject_vectors": 5}
+EXPECTED_COUNTS = {"accept_vectors": 2, "reject_vectors": 11, "raw_reject_vectors": 5}
+KEYRING_CONFIGURATION = FIXTURE["keyring"]["configuration"]["vectors"]
+# Every table this module or test_encryption_read_vectors.py drives, so a re-vendor that adds one is a conscious change.
+TOP_LEVEL_KEYS = {
+    "version", "generator", "algorithm", "key_derivation", "nonce_size", "tag_size", "aad_version", "aad_format",
+    "ciphertext_format", "master_key_hex", "master_key_note", "tenant_id", "derived_key_fingerprint_hex", "keyring",
+    "vectors", "aad_reject_vectors", "decrypted_container", "default_tenant", "master_key_input",
+}  # fmt: skip
 
-(ACCEPT,) = MASTER_KEY_INPUT["accept_vectors"]
-# interop-mode.json value_vectors[mixed_array], the accept row's plaintext, as the interop reader returns it.
-ACCEPT_VALUE = [1, "two", 3.5, None, True]
+# Each accept row's entry as an interop read: (operation, args, value the interop reader returns).
+# The values are interop-mode.json value_vectors[mixed_array] and [float_value_stays_float64]; the args
+# are key_vectors[empty_args] and [uuid_lowercased] (an uppercase UUID the key lowercases).
+ACCEPT_READS: dict[str, tuple[str, tuple[Any, ...], Any]] = {
+    "master_key_every_hex_digit": ("get_all", (), [1, "two", 3.5, None, True]),
+    "master_key_first_byte_80": ("get_by_uuid", (uuid.UUID("550E8400-E29B-41D4-A716-446655440000"),), 2.0),
+}
+ACCEPT_ROWS = {vector["name"]: vector for vector in MASTER_KEY_INPUT["accept_vectors"]}
+# The row the other rows' notes name as "the accept row": every reject row and the keyring rows derive from its key.
+ACCEPT = ACCEPT_ROWS["master_key_every_hex_digit"]
+ACCEPT_VALUE = ACCEPT_READS[ACCEPT["name"]][2]
 # default_tenant.vectors[default_tenant_interop]: same tenant, another master key, cache key and value.
 (DEFAULT_TENANT,) = FIXTURE["default_tenant"]["vectors"]
 DEFAULT_TENANT_MASTER_KEY_HEX = FIXTURE["master_key_hex"]
@@ -52,22 +77,42 @@ DEFAULT_TENANT_MASTER_KEY_HEX = FIXTURE["master_key_hex"]
 # One refusal each: a non-hex string, or one that decodes short. Anything else (a missing key) fails the match.
 DECORATOR_REFUSAL = r"CACHEKIT_MASTER_KEY must be (hex-encoded|at least 32 bytes)"
 WRAPPER_REFUSAL = r"Invalid master key format|Master key must be at least 32 bytes"
+# The refusal each keyring reject row gets at decoration, from the settings validator, on both current-key routes.
+_SETTINGS_REFUSAL = r"(?s)^1 validation error for CachekitConfig\n.*Value error, "
+KEYRING_REFUSALS = {
+    "keyring_four_decrypt_only_keys": _SETTINGS_REFUSAL + "previous_master_keys accepts at most 3 decrypt-only keys, got 4",
+    "keyring_current_key_decrypt_only": _SETTINGS_REFUSAL + "master_key must not appear in previous_master_keys",
+    "keyring_current_key_decrypt_only_uppercase": _SETTINGS_REFUSAL + "master_key must not appear in previous_master_keys",
+}
+CURRENT_KEY_ROUTES = ("master_key_argument", "cachekit_master_key")
+# Deviations: with master_key=, decoration succeeds and the first call raises KeyringConfigurationError when the
+# native keyring is built, so the repeat is refused after load, not at it.
+KEYRING_DEVIATIONS = {
+    ("keyring_current_key_decrypt_only", "master_key_argument"),
+    ("keyring_current_key_decrypt_only_uppercase", "master_key_argument"),
+}
+
+
+def _keyring_params() -> list[Any]:
+    params = []
+    for vector in KEYRING_CONFIGURATION:
+        for route in CURRENT_KEY_ROUTES:
+            marks = []
+            if (vector["name"], route) in KEYRING_DEVIATIONS:
+                reason = (
+                    "ENC-9: the current key repeated in CACHEKIT_PREVIOUS_MASTER_KEYS is refused only on the first "
+                    "call when the current key is given as master_key=, not when the keyring is loaded"
+                )
+                marks.append(pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=reason))
+            params.append(pytest.param(vector, route, marks=marks, id=f"{vector['name']}-{route}"))
+    return params
 
 
 def _ids(group: str) -> list[str]:
     return [vector["name"] for vector in MASTER_KEY_INPUT[group]]
 
 
-@pytest.fixture(autouse=True)
-def _isolated(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """No tenant and no key from the environment unless a test sets one; L1 is process-global per key."""
-    for name in ("CACHEKIT_DEPLOYMENT_UUID", "CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS"):
-        monkeypatch.delenv(name, raising=False)
-    reset_settings()
-    get_l1_cache_manager().clear_all()
-    yield
-    get_l1_cache_manager().clear_all()
-    reset_settings()
+pytestmark = pytest.mark.usefixtures("isolated_keys")
 
 
 def _plant(backend: DictBackend, vector: dict[str, Any]) -> None:
@@ -82,36 +127,73 @@ def _secure_get_all(backend: DictBackend, **kwargs: Any):
     return get_all
 
 
+def _secure_read(backend: DictBackend, vector: dict[str, Any], **kwargs: Any) -> Callable[[], Any]:
+    """The accept row's interop read, through ``@cache.secure`` with no tenant."""
+    operation, args, _ = ACCEPT_READS[vector["name"]]
+    if operation == "get_all":
+        return _secure_get_all(backend, **kwargs)
+
+    @cache.secure(interop=operation, namespace="users", backend=backend, **kwargs)
+    def get_by_uuid(user_uuid: uuid.UUID):
+        return "RECOMPUTED"  # must never run: a miss here is a key-derivation bug
+
+    return lambda: get_by_uuid(*args)
+
+
+def _assert_read(read: Callable[[], Any], vector: dict[str, Any]) -> None:
+    value = ACCEPT_READS[vector["name"]][2]
+    result = read()
+    assert (result, type(result)) == (value, type(value))
+
+
 def test_fixture_integrity() -> None:
     """The vendored fixture is byte-identical to the pinned protocol revision and holds every row."""
     digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
     assert digest == FIXTURE_SHA256, (
         f"fixtures/encryption.json sha256 {digest} != pinned {FIXTURE_SHA256}. "
-        "If the protocol vectors were intentionally updated, refresh the pin."
+        "If the protocol vectors were intentionally updated, refresh the pin and every version, count and name pinned."
     )
-    assert FIXTURE["version"] == "1.3.0"
+    assert FIXTURE["version"] == "1.5.0"
+    assert set(FIXTURE) == TOP_LEVEL_KEYS
     assert {group: len(MASTER_KEY_INPUT[group]) for group in EXPECTED_COUNTS} == EXPECTED_COUNTS
     assert MASTER_KEY_INPUT["tenant_id"] == "default"
+    assert list(ACCEPT_ROWS) == list(ACCEPT_READS)
+    assert {vector["name"]: vector["verdict"] for vector in KEYRING_CONFIGURATION} == {
+        "keyring_three_decrypt_only_keys": "accept",
+        **dict.fromkeys(KEYRING_REFUSALS, "reject"),
+    }
+    # Every keyring row's current key is the accept row's, so its sealed entry is what an accepted keyring reads.
+    assert {vector["current_master_key_hex"] for vector in KEYRING_CONFIGURATION} == {ACCEPT["master_key_hex"]}
 
 
-class TestAcceptRow:
-    """With no tenant, the hex entry points read the sealed entry; the raw bytes derive the pinned key."""
+@pytest.mark.parametrize("vector", MASTER_KEY_INPUT["accept_vectors"], ids=_ids("accept_vectors"))
+class TestAcceptRows:
+    """With no tenant, the hex entry points read each sealed entry; the raw bytes derive the pinned key."""
 
-    def test_master_key_argument(self) -> None:
+    def test_master_key_argument(self, vector: dict[str, Any]) -> None:
         backend = DictBackend()
-        _plant(backend, ACCEPT)
-        get_all = _secure_get_all(backend, master_key=ACCEPT["master_key_hex"])
+        _plant(backend, vector)
 
-        assert get_all() == ACCEPT_VALUE
+        _assert_read(_secure_read(backend, vector, master_key=vector["master_key_hex"]), vector)
 
-    def test_cachekit_master_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", ACCEPT["master_key_hex"])
+    def test_cachekit_master_key(self, vector: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", vector["master_key_hex"])
         reset_settings()
         backend = DictBackend()
-        _plant(backend, ACCEPT)
-        get_all = _secure_get_all(backend)
+        _plant(backend, vector)
 
-        assert get_all() == ACCEPT_VALUE
+        _assert_read(_secure_read(backend, vector), vector)
+
+    def test_raw_bytes_entry_point_derives_the_pinned_key(self, vector: dict[str, Any]) -> None:
+        """The row's 32 bytes, several above 7f, reach the raw-bytes entry point intact."""
+        wrapper = EncryptionWrapper(master_key=bytes.fromhex(vector["master_key_hex"]), previous_master_keys=[])
+
+        assert wrapper.tenant_id == MASTER_KEY_INPUT["tenant_id"]
+        assert wrapper.encryption_key_fingerprint == vector["derived_key_fingerprint_hex"]
+
+
+class TestRotation:
+    """The first accept row's key read next to default_tenant_interop's, one current and one previous."""
 
     def test_current_and_previous_key_read_both_entries(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The fixture note's rotation case: one key current, the other previous, both entries hit."""
@@ -128,13 +210,6 @@ class TestAcceptRow:
 
         assert get_all() == ACCEPT_VALUE
         assert get_user(42) == {"name": "alice", "age": 30}
-
-    def test_raw_bytes_entry_point_derives_the_pinned_key(self) -> None:
-        """The accept row's 32 bytes, several above 7f, reach the raw-bytes entry point intact."""
-        wrapper = EncryptionWrapper(master_key=bytes.fromhex(ACCEPT["master_key_hex"]), previous_master_keys=[])
-
-        assert wrapper.tenant_id == MASTER_KEY_INPUT["tenant_id"]
-        assert wrapper.encryption_key_fingerprint == ACCEPT["derived_key_fingerprint_hex"]
 
 
 @pytest.mark.parametrize("vector", MASTER_KEY_INPUT["reject_vectors"], ids=_ids("reject_vectors"))
@@ -181,3 +256,46 @@ class TestRawRejectRows:
                 master_key=bytes.fromhex(ACCEPT["master_key_hex"]),
                 previous_master_keys=[bytes.fromhex(vector["raw_key_hex"])],
             )
+
+
+def _load_keyring_row(
+    vector: dict[str, Any], current_key_from: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[DictBackend, dict[str, Any]]:
+    """Set the row's keys, the current one on the given route; return a backend holding the accept row's entry and the kwargs."""
+    monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", ",".join(vector["decrypt_only_master_keys_hex"]))
+    kwargs: dict[str, Any] = {}
+    if current_key_from == "master_key_argument":
+        kwargs["master_key"] = vector["current_master_key_hex"]
+    else:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", vector["current_master_key_hex"])
+    reset_settings()
+    backend = DictBackend()
+    _plant(backend, ACCEPT)
+    return backend, kwargs
+
+
+@pytest.mark.parametrize(("vector", "current_key_from"), _keyring_params())
+def test_keyring_configuration(vector: dict[str, Any], current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each keyring configuration row is accepted, or refused when the decorator loads it, as its verdict says."""
+    backend, kwargs = _load_keyring_row(vector, current_key_from, monkeypatch)
+
+    if vector["verdict"] == "accept":
+        assert _secure_get_all(backend, **kwargs)() == ACCEPT_VALUE
+        return
+    # Decoration alone: a refusal here comes before any call, so before any backend read.
+    with pytest.raises(ValidationError, match=KEYRING_REFUSALS[vector["name"]]):
+        _secure_get_all(backend, **kwargs)
+
+
+@pytest.mark.parametrize(("name", "current_key_from"), sorted(KEYRING_DEVIATIONS))
+def test_keyring_deviation_refused_on_first_call(name: str, current_key_from: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ENC-9's rows are still refused, on the first call, so never read: their strict xfail alone passes if they were.
+
+    Delete with KEYRING_DEVIATIONS when ENC-9 moves the refusal to load.
+    """
+    (vector,) = (row for row in KEYRING_CONFIGURATION if row["name"] == name)
+    backend, kwargs = _load_keyring_row(vector, current_key_from, monkeypatch)
+    get_all = _secure_get_all(backend, **kwargs)
+
+    with pytest.raises(KeyringConfigurationError, match="Current key must not appear in the decrypt-only list"):
+        get_all()
