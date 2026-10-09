@@ -238,6 +238,14 @@ class TestRepeatRefusedAtDecoration:
         with pytest.raises(ConfigurationError, match=REPEAT_REFUSAL):
             CacheSerializationHandler(encryption=True, single_tenant_mode=True)
 
+    def test_plaintext_handler_reads_no_settings(self, monkeypatch):
+        """A handler that neither encrypts nor defers fail-closed to settings never loads them, so a malformed
+        keyring setting cannot stop it being built."""
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", "not-hex")
+        reset_settings()
+
+        CacheSerializationHandler(encryption=False, encryption_fail_closed=False)
+
     def test_encryption_disabled_handler_is_not_refused(self, monkeypatch):
         """It never encrypts, so spends no nonce budget; its config-drift keyring fault stays a read-time miss."""
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", KA.hex())
