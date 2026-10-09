@@ -1037,6 +1037,63 @@ class TestListenerPool:
         await asyncio.gather(window(0, 100, 0.01), window(0.005, 200, 0.02))
         assert backend._client.connection_pool.connection_kwargs["socket_timeout"] == configured
 
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    async def test_child_forked_during_a_window_gets_the_configured_timeout(self) -> None:
+        """The task holding the parent's window does not survive the fork, so the child can never close it."""
+        backend = self._backend("redis://cache.example:6379/0")
+        pool = backend._client.connection_pool
+        configured = pool.connection_kwargs["socket_timeout"]
+        held = backend.with_timeout("get", 100)
+        await held.__aenter__()
+        try:
+            ctx = multiprocessing.get_context("fork")
+            results = ctx.Queue()
+
+            async def own_window() -> None:
+                async with backend.with_timeout("get", 200):
+                    pass
+
+            def child(q: Any) -> None:
+                at_start = pool.connection_kwargs.get("socket_timeout")
+                asyncio.run(own_window())
+                q.put(
+                    (
+                        at_start,
+                        pool.connection_kwargs.get("socket_timeout"),
+                        backend.listener_pool().connection_kwargs["socket_timeout"],
+                    )
+                )
+
+            process = ctx.Process(target=child, args=(results,))
+            process.start()
+            try:
+                outcome = results.get(timeout=20)
+            finally:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.kill()
+            assert outcome == (configured, configured, configured)
+            assert pool.connection_kwargs["socket_timeout"] == 0.1  # the parent's window is still open
+        finally:
+            await held.__aexit__(None, None, None)
+        assert pool.connection_kwargs["socket_timeout"] == configured
+
+    async def test_record_inherited_without_fork_hooks_is_dropped_on_first_use(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A fork made from C (uWSGI without --py-call-uwsgi-fork-hooks) runs no at-fork hook: the record's PID catches it."""
+        backend = self._backend("redis://cache.example:6379/0")
+        pool = backend._client.connection_pool
+        configured = pool.connection_kwargs["socket_timeout"]
+        held = backend.with_timeout("get", 100)  # opened before the "fork", closed after it
+        await held.__aenter__()
+        monkeypatch.setattr(os, "getpid", lambda: -1)  # now in the child
+        assert backend.listener_pool().connection_kwargs["socket_timeout"] == configured
+        assert pool.connection_kwargs["socket_timeout"] == configured  # the inherited window is gone
+        async with backend.with_timeout("get", 200):
+            assert pool.connection_kwargs["socket_timeout"] == 0.2
+            await held.__aexit__(None, None, None)  # the forking task's own window, closed in the child: a no-op
+            assert pool.connection_kwargs["socket_timeout"] == 0.2
+        assert pool.connection_kwargs["socket_timeout"] == configured
+
 
 @pytest.mark.unit
 class TestUwsgiWarning:
