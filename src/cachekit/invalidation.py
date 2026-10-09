@@ -32,6 +32,7 @@ from typing import Any, Optional
 import msgpack
 
 from cachekit import l1_cache
+from cachekit.backends._uninterrupted import _ClearedOnInterrupt
 from cachekit.cache_handler import supports_key_tracking
 from cachekit.config.singleton import get_settings
 from cachekit.hash_utils import _WarnThrottle, redact_cache_key, redact_error_for_log
@@ -158,42 +159,47 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
         key: The invalidated cache key, or ``None`` for the whole function. Callers pass ``None``
             for custom ``key=`` functions, whose keys embed caller identifiers.
     """
-    try:
-        send = getattr(getattr(backend, "_client", None), "publish", None)
-        if not callable(send):
-            return
-        payload = encode_event(registry_id, key)
-        if payload is None:
-            unannounced = _too_long_warn.claim()
-            if not unannounced:
-                logger.debug(
-                    "Invalidation not announced: registry id %s is over %d bytes",
+    # An interrupt leaves with its frames cleared: redis-py's hold the client and the AUTH arguments. No local here holds
+    # the client or its bound publish, whose reprs list the password: this frame is still executing when they are cleared
+    # (CWE-532).
+    with _ClearedOnInterrupt():
+        try:
+            if not callable(getattr(getattr(backend, "_client", None), "publish", None)):
+                return
+            payload = encode_event(registry_id, key)
+            if payload is None:
+                unannounced = _too_long_warn.claim()
+                if not unannounced:
+                    logger.debug(
+                        "Invalidation not announced: registry id %s is over %d bytes",
+                        redact_cache_key(registry_id),
+                        _MAX_FIELD_BYTES,
+                    )
+                    return
+                logger.warning(
+                    "Invalidation not announced (invalidations since the last warning: %d); other processes keep their L1 "
+                    "copies until the L1 TTL. Registry id %s is over %d bytes (namespace too long)",
+                    unannounced,
                     redact_cache_key(registry_id),
                     _MAX_FIELD_BYTES,
                 )
                 return
+            receivers = backend._client.publish(CHANNEL, payload)
+        except Exception as e:
+            failures = _publish_failed_warn.claim()
+            if not failures:
+                logger.debug(
+                    "Invalidation announcement failed for %s: %s", redact_cache_key(registry_id), redact_error_for_log(e)
+                )
+                return
             logger.warning(
-                "Invalidation not announced (invalidations since the last warning: %d); other processes keep their L1 "
-                "copies until the L1 TTL. Registry id %s is over %d bytes (namespace too long)",
-                unannounced,
+                "Invalidation announcement failed (failures since the last warning: %d); other processes keep their "
+                "L1 copies until the L1 TTL. Latest registry %s: %s",
+                failures,
                 redact_cache_key(registry_id),
-                _MAX_FIELD_BYTES,
+                redact_error_for_log(e),
             )
             return
-        receivers = send(CHANNEL, payload)
-    except Exception as e:
-        failures = _publish_failed_warn.claim()
-        if not failures:
-            logger.debug("Invalidation announcement failed for %s: %s", redact_cache_key(registry_id), redact_error_for_log(e))
-            return
-        logger.warning(
-            "Invalidation announcement failed (failures since the last warning: %d); other processes keep their "
-            "L1 copies until the L1 TTL. Latest registry %s: %s",
-            failures,
-            redact_cache_key(registry_id),
-            redact_error_for_log(e),
-        )
-        return
     logger.debug("Invalidation announced to %s listener(s)", receivers)
 
 
@@ -322,24 +328,26 @@ def start_listener(backend: Any) -> None:
         if _listener_pid == os.getpid() or time.monotonic() < _start_retry_at:
             return
         pubsub = None
-        try:
-            pubsub = _redis().Redis(connection_pool=backend.listener_pool()).pubsub()
-            pubsub.subscribe(**{CHANNEL: _on_message})
-            _confirm_subscription(pubsub)
-            thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
-        except Exception as e:
-            if pubsub is not None:
-                try:
-                    pubsub.close()
-                except Exception as close_error:
-                    logger.debug("Closing the failed listener's connection failed: %s", redact_error_for_log(close_error))
-            _start_retry_at = time.monotonic() + _START_RETRY_SECONDS
-            logger.warning(
-                "Invalidation listener failed to start; the next cache operation that reaches Redis after %d s retries it: %s",
-                _START_RETRY_SECONDS,
-                redact_error_for_log(e),
-            )
-            return
+        # An interrupt leaves with its frames cleared: redis-py's hold the listener pool and the AUTH arguments (CWE-532).
+        with _ClearedOnInterrupt():
+            try:
+                pubsub = _redis().Redis(connection_pool=backend.listener_pool()).pubsub()
+                pubsub.subscribe(**{CHANNEL: _on_message})
+                _confirm_subscription(pubsub)
+                thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
+            except Exception as e:
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception as close_error:
+                        logger.debug("Closing the failed listener's connection failed: %s", redact_error_for_log(close_error))
+                _start_retry_at = time.monotonic() + _START_RETRY_SECONDS
+                logger.warning(
+                    "Invalidation listener failed to start; the next cache operation that reaches Redis after %d s retries it: %s",
+                    _START_RETRY_SECONDS,
+                    redact_error_for_log(e),
+                )
+                return
         thread.name = "cachekit-invalidation-listener"  # no function or key metadata (CWE-532)
         # Replaces a parent's listener in a forked child. Dropping that one does no I/O on the
         # parent's socket: redis-py shuts a connection's socket down only in the process that opened

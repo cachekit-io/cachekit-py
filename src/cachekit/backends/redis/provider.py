@@ -31,7 +31,7 @@ from pydantic import SecretStr
 from redis.commands.core import Script
 from redis.exceptions import LockNotOwnedError
 
-from cachekit.backends._uninterrupted import _await_uninterrupted
+from cachekit.backends._uninterrupted import _await_uninterrupted, _ClearedOnInterrupt
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError, UnsupportedTenantError
 from cachekit.backends.redis.config import RedisBackendConfig
@@ -189,7 +189,10 @@ class PerRequestRedisBackend:
     cause ``classify_redis_error`` keeps, and from a frame that holds neither the client
     nor its pool nor a pipeline in a local: their reprs list the password, and an error
     tracker sends the locals of every frame on a raised error's traceback (CWE-532). The
-    frame deletes its ``error`` local as the error leaves (see ``kept_cause``).
+    frame deletes its ``error`` local as the error leaves (see ``kept_cause``). An
+    interrupt raised while redis-py is mid-call (KeyboardInterrupt, a worker timeout's
+    SystemExit, gevent.Timeout) propagates as itself, with the locals of the finished
+    frames it ran through, redis-py's included, cleared (see ``_ClearedOnInterrupt``).
 
     Tenant scoping format: t:{url_encoded_tenant_id}:{key}
 
@@ -325,18 +328,19 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails (classified via Fix #3)
         """
         scoped_key = self._scoped_key(key)
-        try:
-            value = self._client.get(scoped_key)
-            if value is not None:
-                # Handle both bytes and str responses
-                if isinstance(value, str):
-                    return value.encode("utf-8")
-                if isinstance(value, bytes):
-                    return value
-            return None
-        except Exception as exc:
-            # Fix #3: Use centralized error classification
-            error = classify_redis_error(exc, operation="get", key=key)
+        with _ClearedOnInterrupt():
+            try:
+                value = self._client.get(scoped_key)
+                if value is not None:
+                    # Handle both bytes and str responses
+                    if isinstance(value, str):
+                        return value.encode("utf-8")
+                    if isinstance(value, bytes):
+                        return value
+                return None
+            except Exception as exc:
+                # Fix #3: Use centralized error classification
+                error = classify_redis_error(exc, operation="get", key=key)
         try:
             raise error from error.original_exception
         finally:
@@ -354,15 +358,16 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails (classified via Fix #3)
         """
         scoped_key = self._scoped_key(key)
-        try:
-            if ttl is not None and ttl > 0:
-                self._client.setex(scoped_key, ttl, value)
-            else:
-                self._client.set(scoped_key, value)
-            return
-        except Exception as exc:
-            # Fix #3: Use centralized error classification
-            error = classify_redis_error(exc, operation="set", key=key)
+        with _ClearedOnInterrupt():
+            try:
+                if ttl is not None and ttl > 0:
+                    self._client.setex(scoped_key, ttl, value)
+                else:
+                    self._client.set(scoped_key, value)
+                return
+            except Exception as exc:
+                # Fix #3: Use centralized error classification
+                error = classify_redis_error(exc, operation="set", key=key)
         try:
             raise error from error.original_exception
         finally:
@@ -381,18 +386,19 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails (classified via Fix #3)
         """
         scoped_key = self._scoped_key(key)
-        try:
-            result = self._client.delete(scoped_key)
-            if not isinstance(result, int):
-                raise BackendError(
-                    message=f"Redis DELETE returned unexpected type: {type(result).__name__}",
-                    operation="delete",
-                    key=key,
-                )
-            return result > 0
-        except Exception as exc:
-            # Fix #3: Use centralized error classification
-            error = classify_redis_error(exc, operation="delete", key=key)
+        with _ClearedOnInterrupt():
+            try:
+                result = self._client.delete(scoped_key)
+                if not isinstance(result, int):
+                    raise BackendError(
+                        message=f"Redis DELETE returned unexpected type: {type(result).__name__}",
+                        operation="delete",
+                        key=key,
+                    )
+                return result > 0
+            except Exception as exc:
+                # Fix #3: Use centralized error classification
+                error = classify_redis_error(exc, operation="delete", key=key)
         try:
             raise error from error.original_exception
         finally:
@@ -411,18 +417,19 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails (classified via Fix #3)
         """
         scoped_key = self._scoped_key(key)
-        try:
-            result = self._client.exists(scoped_key)
-            if not isinstance(result, int):
-                raise BackendError(
-                    message=f"Redis EXISTS returned unexpected type: {type(result).__name__}",
-                    operation="exists",
-                    key=key,
-                )
-            return result > 0
-        except Exception as exc:
-            # Fix #3: Use centralized error classification
-            error = classify_redis_error(exc, operation="exists", key=key)
+        with _ClearedOnInterrupt():
+            try:
+                result = self._client.exists(scoped_key)
+                if not isinstance(result, int):
+                    raise BackendError(
+                        message=f"Redis EXISTS returned unexpected type: {type(result).__name__}",
+                        operation="exists",
+                        key=key,
+                    )
+                return result > 0
+            except Exception as exc:
+                # Fix #3: Use centralized error classification
+                error = classify_redis_error(exc, operation="exists", key=key)
         try:
             raise error from error.original_exception
         finally:
@@ -437,45 +444,46 @@ class PerRequestRedisBackend:
         Returns:
             Tuple of (is_healthy, details_dict)
         """
-        try:
-            import time
+        with _ClearedOnInterrupt():
+            try:
+                import time
 
-            start = time.time()
-            self._client.ping()
-            latency_ms = (time.time() - start) * 1000
+                start = time.time()
+                self._client.ping()
+                latency_ms = (time.time() - start) * 1000
 
-            info = self._client.info()
-            if not isinstance(info, dict):
-                raise BackendError(
-                    message=f"Redis INFO returned unexpected type: {type(info).__name__}",
-                    operation="health_check",
-                    key="N/A",
+                info = self._client.info()
+                if not isinstance(info, dict):
+                    raise BackendError(
+                        message=f"Redis INFO returned unexpected type: {type(info).__name__}",
+                        operation="health_check",
+                        key="N/A",
+                    )
+
+                return (
+                    True,
+                    {
+                        "backend_type": "redis",
+                        "latency_ms": round(latency_ms, 2),
+                        "version": info.get("redis_version", "unknown"),
+                        "used_memory_human": info.get("used_memory_human", "unknown"),
+                        "connected_clients": info.get("connected_clients", 0),
+                    },
+                )
+            except Exception as exc:
+                # Fix #3: Use centralized error classification
+                error = classify_redis_error(exc, operation="health_check")
+                return (
+                    False,
+                    {
+                        "backend_type": "redis",
+                        "latency_ms": -1,
+                        "error": error.message,
+                        "error_type": error.error_type.value,
+                    },
                 )
 
-            return (
-                True,
-                {
-                    "backend_type": "redis",
-                    "latency_ms": round(latency_ms, 2),
-                    "version": info.get("redis_version", "unknown"),
-                    "used_memory_human": info.get("used_memory_human", "unknown"),
-                    "connected_clients": info.get("connected_clients", 0),
-                },
-            )
-        except Exception as exc:
-            # Fix #3: Use centralized error classification
-            error = classify_redis_error(exc, operation="health_check")
-            return (
-                False,
-                {
-                    "backend_type": "redis",
-                    "latency_ms": -1,
-                    "error": error.message,
-                    "error_type": error.error_type.value,
-                },
-            )
-
-    # Fix #6: Implement ALL optional protocols completely
+        # Fix #6: Implement ALL optional protocols completely
 
     async def get_ttl(self, key: str) -> Optional[int]:
         """Get remaining TTL on key (TTLInspectableBackend protocol).
@@ -490,23 +498,24 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails
         """
         scoped_key = self._scoped_key(key)
-        try:
-            ttl = await asyncio.to_thread(self._client.ttl, scoped_key)  # sync client: keep the round trip off the loop
-            if not isinstance(ttl, int):
-                raise BackendError(
-                    message=f"Redis TTL returned unexpected type: {type(ttl).__name__}",
-                    operation="get_ttl",
-                    key=key,
-                )
-            # Redis TTL returns:
-            # -2 if key doesn't exist
-            # -1 if key exists but has no expiry
-            # >0 for remaining TTL in seconds
-            if ttl == -2 or ttl == -1:
-                return None
-            return ttl if ttl > 0 else None
-        except Exception as exc:
-            error = classify_redis_error(exc, operation="get_ttl", key=key)
+        with _ClearedOnInterrupt():
+            try:
+                ttl = await asyncio.to_thread(self._client.ttl, scoped_key)  # sync client: keep the round trip off the loop
+                if not isinstance(ttl, int):
+                    raise BackendError(
+                        message=f"Redis TTL returned unexpected type: {type(ttl).__name__}",
+                        operation="get_ttl",
+                        key=key,
+                    )
+                # Redis TTL returns:
+                # -2 if key doesn't exist
+                # -1 if key exists but has no expiry
+                # >0 for remaining TTL in seconds
+                if ttl == -2 or ttl == -1:
+                    return None
+                return ttl if ttl > 0 else None
+            except Exception as exc:
+                error = classify_redis_error(exc, operation="get_ttl", key=key)
         try:
             raise error from error.original_exception
         finally:
@@ -526,12 +535,13 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails
         """
         scoped_key = self._scoped_key(key)
-        try:
-            result = await asyncio.to_thread(self._client.expire, scoped_key, ttl)
-            # Redis EXPIRE returns 1 if TTL was set, 0 if key doesn't exist
-            return bool(result)
-        except Exception as exc:
-            error = classify_redis_error(exc, operation="refresh_ttl", key=key)
+        with _ClearedOnInterrupt():
+            try:
+                result = await asyncio.to_thread(self._client.expire, scoped_key, ttl)
+                # Redis EXPIRE returns 1 if TTL was set, 0 if key doesn't exist
+                return bool(result)
+            except Exception as exc:
+                error = classify_redis_error(exc, operation="refresh_ttl", key=key)
         try:
             raise error from error.original_exception
         finally:
@@ -587,90 +597,91 @@ class PerRequestRedisBackend:
         # so the executor callables below must never read tenant_context themselves.
         scoped_key = f"{self._scoped_key(key)}:lock"
         body_error: Optional[Exception] = None
-        try:
-            from redis.lock import Lock
-
-            lock = Lock(
-                self._client,
-                name=scoped_key,
-                timeout=timeout,
-                thread_local=False,  # attempts and release may land on different executor threads
-            )
-
-            loop = asyncio.get_running_loop()
-            deadline = None if blocking_timeout is None else loop.time() + blocking_timeout
-            token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
-
-            def _release_sync() -> None:
-                # Catch inside the executor callable, not around _release(): once a cancellation has
-                # landed, _await_uninterrupted re-raises it and an error left on the future would only
-                # surface as asyncio's "exception was never retrieved" at GC.
-                try:
-                    lock.release()
-                except LockNotOwnedError as e:
-                    logger.debug(
-                        "Redis lock already expired or taken over before release: %s", redact_error_for_log(e)
-                    )  # nothing to orphan
-                except redis.RedisError as e:
-                    logger.warning(
-                        "Redis lock release for %s failed (%s); the key lives until its TTL",
-                        redact_cache_key(key),
-                        redact_error_for_log(e),
-                    )
-
-            async def _release() -> None:
-                # Drained: a cancel landing while this still queues for a thread must not drop the release.
-                await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
-
-            while True:
-                # Drained: a cancel cannot stop the thread's SET NX from winning, only hide that it did.
-                attempt = loop.run_in_executor(None, functools.partial(lock.acquire, blocking=False, token=token))
-                try:
-                    acquired = await _await_uninterrupted(attempt)
-                except asyncio.CancelledError:
-                    # The attempt has finished. One that failed (e.g. a Redis ConnectionError) cannot
-                    # have won; log it rather than let it mask the cancellation.
-                    if (err := attempt.exception()) is not None:
-                        logger.warning(
-                            "Redis lock attempt for %s failed (%s) while acquire_lock was being cancelled",
-                            redact_cache_key(key),
-                            redact_error_for_log(err),
-                        )
-                    elif attempt.result():
-                        await _release()
-                    attempt = err = None  # hold no redis-py exception on the way out (see classify_redis_error)
-                    raise
-                # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt
-                # would land past the deadline. blocking_timeout=None means a single attempt.
-                if acquired or deadline is None or loop.time() + lock.sleep > deadline:
-                    break
-                await asyncio.sleep(lock.sleep)
+        with _ClearedOnInterrupt():
             try:
-                yield acquired
-            except Exception as exc:
-                body_error = exc  # raised by the caller's code in the block, not by redis-py
-                raise
-            finally:
-                # Release lock if acquired (also run in thread pool)
-                if acquired:
-                    await _release()
-            return
-        except Exception as exc:
-            if body_error is not None and exc is not body_error:
-                # _release_sync logs a redis-py failure itself; anything else would vanish behind the block's exception.
-                logger.warning(
-                    "Redis lock release for %s failed (%s) after the block raised; raising the block's exception",
-                    redact_cache_key(key),
-                    redact_error_for_log(exc),
+                from redis.lock import Lock
+
+                lock = Lock(
+                    self._client,
+                    name=scoped_key,
+                    timeout=timeout,
+                    thread_local=False,  # attempts and release may land on different executor threads
                 )
-            # The block's own exception wins, even over a release that failed after it, and is kept whole.
-            failed = exc if body_error is None else body_error
-            error = classify_redis_error(failed, operation="acquire_lock", key=key, keep_exception=failed is body_error)
-        except BaseException:
-            # A cancel during the release after the block raised: the block's exception, on whose traceback this frame
-            # is, must not stay in a local here either.
-            attempt = body_error = None
-            raise
+
+                loop = asyncio.get_running_loop()
+                deadline = None if blocking_timeout is None else loop.time() + blocking_timeout
+                token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
+
+                def _release_sync() -> None:
+                    # Catch inside the executor callable, not around _release(): once a cancellation has
+                    # landed, _await_uninterrupted re-raises it and an error left on the future would only
+                    # surface as asyncio's "exception was never retrieved" at GC.
+                    try:
+                        lock.release()
+                    except LockNotOwnedError as e:
+                        logger.debug(
+                            "Redis lock already expired or taken over before release: %s", redact_error_for_log(e)
+                        )  # nothing to orphan
+                    except redis.RedisError as e:
+                        logger.warning(
+                            "Redis lock release for %s failed (%s); the key lives until its TTL",
+                            redact_cache_key(key),
+                            redact_error_for_log(e),
+                        )
+
+                async def _release() -> None:
+                    # Drained: a cancel landing while this still queues for a thread must not drop the release.
+                    await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
+
+                while True:
+                    # Drained: a cancel cannot stop the thread's SET NX from winning, only hide that it did.
+                    attempt = loop.run_in_executor(None, functools.partial(lock.acquire, blocking=False, token=token))
+                    try:
+                        acquired = await _await_uninterrupted(attempt)
+                    except asyncio.CancelledError:
+                        # The attempt has finished. One that failed (e.g. a Redis ConnectionError) cannot
+                        # have won; log it rather than let it mask the cancellation.
+                        if (err := attempt.exception()) is not None:
+                            logger.warning(
+                                "Redis lock attempt for %s failed (%s) while acquire_lock was being cancelled",
+                                redact_cache_key(key),
+                                redact_error_for_log(err),
+                            )
+                        elif attempt.result():
+                            await _release()
+                        attempt = err = None  # hold no redis-py exception on the way out (see classify_redis_error)
+                        raise
+                    # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt
+                    # would land past the deadline. blocking_timeout=None means a single attempt.
+                    if acquired or deadline is None or loop.time() + lock.sleep > deadline:
+                        break
+                    await asyncio.sleep(lock.sleep)
+                try:
+                    yield acquired
+                except Exception as exc:
+                    body_error = exc  # raised by the caller's code in the block, not by redis-py
+                    raise
+                finally:
+                    # Release lock if acquired (also run in thread pool)
+                    if acquired:
+                        await _release()
+                return
+            except Exception as exc:
+                if body_error is not None and exc is not body_error:
+                    # _release_sync logs a redis-py failure itself; anything else would vanish behind the block's exception.
+                    logger.warning(
+                        "Redis lock release for %s failed (%s) after the block raised; raising the block's exception",
+                        redact_cache_key(key),
+                        redact_error_for_log(exc),
+                    )
+                # The block's own exception wins, even over a release that failed after it, and is kept whole.
+                failed = exc if body_error is None else body_error
+                error = classify_redis_error(failed, operation="acquire_lock", key=key, keep_exception=failed is body_error)
+            except BaseException:
+                # An interrupt or a cancel, whose frames the ``with`` clears as it leaves. A cancel during the release after
+                # the block raised: the block's exception, on whose traceback this frame is, must not stay in a local here.
+                attempt = body_error = None
+                raise
         try:
             raise error from error.original_exception
         finally:
@@ -694,15 +705,16 @@ class PerRequestRedisBackend:
             BackendError: If the Redis round-trip fails
         """
         scoped_reg = self._scoped_key(registry_id)
-        try:
-            # Chained, never bound to a local: a pipeline's repr lists the password. A pipelined
-            # command returns its pipeline; redis-py's annotations give the reply type instead.
-            self._client.pipeline(transaction=False).sadd(scoped_reg, key).expire(  # pyright: ignore[reportAttributeAccessIssue]
-                scoped_reg, _TRACKING_SET_TTL_SECONDS
-            ).execute()
-            return
-        except Exception as exc:
-            error = classify_redis_error(exc, operation="track_key", key=registry_id)
+        with _ClearedOnInterrupt():
+            try:
+                # Chained, never bound to a local: a pipeline's repr lists the password. A pipelined
+                # command returns its pipeline; redis-py's annotations give the reply type instead.
+                self._client.pipeline(transaction=False).sadd(scoped_reg, key).expire(  # pyright: ignore[reportAttributeAccessIssue]
+                    scoped_reg, _TRACKING_SET_TTL_SECONDS
+                ).execute()
+                return
+            except Exception as exc:
+                error = classify_redis_error(exc, operation="track_key", key=registry_id)
         try:
             raise error from error.original_exception
         finally:
@@ -742,57 +754,58 @@ class PerRequestRedisBackend:
         does not declare, which a cluster rejects and a proxy cannot route.
         """
         scoped_reg = self._scoped_key(registry_id)
-        try:
-            if self._drain_script is None:
-                self._drain_script = self._client.register_script(_DRAIN_SCRIPT)
-            out: set[str] = set()
-            undecodable = 0
-            for _ in range(_DRAIN_MAX_ROUNDS):
-                popped = self._drain_script(keys=[scoped_reg], args=[self.key_prefix, _DRAIN_CHUNK])
-                if not isinstance(popped, list):
-                    raise BackendError(
-                        message=f"Redis drain script returned unexpected type: {type(popped).__name__}",
-                        operation="drain_tracked",
-                        key=registry_id,
+        with _ClearedOnInterrupt():
+            try:
+                if self._drain_script is None:
+                    self._drain_script = self._client.register_script(_DRAIN_SCRIPT)
+                out: set[str] = set()
+                undecodable = 0
+                for _ in range(_DRAIN_MAX_ROUNDS):
+                    popped = self._drain_script(keys=[scoped_reg], args=[self.key_prefix, _DRAIN_CHUNK])
+                    if not isinstance(popped, list):
+                        raise BackendError(
+                            message=f"Redis drain script returned unexpected type: {type(popped).__name__}",
+                            operation="drain_tracked",
+                            key=registry_id,
+                        )
+                    for member in popped:
+                        try:
+                            out.add(member.decode("utf-8") if isinstance(member, bytes) else member)
+                        except UnicodeDecodeError:
+                            # Not a key this SDK wrote (keys are str); the script already unlinked it.
+                            undecodable += 1
+                    if len(popped) < _DRAIN_CHUNK:
+                        break
+                else:
+                    logger.warning(
+                        "Key registry drain for %s stopped after %d rounds; remaining members wait for the next drain",
+                        redact_cache_key(registry_id),
+                        _DRAIN_MAX_ROUNDS,
                     )
-                for member in popped:
-                    try:
-                        out.add(member.decode("utf-8") if isinstance(member, bytes) else member)
-                    except UnicodeDecodeError:
-                        # Not a key this SDK wrote (keys are str); the script already unlinked it.
-                        undecodable += 1
-                if len(popped) < _DRAIN_CHUNK:
-                    break
+                if undecodable:
+                    # One line per drain, never per member, never the member bytes: a set stuffed with
+                    # garbage must not become a log flood. Not raised — the members are already
+                    # unlinked, and raising would only discard the valid keys' L1 evictions.
+                    logger.warning(
+                        "Key registry drain for %s unlinked %d undecodable members; the tracking set was written outside cachekit",
+                        redact_cache_key(registry_id),
+                        undecodable,
+                    )
+                stragglers = [k for k in local_keys if k not in out]
+                for i in range(0, len(stragglers), _DRAIN_CHUNK):
+                    chunk = stragglers[i : i + _DRAIN_CHUNK]
+                    self._client.unlink(*(self._scoped_key(k) for k in chunk))
+                    out.update(chunk)
+            except Exception as exc:
+                error = classify_redis_error(exc, operation="drain_tracked", key=registry_id)
             else:
-                logger.warning(
-                    "Key registry drain for %s stopped after %d rounds; remaining members wait for the next drain",
+                logger.log(
+                    logging.WARNING if len(out) > _DRAIN_WARN_KEYS else logging.INFO,
+                    "Key registry drained %d keys for %s",
+                    len(out),
                     redact_cache_key(registry_id),
-                    _DRAIN_MAX_ROUNDS,
                 )
-            if undecodable:
-                # One line per drain, never per member, never the member bytes: a set stuffed with
-                # garbage must not become a log flood. Not raised — the members are already
-                # unlinked, and raising would only discard the valid keys' L1 evictions.
-                logger.warning(
-                    "Key registry drain for %s unlinked %d undecodable members; the tracking set was written outside cachekit",
-                    redact_cache_key(registry_id),
-                    undecodable,
-                )
-            stragglers = [k for k in local_keys if k not in out]
-            for i in range(0, len(stragglers), _DRAIN_CHUNK):
-                chunk = stragglers[i : i + _DRAIN_CHUNK]
-                self._client.unlink(*(self._scoped_key(k) for k in chunk))
-                out.update(chunk)
-        except Exception as exc:
-            error = classify_redis_error(exc, operation="drain_tracked", key=registry_id)
-        else:
-            logger.log(
-                logging.WARNING if len(out) > _DRAIN_WARN_KEYS else logging.INFO,
-                "Key registry drained %d keys for %s",
-                len(out),
-                redact_cache_key(registry_id),
-            )
-            return out
+                return out
         try:
             raise error from error.original_exception
         finally:
@@ -940,22 +953,23 @@ class RedisBackendProvider:
             BackendError: If Redis connection fails
         """
         redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inside the pool builder (CWE-532)
-        try:
-            # Fix #1: Create connection pool ONCE. Shared builder wires the
-            # finite socket timeouts, so the ping below fails fast on an
-            # unreachable Redis instead of blocking on the OS TCP timeout.
-            from cachekit.backends.redis.client import create_connection_pool
+        with _ClearedOnInterrupt():
+            try:
+                # Fix #1: Create connection pool ONCE. Shared builder wires the
+                # finite socket timeouts, so the ping below fails fast on an
+                # unreachable Redis instead of blocking on the OS TCP timeout.
+                from cachekit.backends.redis.client import create_connection_pool
 
-            self._pool = create_connection_pool(redis_url, config, max_connections=pool_size)
+                self._pool = create_connection_pool(redis_url, config, max_connections=pool_size)
 
-            # Create singleton Redis client from pool
-            self._client = redis.Redis(connection_pool=self._pool)
+                # Create singleton Redis client from pool
+                self._client = redis.Redis(connection_pool=self._pool)
 
-            # Validate connection works
-            self._client.ping()
-            return
-        except Exception as exc:
-            error = classify_redis_error(exc, operation="init")
+                # Validate connection works
+                self._client.ping()
+                return
+            except Exception as exc:
+                error = classify_redis_error(exc, operation="init")
         try:
             raise error from error.original_exception
         finally:
