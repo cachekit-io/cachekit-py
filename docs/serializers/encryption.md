@@ -81,11 +81,8 @@ def get_patient_records(hospital_id: int):
 ## Composability
 
 EncryptionWrapper works with any serializer whose class declares `cross_sdk_compatible = True`.
-Despite its name, the flag does not mean other-language SDKs can read the format. It declares
-that the serializer decodes one fixed format after decryption and never picks a decoder by
-inspecting the bytes, which the protocol requires on every backend. That is why
-`ArrowSerializer` qualifies although its envelope is not a cross-SDK wire format, and why `AutoSerializer`
-does not even on a local file backend.
+Despite its name, the flag is about how a serializer decodes after decryption, not about which SDKs
+can read it ([the rule](custom.md#under-encryption)).
 
 | Inner Serializer | Use Case |
 |-----------------|---------|

@@ -26,11 +26,15 @@ class SerializerProtocol(Protocol):
 
     Encryption contract (``cross_sdk_compatible``):
         Serializers carry a class-level ``cross_sdk_compatible: bool`` attribute
-        that declares whether ``deserialize`` decodes one fixed format, never
-        choosing a decoder by inspecting the bytes. Protocol ENC-2 requires that of
-        the step after decryption on every backend, so the flag governs whether the
-        serializer may be used under encryption — see ``EncryptionWrapper`` and the
-        validation in ``CacheSerializationHandler.__init__``. Despite its name, it
+        that declares this rule: after decryption (``metadata.encrypted`` is true),
+        ``deserialize`` decodes the one container its configuration fixes and raises
+        when the bytes do not parse as it, never returning a default or the input;
+        inspecting the bytes may only refuse, never select another decoder. Protocol
+        ENC-2 and ENC-3 require that of the step after decryption on every backend,
+        so the flag governs whether the serializer may be used under encryption —
+        see ``EncryptionWrapper`` and the validation in
+        ``CacheSerializationHandler.__init__``. Plaintext reads are outside the rule:
+        ArrowSerializer sniffs to accept a legacy raw entry there. Despite its name, it
         does not mean other-language SDKs can read the format: ArrowSerializer's
         envelope is not a cross-SDK wire format and still qualifies.
 

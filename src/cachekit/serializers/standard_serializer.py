@@ -248,7 +248,8 @@ class StandardSerializer:
         TypeError: StandardSerializer does not support NumPy arrays...
     """
 
-    # Safe under encryption (ENC-2): it decodes one fixed MessagePack container, never chosen by the bytes.
+    # Safe under encryption (ENC-2): configuration (enable_integrity_checking), not the bytes, fixes the
+    # container it decodes after decryption.
     cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, enable_integrity_checking: bool = True):

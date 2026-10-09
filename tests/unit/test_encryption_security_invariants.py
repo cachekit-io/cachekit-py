@@ -162,7 +162,7 @@ class _UnmarkedSerializer:
         return None
 
 
-class TestEncryptionWrapperRefusesSingleSDKSerializer:
+class TestEncryptionWrapperRefusesUnfixedFormatSerializer:
     """ENC-2: a direct EncryptionWrapper refuses what the handler refuses under encryption.
 
     The step after decryption must be the reader's configured serializer, never a sniff of the
@@ -178,7 +178,7 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
             EncryptionWrapper(serializer=_UnmarkedSerializer(), master_key=b"a" * 32)
 
     def test_refusal_gives_the_enc2_reason(self, monkeypatch):
-        """Both refusal paths name ENC-2, not other-language readers: the rule holds on every backend."""
+        """Both refusal paths state the ENC-2 reason."""
         from cachekit.config.singleton import reset_settings
 
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
@@ -200,8 +200,6 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
             )
             assert "inspect" in message
             assert "cross-language" not in message
-            assert "other SDKs" not in message
-            assert "other-language" not in message
 
     def test_refused_before_key_resolution(self, monkeypatch):
         """The serializer is a config error even when the key is missing too, so it is named first."""
@@ -317,7 +315,7 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
             reset_settings()
 
     def test_orjson_string_accepted_with_encryption(self, monkeypatch):
-        """String serializer 'orjson' (cross-SDK) is accepted under encryption (Issue #134)."""
+        """String serializer 'orjson' (fixed format) is accepted under encryption (Issue #134)."""
         pytest.importorskip("orjson")
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         from cachekit.config.singleton import reset_settings

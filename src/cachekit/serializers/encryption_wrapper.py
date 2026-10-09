@@ -60,7 +60,9 @@ def require_cross_sdk_serializer(serializer: object) -> None:
             f"The serializer instance '{type(serializer).__name__}' does not declare "
             f"cross_sdk_compatible=True. Use StandardSerializer (the default), OrjsonSerializer or "
             f"ArrowSerializer. Set the cross_sdk_compatible ClassVar to True only on a custom serializer "
-            f"whose deserialize decodes one fixed format and never inspects the bytes to choose one."
+            f"that keeps this rule: after decryption (metadata.encrypted is true), deserialize decodes the one "
+            f"container its configuration fixes and raises when the bytes do not parse as it, never returning a "
+            f"default or the input; inspecting the bytes may only refuse, never select another decoder."
         )
 
 
