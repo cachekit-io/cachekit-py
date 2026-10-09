@@ -8,7 +8,7 @@ success site records its own fully labelled metric.
 
 import asyncio
 import contextvars
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -62,15 +62,15 @@ class TestOperationContextTracking:
         only when its outcome reaches the breaker.
         """
         orchestrator = _orchestrator(circuit_breaker_enabled=True)
-        on_success_calls: list[CircuitBreaker] = []
-        monkeypatch.setattr(CircuitBreaker, "_on_success", lambda self: on_success_calls.append(self))
+        on_success_calls: list[tuple[CircuitBreaker, Optional[int]]] = []
+        monkeypatch.setattr(CircuitBreaker, "_on_success", lambda self, *, cycle=None: on_success_calls.append((self, cycle)))
 
-        for _ in range(3):
+        for kwargs in ({}, {"cycle": 0}, {"cycle": 2}):  # the admitting cycle reaches the breaker
             orchestrator.set_operation_context("get", duration_ms=1.5)
-            orchestrator.record_success()
+            orchestrator.record_success(**kwargs)
 
         assert recorded == []
-        assert on_success_calls == [orchestrator.circuit_breaker] * 3
+        assert on_success_calls == [(orchestrator.circuit_breaker, cycle) for cycle in (None, 0, 2)]
 
     def test_context_isolation_between_operations(self, recorded: list[dict[str, Any]]):
         orchestrator = _orchestrator()

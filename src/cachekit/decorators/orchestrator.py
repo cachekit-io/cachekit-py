@@ -127,14 +127,15 @@ class FeatureOrchestrator:
         This is the breaker's admission decision, not a state read: it runs the
         OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
         HALF_OPEN probe slot when it admits. Call it once per request, and record
-        the outcome of every admitted request (``record_success`` /
-        ``record_failure``, or ``release_probe`` with this value when it ends with
-        none). A rejected request is not a failure — do not record it.
+        the outcome of every admitted request with this value (``record_success`` /
+        ``record_failure`` / ``handle_cache_error`` as ``cycle``, or
+        ``release_probe`` when it ends with none). A rejected request is not a
+        failure — do not record it.
 
         Returns:
-            None if the request must fail fast. Otherwise the cycle number to hand
-            to ``release_probe`` (see ``CircuitBreaker.admit``; 0 with no breaker).
-            0 is falsy: test the result with ``is None``.
+            None if the request must fail fast. Otherwise the cycle number that
+            admitted it (see ``CircuitBreaker.admit``; 0 with no breaker). 0 is
+            falsy: test the result with ``is None``.
         """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
@@ -250,7 +251,7 @@ class FeatureOrchestrator:
             }
         )
 
-    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True) -> None:
+    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True, cycle: Optional[int] = None) -> None:
         """Record operation failure with automatic context detection.
 
         Automatically uses operation type and duration from set_operation_context()
@@ -261,6 +262,9 @@ class FeatureOrchestrator:
             count_toward_breaker: False records the metric only. For failures that
                 say nothing about backend health, such as an L2 entry that fails
                 decryption or integrity checks.
+            cycle: What ``admit`` returned for the request. A HALF_OPEN breaker
+                ignores a failure from a request another cycle admitted (see
+                ``CircuitBreaker.record_failure``).
         """
         # Get operation context (async-safe)
         ctx = _operation_context.get() or {}
@@ -268,7 +272,7 @@ class FeatureOrchestrator:
         duration_ms = ctx.get("duration_ms", 0.0)
 
         if self._circuit_breaker and count_toward_breaker:
-            self._circuit_breaker._on_failure(error)
+            self._circuit_breaker._on_failure(error, cycle=cycle)
         if self._metrics_collector:
             self._metrics_collector.record_cache_operation(
                 operation=operation,
@@ -277,15 +281,18 @@ class FeatureOrchestrator:
                 duration_ms=duration_ms,
             )
 
-    def record_success(self):
+    def record_success(self, *, cycle: Optional[int] = None):
         """Record operation success with the circuit breaker.
 
         Emits no metrics: every success site also calls record_cache_operation() with the
         full label set (serializer, size), and a second, unlabelled record here would count
         each operation twice in cache_operations_total, once under serializer="unknown".
+
+        ``cycle`` is what ``admit`` returned for the request: a HALF_OPEN breaker counts
+        only its own cycle's probes toward closing (see ``CircuitBreaker.record_success``).
         """
         if self._circuit_breaker:
-            self._circuit_breaker._on_success()
+            self._circuit_breaker._on_success(cycle=cycle)
 
     def release_probe(self, cycle: int) -> None:
         """Give back the HALF_OPEN probe slot of an admitted request that ends with no outcome.
@@ -346,6 +353,7 @@ class FeatureOrchestrator:
         duration_ms: float = 0.0,
         *,
         count_toward_breaker: bool = True,
+        cycle: Optional[int] = None,
         **extra_context: Any,
     ) -> None:
         """Centralized error handler for all cache operations.
@@ -362,6 +370,7 @@ class FeatureOrchestrator:
             duration_ms: Operation duration in milliseconds
             count_toward_breaker: Passed to record_failure(). False keeps the metric
                 and logs but leaves the circuit breaker untouched.
+            cycle: Passed to record_failure(): what ``admit`` returned for the request.
             **extra_context: Additional context to include in logs
 
         Example:
@@ -383,7 +392,7 @@ class FeatureOrchestrator:
         self.set_operation_context(operation, duration_ms)
 
         # 2. Record failure in circuit breaker and metrics collector
-        self.record_failure(error, count_toward_breaker=count_toward_breaker)
+        self.record_failure(error, count_toward_breaker=count_toward_breaker, cycle=cycle)
 
         # 3. Structured logging with full context
         self.log_cache_operation(

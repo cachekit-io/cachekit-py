@@ -1225,11 +1225,14 @@ def create_cache_wrapper(
             _record(cache_key, twin)
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
 
-    def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
+    def _record_l2_hit_async(size_bytes: int, get_duration_ms: float, cycle: int) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
         both post-lock double-check hits (LAB-3769) share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
+
+        cycle is what features.admit() returned for the call, so a probe of an
+        ended HALF_OPEN cycle counts toward no later one.
 
         size_bytes is the length CacheHit already measured (LAB-3757), not a
         recompute from the envelope. CacheHit.size_bytes is set on every hit
@@ -1259,7 +1262,7 @@ def create_cache_wrapper(
             # someone else's registry error is the same invisibility this helper exists
             # to remove.
             _stats.record_l2_hit(get_duration_ms)
-            features.record_success()
+            features.record_success(cycle=cycle)
             if features.collect_stats:
                 features.record_cache_operation(
                     operation="get",
@@ -1926,6 +1929,7 @@ def create_cache_wrapper(
             features.handle_cache_error(
                 error=e,
                 operation="client_creation",
+                cycle=probe_cycle,
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=0.0,
@@ -1976,7 +1980,7 @@ def create_cache_wrapper(
             if cached_result is not None:
                 # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
                 result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
-                features.record_success()
+                features.record_success(cycle=probe_cycle)
 
                 # Record cache hit with structured logging
                 features.log_cache_operation(
@@ -2033,6 +2037,7 @@ def create_cache_wrapper(
             features.handle_cache_error(
                 error=e,
                 operation="cache_get",
+                cycle=probe_cycle,
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=get_duration_ms,
@@ -2076,7 +2081,7 @@ def create_cache_wrapper(
                     _track_and_record(cache_key)
 
                 # Record successful cache set
-                features.record_success()
+                features.record_success(cycle=probe_cycle)
 
                 if features.collect_stats:
                     features.record_cache_operation(
@@ -2099,6 +2104,7 @@ def create_cache_wrapper(
                 features.handle_cache_error(
                     error=e,
                     operation="cache_set",
+                    cycle=probe_cycle,
                     cache_key=cache_key or "unknown",
                     namespace=namespace or "default",
                     duration_ms=set_duration_ms,
@@ -2285,6 +2291,7 @@ def create_cache_wrapper(
                     features.handle_cache_error(
                         error=e,
                         operation="client_creation",
+                        cycle=probe_cycle,
                         cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=0.0,
@@ -2430,7 +2437,7 @@ def create_cache_wrapper(
 
                 # Record cache hit (always compute for L2 latency stats)
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
-                _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
+                _record_l2_hit_async(cached_result.size_bytes, get_duration_ms, probe_cycle)
 
                 # Update L1 cache with the L2 value (serialized bytes) for subsequent
                 # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -2474,6 +2481,7 @@ def create_cache_wrapper(
             features.handle_cache_error(
                 error=e,
                 operation="cache_get",
+                cycle=probe_cycle,
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=get_duration_ms,
@@ -2513,7 +2521,7 @@ def create_cache_wrapper(
                                 # Cache was populated while waiting - use it
                                 result, cached_data = cached_result.value, cached_result.envelope
                                 _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms, probe_cycle)
                                 _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
                                 return result, cached_data
                         except (DecryptionAuthenticationError, KeyringConfigurationError):
@@ -2543,7 +2551,7 @@ def create_cache_wrapper(
                                 # Another request filled the cache while we waited
                                 result, cached_data = cached_result.value, cached_result.envelope
                                 _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms, probe_cycle)
                                 _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
                                 return result, cached_data
                         except (DecryptionAuthenticationError, KeyringConfigurationError):
@@ -2602,7 +2610,7 @@ def create_cache_wrapper(
                                 await _track_and_record_async(cache_key)
 
                             # Record successful cache set
-                            features.record_success()
+                            features.record_success(cycle=probe_cycle)
 
                             if features.collect_stats:
                                 features.record_cache_operation(
@@ -2624,6 +2632,7 @@ def create_cache_wrapper(
                             features.handle_cache_error(
                                 error=e,
                                 operation="cache_set",
+                                cycle=probe_cycle,
                                 cache_key=cache_key or "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
@@ -2723,7 +2732,7 @@ def create_cache_wrapper(
                 await _track_and_record_async(cache_key)
 
             # Record successful cache set
-            features.record_success()
+            features.record_success(cycle=probe_cycle)
 
             if features.collect_stats:
                 features.record_cache_operation(
@@ -2744,6 +2753,7 @@ def create_cache_wrapper(
             features.handle_cache_error(
                 error=e,
                 operation="cache_set",
+                cycle=probe_cycle,
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=set_duration_ms,

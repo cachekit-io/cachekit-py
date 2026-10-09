@@ -88,7 +88,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
 | **OPEN** | Skip the backend: an L1 hit is still served, and an L1 miss runs the function uncached (sync and async). No failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
-| **HALF_OPEN** | Each cycle has 3 probe slots (`half_open_requests`); L1 misses that find none free run uncached. L1 hits are served and are neither probes nor successes. Every admitted probe holds its slot until the cycle ends, whether it succeeds, fails or never reports back. Only a probe whose function raises gives it back: it records no outcome and the next call probes in its place, so while the function keeps raising, more than 3 calls in one cycle can reach the backend | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 slots are held and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
+| **HALF_OPEN** | Each cycle has 3 probe slots (`half_open_requests`); L1 misses that find none free run uncached. L1 hits are served and are neither probes nor successes. Every admitted probe holds its slot until the cycle ends, whether it succeeds, fails or never reports back. Only a probe whose function raises gives it back: it records no outcome and the next call probes in its place, so while the function keeps raising, more than 3 calls in one cycle can reach the backend | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. A probe's outcome counts only toward the cycle that admitted it: a slow probe that reports after its cycle ended (another probe failed, or the cycle was restarted) cannot close or reopen a later cycle. If all 3 slots are held and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
 
 **Example scenario**:
 ```
@@ -252,6 +252,7 @@ class CircuitBreaker:
     failure_times: list[float]  # Recent failures (monotonic clock); len() is the failure count
     last_failure_time: float  # Failures recorded while OPEN do not move it
     half_open_since: float
+    cycle: int  # Numbers each HALF_OPEN cycle
 
     def call(self, func):
         if self.state == "CLOSED":
@@ -272,6 +273,7 @@ class CircuitBreaker:
             self.state = "HALF_OPEN"  # Try recovery
             self.probes = self.successes = 0
             self.half_open_since = time.time()
+            self.cycle += 1
 
         if self.state == "HALF_OPEN":
             if self.probes >= half_open_requests:  # probe budget, default 3
@@ -279,21 +281,32 @@ class CircuitBreaker:
                     return uncached(func)  # Budget spent: rejected, not a failure
                 self.probes = self.successes = 0  # Spent and undecided a cooldown after it began: fresh cycle
                 self.half_open_since = time.time()
+                self.cycle += 1
             self.probes += 1
+            cycle = self.cycle  # The cycle that admitted this probe
             try:
                 result = cached(func)
             except BackendFailure:
-                self.state = "OPEN"  # Recovery failed
-                self.last_failure_time = time.time()
+                if self.is_current(cycle):
+                    self.state = "OPEN"  # Recovery failed
+                    self.last_failure_time = time.time()
                 raise
             except Exception:
-                self.probes -= 1  # The function raised: no outcome, and the next call probes in its place
+                if self.is_current(cycle):
+                    self.probes -= 1  # The function raised: no outcome, and the next call probes in its place
                 raise
-            self.successes += 1
-            if self.successes >= success_threshold:  # default 3
-                self.state = "CLOSED"  # Recovered!
-                self.failure_times = []
+            if self.is_current(cycle):
+                self.successes += 1
+                if self.successes >= success_threshold:  # default 3
+                    self.state = "CLOSED"  # Recovered!
+                    self.failure_times = []
             return result
+
+    def is_current(self, cycle):
+        # A probe can still be in flight when its cycle ends: another probe failed, or the
+        # spent cycle started over. Its outcome then counts toward no later HALF_OPEN cycle.
+        # A late failure that finds the breaker CLOSED still counts there, as any CLOSED failure does.
+        return self.state == "HALF_OPEN" and self.cycle == cycle
 ```
 
 ### Integration with Caching

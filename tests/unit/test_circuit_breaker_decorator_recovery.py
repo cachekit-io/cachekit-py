@@ -40,7 +40,7 @@ import time_machine
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.cache_handler import CacheOperationHandler
+from cachekit.cache_handler import CacheOperationHandler, StandardCacheHandler
 from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators import wrapper as wrapper_module
@@ -82,6 +82,14 @@ class _LockingBackend(_CountingBackend):
     @asynccontextmanager
     async def acquire_lock(self, key: str, **_: Any) -> AsyncIterator[bool]:
         yield True
+
+
+class _BusyLockBackend(_CountingBackend):
+    """``acquire_lock`` never acquires: the async wrapper re-reads L2, then runs the function unlocked."""
+
+    @asynccontextmanager
+    async def acquire_lock(self, key: str, **_: Any) -> AsyncIterator[bool]:
+        yield False
 
 
 class _FlakyResolver:
@@ -748,6 +756,207 @@ class TestFunctionExceptionsDoNotCount:
         for i in range(_DEFAULTS.failure_threshold):
             assert await _call(fn, f"k-{i}") == f"v:k-{i}"  # degrades to uncached, never raises
         assert breaker.state == CircuitState.OPEN
+
+
+class _Hold:
+    """Holds the first ``slots`` calls until ``release()``; ``all_in`` is set once every slot waits."""
+
+    def __init__(self, slots: int) -> None:
+        self.slots, self.taken = slots, 0
+        self._lock, self.all_in, self._gate = threading.Lock(), threading.Event(), threading.Event()
+
+    def __call__(self) -> bool:
+        """Wait at the gate if a slot is left; return whether this call waited."""
+        with self._lock:
+            if self.taken == self.slots:
+                return False
+            self.taken += 1
+            if self.taken == self.slots:
+                self.all_in.set()
+        self._gate.wait(timeout=10)
+        return True
+
+    def release(self) -> None:
+        self._gate.set()
+
+
+def _failing_while(down: threading.Event, method: Callable[..., Any]) -> Callable[..., Any]:
+    """``method``, raising after it runs whenever ``down`` is set."""
+    if inspect.iscoroutinefunction(method):
+
+        async def async_failing(*args: Any, **kwargs: Any) -> Any:
+            result = await method(*args, **kwargs)
+            if down.is_set():
+                raise ConnectionError("backend unreachable")
+            return result
+
+        return async_failing
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        result = method(*args, **kwargs)
+        if down.is_set():
+            raise ConnectionError("backend unreachable")
+        return result
+
+    return failing
+
+
+class TestLateProbesOfAnEarlierCycle:
+    """A probe that reports after its HALF_OPEN cycle ended counts toward no later cycle.
+
+    Two slow probes of cycle 1 are still in flight when its third probe fails and
+    cycle 2 begins. Their outcomes arrive during cycle 2, which closes or reopens only
+    on its own probes. Counted, two late successes would close it on one fresh
+    success, and a late failure would reopen it and restart the cooldown.
+    """
+
+    _SLOW = 2
+
+    @staticmethod
+    async def _second_cycle(fn: Callable[[str], Any], breaker: CircuitBreaker, backend: _CountingBackend, clock) -> float:
+        """With cycle 1's slow probes in flight: fail its last probe, then run cycle 2's first.
+
+        Returns the breaker's last failure time, which no late outcome may move.
+        """
+        first = breaker.admit()
+        assert first is not None
+        breaker.record_failure(cycle=first)
+        assert breaker.state == CircuitState.OPEN
+
+        clock.shift(_PAST_TIMEOUT)
+        sets = backend.sets
+        assert await _call(fn, "fresh-0") == "v:fresh-0"
+        assert backend.sets == sets + 1  # it reached L2
+        assert (breaker.state, breaker.success_count) == (CircuitState.HALF_OPEN, 1)
+        return breaker.get_stats()["last_failure_time"]
+
+    @staticmethod
+    async def _closes_on_its_own_probes(fn: Callable[[str], Any], breaker: CircuitBreaker, last_failure: float) -> None:
+        assert breaker.state == CircuitState.HALF_OPEN
+        assert breaker.success_count == 1
+        assert breaker.get_stats()["last_failure_time"] == last_failure  # the cooldown did not restart
+        for i in range(1, breaker.config.success_threshold):
+            assert await _call(fn, f"fresh-{i}") == f"v:fresh-{i}"
+        assert breaker.state == CircuitState.CLOSED
+
+    @pytest.mark.parametrize("outcome", ["success", "failure"])
+    @pytest.mark.parametrize(
+        ("is_async", "backend_cls", "slow_at"),
+        [
+            (False, _CountingBackend, "function"),
+            (False, _CountingBackend, "l2-read"),
+            (True, _CountingBackend, "function"),
+            (True, _CountingBackend, "l2-read"),
+            (True, _LockingBackend, "function"),
+            (True, _LockingBackend, "l2-read"),
+            (True, _LockingBackend, "lock-double-check"),
+            (True, _BusyLockBackend, "lock-double-check"),
+        ],
+        ids=[
+            "sync-function",
+            "sync-l2-read",
+            "async-function",
+            "async-l2-read",
+            "async-lock-function",
+            "async-lock-l2-read",
+            "async-lock-double-check",
+            "async-lock-timeout-double-check",
+        ],
+    )
+    async def test_late_outcomes_do_not_decide_a_later_cycle(
+        self, is_async, backend_cls, slow_at, outcome, live_breakers, clock, monkeypatch
+    ):
+        backend = backend_cls()
+        hold, down = _Hold(self._SLOW), threading.Event()
+
+        def body(x: str) -> str:
+            if slow_at == "function" and x.startswith("slow"):
+                hold()
+            return f"v:{x}"
+
+        async def async_body(x: str) -> str:
+            if slow_at == "function" and x.startswith("slow"):
+                await asyncio.to_thread(hold)
+            return f"v:{x}"
+
+        namespace = f"lab5374-{slow_at}-{outcome}-{is_async}-{backend_cls.__name__}"
+        fn = cache(ttl=300, l1_enabled=False, namespace=namespace, backend=backend)(async_body if is_async else body)
+        (breaker,) = live_breakers
+        slow = [f"slow-{i}" for i in range(self._SLOW)]
+
+        if slow_at != "function":
+            for key in slow:  # stored now, so the slow probes are L2 hits
+                assert await _call(fn, key) == f"v:{key}"
+            real_get, missed = backend.get, set[str]()
+
+            def get(key: str) -> Optional[bytes]:
+                if slow_at == "lock-double-check" and key not in missed and hold.taken < hold.slots:
+                    missed.add(key)
+                    return None  # the first read misses, so the hit comes from the re-read after the lock
+                hold()
+                return real_get(key)
+
+            backend.get = get  # type: ignore[method-assign]
+        # A backend error is logged and swallowed below the wrapper, so it never reaches the
+        # breaker; a raise from the handler call itself does, and is what `down` injects.
+        for owner, name in (
+            (CacheOperationHandler, "get_cached_value"),
+            (CacheOperationHandler, "get_cached_value_async"),
+            (CacheOperationHandler, "store_result"),
+            (StandardCacheHandler, "set_async"),
+        ):
+            monkeypatch.setattr(owner, name, _failing_while(down, getattr(owner, name)))
+        _trip(breaker)
+
+        clock.shift(_PAST_TIMEOUT)
+        with ThreadPoolExecutor(max_workers=self._SLOW) as pool:
+            if is_async:
+                calls = [asyncio.ensure_future(fn(key)) for key in slow]
+            else:
+                calls = [asyncio.wrap_future(pool.submit(fn, key)) for key in slow]
+            assert await asyncio.to_thread(hold.all_in.wait, 10)  # both admitted by cycle 1, in flight
+
+            last_failure = await self._second_cycle(fn, breaker, backend, clock)
+
+            if outcome == "failure":
+                down.set()  # the slow probes' cache read or write now raises
+            hold.release()
+            assert await asyncio.gather(*calls) == [f"v:{key}" for key in slow]  # fail-open either way
+            down.clear()
+
+        await self._closes_on_its_own_probes(fn, breaker, last_failure)
+
+    async def test_late_client_creation_failure(self, is_async, backend, live_breakers, clock, monkeypatch):
+        """A probe still connecting when its cycle ends reports that failure late.
+
+        An async probe resolves its backend with no await after admission, so it blocks its
+        own event loop: here each one runs on a loop of its own thread, as in an app that
+        runs a loop per thread, and the breaker moves on without them.
+        """
+        hold = _Hold(self._SLOW)
+
+        def resolve() -> _CountingBackend:
+            if hold():
+                raise ConnectionError("connect timed out")
+            return backend
+
+        monkeypatch.setattr(wrapper_module, "_resolve_lazy_backend", resolve)
+        fn = _decorate(f"lab5374-client-creation-{is_async}", is_async=is_async)  # lazy: resolved on a call
+        (breaker,) = live_breakers
+        _trip(breaker)
+
+        clock.shift(_PAST_TIMEOUT)
+        with ThreadPoolExecutor(max_workers=self._SLOW) as pool:
+            run = asyncio.run if is_async else lambda result: result
+            calls = [asyncio.wrap_future(pool.submit(lambda key: run(fn(key)), f"slow-{i}")) for i in range(self._SLOW)]
+            assert await asyncio.to_thread(hold.all_in.wait, 10)
+
+            last_failure = await self._second_cycle(fn, breaker, backend, clock)
+
+            hold.release()
+            assert await asyncio.gather(*calls) == [f"v:slow-{i}" for i in range(self._SLOW)]  # uncached
+
+        await self._closes_on_its_own_probes(fn, breaker, last_failure)
 
 
 class TestInteropValueContractOnDegradedPaths:

@@ -763,3 +763,102 @@ class TestClosedFailureWindow:
             self._fail_at(breaker, clock, 3630)
         assert breaker.state == CircuitState.CLOSED
         assert breaker.failure_count == 1
+
+
+class TestOutcomesFromAnotherCycle:
+    """A HALF_OPEN cycle closes or reopens only on outcomes of the probes it admitted.
+
+    A slow probe of an earlier cycle can report after that cycle ended and a new one
+    began. Its outcome carries the cycle ``admit`` gave it, so the new cycle ignores it.
+    An outcome with no cycle counts toward the current state.
+    """
+
+    @staticmethod
+    def _breaker() -> CircuitBreaker:
+        config = CircuitBreakerConfig(failure_threshold=1, success_threshold=3, half_open_requests=3, timeout_seconds=30)
+        return CircuitBreaker(config, namespace="test")
+
+    @staticmethod
+    def _second_cycle(breaker, traveller) -> tuple[list, int]:
+        """Open at t=1000; cycle 1 admits 3 probes at t=1031 and one fails; cycle 2 admits one at t=1062."""
+        breaker.record_failure()
+        traveller.move_to(1031)
+        first = [breaker.admit() for _ in range(3)]
+        assert first[0] is not None and first == [first[0]] * 3
+        breaker.record_failure(cycle=first[0])
+        assert breaker.state == CircuitState.OPEN
+        traveller.move_to(1062)
+        fresh = breaker.admit()
+        assert fresh is not None and fresh != first[0]
+        assert breaker.state == CircuitState.HALF_OPEN
+        return first, fresh
+
+    def test_stale_successes_do_not_close_the_breaker(self):
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            first, fresh = self._second_cycle(breaker, traveller)
+
+            for cycle in (first[1], first[2], fresh):
+                breaker.record_success(cycle=cycle)
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.success_count == 1
+
+            for _ in range(2):  # the cycle's own probes still close it
+                breaker.record_success(cycle=breaker.admit())
+            assert breaker.state == CircuitState.CLOSED
+
+    def test_stale_failure_does_not_reopen_the_breaker(self):
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            first, _ = self._second_cycle(breaker, traveller)
+            last_failure, failures = breaker.get_stats()["last_failure_time"], breaker.failure_count
+
+            breaker.record_failure(cycle=first[1])
+
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.get_stats()["last_failure_time"] == last_failure == 1031  # the cooldown did not restart
+            assert breaker.failure_count == failures
+
+    def test_outcomes_from_an_expired_cycle_change_nothing(self):
+        """The expiry restart begins cycle 2 while cycle 1's probes may still be in flight."""
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            breaker.record_failure()
+            traveller.move_to(1031)
+            first = [breaker.admit() for _ in range(3)]  # cycle 1's budget, no outcome yet
+            traveller.move_to(1062)  # more than timeout_seconds after cycle 1 began
+            fresh = breaker.admit()
+            assert first[0] is not None and fresh is not None and fresh != first[0]
+            before = breaker.get_stats()
+
+            breaker.record_success(cycle=first[0])
+            breaker.record_success(cycle=first[1])
+
+            assert breaker.get_stats() == before
+            assert breaker.success_count == 0
+
+    def test_outcome_without_a_cycle_counts_toward_the_current_one(self):
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            self._second_cycle(breaker, traveller)
+
+            for _ in range(3):
+                breaker.record_success()
+            assert breaker.state == CircuitState.CLOSED
+
+    def test_late_failure_still_counts_while_closed(self):
+        """Only HALF_OPEN tells cycles apart: CLOSED counts every failure, whichever call reports it."""
+        config = CircuitBreakerConfig(failure_threshold=1, success_threshold=1, half_open_requests=1, timeout_seconds=30)
+        breaker = CircuitBreaker(config, namespace="test")
+        with time_machine.travel(1000, tick=False) as traveller:
+            slow = breaker.admit()  # admitted while CLOSED, before any cycle
+            breaker.record_failure()
+            traveller.move_to(1031)
+            probe = breaker.admit()
+            assert slow is not None and probe is not None and probe != slow
+            breaker.record_success(cycle=probe)
+            assert breaker.state == CircuitState.CLOSED
+
+            breaker.record_failure(cycle=slow)
+
+            assert breaker.state == CircuitState.OPEN

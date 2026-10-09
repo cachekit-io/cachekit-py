@@ -44,8 +44,9 @@ class CircuitState(Enum):
     State transitions:
     CLOSED -> OPEN: When failure_threshold failures fall within a 60 s rolling window
     OPEN -> HALF_OPEN: After timeout_seconds have elapsed
-    HALF_OPEN -> CLOSED: After success_threshold successful requests
-    HALF_OPEN -> OPEN: On any failure during testing
+    HALF_OPEN -> CLOSED: After success_threshold successful probes of the cycle
+    HALF_OPEN -> OPEN: On any failure of a probe of the cycle
+        (an outcome passed with another cycle's number changes nothing)
     HALF_OPEN -> HALF_OPEN: A fresh probe cycle, when the probe budget is spent
         and no outcome has ended the cycle within timeout_seconds
 
@@ -76,8 +77,9 @@ class CircuitBreakerConfig:
         failure_threshold: Number of failures within a 60 s rolling window that opens
             the circuit. Successes do not reset the count; failures older than the
             window stop counting. Lower values make the circuit more sensitive to errors.
-        success_threshold: Number of consecutive successes in HALF_OPEN before closing.
-            Higher values ensure more stable recovery.
+        success_threshold: Number of consecutive successes in HALF_OPEN before closing,
+            counting only probes the current cycle admitted when the outcome carries
+            its cycle. Higher values ensure more stable recovery.
         timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
@@ -377,18 +379,23 @@ class CircuitBreaker:
             return True
         return False
 
-    def _on_success(self):
-        """Handle successful operation."""
-        with self._lock:
-            if self._state == CircuitState.HALF_OPEN:
-                # Decrement permits as request completes
-                self._half_open_permits = max(0, self._half_open_permits - 1)
-                self._success_count += 1
-                if self._success_count >= self.config.success_threshold:
-                    self._transition_to_closed()
+    def _from_another_cycle(self, cycle: Optional[int]) -> bool:
+        """Whether a HALF_OPEN outcome comes from a call this cycle did not admit. Caller holds _lock."""
+        return cycle is not None and cycle != self._half_open_cycle
 
-    def _on_failure(self, error: Exception):
-        """Handle failed operation.
+    def _on_success(self, *, cycle: Optional[int] = None):
+        """Handle successful operation. ``cycle``: see ``record_success``."""
+        with self._lock:
+            if self._state != CircuitState.HALF_OPEN or self._from_another_cycle(cycle):
+                return
+            # Decrement permits as request completes
+            self._half_open_permits = max(0, self._half_open_permits - 1)
+            self._success_count += 1
+            if self._success_count >= self.config.success_threshold:
+                self._transition_to_closed()
+
+    def _on_failure(self, error: Exception, *, cycle: Optional[int] = None):
+        """Handle failed operation. ``cycle``: see ``record_failure``.
 
         Failures whose ``error_type`` is listed in ``config.excluded_error_types``
         (e.g. PERMANENT config errors) do not count toward tripping the breaker.
@@ -409,8 +416,11 @@ class CircuitBreaker:
             if self._state == CircuitState.OPEN:
                 return
 
-            # Decrement permits if in HALF_OPEN state
             if self._state == CircuitState.HALF_OPEN:
+                # A probe of an earlier cycle reporting late: that cycle already ended,
+                # and this one reopens only on its own probes.
+                if self._from_another_cycle(cycle):
+                    return
                 self._half_open_permits = max(0, self._half_open_permits - 1)
 
             now = monotonic()
@@ -486,7 +496,7 @@ class CircuitBreaker:
             self._transition_to_closed()
             logger.info(f"Circuit breaker {self.namespace} manually reset to CLOSED")
 
-    def record_failure(self, error: Optional[Exception] = None):
+    def record_failure(self, error: Optional[Exception] = None, *, cycle: Optional[int] = None):
         """Record a failed operation.
 
         Public helper for tests and direct users of CircuitBreaker; delegates to
@@ -497,17 +507,28 @@ class CircuitBreaker:
 
         Args:
             error: Optional exception to record. If not provided, uses a generic Exception.
+            cycle: What ``admit`` returned for the call. While HALF_OPEN, a failure
+                from a call the current cycle did not admit changes nothing: a probe
+                of an earlier cycle reporting late does not reopen this one. None
+                counts the failure toward the current state.
         """
-        self._on_failure(error or Exception("Test failure"))
+        self._on_failure(error or Exception("Test failure"), cycle=cycle)
 
-    def record_success(self):
+    def record_success(self, *, cycle: Optional[int] = None):
         """Record a successful operation.
 
         Public helper for tests and direct users of CircuitBreaker; delegates to
         the internal ``_on_success``. The SDK's own reliability path records
         outcomes through that same internal method (driven by FeatureOrchestrator).
+
+        Args:
+            cycle: What ``admit`` returned for the call. While HALF_OPEN, only a
+                success from a probe the current cycle admitted counts toward
+                ``success_threshold``: a probe of an earlier cycle reporting late
+                cannot close the breaker. None counts the success toward the
+                current state.
         """
-        self._on_success()
+        self._on_success(cycle=cycle)
 
     def release_probe(self, cycle: int):
         """Give back the probe slot of an admitted call that ends with no outcome.
@@ -533,8 +554,10 @@ class CircuitBreaker:
     def admit(self) -> Optional[int]:
         """Admit or reject a call, and say which HALF_OPEN cycle admitted it.
 
-        The same decision as ``should_attempt_call``, for a caller that may need
-        ``release_probe``.
+        The same decision as ``should_attempt_call``, for a caller that hands the
+        cycle back with the call's outcome (``record_success`` / ``record_failure``)
+        or its ``release_probe``, so a probe that reports after its cycle ended
+        cannot count toward the next one.
 
         Returns:
             None if the call must fail fast. Otherwise the number of the latest
@@ -554,8 +577,9 @@ class CircuitBreaker:
         ``half_open_requests`` probe slots. A spent cycle that no outcome has
         ended within ``timeout_seconds`` starts over with a fresh budget. Record
         the outcome of every admitted call with ``record_success`` /
-        ``record_failure``; never record a rejection. A call that may end with no
-        outcome is admitted with ``admit`` instead, so it can ``release_probe``.
+        ``record_failure``; never record a rejection. A call that may report after
+        its HALF_OPEN cycle ended, or end with no outcome, is admitted with
+        ``admit`` instead, so it can pass the cycle along or ``release_probe``.
 
         Returns:
             True if the call may proceed, False if it must fail fast.
