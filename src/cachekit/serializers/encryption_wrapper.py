@@ -311,8 +311,10 @@ class EncryptionWrapper:
         # Decrypt-only previous keys from settings if not provided (key rotation,
         # spec/encryption.md → "Key Rotation (Keyring)"). Settings enforce the cap
         # of 3, per-key hex/length validation, and the forward-only subset check
-        # at load; the Rust Keyring re-validates all three behind the FFI boundary
-        # for wrappers constructed with explicit parameters.
+        # at load, and CacheSerializationHandler repeats the subset check for an
+        # encrypting cache's master_key= when it is built; the Rust Keyring
+        # re-validates all three behind the FFI boundary for wrappers constructed
+        # with explicit parameters and for settings assigned after those checks.
         # Keyring config errors below raise KeyringConfigurationError, NEVER
         # EncryptionError: EncryptionError is a SerializationError, which the
         # read-path policy (handle_decrypt_failure) classifies as corruption →
