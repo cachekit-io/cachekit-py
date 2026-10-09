@@ -2193,12 +2193,11 @@ class StandardCacheHandler:
             return self._with_timeout(operation, *args, **kwargs)
 
     def _with_timeout(self, operation, *args, **kwargs):
-        """Execute operation with timeout delegation to backend.
+        """Run the operation.
 
-        Timeout handling is delegated to the backend implementation via
-        TimeoutConfigurableBackend protocol.
+        Operation timeouts are enforced at the backend connection layer
+        (e.g. redis-py socket_timeout), not here.
         """
-        # Execute operation directly - timeout handled by backend layer
         return operation(*args, **kwargs)
 
     async def _maybe_refresh_ttl(self, key: str, refresh_ttl: int) -> None:

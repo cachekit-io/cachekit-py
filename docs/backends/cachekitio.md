@@ -159,7 +159,7 @@ those 30 seconds, the key can get one more.
 
 ## Timeout Override
 
-Returns a new instance:
+Returns a new instance. This builder is not the `TimeoutConfigurableBackend` protocol's `with_timeout(operation, timeout_ms)` context manager, which this backend does not implement, though `isinstance` against that protocol returns True because it matches by name only:
 
 ```python notest
 backend = CachekitIOBackend()
