@@ -34,7 +34,12 @@ from cachekit.backends.provider import (
     LoggerProvider,
 )
 from cachekit.config import ConfigurationError, get_settings
-from cachekit.config.validation import hide_any_secret, refuse_bytes_key, reveal_secret
+from cachekit.config.validation import (
+    hide_any_secret,
+    refuse_bytes_key,
+    refuse_current_key_in_previous_keys,
+    reveal_secret,
+)
 from cachekit.di import DIContainer
 
 # Re-exported for backwards compatibility — redact_cache_key moved to the hash_utils
@@ -767,6 +772,19 @@ class CacheSerializationHandler:
                     )
                 )
             encryption = False
+
+        # The keyring's forward-only rule, refused here at decoration before any backend call, whichever route the
+        # current key took. Settings run the same check at load, but never see master_key= and take later assignments
+        # unvalidated; without this, the native keyring refuses only when the first read or write builds it. An
+        # encryption-disabled handler never encrypts, so it spends no nonce budget: its keyring is built only for a
+        # config-drift read, whose fault is a miss by design. Nor does it load settings here: a plaintext handler must
+        # not fail on a malformed keyring setting it never uses.
+        if encryption:
+            settings = get_settings()
+            try:
+                refuse_current_key_in_previous_keys(master_key or settings.master_key, settings.previous_master_keys)
+            except ValueError as e:
+                raise ConfigurationError(str(e)) from e
 
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor

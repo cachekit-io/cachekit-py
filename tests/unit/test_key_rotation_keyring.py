@@ -37,14 +37,17 @@ import inspect
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from cachekit import cache
 from cachekit.backends.redis.error_handler import classify_redis_error
+from cachekit.cache_handler import CacheSerializationHandler
+from cachekit.config import ConfigurationError, EncryptionConfig, get_settings
 from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
+from cachekit.config.singleton import reset_settings
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.l1_cache import get_l1_cache
 from cachekit.reliability.circuit_breaker import CircuitState
@@ -53,9 +56,6 @@ from cachekit.serializers.encryption_wrapper import (
     EncryptionWrapper,
     KeyringConfigurationError,
 )
-
-if TYPE_CHECKING:
-    from cachekit.cache_handler import CacheSerializationHandler
 
 K1 = b"\x11" * 32  # retiring master key
 K2 = b"\x22" * 32  # current master key after rotation
@@ -150,6 +150,108 @@ class TestPreviousMasterKeysConfig:
             assert exc_info.value.__cause__ is None
             for key in env:
                 monkeypatch.delenv(key)
+
+
+class _CallRecordingBackend:
+    """Backend that records every call, to prove a refusal came before any."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def get(self, key: str) -> bytes | None:
+        self.calls.append("get")
+        return None
+
+    def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+        self.calls.append("set")
+
+    def delete(self, key: str) -> bool:
+        self.calls.append("delete")
+        return False
+
+    def exists(self, key: str) -> bool:
+        self.calls.append("exists")
+        return False
+
+    def health_check(self) -> tuple[bool, dict[str, Any]]:
+        return True, {}
+
+
+KA = b"\xab" * 32  # a current key whose hex has letters, so its uppercase spelling differs
+REPEAT_REFUSAL = "^master_key must not appear in previous_master_keys: "
+
+
+@pytest.mark.usefixtures("_read_site_env")
+class TestRepeatRefusedAtDecoration:
+    """ENC-9: a master_key= that also appears in CACHEKIT_PREVIOUS_MASTER_KEYS is refused when the cache is
+    built, before any backend call, on every route that builds a CacheSerializationHandler. Settings never see a
+    master_key=, so the handler runs the settings' own check, as decoded bytes."""
+
+    @pytest.mark.parametrize("previous", [KA.hex(), KA.hex().upper()], ids=["same-case", "uppercase"])
+    @pytest.mark.parametrize(
+        "decorate",
+        [
+            pytest.param(lambda backend, key: cache.secure(backend=backend, master_key=key), id="secure"),
+            pytest.param(
+                lambda backend, key: cache.production(
+                    backend=backend, encryption=EncryptionConfig(enabled=True, single_tenant_mode=True, master_key=key)
+                ),
+                id="preset-encryption-config",
+            ),
+            pytest.param(
+                lambda backend, key: cache(backend=backend, master_key=key, encryption=True, single_tenant_mode=True),
+                id="flat",
+            ),
+            pytest.param(
+                lambda backend, key: (
+                    lambda fn: CacheSerializationHandler(master_key=key, encryption=True, single_tenant_mode=True)
+                ),
+                id="direct-handler",
+            ),
+        ],
+    )
+    def test_refused_at_decoration(self, monkeypatch, decorate, previous):
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", previous)
+        reset_settings()
+        backend = _CallRecordingBackend()
+
+        with pytest.raises(ConfigurationError, match=REPEAT_REFUSAL):
+            decorate(backend, KA.hex())(lambda: None)
+        assert backend.calls == []
+
+    def test_reads_previous_keys_as_they_stand_at_decoration(self, monkeypatch):
+        """Settings validate no assignment, so a check made only at load would miss this one."""
+        backend = _CallRecordingBackend()
+        cache.secure(backend=backend, master_key=KA.hex())(lambda: None)  # accepted: no previous keys yet
+
+        monkeypatch.setattr(get_settings(), "previous_master_keys", [SecretStr(KA.hex().upper())])
+        with pytest.raises(ConfigurationError, match=REPEAT_REFUSAL):
+            cache.secure(backend=backend, master_key=KA.hex())(lambda: None)
+        assert backend.calls == []
+
+    def test_reads_an_assigned_settings_master_key(self, monkeypatch):
+        """The same holds for the current key itself, when it comes from settings assigned after load."""
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", KA.hex())
+        reset_settings()
+        monkeypatch.setattr(get_settings(), "master_key", SecretStr(KA.hex()))
+
+        with pytest.raises(ConfigurationError, match=REPEAT_REFUSAL):
+            CacheSerializationHandler(encryption=True, single_tenant_mode=True)
+
+    def test_plaintext_handler_reads_no_settings(self, monkeypatch):
+        """A handler that neither encrypts nor defers fail-closed to settings never loads them, so a malformed
+        keyring setting cannot stop it being built."""
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", "not-hex")
+        reset_settings()
+
+        CacheSerializationHandler(encryption=False, encryption_fail_closed=False)
+
+    def test_encryption_disabled_handler_is_not_refused(self, monkeypatch):
+        """It never encrypts, so spends no nonce budget; its config-drift keyring fault stays a read-time miss."""
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", KA.hex())
+        reset_settings()
+
+        CacheSerializationHandler(encryption=False, master_key=KA.hex())
 
 
 class _KeyringSpy:
