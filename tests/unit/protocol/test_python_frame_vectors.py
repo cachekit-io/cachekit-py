@@ -39,6 +39,7 @@ spec/wire-format.md, "CK v3 frame". Through the real read paths, this module pro
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -54,7 +55,7 @@ from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryEr
 from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionError, TenantMismatchError
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
-from tests.unit.protocol.test_cache_key_vectors import _KeyRecordingBackend
+from tests.unit.protocol.conftest import KeyRecordingBackend
 
 pytestmark = pytest.mark.unit
 
@@ -68,6 +69,9 @@ ENCRYPTED_READER: dict[str, str] = _FIXTURE["encrypted_reader"]
 ENCRYPTED_READ_VECTORS: list[dict[str, Any]] = _FIXTURE["encrypted_read_vectors"]
 CACHE_KEY = ENCRYPTED_READER["cache_key"]
 FRAMES = {v["name"]: v for v in FRAME_VECTORS}
+TOP_LEVEL_KEYS = {
+    "description", "frame_layout", "generator", "frame_vectors", "error_vectors", "encrypted_reader", "encrypted_read_vectors",
+}  # fmt: skip
 RECOMPUTED = "RECOMPUTED"
 
 
@@ -90,8 +94,9 @@ WRITE_CONFIGS: dict[str, tuple[Callable[[], Any], bool]] = {
 }
 # The alias writes wrote a map holding a tuple; value_json is how the frame stores it. StandardSerializer
 # reads it back as value_json (an array), AutoSerializer restores the tuple its marker records.
-WRITTEN_VALUES = {"std_alias_write": {"pair": (1, "two")}, "pythonic_alias_write": {"pair": (1, "two")}}
-READ_VALUES = {"pythonic_alias_write": {"pair": (1, "two")}}
+TUPLE_MAP = {"pair": (1, "two")}
+WRITTEN_VALUES = {"std_alias_write": TUPLE_MAP, "pythonic_alias_write": TUPLE_MAP}
+READ_VALUES = {"pythonic_alias_write": TUPLE_MAP}
 # The table both Arrow frames hold (they carry no value_json; this is what their IPC files decode to).
 ARROW_COLUMNS = {"id": [1, 2], "score": [1.5, 2.5]}
 # (reader serializer, frame) pairs that MUST miss: the frame records a name that is not the reader's canonical one.
@@ -153,7 +158,7 @@ def _encrypted_reader(*, fail_closed: bool, tenant_id: str = ENCRYPTED_READER["t
 def _write(name: str, value: Any) -> bytes:
     """The frame a cache under the write vector's configuration stores for ``value``."""
     serializer, integrity_checking = WRITE_CONFIGS[name]
-    backend = _KeyRecordingBackend()
+    backend = KeyRecordingBackend()
 
     @cache(backend=backend, ttl=60, l1_enabled=False, serializer=serializer(), integrity_checking=integrity_checking)
     def compute() -> Any:
@@ -166,7 +171,7 @@ def _write(name: str, value: Any) -> bytes:
 
 def _planted_read(frame_hex: str, serializer: Any, integrity_checking: bool = True) -> Any:
     """What a cache returns when the frame sits at its key: the frame's value, or RECOMPUTED on a miss."""
-    backend = _KeyRecordingBackend()
+    backend = KeyRecordingBackend()
 
     @cache(backend=backend, ttl=60, l1_enabled=False, serializer=serializer, integrity_checking=integrity_checking)
     def compute() -> Any:
@@ -187,20 +192,14 @@ def _read_value(name: str) -> Any:
     return pytest.importorskip("pandas").DataFrame(ARROW_COLUMNS)
 
 
-def _assert_same_value(actual: Any, expected: Any) -> None:
-    if type(expected).__name__ == "DataFrame":
-        pytest.importorskip("pandas").testing.assert_frame_equal(actual, expected)
-    else:
-        assert (actual, type(actual)) == (expected, type(expected))
-
-
 def test_fixture_integrity() -> None:
-    """The vendored fixture is byte-identical to the pinned protocol revision."""
+    """The vendored fixture is byte-identical to the pinned protocol revision and holds only the tables driven here."""
     digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
     assert digest == FIXTURE_SHA256, (
         f"fixtures/python-frame.json sha256 {digest} != pinned {FIXTURE_SHA256}. "
-        "If the protocol vectors were intentionally updated, refresh the pin AND the names."
+        "If the protocol vectors were intentionally updated, refresh the pin and every version, count and name pinned."
     )
+    assert set(_FIXTURE) == TOP_LEVEL_KEYS
 
 
 def test_vector_names() -> None:
@@ -294,9 +293,13 @@ class TestWriteVectors:
         _assert_arrow_layout(bytes(payload), vector["arrow_detection"])
 
     def test_reader_under_the_write_configuration_reads_it_back(self, name: str) -> None:
-        expected = _read_value(name)
+        expected = _read_value(name)  # skips the Arrow writes where the [data] extra is absent
         serializer, integrity_checking = WRITE_CONFIGS[name]
-        _assert_same_value(_planted_read(FRAMES[name]["frame_hex"], serializer(), integrity_checking), expected)
+        actual = _planted_read(FRAMES[name]["frame_hex"], serializer(), integrity_checking)
+        if "arrow_detection" in FRAMES[name]:
+            importlib.import_module("pandas").testing.assert_frame_equal(actual, expected)
+        else:
+            assert (actual, type(actual)) == (expected, type(expected))
 
 
 class TestSerializerNameMisses:
@@ -311,11 +314,6 @@ class TestSerializerNameMisses:
     )
     def test_nameless_frame_is_a_miss(self, vector: dict[str, Any]) -> None:
         assert _planted_read(vector["frame_hex"], "default") == RECOMPUTED
-
-    def test_instance_reader_reads_the_instance_write(self) -> None:
-        """Control: the StandardSerializer() frame misses under "default" for its name, not its bytes."""
-        vector = FRAMES["standard_serializer_instance_write"]
-        assert _planted_read(vector["frame_hex"], StandardSerializer()) == vector["value_json"]
 
 
 class TestErrorVectors:
@@ -353,7 +351,7 @@ class TestEncryptedReadVectors:
     def test_other_tenants_reader_decrypts_other_tenant_frame(self, fail_closed: bool) -> None:
         """Control: ciphertext_other_tenant authenticates for its own tenant, so the refusal below is the tenant's."""
         (vector,) = [v for v in ENCRYPTED_READ_VECTORS if v["name"] == "ciphertext_other_tenant"]
-        (written,) = [v for v in FRAME_VECTORS if v["name"] == "default_saas_write_msgpack_bytestorage_bin"]
+        written = FRAMES["default_saas_write_msgpack_bytestorage_bin"]
         reader = _encrypted_reader(fail_closed=fail_closed, tenant_id=vector["expected_header"]["m"]["tenant_id"])
         assert reader.deserialize_data(bytes.fromhex(vector["frame_hex"]), cache_key=CACHE_KEY) == written["value_json"]
 

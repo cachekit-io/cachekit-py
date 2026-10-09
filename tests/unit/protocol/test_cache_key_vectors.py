@@ -36,6 +36,7 @@ import pytest
 from cachekit import cache
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.standard_serializer import StandardSerializer
+from tests.unit.protocol.conftest import KeyRecordingBackend
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "cache-keys.json"
 FIXTURE_SHA256 = "e75fb8f98d0e54fcb0d586cae72b8aa6129ed082f254539b450a47ba8e96167a"  # pragma: allowlist secret
@@ -47,6 +48,10 @@ VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 EXPECTED_VECTOR_COUNT = 21
 EXPECTED_ERROR_VECTOR_COUNT = 4
 EXPECTED_SERIALIZER_OBJECT_VECTOR_COUNT = 5
+TOP_LEVEL_KEYS = {
+    "version", "generator", "ci_verification", "note", "key_format", "hash_algorithm",
+    "vectors", "error_vectors", "serializer_object_vectors",
+}  # fmt: skip
 
 # serializer_object_vectors' serializer_class: the SDK's own class (defined_by sdk) as (module, the optional
 # package it needs), imported when a test runs so a lane without the [data]/[json] extras still collects; or
@@ -69,31 +74,6 @@ def _serializer_class(name: str) -> type:
     return getattr(importlib.import_module(module), name)
 
 
-class _KeyRecordingBackend:
-    """Byte store that records every key it is asked for, so a key shows up even when the write fails."""
-
-    def __init__(self) -> None:
-        self.store: dict[str, bytes] = {}
-        self.keys: list[str] = []
-
-    def get(self, key: str) -> bytes | None:
-        self.keys.append(key)
-        return self.store.get(key)
-
-    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
-        self.keys.append(key)
-        self.store[key] = value
-
-    def delete(self, key: str) -> bool:
-        return self.store.pop(key, None) is not None
-
-    def exists(self, key: str) -> bool:
-        return key in self.store
-
-    def health_check(self) -> tuple[bool, dict[str, Any]]:
-        return True, {}
-
-
 def _stub(vector: dict[str, Any]):
     def stub(*args: Any, **kwargs: Any) -> str:
         return "computed"
@@ -105,7 +85,7 @@ def _stub(vector: dict[str, Any]):
 
 def _keys_through_cache(vector: dict[str, Any], serializer: Any) -> set[str]:
     """Every key a cache configured with ``serializer`` hands its backend for the vector's call."""
-    backend = _KeyRecordingBackend()
+    backend = KeyRecordingBackend()
     cached = cache(
         backend=backend,
         ttl=60,
@@ -119,12 +99,13 @@ def _keys_through_cache(vector: dict[str, Any], serializer: Any) -> set[str]:
 
 
 def test_fixture_integrity():
-    """The vendored fixture is byte-identical to the pinned protocol revision."""
+    """The vendored fixture is byte-identical to the pinned protocol revision and holds only the tables driven here."""
     digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
     assert digest == FIXTURE_SHA256, (
         f"fixtures/cache-keys.json sha256 {digest} != pinned {FIXTURE_SHA256}. "
-        "If the protocol vectors were intentionally updated, refresh the pin AND the count."
+        "If the protocol vectors were intentionally updated, refresh the pin and every version, count and name pinned."
     )
+    assert set(VECTORS) == TOP_LEVEL_KEYS
 
 
 def test_vector_count():
@@ -137,15 +118,8 @@ def test_vector_count():
 @pytest.mark.parametrize("vector", VECTORS["vectors"], ids=lambda v: v["name"])
 def test_cache_key_vectors(vector: dict[str, Any]):
     """CacheKeyGenerator reproduces every pinned auto-mode key byte-for-byte."""
-
-    def stub() -> None:  # pragma: no cover - identity carrier, never called
-        pass
-
-    stub.__module__ = vector["function_module"]
-    stub.__qualname__ = vector["function_qualname"]
-
     key = CacheKeyGenerator().generate_key(
-        stub,
+        _stub(vector),
         tuple(vector["args"]),
         vector["kwargs"],
         namespace=vector["namespace"],
@@ -175,7 +149,7 @@ class TestErrorVectors:
             )
 
     def test_configured_cache_raises(self, vector: dict[str, Any]):
-        with pytest.raises((TypeError, ValueError), match="serializer"):
+        with pytest.raises((TypeError, ValueError), match=r"^(Unknown serializer: ''|serializer must be a string name)"):
             _keys_through_cache(vector, vector["serializer_type"])
 
 
@@ -184,5 +158,4 @@ def test_serializer_object_vectors(vector: dict[str, Any]):
     """A cache configured with a serializer instance keys the call as pinned (the identity is the class name)."""
     assert (vector["serializer_class"] in SDK_SERIALIZER_CLASSES) == (vector["defined_by"] == "sdk")
     serializer = _serializer_class(vector["serializer_class"])()
-    assert type(serializer).__name__ == vector["serializer_class"]
     assert _keys_through_cache(vector, serializer) == {vector["expected_key"]}
