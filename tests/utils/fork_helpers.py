@@ -20,15 +20,22 @@ def report(w: int, outcome: object) -> NoReturn:
 
 
 def child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
-    """What the child at pid reported on the pipe r; a hung child is killed."""
+    """What the child at pid reported on the pipe r, or why it reported nothing; a hung child is killed."""
     if pid <= 0:  # not an assert: python -O strips those, and os.kill(0, ...) signals pytest's whole process group
         raise ValueError("no child was forked")
-    data = os.read(r, 65536) if select.select([r], [], [], timeout)[0] else b""
-    if not data:
+    ready = select.select([r], [], [], timeout)[0]
+    data = os.read(r, 65536) if ready else b""
+    if not data:  # on EOF the child has exited (it holds the only write end), and a kill leaves its exit status as is
         os.kill(pid, signal.SIGKILL)
-    os.waitpid(pid, 0)
+    _, status = os.waitpid(pid, 0)
     os.close(r)
-    return ast.literal_eval(data.decode()) if data else "no outcome: the child hung or died"
+    if data:
+        return ast.literal_eval(data.decode())
+    if not ready:
+        return f"no outcome: timed out after {timeout:g} s"
+    if os.WIFSIGNALED(status):
+        return f"no outcome: killed by signal {os.WTERMSIG(status)} ({signal.Signals(os.WTERMSIG(status)).name})"
+    return f"no outcome: exited {os.WEXITSTATUS(status)}"
 
 
 def on_new_thread(fn: Callable[[], object], timeout: float = 5.0) -> object:
