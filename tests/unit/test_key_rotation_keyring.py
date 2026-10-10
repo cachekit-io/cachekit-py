@@ -411,6 +411,19 @@ class TestSettingsAssignment:
 
         assert config._l1_bytes == 7 * 1024 * 1024
 
+    def test_extra_attribute_on_an_extra_allow_subclass_lands(self):
+        """Pydantic stores an undeclared name in __pydantic_extra__, not __dict__, so the commit must carry it."""
+        from pydantic_settings import SettingsConfigDict
+
+        class _Open(CachekitConfig):
+            model_config = SettingsConfigDict(extra="allow")
+
+        config = _Open()
+        config.custom = 1
+
+        assert config.custom == 1
+        assert config.model_extra == {"custom": 1}
+
     def test_valid_assignment_lands_validated(self, settings):
         settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
         settings.master_key = K1.hex()  # type: ignore[assignment]
