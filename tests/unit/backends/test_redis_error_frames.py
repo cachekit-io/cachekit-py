@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextvars
 import errno
 import gc
 import logging
@@ -53,6 +52,7 @@ from cachekit.backends.redis.backend import RedisBackend
 from cachekit.backends.redis.client import reset_global_pool
 from cachekit.backends.redis.error_handler import RedisClientError, classify_redis_error
 from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider
+from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.hash_utils import redact_cache_key
 from tests.unit.config.test_redacting_settings import _CACHEKIT_SRC, _cachekit_locals_holding, _held_exception
 
@@ -765,10 +765,10 @@ def test_an_interrupt_through_the_decorator_propagates_as_itself_and_spares_the_
     fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"redis-interrupt-{uuid.uuid4().hex}")(double)
 
     with _interrupting_sends(interrupt):
-        # In a copy of the context: the interrupt cuts the call short, before the decorator restores its own context.
-        exc = _raised(lambda: contextvars.copy_context().run(fn, 1), interrupt)
+        exc = _raised(lambda: fn(1), interrupt)
 
     _assert_cleared(exc, interrupt, password, through=exc)
+    assert get_current_function_stats() is None  # the decorator restored the caller's context on the way out
     breaker = fn.get_health_status()["circuit_breaker"]
     assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
 

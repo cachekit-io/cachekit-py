@@ -25,7 +25,24 @@ import pytest
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.decorators.stats_context import get_current_function_stats
+from cachekit.decorators.stats_context import (
+    get_current_function_stats,
+    reset_current_function_stats,
+    set_current_function_stats,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_stats_context():
+    """Start each test with no stats context and restore the outer one after it.
+
+    A leak stays set in the pytest thread's context, so without this one leaking
+    test would also fail every later test here that checks for None, and the
+    failure would point at the wrong test.
+    """
+    token = set_current_function_stats(None)
+    yield
+    reset_current_function_stats(token)
 
 
 @pytest.mark.unit
@@ -38,7 +55,7 @@ class TestContextLeakOnBackendFailure:
         Simulates backend provider.get_backend() raising exception.
         Function should execute uncached and context should be clean.
         """
-        with patch("cachekit.cache_handler.get_backend_provider") as mock_provider:
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
             # Mock backend provider to fail
             mock_provider.return_value.get_backend.side_effect = RuntimeError("Backend init failed")
 
@@ -49,6 +66,7 @@ class TestContextLeakOnBackendFailure:
             # Call function (should fallback to uncached execution)
             result = test_func(5)
             assert result == 10
+            mock_provider.return_value.get_backend.assert_called_once()
 
             # Verify context is None (no leak)
             assert get_current_function_stats() is None
@@ -356,6 +374,32 @@ class TestEdgeCaseContextLeaks:
         # Verify context is None (no leak)
         assert get_current_function_stats() is None
 
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+    @pytest.mark.parametrize("site", ["l2_read", "backend_resolution"])
+    def test_context_reset_on_interrupt_from_backend_io(self, mock_backend, site, interrupt):
+        """An interrupt from the decorator's own backend I/O must reset context too.
+
+        KeyboardInterrupt and SystemExit are BaseExceptions, so the decorator's
+        `except Exception` degrade handlers never see them; only a finally does.
+        The call runs in this test's own context: a copied one would hide a leak.
+        """
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            if site == "l2_read":
+                mock_backend.get = Mock(side_effect=interrupt)
+                decorator = cache(backend=mock_backend)
+            else:
+                mock_provider.return_value.get_backend.side_effect = interrupt
+                decorator = cache()
+
+            @decorator
+            def test_func(x):
+                return x * 2
+
+            with pytest.raises(interrupt):
+                test_func(5)
+
+        assert get_current_function_stats() is None
+
     def test_context_reset_after_recursive_calls(self, mock_backend):
         """Recursive decorated functions should maintain context isolation.
 
@@ -460,6 +504,29 @@ class TestAsyncContextLeaks:
             await error_func()
 
         # Stats context should be reset
+        assert get_current_function_stats() is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+    async def test_async_context_reset_on_interrupt_from_backend_resolution(self, interrupt):
+        """An interrupt from backend resolution must reset context, as on the sync path.
+
+        Awaited directly, so the wrapper runs in this test's task and a leak would
+        show here; a separate task would run in a copied context. Raised from backend
+        resolution, not the L2 read: a miss reads L2 in its single-flight task, and
+        asyncio re-raises an interrupt from a task out of the event loop, not into
+        the awaiting caller.
+        """
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_provider.return_value.get_backend.side_effect = interrupt
+
+            @cache()
+            async def async_func(x):
+                return x * 2
+
+            with pytest.raises(interrupt):
+                await async_func(5)
+
         assert get_current_function_stats() is None
 
 
