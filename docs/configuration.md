@@ -94,6 +94,10 @@ CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>,<older-key-hex>
 # DecryptionAuthenticationError to the caller instead of silently recomputing.
 # Per-decorator fail_closed=True/False overrides this fleet-wide default.
 CACHEKIT_ENCRYPTION_FAIL_CLOSED=false
+# Single-tenant encryption tenant (default: unset = the protocol literal "default").
+# Must parse as a UUID, or `import cachekit` fails, as for any malformed CACHEKIT_ variable,
+# even in a process that never encrypts. The error names the variable, never the value.
+CACHEKIT_DEPLOYMENT_UUID=<uuid>
 
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0

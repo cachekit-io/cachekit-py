@@ -6,13 +6,15 @@ protocol literal ``"default"`` (spec/intent-presets.md § Master Key Input, rule
 """
 
 import os
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from cachekit.cache_handler import CacheSerializationHandler
-from cachekit.config import ConfigurationError, reset_settings
+from cachekit.config import ConfigurationError, get_settings, reset_settings
 from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import KeyringConfigurationError
 
@@ -99,10 +101,10 @@ class TestTenantIdResolution:
             assert handler._single_tenant_id == env_uuid
 
     def test_invalid_env_var_raises_error(self):
-        """Invalid UUID in environment variable should raise ConfigurationError."""
+        """An invalid CACHEKIT_DEPLOYMENT_UUID is refused when the settings load, before any cache is built."""
         with patch.dict(os.environ, {"CACHEKIT_DEPLOYMENT_UUID": "invalid-uuid"}):
             reset_settings()  # Clear cached settings to pick up new env var
-            with pytest.raises(ConfigurationError, match="Invalid CACHEKIT_DEPLOYMENT_UUID"):
+            with pytest.raises(ValidationError, match="deployment_uuid must be a valid UUID"):
                 CacheSerializationHandler(
                     encryption=True,
                     single_tenant_mode=True,
@@ -124,6 +126,94 @@ class TestTenantIdResolution:
 
         assert handler._single_tenant_id == CacheSerializationHandler.DEFAULT_TENANT_ID == "default"
         assert legacy_file.read_text() == "770fa622-041d-63f6-c938-668877662222"  # untouched, ignored
+
+
+_UUID = "550e8400-e29b-41d4-a716-446655440000"
+# Every form uuid.UUID() parses, as the handler did before the settings validated the value.
+_NON_CANONICAL_FORMS = {
+    "upper-case": _UUID.upper(),
+    "braces": "{" + _UUID + "}",
+    "urn": "urn:uuid:" + _UUID,
+    "no-hyphens": _UUID.replace("-", ""),
+}
+_ACCEPTED_FORMS = {"canonical": _UUID, **_NON_CANONICAL_FORMS}
+_REFUSED_FORMS = {
+    "not-a-uuid": "not-a-uuid",
+    "padded": f" {_UUID} ",
+    "one-digit-long": _UUID + "0",
+    "64-hex-key": "ab" * 32,
+}
+
+
+class TestDeploymentUuidSetting:
+    """The setting refuses what the handler refuses, and rewrites nothing: the value is a key-derivation input."""
+
+    @pytest.mark.parametrize("form", _ACCEPTED_FORMS.values(), ids=_ACCEPTED_FORMS.keys())
+    def test_accepted_form_loads_unchanged_and_derives_the_same_tenant(self, monkeypatch, form):
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", form)
+        reset_settings()
+
+        assert get_settings().deployment_uuid == form
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64)
+        assert handler._single_tenant_id == str(uuid.UUID(form)) == _UUID
+
+    @pytest.mark.parametrize("form", _ACCEPTED_FORMS.values(), ids=_ACCEPTED_FORMS.keys())
+    def test_accepted_form_assigns_unchanged(self, monkeypatch, form):
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+
+        get_settings().deployment_uuid = form
+
+        assert get_settings().deployment_uuid == form
+
+    @pytest.mark.parametrize("form", _NON_CANONICAL_FORMS.values(), ids=_NON_CANONICAL_FORMS.keys())
+    def test_interop_mode_still_refuses_a_non_canonical_form(self, monkeypatch, form):
+        """Other SDKs derive from the raw string, so interop mode takes only the canonical form."""
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", form)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError, match="canonical lowercase-hyphenated form"):
+            CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64, interop_mode=True)
+
+    def test_interop_mode_accepts_the_canonical_form(self, monkeypatch):
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _UUID)
+        reset_settings()
+
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64, interop_mode=True)
+
+        assert handler._single_tenant_id == _UUID
+
+    @pytest.mark.parametrize("unset", [None, ""], ids=["absent", "empty"])
+    def test_unset_means_the_default_tenant(self, monkeypatch, unset):
+        if unset is None:
+            monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        else:
+            monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", unset)
+        reset_settings()
+
+        assert get_settings().deployment_uuid == unset
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64)
+        assert handler._single_tenant_id == CacheSerializationHandler.DEFAULT_TENANT_ID
+
+    @pytest.mark.parametrize("form", _REFUSED_FORMS.values(), ids=_REFUSED_FORMS.keys())
+    def test_refused_form_fails_at_load(self, monkeypatch, form):
+        with pytest.raises(ValueError):
+            uuid.UUID(form)  # the handler refused it too
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", form)
+        reset_settings()
+
+        with pytest.raises(ValidationError, match="deployment_uuid must be a valid UUID"):
+            get_settings()
+
+    @pytest.mark.parametrize("form", _REFUSED_FORMS.values(), ids=_REFUSED_FORMS.keys())
+    def test_refused_assignment_writes_nothing(self, monkeypatch, form):
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _UUID)
+        reset_settings()
+
+        with pytest.raises(ValidationError, match="deployment_uuid must be a valid UUID"):
+            get_settings().deployment_uuid = form
+
+        assert get_settings().deployment_uuid == _UUID
 
 
 class TestTenantIDUsage:

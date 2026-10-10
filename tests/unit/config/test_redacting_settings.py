@@ -51,6 +51,7 @@ _SETTINGS_ASSIGNMENT_REFUSALS: dict[str, tuple[str, object]] = {
     "field-level": ("previous_master_keys", {_DISTINCT_KEY_HEX: 1}),
     "model-level": ("previous_master_keys", [_DISTINCT_KEY_HEX, "01" * 32, "02" * 32, "03" * 32]),
     "mistyped-field": ("previous_master_key", _DISTINCT_KEY_HEX),
+    "deployment-uuid": ("deployment_uuid", _DISTINCT_KEY_HEX),
 }
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
@@ -643,6 +644,49 @@ def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_c
     return found
 
 
+def _assert_no_fragment_of_key(rendered: str) -> None:
+    """No 16-character window of ``_DISTINCT_KEY_HEX`` appears in ``rendered``: a truncated key is still a leak."""
+    fragments = {_DISTINCT_KEY_HEX[i : i + 16] for i in range(len(_DISTINCT_KEY_HEX) - 15)}
+    assert [fragment for fragment in fragments if fragment in rendered] == []
+
+
+@pytest.mark.unit
+class TestDeploymentUuidRedaction:
+    """A key pasted where the deployment UUID goes is refused without quoting it (CWE-532). The assignment route
+    is a row of ``_SETTINGS_ASSIGNMENT_REFUSALS``."""
+
+    @pytest.mark.parametrize(
+        "build",
+        [CachekitConfig, CachekitConfig.from_env, singleton.get_settings],
+        ids=["constructor", "from_env", "get_settings"],
+    )
+    def test_env_refusal_at_load_redacts_the_key(self, monkeypatch: pytest.MonkeyPatch, build: Callable[[], object]) -> None:
+        monkeypatch.setattr(singleton, "_settings_instance", None)
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _DISTINCT_KEY_HEX)
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        _assert_no_route_to(exc_info.value, _DISTINCT_KEY_HEX)
+        _assert_no_fragment_of_key(str(exc_info.value) + repr(exc_info.value.errors()) + exc_info.value.json())
+        [err] = exc_info.value.errors()
+        assert (err["loc"], err["msg"]) == (("deployment_uuid",), "Value error, deployment_uuid must be a valid UUID")
+        assert _cachekit_locals_holding(exc_info.value, _DISTINCT_KEY_HEX, below_caller=True) == []
+
+    def test_parameter_refusal_names_only_its_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The parameter never reaches the settings validator: the handler refuses it, and nothing chained to that
+        refusal quotes it either. Python's own UUID parse error does."""
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        singleton.reset_settings()
+        with pytest.raises(ConfigurationError) as exc_info:
+            CacheSerializationHandler(
+                encryption=True, single_tenant_mode=True, master_key=_KEY_HEX, deployment_uuid=_DISTINCT_KEY_HEX
+            )
+
+        assert str(exc_info.value) == "Invalid deployment_uuid parameter (must be valid UUID)"
+        assert (exc_info.value.__cause__, exc_info.value.__context__) == (None, None)
+        _assert_no_fragment_of_key(str(exc_info.value))
+
+
 @pytest.mark.unit
 class TestSettingsAssignmentRedaction:
     """A refused assignment to the loaded settings carries no route to the key it was given, whole or truncated."""
@@ -655,9 +699,7 @@ class TestSettingsAssignmentRedaction:
             setattr(singleton.get_settings(), field, value)
 
         _assert_no_route_to(exc_info.value, _DISTINCT_KEY_HEX)
-        rendered = str(exc_info.value) + repr(exc_info.value.errors()) + exc_info.value.json()
-        fragments = {_DISTINCT_KEY_HEX[i : i + 16] for i in range(len(_DISTINCT_KEY_HEX) - 15)}
-        assert [fragment for fragment in fragments if fragment in rendered] == []
+        _assert_no_fragment_of_key(str(exc_info.value) + repr(exc_info.value.errors()) + exc_info.value.json())
 
     @pytest.mark.parametrize(
         ("field", "value"), _SETTINGS_ASSIGNMENT_REFUSALS.values(), ids=_SETTINGS_ASSIGNMENT_REFUSALS.keys()

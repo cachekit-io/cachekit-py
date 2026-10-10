@@ -657,6 +657,21 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379
 
 ---
 
+### Invalid deployment UUID
+
+**Exception**: `pydantic.ValidationError` (a `ValueError`) for `CACHEKIT_DEPLOYMENT_UUID`, raised when cachekit loads its settings, which `import cachekit` does, so it fails in any process, even one that never encrypts, as any other malformed `CACHEKIT_` variable does. Assigning a bad value to `get_settings().deployment_uuid` raises the same and leaves the setting unchanged. The `deployment_uuid=` parameter raises `ConfigurationError` when an encrypting single-tenant cache is built. Earlier releases accepted any `CACHEKIT_DEPLOYMENT_UUID` at load and refused it only when an encrypting cache was built.
+
+**Cause**: the value does not parse as a UUID. Every form Python's `uuid.UUID()` parses loads as given: upper case, braces, `urn:uuid:`, no hyphens. Interop mode also requires the canonical lowercase-hyphenated form ([interop mode](features/interop-mode.md)).
+
+The message names the source (`deployment_uuid must be a valid UUID`, `Invalid deployment_uuid parameter (must be valid UUID)`) and never the value, so a key pasted into the wrong variable is not written to logs. Earlier releases quoted it.
+
+**Solution**: set a UUID, or unset the variable to use the protocol default tenant, `"default"`.
+```bash
+export CACHEKIT_DEPLOYMENT_UUID=$(python -c 'import uuid; print(uuid.uuid4())')
+```
+
+---
+
 ### Unsupported keyword argument
 
 **Message**: `The <preset> preset does not accept ...`, `@cache does not accept ...` or `@cache(config=...) does not accept ...`, naming each keyword
