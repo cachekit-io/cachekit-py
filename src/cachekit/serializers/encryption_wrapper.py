@@ -313,12 +313,9 @@ class EncryptionWrapper:
         # of 3, per-key hex/length validation, and the forward-only subset check
         # at load and on every assignment, and CacheSerializationHandler repeats the
         # subset check for an encrypting cache's master_key= when it is built; the
-        # Rust Keyring re-validates all three behind the FFI boundary for wrappers
-        # constructed with explicit parameters, and as defence in depth for keys
-        # read from settings. This wrapper keeps the keyring it builds: a later
-        # change to the settings reaches only wrappers built after it, and
-        # CacheSerializationHandler builds one per tenant, on first use and after
-        # LRU eviction.
+        # Rust Keyring re-validates all three behind the FFI boundary. This wrapper
+        # keeps the keyring it builds: a later change to the settings reaches only
+        # wrappers built after it.
         # Keyring config errors below raise KeyringConfigurationError, NEVER
         # EncryptionError: EncryptionError is a SerializationError, which the
         # read-path policy (handle_decrypt_failure) classifies as corruption →

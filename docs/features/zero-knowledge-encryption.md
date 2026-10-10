@@ -682,15 +682,11 @@ raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 passed directly that is not exactly 32 bytes, more than three previous keys, or the current
 key repeated among them. Settings check all three at load and refuse an assignment that breaks
 them, leaving the settings as they were (`previous_master_keys` is a tuple, so a change has to
-be an assignment), and an encrypting cache checks its current key against
-the previous keys when it is built, so behind the decorators this surfaces only on a config-drift
-read (below). Each encryption wrapper keeps the keyring it built. A cache builds one wrapper per
-tenant, on that tenant's first use and again after the wrapper is evicted from the cache's LRU, and
-each build reads the settings as they stand then. So a key change reaches every wrapper built after
-it, and one multi-tenant cache can run the old keyring for some tenants and the new one for others.
-Restart the process to apply a key change everywhere at once.
-Outside config-drift reads, the fault never
-evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users
+be an assignment), and an encrypting cache checks its current key against the previous keys when
+it is built. Behind the decorators this surfaces on a config-drift read (below), or when a
+previous key assigned to the settings repeats the `master_key=` of a cache already built: the
+settings never see that key, so its next wrapper build refuses it. Outside config-drift reads, the
+fault never evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users
 and callers of the `CacheOperationHandler` read and write methods receive it in both fail modes. Behind
 the `@cache` decorators, a read of an existing encrypted entry raises it too, from L1 or L2 and
 from the re-read after a distributed-lock wait, so the function does not run and no
@@ -701,6 +697,12 @@ circuit-breaker failure is counted. Two cases take other paths: a missing *curre
 or one of the wrong length, raises `EncryptionError`, and an encryption-disabled handler reading an entry that
 claims encryption treats the fault as corruption (miss + evict), because only the
 unauthenticated header sent it down the decrypt path.
+
+A wrapper keeps the keyring it built. A cache builds one per tenant, on that tenant's first use and
+after LRU eviction, so a key change in the settings reaches only wrappers built after it: their
+previous keys, and their current key too unless the cache was given `master_key=`. One multi-tenant
+cache can therefore run the old keyring for some tenants and the new one for others. To apply a key
+change everywhere at once, change the environment and restart the process.
 
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key

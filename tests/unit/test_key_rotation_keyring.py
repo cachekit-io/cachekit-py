@@ -248,7 +248,7 @@ class TestSettingsAssignment:
         assert settings.previous_master_keys == (SecretStr(K3.hex()),)
 
     def test_validator_that_sets_a_private_attribute_does_not_deadlock(self, monkeypatch):
-        """A subclass's validator may set a private attribute while the guard holds its lock. A throwaway lock keeps a
+        """A subclass's validator may set a private attribute while the guard holds its lock. A fresh lock of the guard's kind keeps a
         regression from blocking every later assignment in this process."""
         import threading
 
@@ -256,7 +256,7 @@ class TestSettingsAssignment:
 
         import cachekit.config.settings as settings_module
 
-        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", threading.Lock())
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", type(settings_module._ASSIGNMENT_LOCK)())  # same kind, fresh
 
         class _Marking(CachekitConfig):
             _validated: bool = PrivateAttr(default=False)
@@ -273,6 +273,33 @@ class TestSettingsAssignment:
 
         assert not assigning.is_alive()
         assert config.l1_max_size_mb == 7
+
+    def test_property_setter_that_assigns_a_field_does_not_deadlock(self, monkeypatch):
+        """A subclass property setter that assigns a field runs on the copy while the guard holds its lock, then
+        assigns again through the guard. A fresh lock of the guard's kind keeps a regression from blocking later
+        assignments."""
+        import threading
+
+        import cachekit.config.settings as settings_module
+
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", type(settings_module._ASSIGNMENT_LOCK)())  # same kind, fresh
+
+        class _Sized(CachekitConfig):
+            @property
+            def size(self) -> int:
+                return self.l1_max_size_mb
+
+            @size.setter
+            def size(self, value: int) -> None:
+                self.l1_max_size_mb = value
+
+        config = _Sized()
+        assigning = threading.Thread(target=setattr, args=(config, "size", 5), daemon=True)
+        assigning.start()
+        assigning.join(timeout=5)
+
+        assert not assigning.is_alive()
+        assert config.l1_max_size_mb == 5
 
     def test_valid_assignment_lands_validated(self, settings):
         settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]

@@ -39,8 +39,9 @@ MAX_PREVIOUS_MASTER_KEYS = 3
 
 # Serializes CachekitConfig assignments: each validates the whole state it would leave, so two
 # assignments that are each valid alone (a new master_key, and that key added to previous_master_keys)
-# cannot land together unchecked.
-_ASSIGNMENT_LOCK = threading.Lock()
+# cannot land together unchecked. Reentrant: a subclass's validator or property setter may assign a field
+# while the lock is held.
+_ASSIGNMENT_LOCK = threading.RLock()
 
 
 class CachekitConfig(RedactingSettings):
@@ -303,10 +304,10 @@ class CachekitConfig(RedactingSettings):
         try:
             with _ASSIGNMENT_LOCK:
                 candidate = self.model_copy()
-                # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy only.
+                # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy.
                 _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
                 # The value the copy validated, never `value` again: a generator is spent by now, and an iterable
-                # may yield something else on a second pass.
+                # may yield something else on a second pass. Pydantic validates it once more as it writes.
                 super().__setattr__(name, getattr(candidate, name))
         finally:
             del value, candidate  # the copy holds the refused value
