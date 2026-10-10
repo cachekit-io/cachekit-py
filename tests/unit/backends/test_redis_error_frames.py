@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import errno
 import gc
 import logging
 import pathlib
@@ -84,7 +83,7 @@ class _FakeRedis:
         self.holding = threading.Event()
         self._sock = socket.create_server(("127.0.0.1", 0))
         self.port = self._sock.getsockname()[1]
-        self._conns: list[socket.socket] = []
+        self._handlers: list[threading.Thread] = []
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self) -> None:
@@ -93,8 +92,9 @@ class _FakeRedis:
                 conn, _ = self._sock.accept()
             except OSError:
                 return
-            self._conns.append(conn)
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            handler = threading.Thread(target=self._handle, args=(conn,), daemon=True)
+            handler.start()
+            self._handlers.append(handler)
 
     def _handle(self, conn: socket.socket) -> None:
         with conn, conn.makefile("rb") as reader:
@@ -118,17 +118,22 @@ class _FakeRedis:
             self.holding.set()
             self._hold.wait(5)
 
-    def refuse_from_now(self) -> None:
-        """Refuse every later AUTH, and drop the open connections so the client has to authenticate again."""
+    def refuse_from_now(self, backend: object) -> None:
+        """Refuse every later AUTH, so ``backend``'s next command opens a new connection and its AUTH is refused.
+
+        A provider backend's init ping leaves an authenticated connection in its redis-py pool. The pool drops it here,
+        before the command runs, and this returns once the server has seen every connection it accepted close. A close
+        from the server's side would not do: the pool reconnects only a connection it already sees closed, and the
+        client sees the server's close only once the kernel delivers it, so a command sent before then fails on the old
+        connection without reaching AUTH.
+        """
         self.refusing = True
-        for conn in self._conns:
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError as exc:
-                # Closed on our side, or by the client. Anything else may leave a connection authenticated, and a
-                # ``wrongpass`` case would quietly run as a ``dropped`` one.
-                if exc.errno not in (errno.EBADF, errno.ENOTCONN):
-                    raise
+        if (client := getattr(backend, "_client", None)) is not None:
+            client.connection_pool.disconnect()
+        for handler in self._handlers:
+            handler.join(5)
+            # Still open, it is still authenticated, and a ``wrongpass`` case would quietly run as a ``dropped`` one.
+            assert not handler.is_alive(), "a connection authenticated before the refusal is still open"
 
     def close(self) -> None:
         self._sock.close()
@@ -336,7 +341,7 @@ def test_provider_backend_failure_reaches_no_frame_holding_the_password(
     server = fake_redis(refusing=False)
     backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
     if failure == "wrongpass":
-        server.refuse_from_now()
+        server.refuse_from_now(backend)
 
     err = _raised(lambda: _SHARED_CALLS[call](backend))  # type: ignore[arg-type]
     assert isinstance(err, BackendError)
@@ -406,7 +411,7 @@ def test_a_cancel_during_a_failing_lock_attempt_reaches_no_frame_holding_the_pas
     server = fake_redis(refusing=False, hold=hold)
     backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
     if failure == "wrongpass":
-        server.refuse_from_now()
+        server.refuse_from_now(backend)
 
     exc = asyncio.run(_cancelled_mid_attempt(backend, server, hold))  # type: ignore[arg-type]
 
@@ -520,7 +525,7 @@ def test_a_failed_write_is_freed_without_the_cyclic_gc(
     server = fake_redis(refusing=False, serving=_WRITE_FAILURES[failure])
     backend = _WRITERS[built](_url(server, password).get_secret_value())
     if failure == "wrongpass":
-        server.refuse_from_now()
+        server.refuse_from_now(backend)
     gc.collect()
     gc.disable()
     try:
@@ -673,7 +678,7 @@ def test_an_interrupt_while_classifying_a_failure_clears_the_failures_frames_too
     build, run = _OPERATIONS[operation]
     server = fake_redis(refusing=False)
     built = build(_url(server, password))
-    server.refuse_from_now()  # the next AUTH fails
+    server.refuse_from_now(built)  # the next command opens a new connection, whose AUTH fails
     monkeypatch.setattr(backend_module, "_command_error", classify)
     monkeypatch.setattr(provider_module, "classify_redis_error", classify)
 
