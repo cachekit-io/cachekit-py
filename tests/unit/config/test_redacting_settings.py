@@ -670,6 +670,23 @@ class TestSettingsAssignmentRedaction:
 
         assert _cachekit_locals_holding(exc_info.value, _DISTINCT_KEY_HEX, below_caller=True) == []
 
+    def test_refused_assignment_through_a_property_leaves_no_frame_local(self) -> None:
+        """A subclass property setter that assigns a key runs outside the copy, so it needs the same boundary."""
+
+        class _Rotating(CachekitConfig):
+            def _rotate(self, key: str) -> None:
+                self.master_key = key  # type: ignore[assignment]
+
+            rotate = property(fset=_rotate)
+
+        config = _Rotating(previous_master_keys=(_DISTINCT_KEY_HEX,))  # type: ignore[arg-type]
+        with pytest.raises(ValidationError) as exc_info:
+            config.rotate = _DISTINCT_KEY_HEX
+
+        assert config.master_key is None
+        _assert_no_route_to(exc_info.value, _DISTINCT_KEY_HEX)
+        assert _cachekit_locals_holding(exc_info.value, _DISTINCT_KEY_HEX, below_caller=True) == []
+
 
 @pytest.mark.unit
 class TestRedactingSettingsFrameLocals:

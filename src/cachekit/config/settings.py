@@ -304,9 +304,10 @@ class CachekitConfig(RedactingSettings):
         try:
             with _ASSIGNMENT_LOCK:
                 # A subclass property: run its setter once, on this instance. Each field it assigns comes back
-                # through this guard; replaying it on a copy would apply a non-idempotent setter twice.
+                # through this guard; replaying it on a copy would apply a non-idempotent setter twice. Redacted like
+                # the copy path, so a refused key leaves no pydantic frame holding it.
                 if isinstance(getattr(type(self), name, None), property):
-                    super().__setattr__(name, value)
+                    _redacting(functools.partial(BaseSettings.__setattr__, self, name, value), type(self).__name__)
                     return
                 candidate = self.model_copy()
                 # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy.
