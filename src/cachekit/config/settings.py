@@ -303,12 +303,18 @@ class CachekitConfig(RedactingSettings):
         candidate = None
         try:
             with _ASSIGNMENT_LOCK:
+                # A subclass property: run its setter once, on this instance. Each field it assigns comes back
+                # through this guard; replaying it on a copy would apply a non-idempotent setter twice.
+                if isinstance(getattr(type(self), name, None), property):
+                    super().__setattr__(name, value)
+                    return
                 candidate = self.model_copy()
                 # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy.
                 _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
-                # The value the copy validated, never `value` again: a generator is spent by now, and an iterable
-                # may yield something else on a second pass. Pydantic validates it once more as it writes.
-                super().__setattr__(name, getattr(candidate, name))
+                # Commit the state the copy validated, with no second validation: `value` may be a spent generator,
+                # and a non-idempotent validator would change it again. One swap of __dict__, as pydantic commits.
+                object.__setattr__(self, "__pydantic_fields_set__", candidate.__pydantic_fields_set__)
+                object.__setattr__(self, "__dict__", candidate.__dict__)
         finally:
             del value, candidate  # the copy holds the refused value
 

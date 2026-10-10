@@ -301,6 +301,42 @@ class TestSettingsAssignment:
         assert not assigning.is_alive()
         assert config.l1_max_size_mb == 5
 
+    def test_property_setter_runs_once_on_the_live_settings(self):
+        """A setter that is not idempotent must apply once, a write-only property must still be assignable, and what the
+        setter writes to a private attribute must land on the live settings, not on a discarded copy."""
+        from pydantic import PrivateAttr
+
+        class _Growing(CachekitConfig):
+            _grown_by: int = PrivateAttr(default=0)
+
+            def _grow(self, by: int) -> None:
+                self._grown_by += by
+                self.l1_max_size_mb += by
+
+            grow = property(fset=_grow)
+
+        config = _Growing(l1_max_size_mb=10)
+        config.grow = 5
+
+        assert config.l1_max_size_mb == 15
+        assert config._grown_by == 5
+
+    def test_assigned_value_is_validated_once(self):
+        """The live settings take the state the copy validated, so a validator that is not idempotent runs once."""
+        from pydantic import field_validator
+
+        class _Bumping(CachekitConfig):
+            @field_validator("l1_max_size_mb")
+            @classmethod
+            def _bump(cls, value: int) -> int:
+                return value + 1
+
+        config = _Bumping()
+        config.l1_max_size_mb = 5
+
+        assert config.l1_max_size_mb == 6
+        assert "l1_max_size_mb" in config.model_fields_set
+
     def test_valid_assignment_lands_validated(self, settings):
         settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
         settings.master_key = K1.hex()  # type: ignore[assignment]
