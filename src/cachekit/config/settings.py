@@ -313,7 +313,9 @@ class CachekitConfig(RedactingSettings):
                 # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy.
                 _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
                 # Commit the state the copy validated, with no second validation: `value` may be a spent generator,
-                # and a non-idempotent validator would change it again. One swap of __dict__, as pydantic commits.
+                # and a non-idempotent validator would change it again. One swap of __dict__, as pydantic commits, plus
+                # the private state a subclass's model validator may have derived on the copy.
+                object.__setattr__(self, "__pydantic_private__", candidate.__pydantic_private__)
                 object.__setattr__(self, "__pydantic_fields_set__", candidate.__pydantic_fields_set__)
                 object.__setattr__(self, "__dict__", candidate.__dict__)
         finally:

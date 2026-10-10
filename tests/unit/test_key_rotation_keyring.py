@@ -337,6 +337,23 @@ class TestSettingsAssignment:
         assert config.l1_max_size_mb == 6
         assert "l1_max_size_mb" in config.model_fields_set
 
+    def test_private_state_a_model_validator_derives_lands(self):
+        """Model validators run on the copy, so what one writes to a private attribute must be committed with it."""
+        from pydantic import PrivateAttr, model_validator
+
+        class _Derived(CachekitConfig):
+            _l1_bytes: int = PrivateAttr(default=0)
+
+            @model_validator(mode="after")
+            def _derive(self) -> _Derived:
+                self._l1_bytes = self.l1_max_size_mb * 1024 * 1024
+                return self
+
+        config = _Derived()
+        config.l1_max_size_mb = 7
+
+        assert config._l1_bytes == 7 * 1024 * 1024
+
     def test_valid_assignment_lands_validated(self, settings):
         settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
         settings.master_key = K1.hex()  # type: ignore[assignment]
