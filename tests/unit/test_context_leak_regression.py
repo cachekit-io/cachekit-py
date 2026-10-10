@@ -25,7 +25,24 @@ import pytest
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.decorators.stats_context import get_current_function_stats
+from cachekit.decorators.stats_context import (
+    get_current_function_stats,
+    reset_current_function_stats,
+    set_current_function_stats,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_stats_context():
+    """Start each test with no stats context and restore the outer one after it.
+
+    A leak stays set in the pytest thread's context, so without this one leaking
+    test would also fail every later test here that checks for None, and the
+    failure would point at the wrong test.
+    """
+    token = set_current_function_stats(None)
+    yield
+    reset_current_function_stats(token)
 
 
 @pytest.mark.unit

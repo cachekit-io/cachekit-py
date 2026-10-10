@@ -1848,9 +1848,11 @@ def create_cache_wrapper(
                         # operator fixes L2). L2 remains the retained evidence.
                         _l1_cache.invalidate(cache_key)
                         if not _foreign_l1_entry(e):
-                            # Explicit local re-raise, as in async_wrapper's L1 guard: a fail-closed
-                            # tamper raise must reach the caller even if a later edit wraps this
-                            # read path in a broad `except Exception`.
+                            # Explicit local re-raise, as in async_wrapper's L1 guard: it keeps a
+                            # fail-closed tamper raise ahead of any `except Exception` later added
+                            # to this inner try. It cannot stop a broad handler wrapped around this
+                            # read path from outside; test_fail_closed_invalidates_poisoned_l1_before_raising
+                            # pins that the raise reaches the caller.
                             try:
                                 # Single policy point (cachekit-py#170): metric + fail policy.
                                 handle_decrypt_failure(
@@ -2205,9 +2207,10 @@ def create_cache_wrapper(
                         # Explicit local re-raise mirrors the sync L1/L2 fail-closed
                         # guards and the async lock-path guard: a fail-closed tamper raise
                         # must reach the caller, never be demoted to a fail-open recompute
-                        # if a future edit wraps this read path in a broad `except
-                        # Exception` (defense-in-depth, LAB-108). No manual stats reset —
-                        # the async wrapper's outer `finally` covers every exit path.
+                        # (defense-in-depth, LAB-108). The clause keeps it ahead of any
+                        # `except Exception` later added to this inner try; it cannot stop a
+                        # broad handler wrapped around this read path from outside, which
+                        # test_async_fail_closed_invalidates_poisoned_l1_before_raising catches.
                         if not _foreign_l1_entry(e):
                             try:
                                 handle_decrypt_failure(
