@@ -386,17 +386,15 @@ def test_interrupt_while_classifying_a_transport_failure_clears_its_frames(monke
 
 
 def test_interrupt_while_dropping_a_transport_failures_tracebacks_holds_no_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An interrupt that lands in ``_send``'s walk over a transport failure's chain, the error already built."""
+    """An interrupt that lands in ``_send``'s walk over a transport failure's chain, the error already built.
+
+    Only the transport handler's walk is patched: the interrupt branch uses the shared module's own walk.
+    """
     walk = backend_module._raised_during_request
-    walks: list[BaseException] = []
 
     def interrupted(exc: BaseException, handled_before: BaseException | None) -> Iterator[BaseException]:
-        walks.append(exc)
-        chain = walk(exc, handled_before)
-        yield next(chain)
-        if len(walks) == 1:  # the transport handler's walk, not the interrupt branch's
-            raise KeyboardInterrupt
-        yield from chain
+        yield next(walk(exc, handled_before))
+        raise KeyboardInterrupt
 
     monkeypatch.setattr(backend_module, "_raised_during_request", interrupted)
     backend = _faked(monkeypatch, lambda method, url, **kwargs: _make_request())

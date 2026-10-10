@@ -36,7 +36,7 @@ from cachekit.decorators.stats_context import (
 def _isolated_stats_context():
     """Start each test with no stats context and restore the outer one after it.
 
-    A leak stays set in the pytest thread's context, so without this one leaking
+    A leak stays set in the pytest thread's context, so without it, one leaking
     test would also fail every later test here that checks for None, and the
     failure would point at the wrong test.
     """
