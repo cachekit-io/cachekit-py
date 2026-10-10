@@ -663,7 +663,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379
 
 **Cause**: the value does not parse as a UUID. Every form Python's `uuid.UUID()` parses loads as given: upper case, braces, `urn:uuid:`, no hyphens. Interop mode also requires the canonical lowercase-hyphenated form ([interop mode](features/interop-mode.md)).
 
-The message names the source (`deployment_uuid must be a valid UUID`, `Invalid deployment_uuid parameter (must be valid UUID)`) and never the value, so a key pasted into the wrong variable is not written to logs. Earlier releases quoted it.
+The message names the source (`deployment_uuid must be a valid UUID`, `Invalid deployment_uuid parameter (must be valid UUID)`) and never the value, so a refused value is not written to logs. Earlier releases quoted it. A cachekit master key is too long to parse, so one pasted into the wrong variable is refused. A value that parses is a tenant name, not a secret: it shows in the settings' `repr`, and an encrypting single-tenant cache logs its canonical form as `tenant_id` in the INFO record `Single-tenant mode initialized`. Any 32 hex digits parse, so never set a secret here, such as a 128-bit token.
 
 **Solution**: set a UUID, or unset the variable to use the protocol default tenant, `"default"`.
 ```bash
