@@ -96,7 +96,8 @@ CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>,<older-key-hex>
 CACHEKIT_ENCRYPTION_FAIL_CLOSED=false
 # Single-tenant encryption tenant (default: unset = the protocol literal "default").
 # Must parse as a UUID, or `import cachekit` fails, as for any malformed CACHEKIT_ variable,
-# even in a process that never encrypts. The error names the variable, never the value.
+# even in a process that never encrypts. The error names the setting
+# (`deployment_uuid must be a valid UUID`), never the value.
 CACHEKIT_DEPLOYMENT_UUID=<uuid>
 
 # Fallback: REDIS_URL also supported (lower priority)

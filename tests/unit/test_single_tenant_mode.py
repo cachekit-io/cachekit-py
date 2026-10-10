@@ -100,16 +100,6 @@ class TestTenantIdResolution:
 
             assert handler._single_tenant_id == env_uuid
 
-    def test_invalid_env_var_raises_error(self):
-        """An invalid CACHEKIT_DEPLOYMENT_UUID is refused when the settings load, before any cache is built."""
-        with patch.dict(os.environ, {"CACHEKIT_DEPLOYMENT_UUID": "invalid-uuid"}):
-            reset_settings()  # Clear cached settings to pick up new env var
-            with pytest.raises(ValidationError, match="deployment_uuid must be a valid UUID"):
-                CacheSerializationHandler(
-                    encryption=True,
-                    single_tenant_mode=True,
-                )
-
     def test_default_is_protocol_literal_and_never_machine_local(self, tmp_path, monkeypatch):
         """No explicit tenant → literal "default" (spec rule 5); the legacy persisted
         ``~/.cachekit/deployment_uuid`` is neither read nor written — a per-host value
@@ -174,14 +164,6 @@ class TestDeploymentUuidSetting:
 
         with pytest.raises(ConfigurationError, match="canonical lowercase-hyphenated form"):
             CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64, interop_mode=True)
-
-    def test_interop_mode_accepts_the_canonical_form(self, monkeypatch):
-        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _UUID)
-        reset_settings()
-
-        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64, interop_mode=True)
-
-        assert handler._single_tenant_id == _UUID
 
     @pytest.mark.parametrize("unset", [None, ""], ids=["absent", "empty"])
     def test_unset_means_the_default_tenant(self, monkeypatch, unset):

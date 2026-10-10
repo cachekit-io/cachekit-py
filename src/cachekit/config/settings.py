@@ -255,10 +255,8 @@ class CachekitConfig(RedactingSettings):
     def _refuse_malformed_deployment_uuid(cls, value: Optional[str]) -> Optional[str]:
         """Refuse what ``uuid.UUID()`` refuses, at load and on assignment, and return the rest unchanged.
 
-        The value is a key-derivation input: the handler normalizes it in auto mode and, in interop mode, refuses a
-        non-canonical form other SDKs would derive from as given. So this accepts every form those paths accept and
-        rewrites none. ``None`` and ``""`` stay unset (the protocol literal "default"). The message names the field,
-        never the value: a pasted master key would otherwise ship in it (CWE-532).
+        A key-derivation input, so no accepted form is narrowed or rewritten; ``None`` and ``""`` stay unset. The message
+        names the field, never the value: a pasted master key would otherwise ship in it (CWE-532).
         """
         if value and not _parses_as_uuid(value):
             raise ValueError("deployment_uuid must be a valid UUID")
