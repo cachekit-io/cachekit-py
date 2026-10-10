@@ -49,6 +49,7 @@ _DISTINCT_KEY_HEX = bytes(range(32)).hex()
 _SETTINGS_ASSIGNMENT_REFUSALS: dict[str, tuple[str, object]] = {
     "field-level": ("previous_master_keys", {_DISTINCT_KEY_HEX: 1}),
     "model-level": ("previous_master_keys", [_DISTINCT_KEY_HEX, "01" * 32, "02" * 32, "03" * 32]),
+    "mistyped-field": ("previous_master_key", _DISTINCT_KEY_HEX),
 }
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [

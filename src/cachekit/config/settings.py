@@ -294,9 +294,9 @@ class CachekitConfig(RedactingSettings):
         assignment would stay on the instance, readable by other threads until the error surfaces. The value
         is dropped in a finally: the raised error's traceback holds this frame (CWE-532).
         """
-        # Not a field (a subclass's private attribute, say): nothing to validate, and a validator that sets one
-        # must not re-enter the lock below.
-        if name not in type(self).model_fields:
+        # A private attribute: nothing to validate, and a validator that sets one must not re-enter the lock below.
+        # Any other name goes through the guard, so a mistyped field's value is refused inside _redacting too.
+        if name in type(self).__private_attributes__:
             super().__setattr__(name, value)
             return
         candidate = None
