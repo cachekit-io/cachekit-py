@@ -1141,8 +1141,7 @@ class TestDecoratorL2ReadsFailLoud:
         for _ in range(3):
             with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
                 await _call(fn, 1)
-            # The sync wrapper has no outer `finally`: a raising exit that skips the
-            # stats reset leaks this call's stats into the caller's context.
+            # Every exit, this raise included, must restore the caller's stats context.
             assert get_current_function_stats() is None
 
         assert runs == []
