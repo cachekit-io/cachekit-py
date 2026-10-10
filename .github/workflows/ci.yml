@@ -16,6 +16,8 @@ env:
   RUST_BACKTRACE: 1
   REDIS_DISABLE_HIREDIS: true
   DEFAULT_PYTHON_VERSION: "3.12"
+  # ECR Public mirror of the Docker official redis image; 7-alpine index digest resolved 2026-10-09.
+  REDIS_IMAGE: public.ecr.aws/docker/library/redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -104,8 +106,8 @@ jobs:
 
     - name: Start Redis (no persistence)
       run: |
-        docker run -d --name redis -p 6379:6379 \
-          redis:7-alpine redis-server --save "" --appendonly no
+        for attempt in 1 2 3; do docker pull "$REDIS_IMAGE" && break; [ "$attempt" = 3 ] && exit 1; sleep $((attempt * 10)); done
+        docker run -d --name redis -p 6379:6379 "$REDIS_IMAGE" redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -299,8 +301,8 @@ jobs:
 
     - name: Start Redis (no persistence)
       run: |
-        docker run -d --name redis -p 6379:6379 \
-          redis:7-alpine redis-server --save "" --appendonly no
+        for attempt in 1 2 3; do docker pull "$REDIS_IMAGE" && break; [ "$attempt" = 3 ] && exit 1; sleep $((attempt * 10)); done
+        docker run -d --name redis -p 6379:6379 "$REDIS_IMAGE" redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -347,8 +349,8 @@ jobs:
 
     - name: Start Redis (no persistence)
       run: |
-        docker run -d --name redis -p 6379:6379 \
-          redis:7-alpine redis-server --save "" --appendonly no
+        for attempt in 1 2 3; do docker pull "$REDIS_IMAGE" && break; [ "$attempt" = 3 ] && exit 1; sleep $((attempt * 10)); done
+        docker run -d --name redis -p 6379:6379 "$REDIS_IMAGE" redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0

@@ -1706,70 +1706,66 @@ def create_cache_wrapper(
 
         token = set_current_function_stats(_stats)
 
-        cache_key = None  # Initialize to avoid UnboundLocalError
-
-        # Key generation - needed for both L1-only and L1+L2 modes
         try:
-            cache_key = _resolve_cache_key(args, kwargs)
-        except Exception as e:
-            if interop is not None:
-                # Interop/v1: out-of-model arguments MUST be rejected with an
-                # error — never silently degrade to uncached execution.
-                reset_current_function_stats(token)
-                raise
-            # Key generation failed - execute function without caching
-            features.handle_cache_error(
-                error=e,
-                operation="key_generation",
-                cache_key="<generation_failed>",
-                namespace=namespace or "default",
-                duration_ms=0.0,
-                count_toward_breaker=False,  # pre-admission, never reached the backend
-            )
-            reset_current_function_stats(token)
-            return func(*args, **kwargs)
+            cache_key = None  # Initialize to avoid UnboundLocalError
 
-        # L1-ONLY MODE: Store raw Python objects (no serialization).
-        # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
-        if _l1_only_mode and _object_cache is None:
-            # L1 disabled in L1-only mode -> no cache anywhere; call through
+            # Key generation - needed for both L1-only and L1+L2 modes
             try:
+                cache_key = _resolve_cache_key(args, kwargs)
+            except Exception as e:
+                if interop is not None:
+                    # Interop/v1: out-of-model arguments MUST be rejected with an
+                    # error — never silently degrade to uncached execution.
+                    raise
+                # Key generation failed - execute function without caching
+                features.handle_cache_error(
+                    error=e,
+                    operation="key_generation",
+                    cache_key="<generation_failed>",
+                    namespace=namespace or "default",
+                    duration_ms=0.0,
+                    count_toward_breaker=False,  # pre-admission, never reached the backend
+                )
                 return func(*args, **kwargs)
-            finally:
-                reset_current_function_stats(token)
-        if _l1_only_mode and _object_cache:
-            if _l1_swr_active and ttl is not None:
-                found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl)
-            else:
-                found, cached_value = _object_cache.get(cache_key)
-                needs_refresh, version = False, 0
-            if found:
-                _stats.record_l1_hit()
-                if needs_refresh:
-                    # SWR: serve the stale value now, refresh on a daemon thread
-                    # (sync functions have no event loop to schedule a task on)
-                    snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
-                    if snapshot is not None:
-                        slot, refresh_args, refresh_kwargs = snapshot
-                        try:
-                            threading.Thread(
-                                target=_l1_swr_refresh_sync,
-                                args=(slot, cache_key, version, refresh_args, refresh_kwargs),
-                                name="cachekit-swr-refresh",  # no function or key metadata (CWE-532)
-                                daemon=True,
-                            ).start()
-                        except RuntimeError as exc:
-                            # Thread couldn't start (resource pressure) — release
-                            # the slot and this exact refresh so a later call retries
-                            _l1_swr_pool.release(slot)
-                            _object_cache.cancel_refresh(cache_key, version)
-                            _warn_refresh(_refresh_unstarted_warn, "L1-only SWR refresh could not be started", cache_key, exc)
-                reset_current_function_stats(token)
-                return cached_value
 
-            # Cache miss: run the function once for every concurrent miss on this key. A caller
-            # that joins gets the same object, as a later hit does, and counts as a hit.
-            try:
+            # L1-ONLY MODE: Store raw Python objects (no serialization).
+            # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
+            if _l1_only_mode and _object_cache is None:
+                # L1 disabled in L1-only mode -> no cache anywhere; call through
+                return func(*args, **kwargs)
+            if _l1_only_mode and _object_cache:
+                if _l1_swr_active and ttl is not None:
+                    found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl)
+                else:
+                    found, cached_value = _object_cache.get(cache_key)
+                    needs_refresh, version = False, 0
+                if found:
+                    _stats.record_l1_hit()
+                    if needs_refresh:
+                        # SWR: serve the stale value now, refresh on a daemon thread
+                        # (sync functions have no event loop to schedule a task on)
+                        snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
+                        if snapshot is not None:
+                            slot, refresh_args, refresh_kwargs = snapshot
+                            try:
+                                threading.Thread(
+                                    target=_l1_swr_refresh_sync,
+                                    args=(slot, cache_key, version, refresh_args, refresh_kwargs),
+                                    name="cachekit-swr-refresh",  # no function or key metadata (CWE-532)
+                                    daemon=True,
+                                ).start()
+                            except RuntimeError as exc:
+                                # Thread couldn't start (resource pressure) — release
+                                # the slot and this exact refresh so a later call retries
+                                _l1_swr_pool.release(slot)
+                                _object_cache.cancel_refresh(cache_key, version)
+                                _warn_refresh(
+                                    _refresh_unstarted_warn, "L1-only SWR refresh could not be started", cache_key, exc
+                                )
+                    return cached_value
+
+                # Cache miss: run the function once for every concurrent miss on this key. A caller
+                # that joins gets the same object, as a later hit does, and counts as a hit.
                 result, joined = _thread_flights.run(
                     (cache_key,),
                     functools.partial(_l1_only_fill, cache_key, args, kwargs),
@@ -1778,287 +1774,251 @@ def create_cache_wrapper(
                 if joined:
                     _stats.record_l1_hit()
                 return result
-            finally:
-                reset_current_function_stats(token)
 
-        # L1+L2 MODE: Original behavior with backend initialization
+            # L1+L2 MODE: Original behavior with backend initialization
 
-        # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
-        # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
-        # caller before the function runs, whatever the breaker state, and never counts a failure
-        # on the breaker every tenant of this function shares. "" until the backend is resolved;
-        # the first call checks right after resolving it, below. Sits outside the main
-        # try/finally, so the raise path restores the context itself.
-        try:
+            # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
+            # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
+            # caller before the function runs, whatever the breaker state, and never counts a failure
+            # on the breaker every tenant of this function shares. "" until the backend is resolved;
+            # the first call checks right after resolving it, below.
             _l2_scope()
-        except Exception:
-            reset_current_function_stats(token)
-            raise
 
-        nonlocal _backend
+            nonlocal _backend
 
-        # Interop fail-closed guard (CWE-636): a key-prefixing backend would make
-        # this SDK read/write a key other SDKs cannot see. Re-checked on every call
-        # because the backend is lazily resolved and a prefix could appear
-        # dynamically. It runs before the L1 lookup, because an L1 hit returns early
-        # and must not skip it (LAB-5351). ensure_interop_backend_compatible(None)
-        # is a no-op, so until the backend is resolved an interop call skips L1 and
-        # is checked right after resolution, below. The raise paths sit outside the
-        # main try/finally, so they restore the stats context themselves (see
-        # test_context_leak_regression.py).
-        interop_checked = False
-        if interop is not None and _backend is not None:
-            try:
+            # Interop fail-closed guard (CWE-636): a key-prefixing backend would make
+            # this SDK read/write a key other SDKs cannot see. Re-checked on every call
+            # because the backend is lazily resolved and a prefix could appear
+            # dynamically. It runs before the L1 lookup, because an L1 hit returns early
+            # and must not skip it (LAB-5351). ensure_interop_backend_compatible(None)
+            # is a no-op, so until the backend is resolved an interop call skips L1 and
+            # is checked right after resolution, below.
+            interop_checked = False
+            if interop is not None and _backend is not None:
                 ensure_interop_backend_compatible(_backend)
-            except Exception:
-                reset_current_function_stats(token)
-                raise
-            interop_checked = True
+                interop_checked = True
 
-        # Guard clause: L1 cache check first - early return eliminates network latency.
-        # It runs before the breaker's admission check and records no breaker outcome:
-        # the breaker tracks backend health, and an L1 hit never reaches the backend,
-        # so it is served whatever the breaker state (LAB-5351). It waits for the backend:
-        # an encrypted entry's AAD binds the backend's key prefix, which is unknown until
-        # then, so an entry another wrapper wrote here would read as tampered.
-        if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
-            l1_start = time.perf_counter()
-            l1_found, l1_bytes = _l1_cache.get(cache_key)
-            if l1_found and l1_bytes:
-                # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
-                try:
-                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
-                    l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
+            # Guard clause: L1 cache check first - early return eliminates network latency.
+            # It runs before the breaker's admission check and records no breaker outcome:
+            # the breaker tracks backend health, and an L1 hit never reaches the backend,
+            # so it is served whatever the breaker state (LAB-5351). It waits for the backend:
+            # an encrypted entry's AAD binds the backend's key prefix, which is unknown until
+            # then, so an entry another wrapper wrote here would read as tampered.
+            if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
+                l1_start = time.perf_counter()
+                l1_found, l1_bytes = _l1_cache.get(cache_key)
+                if l1_found and l1_bytes:
+                    # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
+                    try:
+                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
+                        l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
-                    # Record L1 cache hit metrics
-                    if features.collect_stats:
-                        features.record_cache_operation(
-                            operation="get",
+                        # Record L1 cache hit metrics
+                        if features.collect_stats:
+                            features.record_cache_operation(
+                                operation="get",
+                                namespace=namespace or "default",
+                                serializer="l1_memory",
+                                success=True,
+                                duration_ms=l1_duration_ms,
+                                size_bytes=len(l1_bytes),
+                            )
+
+                        features.log_cache_operation(
+                            operation="l1_get",
+                            key=cache_key,
                             namespace=namespace or "default",
                             serializer="l1_memory",
-                            success=True,
                             duration_ms=l1_duration_ms,
-                            size_bytes=len(l1_bytes),
+                            hit=True,
+                            ttl=ttl,
                         )
 
+                        # Record L1 hit for cache_info()
+                        _stats.record_l1_hit()
+                        return l1_value
+                    except TenantResolutionError:
+                        # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
+                        # with the entry, which stays. The L2 read below misses for the same reason.
+                        logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
+                    except SerializationError as e:
+                        # Poisoned L1 must not outlive remediation of the durable L2 copy —
+                        # invalidate BEFORE the policy decision (a fail-closed raise would
+                        # otherwise keep re-raising from stale process-local L1 after the
+                        # operator fixes L2). L2 remains the retained evidence.
+                        _l1_cache.invalidate(cache_key)
+                        if not _foreign_l1_entry(e):
+                            # Explicit local re-raise, as in async_wrapper's L1 guard: it keeps a
+                            # fail-closed tamper raise ahead of any `except Exception` later added
+                            # to this inner try. It cannot stop a broad handler wrapped around this
+                            # read path from outside; test_fail_closed_invalidates_poisoned_l1_before_raising
+                            # pins that the raise reaches the caller.
+                            try:
+                                # Single policy point (cachekit-py#170): metric + fail policy.
+                                handle_decrypt_failure(
+                                    e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                                )
+                            except DecryptionAuthenticationError:
+                                raise
+                        # Fail open, or an L1 keying collision (_foreign_l1_entry): fall through to L2
+                    except KeyringConfigurationError:
+                        # LOCAL keyring config fault — not a poisoned L1 entry, so
+                        # neither the invalidate nor the "deserialization failed"
+                        # message below is true, and swallowing it here degrades a
+                        # misconfigured keyring into a silent L2 fall-through. Same
+                        # re-raise as the L2 sites in cache_handler.py.
+                        raise
+                    except Exception as e:
+                        # L1 deserialization failed - invalidate and continue to L2
+                        logger().warning(
+                            f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+                        )
+                        _l1_cache.invalidate(cache_key)
+
+            # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
+            # with its probe budget spent) - run the function uncached. This sits
+            # outside the try below on purpose: that except records a failure, and a
+            # rejection is not one. Recorded, every rejected call would push the OPEN
+            # window forward and reopen HALF_OPEN, so the breaker never recovers.
+            probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+            if probe_cycle is None:
+                _log_breaker_rejection(cache_key)
+                return _uncached_result(func(*args, **kwargs))
+
+            try:
+                if _backend is None:
+                    _backend = _resolve_lazy_backend()
+                    _l2_scope()  # first call: the tenant check above ran before the backend existed
+
+                _install_cache_handler(_backend)
+            except UnsupportedTenantError:
+                # From the first-call check above, or from a provider that checks the tenant while
+                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+                # client failure, so never degraded or counted (LAB-5713).
+                raise
+            except Exception as e:
+                # Guard clause: Client creation failed - early return with fallback
+                features.handle_cache_error(
+                    error=e,
+                    operation="client_creation",
+                    cycle=probe_cycle,
+                    cache_key=cache_key or "unknown",
+                    namespace=namespace or "default",
+                    duration_ms=0.0,
+                    serializer="rust",
+                )
+                return _uncached_result(func(*args, **kwargs))
+
+            # First interop call: the check above had no backend to check (see there).
+            if interop is not None and not interop_checked:
+                ensure_interop_backend_compatible(_backend)
+
+            if _l1_cache and invalidation.listener_start_due(_backend):
+                invalidation.start_listener(_backend)
+            twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
+
+            # Continue with the rest of the sync wrapper logic...
+            # Try to get cached value with optional TTL refresh
+            start_time = time.perf_counter()
+            try:
+                refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
+
+                # Use operation handler for all cache access (uses backend internally).
+                # A freshness-capable backend (CachekitIO) always takes the freshness
+                # read — not just when SWR is configured — so every hit carries the
+                # server's staleness label (LAB-381/LAB-557); a stale hit is served
+                # immediately and (with SWR active) revalidated on a background daemon
+                # thread below. The freshness path drops refresh_ttl, which is a
+                # documented no-op on the sync path anyway (StandardCacheHandler.get),
+                # and skips the mmap fast path (CachekitIO is not buffer-readable).
+                _sync_l2_stale = False
+                _sync_l2_fresh_for: int | None = None
+                if _l2_freshness_capable():
+                    _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, args, kwargs)
+                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                    _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                    _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
+                else:
+                    cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
+
+                duration = time.perf_counter() - start_time
+
+                if cached_result is not None:
+                    # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
+                    result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
+                    features.record_success(probe_cycle)
+
+                    # Record cache hit with structured logging
                     features.log_cache_operation(
-                        operation="l1_get",
+                        operation="get",
                         key=cache_key,
                         namespace=namespace or "default",
-                        serializer="l1_memory",
-                        duration_ms=l1_duration_ms,
+                        serializer="rust",
+                        duration_ms=duration * 1000,
                         hit=True,
                         ttl=ttl,
                     )
 
-                    # Record L1 hit for cache_info()
-                    _stats.record_l1_hit()
+                    # Also record statistics if enabled
+                    if features.collect_stats:
+                        features.record_cache_operation(
+                            operation="get",
+                            namespace=namespace or "default",
+                            serializer="rust",
+                            success=True,
+                            duration_ms=duration * 1000,
+                            size_bytes=size_bytes,
+                        )
 
-                    # WHY: L1 cache hit returns BEFORE the try-finally block (line ~642-713)
-                    # that handles context cleanup. Without this explicit reset, the contextvar
-                    # leaks to subsequent calls, causing stats pollution between requests.
-                    # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
-                    reset_current_function_stats(token)
-                    return l1_value
-                except TenantResolutionError:
-                    # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
-                    # with the entry, which stays. The L2 read below misses for the same reason.
-                    logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
-                except SerializationError as e:
-                    # Poisoned L1 must not outlive remediation of the durable L2 copy —
-                    # invalidate BEFORE the policy decision (a fail-closed raise would
-                    # otherwise keep re-raising from stale process-local L1 after the
-                    # operator fixes L2). L2 remains the retained evidence.
-                    _l1_cache.invalidate(cache_key)
-                    if not _foreign_l1_entry(e):
-                        try:
-                            # Single policy point (cachekit-py#170): metric + fail policy.
-                            handle_decrypt_failure(
-                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                            )
-                        except DecryptionAuthenticationError:
-                            reset_current_function_stats(token)
-                            raise
-                    # Fail open, or an L1 keying collision (_foreign_l1_entry): fall through to L2
-                except KeyringConfigurationError:
-                    # LOCAL keyring config fault — not a poisoned L1 entry, so
-                    # neither the invalidate nor the "deserialization failed"
-                    # message below is true, and swallowing it here degrades a
-                    # misconfigured keyring into a silent L2 fall-through. Same
-                    # re-raise as the L2 sites in cache_handler.py.
-                    #
-                    # The sync wrapper has no outer `finally`, so a raising exit
-                    # must reset the stats token by hand — exactly as the
-                    # DecryptionAuthenticationError sibling above does. (The
-                    # async L1 guard needs no reset; its wrapper's outer
-                    # `finally` covers every exit path.)
-                    reset_current_function_stats(token)
-                    raise
-                except Exception as e:
-                    # L1 deserialization failed - invalidate and continue to L2
-                    logger().warning(
-                        f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
-                    )
-                    _l1_cache.invalidate(cache_key)
+                    # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
+                    # + remaining-freshness bound (LAB-557), as on the async path (LAB-348).
+                    _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
 
-        # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
-        # with its probe budget spent) - run the function uncached. This sits
-        # outside the try below on purpose: that except records a failure, and a
-        # rejection is not one. Recorded, every rejected call would push the OPEN
-        # window forward and reopen HALF_OPEN, so the breaker never recovers.
-        probe_cycle = features.admit()  # None when rejected; 0 is an admission too
-        if probe_cycle is None:
-            _log_breaker_rejection(cache_key)
-            reset_current_function_stats(token)
-            return _uncached_result(func(*args, **kwargs))
+                    # Record L2 hit with latency for cache_info()
+                    duration_ms = duration * 1000
+                    _stats.record_l2_hit(duration_ms)
 
-        try:
-            if _backend is None:
-                _backend = _resolve_lazy_backend()
-                _l2_scope()  # first call: the tenant check above ran before the backend existed
+                    # SWR: stale hit — serve now, revalidate on a daemon thread.
+                    # Gated on _l2_swr_active: without a configured stale window this
+                    # decorator serves the mixed-reader hit but owns no revalidation.
+                    if _sync_l2_stale and _l2_swr_active:
+                        _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
 
-            _install_cache_handler(_backend)
-        except UnsupportedTenantError:
-            # From the first-call check above, or from a provider that checks the tenant while
-            # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
-            # client failure, so never degraded or counted (LAB-5713).
-            reset_current_function_stats(token)
-            raise
-        except Exception as e:
-            # Guard clause: Client creation failed - early return with fallback
-            features.handle_cache_error(
-                error=e,
-                operation="client_creation",
-                cycle=probe_cycle,
-                cache_key=cache_key or "unknown",
-                namespace=namespace or "default",
-                duration_ms=0.0,
-                serializer="rust",
-            )
-            # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
-            reset_current_function_stats(token)
-            return _uncached_result(func(*args, **kwargs))
-
-        # First interop call: the check above had no backend to check (see there).
-        if interop is not None and not interop_checked:
-            try:
-                ensure_interop_backend_compatible(_backend)
-            except Exception:
-                reset_current_function_stats(token)
+                    return result
+            except (DecryptionAuthenticationError, KeyringConfigurationError):
+                # Both propagate from get_cached_value* and must reach the caller: a
+                # fail-closed tamper failure (raised only when encryption.fail_closed=True;
+                # the metric and error log were recorded there), and a LOCAL keyring config
+                # fault (same contract as the L1 guard above). The generic clause below
+                # would log either as a cache error, count it on the breaker, and recompute
+                # uncached on every call (LAB-4841).
                 raise
-
-        if _l1_cache and invalidation.listener_start_due(_backend):
-            invalidation.start_listener(_backend)
-        twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
-
-        # Continue with the rest of the sync wrapper logic...
-        # Try to get cached value with optional TTL refresh
-        start_time = time.perf_counter()
-        try:
-            refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
-
-            # Use operation handler for all cache access (uses backend internally).
-            # A freshness-capable backend (CachekitIO) always takes the freshness
-            # read — not just when SWR is configured — so every hit carries the
-            # server's staleness label (LAB-381/LAB-557); a stale hit is served
-            # immediately and (with SWR active) revalidated on a background daemon
-            # thread below. The freshness path drops refresh_ttl, which is a
-            # documented no-op on the sync path anyway (StandardCacheHandler.get),
-            # and skips the mmap fast path (CachekitIO is not buffer-readable).
-            _sync_l2_stale = False
-            _sync_l2_fresh_for: int | None = None
-            if _l2_freshness_capable():
-                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, args, kwargs)
-                cached_result = _fresh_hit[0] if _fresh_hit is not None else None
-                _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
-                _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
-            else:
-                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
-
-            duration = time.perf_counter() - start_time
-
-            if cached_result is not None:
-                # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
-                result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
-                features.record_success(probe_cycle)
-
-                # Record cache hit with structured logging
-                features.log_cache_operation(
-                    operation="get",
-                    key=cache_key,
+            except Exception as e:
+                # Cache GET failed - execute function without caching
+                get_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.handle_cache_error(
+                    error=e,
+                    operation="cache_get",
+                    cycle=probe_cycle,
+                    cache_key=cache_key or "unknown",
                     namespace=namespace or "default",
+                    duration_ms=get_duration_ms,
                     serializer="rust",
-                    duration_ms=duration * 1000,
-                    hit=True,
-                    ttl=ttl,
                 )
+                return _uncached_result(func(*args, **kwargs))
 
-                # Also record statistics if enabled
-                if features.collect_stats:
-                    features.record_cache_operation(
-                        operation="get",
-                        namespace=namespace or "default",
-                        serializer="rust",
-                        success=True,
-                        duration_ms=duration * 1000,
-                        size_bytes=size_bytes,
-                    )
+            # CACHE MISS - Execute function and cache result
+            # Note: Sync wrappers don't support distributed locking (backend protocol is async-only)
+            # For thundering herd protection, use async decorators instead
+            # Record miss for cache_info()
+            _stats.record_miss()
 
-                # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
-                # + remaining-freshness bound (LAB-557), as on the async path (LAB-348).
-                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
-
-                # Record L2 hit with latency for cache_info()
-                duration_ms = duration * 1000
-                _stats.record_l2_hit(duration_ms)
-
-                # SWR: stale hit — serve now, revalidate on a daemon thread.
-                # Gated on _l2_swr_active: without a configured stale window this
-                # decorator serves the mixed-reader hit but owns no revalidation.
-                if _sync_l2_stale and _l2_swr_active:
-                    _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
-
-                # WHY: L2 cache hit returns from try block that lacks finally cleanup
-                # (only inner try at line ~567, not the outer try-finally at ~645-720)
-                reset_current_function_stats(token)
-                return result
-        except (DecryptionAuthenticationError, KeyringConfigurationError):
-            # Both propagate from get_cached_value* and must reach the caller: a
-            # fail-closed tamper failure (raised only when encryption.fail_closed=True;
-            # the metric and error log were recorded there), and a LOCAL keyring config
-            # fault (same contract as the L1 guard above). The generic clause below
-            # would log either as a cache error, count it on the breaker, and recompute
-            # uncached on every call (LAB-4841).
-            reset_current_function_stats(token)
-            raise
-        except Exception as e:
-            # Cache GET failed - execute function without caching
-            get_duration_ms = (time.perf_counter() - start_time) * 1000
-            features.handle_cache_error(
-                error=e,
-                operation="cache_get",
-                cycle=probe_cycle,
-                cache_key=cache_key or "unknown",
-                namespace=namespace or "default",
-                duration_ms=get_duration_ms,
-                serializer="rust",
-            )
-            # WHY: Early return on cache GET failure - same reason as L2 hit path
-            reset_current_function_stats(token)
-            return _uncached_result(func(*args, **kwargs))
-
-        # CACHE MISS - Execute function and cache result
-        # Note: Sync wrappers don't support distributed locking (backend protocol is async-only)
-        # For thundering herd protection, use async decorators instead
-        # Record miss for cache_info()
-        _stats.record_miss()
-
-        try:
             # Execute the original function. Its exception is not a backend failure, so it is
-            # never counted, but an admitted HALF_OPEN probe hands its slot to the next call
-            # instead of holding it until the cycle expires. probe_cycle confines that to a
-            # slot this call took: a call admitted while CLOSED, or by an ended cycle, gives
-            # the current cycle nothing back.
+            # never counted, and the function never reruns for it: rerunning it for a BackendError
+            # it raised would repeat its side effects. An admitted HALF_OPEN probe does hand its
+            # slot to the next call instead of holding it until the cycle expires. probe_cycle
+            # confines that to a slot this call took: a call admitted while CLOSED, or by an
+            # ended cycle, gives the current cycle nothing back.
             try:
                 result = func(*args, **kwargs)
             except Exception:
@@ -2113,12 +2073,10 @@ def create_cache_wrapper(
 
             return result
 
-        # No handler here: the store's own failures are caught above, so what reaches this
-        # point is the function's exception (or a fail-loud write error). It is not a backend
-        # failure, so it never counts toward the breaker, and rerunning the function for a
-        # BackendError it raised would repeat its side effects.
         finally:
-            # ALWAYS reset stats context, even on exception
+            # The one reset, as in async_wrapper: every exit restores the caller's context here,
+            # an interrupt included, which no `except Exception` above sees. A token resets once:
+            # a second reset raises RuntimeError, so no path may also reset by hand.
             reset_current_function_stats(token)
 
     @functools.wraps(func)
@@ -2249,9 +2207,10 @@ def create_cache_wrapper(
                         # Explicit local re-raise mirrors the sync L1/L2 fail-closed
                         # guards and the async lock-path guard: a fail-closed tamper raise
                         # must reach the caller, never be demoted to a fail-open recompute
-                        # if a future edit wraps this read path in a broad `except
-                        # Exception` (defense-in-depth, LAB-108). No manual stats reset —
-                        # the async wrapper's outer `finally` covers every exit path.
+                        # (defense-in-depth, LAB-108). The clause keeps it ahead of any
+                        # `except Exception` later added to this inner try; it cannot stop a
+                        # broad handler wrapped around this read path from outside, which
+                        # test_async_fail_closed_invalidates_poisoned_l1_before_raising catches.
                         if not _foreign_l1_entry(e):
                             try:
                                 handle_decrypt_failure(

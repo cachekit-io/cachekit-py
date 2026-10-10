@@ -13,8 +13,7 @@ import statistics
 import sys
 import threading
 import time
-import traceback
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -23,7 +22,7 @@ from urllib.parse import quote
 from pydantic import SecretBytes, SecretStr, ValidationError
 from urllib3.exceptions import ClosedPoolError
 
-from cachekit.backends._uninterrupted import _await_uninterrupted
+from cachekit.backends._uninterrupted import _await_uninterrupted, _clear_interrupted, _raised_during_request
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
@@ -60,25 +59,6 @@ def _log_release_failure(lock_key: str, exc: BaseException) -> None:
         redact_cache_key(lock_key),
         redact_error_for_log(exc),
     )
-
-
-def _raised_during_request(exc: BaseException, handled_before: BaseException | None) -> Iterator[BaseException]:
-    """``exc``, then each exception its ``__cause__`` and ``__context__`` reach, once each, stopping at ``handled_before``.
-
-    ``handled_before`` is the exception the caller was already handling when the request began: the request's exceptions
-    chain it as ``__context__``, but its traceback is the caller's. ``exc`` itself comes first even when it is
-    ``handled_before`` (a reused ``gevent.Timeout``), because its traceback now runs through the request too.
-    """
-    yield exc
-    seen = {id(exc), id(handled_before)}
-    pending = [exc.__cause__, exc.__context__]
-    while pending:
-        chained = pending.pop()
-        if chained is None or id(chained) in seen:
-            continue
-        seen.add(id(chained))
-        yield chained
-        pending += [chained.__cause__, chained.__context__]
 
 
 # Lock capability token travels in this request header, never the query string:
@@ -490,14 +470,11 @@ class CachekitIOBackend:
         except BaseException as exc:
             # An interrupt (a worker timeout's SystemExit, KeyboardInterrupt, gevent.Timeout), here or in the handler
             # above, propagates as itself, but its traceback, and those of the exceptions it chained during the request,
-            # run through urllib3's request frames, whose locals hold the Authorization header (CWE-532). clear_frames
-            # drops the locals of every finished frame below _send and keeps each frame's file and line; _send's own
-            # frame is still executing and is skipped, so it must hold no key-bearing local. The exception the caller is
-            # handling, unless it is the interrupt, gets back the traceback it came in with, as above.
-            for raised in _raised_during_request(exc, handled_before):
-                traceback.clear_frames(raised.__traceback__)
-            if handled_before is not None and handled_before is not exc:
-                handled_before.__traceback__ = handled_traceback
+            # run through urllib3's request frames, whose locals hold the Authorization header (CWE-532). This clears the
+            # locals of every finished frame below _send; _send's own frame is still executing and is skipped, so it must
+            # hold no key-bearing local. The exception the caller is handling, unless it is the interrupt, gets back the
+            # traceback it came in with, as above.
+            _clear_interrupted(exc, handled_before, handled_traceback)
             raised = error = None  # an interrupt in the walk above leaves the error bound: hold no exception on the way out
             raise
         # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's
