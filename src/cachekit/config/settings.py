@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import uuid
 from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
@@ -44,6 +45,15 @@ MAX_PREVIOUS_MASTER_KEYS = 3
 # other change (a private attribute, a delete) takes the lock too, or the swap would undo it. Reentrant:
 # a subclass's validator or property setter may assign a field or a private attribute while it is held.
 _ASSIGNMENT_LOCK = threading.RLock()
+
+
+def _parses_as_uuid(value: str) -> bool:
+    # A bool, so the caller raises outside this except: the parse error can quote the value (CWE-532).
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 class CachekitConfig(RedactingSettings):
@@ -239,6 +249,18 @@ class CachekitConfig(RedactingSettings):
             "Per-decorator EncryptionConfig(fail_closed=...) overrides this fleet-wide default."
         ),
     )
+
+    @field_validator("deployment_uuid")
+    @classmethod
+    def _refuse_malformed_deployment_uuid(cls, value: Optional[str]) -> Optional[str]:
+        """Refuse what ``uuid.UUID()`` refuses, at load and on assignment, and return the rest unchanged.
+
+        A key-derivation input, so no accepted form is narrowed or rewritten; ``None`` and ``""`` stay unset. The message
+        names the field, never the value: a pasted master key would otherwise ship in it (CWE-532).
+        """
+        if value and not _parses_as_uuid(value):
+            raise ValueError("deployment_uuid must be a valid UUID")
+        return value
 
     @field_validator("previous_master_keys", mode="before")
     @classmethod

@@ -936,8 +936,12 @@ class CacheSerializationHandler:
                 continue
             try:
                 validated_uuid = str(uuid.UUID(raw))
-            except ValueError as e:
-                raise ConfigurationError(f"Invalid {source} (must be valid UUID): {raw}. Error: {e}") from e
+            except ValueError:
+                validated_uuid = None
+            if validated_uuid is None:
+                # Names the source, never the value: a key pasted in its place would ship in the message (CWE-532).
+                # Raised outside the except, so the parse error, which can quote the value, is not its __context__.
+                raise ConfigurationError(f"Invalid {source} (must be valid UUID)")
             self._require_canonical_tenant_form(raw, validated_uuid, source=source)
             return validated_uuid, source
 
