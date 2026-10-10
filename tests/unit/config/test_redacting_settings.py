@@ -42,6 +42,16 @@ from cachekit.config.validation import _BYTES_KEY_REFUSAL
 from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 
 _KEY_HEX = "ab" * 32
+# No two 16-character windows of it are alike, so a truncated rendering of it is still found.
+_DISTINCT_KEY_HEX = bytes(range(32)).hex()
+
+# Post-load assignments to the settings that are refused: by a field, by the model validator, and to a name
+# that is no field.
+_SETTINGS_ASSIGNMENT_REFUSALS: dict[str, tuple[str, object]] = {
+    "field-level": ("previous_master_keys", {_DISTINCT_KEY_HEX: 1}),
+    "model-level": ("previous_master_keys", [_DISTINCT_KEY_HEX, "01" * 32, "02" * 32, "03" * 32]),
+    "mistyped-field": ("previous_master_key", _DISTINCT_KEY_HEX),
+}
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
     RedisBackendConfig,
@@ -634,6 +644,51 @@ def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_c
 
 
 @pytest.mark.unit
+class TestSettingsAssignmentRedaction:
+    """A refused assignment to the loaded settings carries no route to the key it was given, whole or truncated."""
+
+    @pytest.mark.parametrize(
+        ("field", "value"), _SETTINGS_ASSIGNMENT_REFUSALS.values(), ids=_SETTINGS_ASSIGNMENT_REFUSALS.keys()
+    )
+    def test_refused_assignment_redacts_the_key(self, field: str, value: object) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            setattr(singleton.get_settings(), field, value)
+
+        _assert_no_route_to(exc_info.value, _DISTINCT_KEY_HEX)
+        rendered = str(exc_info.value) + repr(exc_info.value.errors()) + exc_info.value.json()
+        fragments = {_DISTINCT_KEY_HEX[i : i + 16] for i in range(len(_DISTINCT_KEY_HEX) - 15)}
+        assert [fragment for fragment in fragments if fragment in rendered] == []
+
+    @pytest.mark.parametrize(
+        ("field", "value"), _SETTINGS_ASSIGNMENT_REFUSALS.values(), ids=_SETTINGS_ASSIGNMENT_REFUSALS.keys()
+    )
+    def test_refused_assignment_leaves_no_frame_local(self, field: str, value: object) -> None:
+        """Pydantic's own assignment frames hold the raw value too, so the guard must re-raise from above them: the
+        cachekit-only walk of TestEntryPointFrameLocals would pass without that."""
+        with pytest.raises(ValidationError) as exc_info:
+            setattr(singleton.get_settings(), field, value)
+
+        assert _cachekit_locals_holding(exc_info.value, _DISTINCT_KEY_HEX, below_caller=True) == []
+
+    def test_refused_assignment_through_a_property_leaves_no_frame_local(self) -> None:
+        """A subclass property setter that assigns a key runs outside the copy, so it needs the same boundary."""
+
+        class _Rotating(CachekitConfig):
+            def _rotate(self, key: str) -> None:
+                self.master_key = key  # type: ignore[assignment]
+
+            rotate = property(fset=_rotate)
+
+        config = _Rotating(previous_master_keys=(_DISTINCT_KEY_HEX,))  # type: ignore[arg-type]
+        with pytest.raises(ValidationError) as exc_info:
+            config.rotate = _DISTINCT_KEY_HEX
+
+        assert config.master_key is None
+        _assert_no_route_to(exc_info.value, _DISTINCT_KEY_HEX)
+        assert _cachekit_locals_holding(exc_info.value, _DISTINCT_KEY_HEX, below_caller=True) == []
+
+
+@pytest.mark.unit
 class TestRedactingSettingsFrameLocals:
     """No cachekit frame on a raised config error's traceback keeps the raw input (CWE-532)."""
 
@@ -1073,6 +1128,15 @@ _ENTRY_POINT_ROWS: dict[str, _EntryPointRow] = {
         ConfigurationError,
         _SHORT_KEY_HEX,
     ),
+    **{
+        f"settings-assignment-{name}": (
+            {},
+            lambda field=field, value=value: setattr(singleton.get_settings(), field, value),
+            ValidationError,
+            _DISTINCT_KEY_HEX,
+        )
+        for name, (field, value) in _SETTINGS_ASSIGNMENT_REFUSALS.items()
+    },
 }
 
 

@@ -76,9 +76,9 @@ class TestPreviousMasterKeysConfig:
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", f" {K1.hex()} ,, ")
         assert len(CachekitConfig().previous_master_keys) == 1
 
-    def test_default_is_empty_list(self, monkeypatch):
+    def test_default_is_empty(self, monkeypatch):
         monkeypatch.delenv("CACHEKIT_PREVIOUS_MASTER_KEYS", raising=False)
-        assert CachekitConfig().previous_master_keys == []
+        assert CachekitConfig().previous_master_keys == ()
 
     def test_more_than_three_keys_raises_never_truncates(self):
         four = [SecretStr(f"{i:02x}" * 32) for i in range(1, 5)]
@@ -152,6 +152,287 @@ class TestPreviousMasterKeysConfig:
                 monkeypatch.delenv(key)
 
 
+_REFUSED_ASSIGNMENTS = {
+    "previous-is-current": ("previous_master_keys", [SecretStr(K2.hex())], "must not appear in previous_master_keys"),
+    "previous-is-current-uppercase": (
+        "previous_master_keys",
+        [SecretStr(K2.hex().upper())],
+        "must not appear in previous_master_keys",
+    ),
+    "current-is-previous": ("master_key", SecretStr(K1.hex()), "must not appear in previous_master_keys"),
+    "fourth-previous": (
+        "previous_master_keys",
+        [SecretStr(f"{i:02x}" * 32) for i in range(4, 8)],
+        f"at most {MAX_PREVIOUS_MASTER_KEYS}",
+    ),
+    "previous-not-hex": ("previous_master_keys", [SecretStr("zz" * 32)], "not valid hex"),
+    "previous-short": ("previous_master_keys", [SecretStr("aa" * 31)], "at least 32 bytes"),
+}
+
+
+class TestSettingsAssignment:
+    """An assignment to the loaded settings runs the load-time rules, and a refused one writes nothing."""
+
+    @pytest.fixture
+    def settings(self, monkeypatch) -> CachekitConfig:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", K2.hex())
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", K1.hex())
+        reset_settings()
+        return get_settings()
+
+    @pytest.mark.parametrize(("field", "value", "reason"), _REFUSED_ASSIGNMENTS.values(), ids=_REFUSED_ASSIGNMENTS.keys())
+    def test_refused_assignment_leaves_settings_as_they_were(self, settings, field, value, reason):
+        before = getattr(settings, field)
+
+        with pytest.raises(ValidationError, match=reason):
+            setattr(settings, field, value)
+
+        assert getattr(settings, field) is before
+
+    @pytest.mark.parametrize("case", ["previous-is-current", "previous-is-current-uppercase", "current-is-previous"])
+    def test_refused_value_is_never_written(self, settings, monkeypatch, case):
+        """The keyring rules run in the model validator, which pydantic's validate_assignment calls only after it has
+        written the new value. The repeat check is the last of them, so a spy there sees what a concurrent reader of
+        the live settings would see while they run: the old values."""
+        import cachekit.config.settings as settings_module
+
+        field, value, reason = _REFUSED_ASSIGNMENTS[case]
+        before = (settings.master_key, settings.previous_master_keys)
+        seen: list[tuple[Any, Any]] = []
+        refuse = settings_module.refuse_current_key_in_previous_keys
+
+        def spy(*args: Any) -> None:
+            seen.append((settings.master_key, settings.previous_master_keys))
+            refuse(*args)
+
+        monkeypatch.setattr(settings_module, "refuse_current_key_in_previous_keys", spy)
+
+        with pytest.raises(ValidationError, match=reason):
+            setattr(settings, field, value)
+
+        assert len(seen) == 1
+        assert seen[0][0] is before[0]
+        assert seen[0][1] is before[1]
+
+    def test_previous_keys_cannot_be_edited_in_place(self, settings):
+        """No validator runs on an in-place edit, so the keyring takes none: a change has to be an assignment."""
+        with pytest.raises(AttributeError):
+            settings.previous_master_keys.append(SecretStr(K2.hex().upper()))  # type: ignore[attr-defined]
+
+        assert settings.previous_master_keys == (SecretStr(K1.hex()),)
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            pytest.param(lambda keys: (key for key in keys), id="generator"),
+            pytest.param(lambda keys: map(str, keys), id="map"),
+        ],
+    )
+    def test_one_shot_iterable_lands_whole(self, settings, make):
+        """The guard validates the value on a copy, so the live settings must store what the copy validated: a second
+        pass over a one-shot iterable would find it empty and drop every previous key without an error."""
+        settings.previous_master_keys = make([K1.hex(), K3.hex()])
+
+        assert settings.previous_master_keys == (SecretStr(K1.hex()), SecretStr(K3.hex()))
+
+    def test_iterable_that_changes_between_passes_cannot_land_unchecked(self, settings):
+        """An iterable that yields a valid keyring once and the current key after must not reach the live settings."""
+        passes = iter([[K3.hex()], [K2.hex()]])
+
+        class _Shifting:
+            def __iter__(self):
+                return iter(next(passes))
+
+        settings.previous_master_keys = _Shifting()  # type: ignore[assignment]
+
+        assert settings.previous_master_keys == (SecretStr(K3.hex()),)
+
+    def test_validator_that_sets_a_private_attribute_does_not_deadlock(self, monkeypatch):
+        """A subclass's validator may set a private attribute while the guard holds its lock. A fresh lock of the guard's kind keeps a
+        regression from blocking every later assignment in this process."""
+        import threading
+
+        from pydantic import PrivateAttr, model_validator
+
+        import cachekit.config.settings as settings_module
+
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", type(settings_module._ASSIGNMENT_LOCK)())  # same kind, fresh
+
+        class _Marking(CachekitConfig):
+            _validated: bool = PrivateAttr(default=False)
+
+            @model_validator(mode="after")
+            def _mark(self) -> _Marking:
+                self._validated = True
+                return self
+
+        config = _Marking()
+        assigning = threading.Thread(target=setattr, args=(config, "l1_max_size_mb", 7), daemon=True)
+        assigning.start()
+        assigning.join(timeout=5)
+
+        assert not assigning.is_alive()
+        assert config.l1_max_size_mb == 7
+
+    def test_property_setter_that_assigns_a_field_does_not_deadlock(self, monkeypatch):
+        """A subclass property setter that assigns a field runs on the copy while the guard holds its lock, then
+        assigns again through the guard. A fresh lock of the guard's kind keeps a regression from blocking later
+        assignments."""
+        import threading
+
+        import cachekit.config.settings as settings_module
+
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", type(settings_module._ASSIGNMENT_LOCK)())  # same kind, fresh
+
+        class _Sized(CachekitConfig):
+            @property
+            def size(self) -> int:
+                return self.l1_max_size_mb
+
+            @size.setter
+            def size(self, value: int) -> None:
+                self.l1_max_size_mb = value
+
+        config = _Sized()
+        assigning = threading.Thread(target=setattr, args=(config, "size", 5), daemon=True)
+        assigning.start()
+        assigning.join(timeout=5)
+
+        assert not assigning.is_alive()
+        assert config.l1_max_size_mb == 5
+
+    @pytest.mark.parametrize(
+        ("change", "landed"),
+        [
+            pytest.param(lambda config: setattr(config, "_note", "set"), lambda config: config._note == "set", id="set"),
+            pytest.param(lambda config: delattr(config, "_note"), lambda config: not hasattr(config, "_note"), id="delete"),
+        ],
+    )
+    def test_private_change_from_another_thread_is_not_undone(self, monkeypatch, change, landed):
+        """An assignment commits by swapping in its copy's private state, so a private attribute another thread sets or
+        deletes between the copy and the commit must wait for the lock instead of being undone by the swap."""
+        import threading
+
+        from pydantic import PrivateAttr, model_validator
+
+        import cachekit.config.settings as settings_module
+
+        lock = type(settings_module._ASSIGNMENT_LOCK)()  # same kind, fresh
+        progressed = threading.Event()  # the other thread reached the lock, or made its change without it
+
+        class _Reporting:
+            """The guard's lock, reporting when the other thread reaches it."""
+
+            def __enter__(self) -> None:
+                if threading.current_thread() is changing:
+                    progressed.set()
+                lock.acquire()
+
+            def __exit__(self, *exc_info: object) -> None:
+                lock.release()
+
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", _Reporting())
+
+        class _Noted(CachekitConfig):
+            _note: str = PrivateAttr(default="")
+
+            @model_validator(mode="after")
+            def _change_meanwhile(self) -> _Noted:
+                if armed:  # on the copy, between model_copy() and the commit
+                    changing.start()
+                    progressed.wait(timeout=5)
+                return self
+
+        def change_live() -> None:
+            change(config)
+            progressed.set()
+
+        changing = threading.Thread(target=change_live, daemon=True)
+        armed = False
+        config = _Noted()
+        armed = True
+        config.l1_max_size_mb = 7
+        changing.join(timeout=5)
+
+        assert not changing.is_alive()
+        assert config.l1_max_size_mb == 7
+        assert landed(config)
+
+    def test_property_setter_runs_once_on_the_live_settings(self):
+        """A setter that is not idempotent must apply once, a write-only property must still be assignable, and what the
+        setter writes to a private attribute must land on the live settings, not on a discarded copy."""
+        from pydantic import PrivateAttr
+
+        class _Growing(CachekitConfig):
+            _grown_by: int = PrivateAttr(default=0)
+
+            def _grow(self, by: int) -> None:
+                self._grown_by += by
+                self.l1_max_size_mb += by
+
+            grow = property(fset=_grow)
+
+        config = _Growing(l1_max_size_mb=10)
+        config.grow = 5
+
+        assert config.l1_max_size_mb == 15
+        assert config._grown_by == 5
+
+    def test_assigned_value_is_validated_once(self):
+        """The live settings take the state the copy validated, so a validator that is not idempotent runs once."""
+        from pydantic import field_validator
+
+        class _Bumping(CachekitConfig):
+            @field_validator("l1_max_size_mb")
+            @classmethod
+            def _bump(cls, value: int) -> int:
+                return value + 1
+
+        config = _Bumping()
+        config.l1_max_size_mb = 5
+
+        assert config.l1_max_size_mb == 6
+        assert "l1_max_size_mb" in config.model_fields_set
+
+    def test_private_state_a_model_validator_derives_lands(self):
+        """Model validators run on the copy, so what one writes to a private attribute must be committed with it."""
+        from pydantic import PrivateAttr, model_validator
+
+        class _Derived(CachekitConfig):
+            _l1_bytes: int = PrivateAttr(default=0)
+
+            @model_validator(mode="after")
+            def _derive(self) -> _Derived:
+                self._l1_bytes = self.l1_max_size_mb * 1024 * 1024
+                return self
+
+        config = _Derived()
+        config.l1_max_size_mb = 7
+
+        assert config._l1_bytes == 7 * 1024 * 1024
+
+    def test_extra_attribute_on_an_extra_allow_subclass_lands(self):
+        """Pydantic stores an undeclared name in __pydantic_extra__, not __dict__, so the commit must carry it."""
+        from pydantic_settings import SettingsConfigDict
+
+        class _Open(CachekitConfig):
+            model_config = SettingsConfigDict(extra="allow")
+
+        config = _Open()
+        config.custom = 1
+
+        assert config.custom == 1
+        assert config.model_extra == {"custom": 1}
+
+    def test_valid_assignment_lands_validated(self, settings):
+        settings.previous_master_keys = [K3.hex()]  # type: ignore[list-item]
+        settings.master_key = K1.hex()  # type: ignore[assignment]
+
+        assert settings.previous_master_keys == (SecretStr(K3.hex()),)
+        assert isinstance(settings.master_key, SecretStr)
+        assert settings.master_key.get_secret_value() == K1.hex()
+
+
 class _CallRecordingBackend:
     """Backend that records every call, to prove a refusal came before any."""
 
@@ -220,7 +501,8 @@ class TestRepeatRefusedAtDecoration:
         assert backend.calls == []
 
     def test_reads_previous_keys_as_they_stand_at_decoration(self, monkeypatch):
-        """Settings validate no assignment, so a check made only at load would miss this one."""
+        """Settings hold no current key here, so they accept this assignment; only a check made when the cache is
+        built sees it repeat the master_key= argument."""
         backend = _CallRecordingBackend()
         cache.secure(backend=backend, master_key=KA.hex())(lambda: None)  # accepted: no previous keys yet
 
@@ -229,18 +511,22 @@ class TestRepeatRefusedAtDecoration:
             cache.secure(backend=backend, master_key=KA.hex())(lambda: None)
         assert backend.calls == []
 
-    def test_reads_an_assigned_settings_master_key(self, monkeypatch):
-        """The same holds for the current key itself, when it comes from settings assigned after load."""
-        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", KA.hex())
-        reset_settings()
-        monkeypatch.setattr(get_settings(), "master_key", SecretStr(KA.hex()))
+    def test_reads_the_settings_master_key_as_it_stands_at_build(self, monkeypatch):
+        """The same holds for the current key itself, when it comes from settings. Settings refuse the repeat at load
+        and on assignment, so unvalidated settings stand in for it: the handler's check stays as defence in depth."""
+        import cachekit.cache_handler as cache_handler
+
+        unvalidated = CachekitConfig.model_construct(
+            master_key=SecretStr(KA.hex()), previous_master_keys=[SecretStr(KA.hex())], encryption_fail_closed=False
+        )
+        monkeypatch.setattr(cache_handler, "get_settings", lambda: unvalidated)
 
         with pytest.raises(ConfigurationError, match=REPEAT_REFUSAL):
             CacheSerializationHandler(encryption=True, single_tenant_mode=True)
 
-    def test_plaintext_handler_reads_no_settings(self, monkeypatch):
-        """A handler that neither encrypts nor defers fail-closed to settings never loads them, so a malformed
-        keyring setting cannot stop it being built."""
+    def test_plaintext_handler_construction_reads_no_settings(self, monkeypatch):
+        """Building a handler that neither encrypts nor defers fail-closed to settings never loads them, so a malformed
+        keyring setting cannot stop it being built. Its later operations may still read settings."""
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", "not-hex")
         reset_settings()
 
@@ -575,8 +861,8 @@ class TestDecryptErrorTaxonomy:
 
 
 def _settings_previous_keys(monkeypatch: pytest.MonkeyPatch, keys: list[bytes]) -> None:
-    """Hand the wrapper previous keys that skip settings-load validation, as a settings
-    object assigned to after load does (it validates no assignment). A key passed
+    """Hand the wrapper previous keys that skip settings validation, which settings refuse at
+    load and on assignment: the wrapper's own check is defence in depth. A key passed
     explicitly never gets this far: __init__ holds it to exactly 32 bytes."""
     import cachekit.serializers.encryption_wrapper as ew
 

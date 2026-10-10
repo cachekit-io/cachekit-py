@@ -75,7 +75,8 @@ DEFAULT_TENANT_MASTER_KEY_HEX = FIXTURE["master_key_hex"]
 # One refusal each: a non-hex string, or one that decodes short. Anything else (a missing key) fails the match.
 DECORATOR_REFUSAL = r"CACHEKIT_MASTER_KEY must be (hex-encoded|at least 32 bytes)"
 WRAPPER_REFUSAL = r"Invalid master key format|Master key must be at least 32 bytes"
-# The refusal each keyring reject row gets at decoration, from the settings validator, on both current-key routes.
+# The refusal each keyring reject row gets at decoration from the settings validator; _keyring_refusal names the one
+# exception, a repeat row on master_key_argument.
 _SETTINGS_REFUSAL = r"(?s)^1 validation error for CachekitConfig\n.*Value error, "
 _REPEAT_REFUSAL = "master_key must not appear in previous_master_keys"
 KEYRING_REFUSALS = {
@@ -88,7 +89,7 @@ REPEAT_ROWS = ("keyring_current_key_decrypt_only", "keyring_current_key_decrypt_
 
 
 def _keyring_refusal(name: str, route: str) -> tuple[type[Exception], str]:
-    """The settings never see a master_key=, so the decorator's handler refuses its repeat, as it does a bad key."""
+    """The settings never see a master_key=, so the decorator's handler refuses its repeat when it is built."""
     if name in REPEAT_ROWS and route == "master_key_argument":
         return ConfigurationError, f"^{_REPEAT_REFUSAL}: "
     return ValidationError, KEYRING_REFUSALS[name]

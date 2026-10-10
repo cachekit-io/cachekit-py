@@ -17,23 +17,33 @@ Note:
 
 from __future__ import annotations
 
+import functools
+import threading
 from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
+    BaseModel,
     Field,
     SecretStr,
     field_validator,
     model_validator,
 )
-from pydantic_settings import NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from .validation import RedactingSettings, refuse_current_key_in_previous_keys
+from .validation import RedactingSettings, _redacting, refuse_current_key_in_previous_keys
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
 # at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
 # rejected at load — never silently truncated. Mirrors cachekit-core's
 # MAX_DECRYPT_ONLY_KEYS, which re-validates behind the FFI boundary.
 MAX_PREVIOUS_MASTER_KEYS = 3
+
+# Serializes CachekitConfig assignments: each validates the whole state it would leave, so two
+# assignments that are each valid alone (a new master_key, and that key added to previous_master_keys)
+# cannot land together unchecked. An assignment commits by swapping in its copy's whole state, so every
+# other change (a private attribute, a delete) takes the lock too, or the swap would undo it. Reentrant:
+# a subclass's validator or property setter may assign a field or a private attribute while it is held.
+_ASSIGNMENT_LOCK = threading.RLock()
 
 
 class CachekitConfig(RedactingSettings):
@@ -122,6 +132,8 @@ class CachekitConfig(RedactingSettings):
         # logs. errors()/json() ignore this flag; RedactingSettings sanitizes
         # those surfaces.
         hide_input_in_errors=True,
+        # Assignment after load runs every field and model validator; __setattr__ makes a refusal write nothing.
+        validate_assignment=True,
     )
 
     # Generic cache configuration (backend-agnostic)
@@ -205,8 +217,9 @@ class CachekitConfig(RedactingSettings):
         default=None,
         description="Master encryption key (hex-encoded; use exactly 32 bytes, 64 hex characters)",
     )
-    previous_master_keys: Annotated[list[SecretStr], NoDecode] = Field(
-        default_factory=list,
+    # A tuple, so the keyring cannot be edited in place, where no validator runs: a change is an assignment.
+    previous_master_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(
+        default_factory=tuple,
         description=(
             "Decrypt-only previous master keys for key rotation (env: "
             "CACHEKIT_PREVIOUS_MASTER_KEYS, comma-separated hex). Entries written "
@@ -276,6 +289,46 @@ class CachekitConfig(RedactingSettings):
         refuse_current_key_in_previous_keys(self.master_key, self.previous_master_keys)
 
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Validate an assignment on a copy first, and write it only if the copy passes.
+
+        validate_assignment alone writes the new value before the model validator runs, so a refused keyring
+        assignment would stay on the instance, readable by other threads until the error surfaces. The value
+        is dropped in a finally: the raised error's traceback holds this frame (CWE-532).
+        """
+        # A private attribute: nothing to validate, so no copy. It still takes the lock, so it cannot land between
+        # another thread's model_copy() and swap and be lost. Any other name goes through the guard, so a mistyped
+        # field's value is refused inside _redacting too.
+        if name in type(self).__private_attributes__:
+            with _ASSIGNMENT_LOCK:
+                super().__setattr__(name, value)
+            return
+        candidate = None
+        try:
+            with _ASSIGNMENT_LOCK:
+                # A subclass property: run its setter once, on this instance. Each field it assigns comes back
+                # through this guard; replaying it on a copy would apply a non-idempotent setter twice. Redacted like
+                # the copy path, so a refused key leaves no pydantic frame holding it.
+                if isinstance(getattr(type(self), name, None), property):
+                    _redacting(functools.partial(BaseSettings.__setattr__, self, name, value), type(self).__name__)
+                    return
+                candidate = self.model_copy()
+                # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy.
+                _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
+                # Commit the state the copy validated, with no second validation: `value` may be a spent generator,
+                # and a non-idempotent validator would change it again. Every slot pydantic keeps instance state in, as
+                # model_copy() fills them: __dict__, the fields set, an extra="allow" subclass's undeclared names, and
+                # the private state a subclass's model validator may have derived on the copy.
+                for slot in BaseModel.__slots__:
+                    object.__setattr__(self, slot, getattr(candidate, slot))
+        finally:
+            del value, candidate  # the copy holds the refused value
+
+    def __delattr__(self, name: str) -> None:
+        """Delete under the assignment lock, so an assignment's swap cannot undo the delete."""
+        with _ASSIGNMENT_LOCK:
+            super().__delattr__(name)
 
     def __repr__(self) -> str:
         """Return string representation with sensitive information masked.
