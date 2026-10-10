@@ -301,6 +301,63 @@ class TestSettingsAssignment:
         assert not assigning.is_alive()
         assert config.l1_max_size_mb == 5
 
+    @pytest.mark.parametrize(
+        ("change", "landed"),
+        [
+            pytest.param(lambda config: setattr(config, "_note", "set"), lambda config: config._note == "set", id="set"),
+            pytest.param(lambda config: delattr(config, "_note"), lambda config: not hasattr(config, "_note"), id="delete"),
+        ],
+    )
+    def test_private_change_from_another_thread_is_not_undone(self, monkeypatch, change, landed):
+        """An assignment commits by swapping in its copy's private state, so a private attribute another thread sets or
+        deletes between the copy and the commit must wait for the lock instead of being undone by the swap."""
+        import threading
+
+        from pydantic import PrivateAttr, model_validator
+
+        import cachekit.config.settings as settings_module
+
+        lock = type(settings_module._ASSIGNMENT_LOCK)()  # same kind, fresh
+        progressed = threading.Event()  # the other thread reached the lock, or made its change without it
+
+        class _Reporting:
+            """The guard's lock, reporting when the other thread reaches it."""
+
+            def __enter__(self) -> None:
+                if threading.current_thread() is changing:
+                    progressed.set()
+                lock.acquire()
+
+            def __exit__(self, *exc_info: object) -> None:
+                lock.release()
+
+        monkeypatch.setattr(settings_module, "_ASSIGNMENT_LOCK", _Reporting())
+
+        class _Noted(CachekitConfig):
+            _note: str = PrivateAttr(default="")
+
+            @model_validator(mode="after")
+            def _change_meanwhile(self) -> _Noted:
+                if armed:  # on the copy, between model_copy() and the commit
+                    changing.start()
+                    progressed.wait(timeout=5)
+                return self
+
+        def change_live() -> None:
+            change(config)
+            progressed.set()
+
+        changing = threading.Thread(target=change_live, daemon=True)
+        armed = False
+        config = _Noted()
+        armed = True
+        config.l1_max_size_mb = 7
+        changing.join(timeout=5)
+
+        assert not changing.is_alive()
+        assert config.l1_max_size_mb == 7
+        assert landed(config)
+
     def test_property_setter_runs_once_on_the_live_settings(self):
         """A setter that is not idempotent must apply once, a write-only property must still be assignable, and what the
         setter writes to a private attribute must land on the live settings, not on a discarded copy."""
