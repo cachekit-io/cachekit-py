@@ -10,11 +10,13 @@ Spec: protocol spec/saas-api.md#stale-while-revalidate.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import faulthandler
 import logging
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -26,6 +28,7 @@ import pytest
 from cachekit import cache, hash_utils
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.validation import ConfigurationError
+from tests.utils.fork_helpers import child_outcome, report, run_fresh
 
 _CAP = 2_592_000  # 30-day storage cap shared by ttl + stale_ttl
 
@@ -328,6 +331,83 @@ class TestSWRConfig:
         assert f() == 7
 
 
+def _forked_stale_hit_outcome(fork: str) -> object:
+    """What a forked child reports after one stale hit on an L1-only and an L2 SWR function.
+
+    fork is "c" for libc's fork(), which runs no at-fork hook (uWSGI without --py-call-uwsgi-fork-hooks),
+    or "os" for os.fork(). Run only in a fresh interpreter (run_fresh), with no other thread alive at
+    fork: one waiting for the GIL at a fork from C hangs the child in no cachekit code.
+    """
+    import ctypes
+    import types
+
+    from cachekit import l1_cache, object_cache
+    from cachekit import logging as structured_logging
+    from cachekit.config import L1CacheConfig
+
+    backend = FakeSWRBackend()
+    calls = {"l1": 0, "l2": 0}
+
+    @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5))
+    def l1_only() -> int:
+        calls["l1"] += 1
+        return calls["l1"]
+
+    @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+    def l2_swr() -> int:
+        calls["l2"] += 1
+        return calls["l2"]
+
+    l1_only(), l2_swr()  # misses: each stores 1
+    manager = l1_cache.get_l1_cache_manager()
+    if manager._cleanup_thread is not None:  # ends it, still referenced: the parent ran cleanup
+        manager._stop_cleanup.set()
+        manager._cleanup_thread.join()
+    for structured in structured_logging._logger_instances.values():  # their writers wake every flush interval
+        structured.writer.stop()
+        structured.writer.join()
+    if threading.active_count() != 1:  # not an assert: python -O strips those
+        raise RuntimeError(f"a thread would be alive at fork: {threading.enumerate()}")
+    faulthandler.register(signal.SIGALRM, chain=True)  # the child inherits it: a hang dumps its stack
+    r, w = os.pipe()
+    child = ctypes.PyDLL(None).fork() if fork == "c" else os.fork()  # PyDLL keeps the GIL through the call
+    if child == 0:
+        try:
+            signal.alarm(5)
+            os.close(r)
+            requested: list[str] = []
+            logged: list[str] = []
+
+            class _RecordingThread(threading.Thread):  # keeps the child single-threaded
+                def start(self) -> None:
+                    requested.append(self.name)
+
+            class _Recorder(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    logged.append(record.getMessage())
+
+            threading.Thread = _RecordingThread  # the child's copy only; it never returns
+            logging.getLogger("cachekit").addHandler(_Recorder(logging.WARNING))  # where the refresh paths report
+            now = time.monotonic()
+            object_cache.time = types.SimpleNamespace(monotonic=lambda: now + 60)  # past ttl * ratio, short of ttl
+            backend.stale = True
+            outcome: object = {
+                "hookless": l1_cache._forked_without_hooks(),
+                "served": (l1_only(), l2_swr()),
+                "requested": requested,
+                "calls": calls,
+                "logged": logged,
+            }
+        except BaseException as e:
+            outcome = {"error": repr(e)}
+        try:
+            report(w, outcome)
+        finally:
+            os._exit(1)
+    os.close(w)
+    return child_outcome(child, r)
+
+
 class TestSWRForkIsolation:
     """LAB-506 follow-through: SWR scheduler state must not survive fork().
 
@@ -393,6 +473,28 @@ class TestSWRForkIsolation:
             assert outcome["revalidated"], "forked child must reset inherited SWR in-flight state and revalidate"
         finally:
             gate.set()  # release the parent's parked revalidation thread
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+    @pytest.mark.parametrize(
+        ("fork", "hookless", "requested"),
+        [
+            pytest.param("c", True, [], id="c-fork"),
+            pytest.param("os", False, ["cachekit-swr-refresh", "cachekit-swr-revalidate"], id="os-fork"),
+        ],
+    )
+    def test_child_forked_without_hooks_serves_stale_and_starts_no_refresh(self, fork, hookless, requested) -> None:
+        """A thread started in a child forked from C can hang in Thread.start(), so neither sync SWR path
+        asks for one there. Stale is still served; an os.fork() child still refreshes both."""
+        run = run_fresh(_forked_stale_hit_outcome, fork)
+
+        assert run.returncode == 0, run.stderr
+        assert ast.literal_eval(run.stdout) == {
+            "hookless": hookless,
+            "served": (1, 1),  # the parent's values, stale in the child
+            "requested": requested,
+            "calls": {"l1": 1, "l2": 1},  # and not recomputed in the call
+            "logged": [],  # logging's own locks may be orphaned in this child
+        }, run.stderr  # a hung child's stack, dumped on its alarm
 
     """Branches the main flows don't reach: L1 refresh, no-lock backends,
     sync failure, slot exhaustion, operation-handler degradation."""

@@ -141,6 +141,7 @@ class ObjectCache:
     ``--py-call-uwsgi-fork-hooks``) gets no repair: its first call to a cached
     function hangs if a parent thread held that cache's lock at fork, and a key
     whose refresh was in flight in the parent is served stale until it expires.
+    A sync function's decorator starts no refresh thread there at all.
 
     Examples:
         Basic usage with TTL:
