@@ -120,7 +120,7 @@ def _cycle() -> list:
 
 def _too_deep() -> list:
     nest: list = ["tenant-42"]
-    for _ in range(100_000):  # past json's recursion limit on every supported interpreter; 10_000 is not, on 3.14
+    for _ in range(sys.getrecursionlimit() + 100):
         nest = [nest]
     return nest
 
@@ -229,12 +229,11 @@ class TestSynchronousEntries:
         [
             (lambda: {(1, 2): "ns:tenant-42:func:app.f:args:x"}, "<dict>"),
             (_cycle, "<list>"),
-            (_too_deep, "<list>"),
         ],
-        ids=["tuple-key", "cycle", "too-deep"],
+        ids=["tuple-key", "cycle"],
     )
     def test_field_json_raises_on_is_written_as_its_type_only(self, written, build, type_name):
-        """json raises on it (TypeError, ValueError, RecursionError): the entry is still written, its other fields intact.
+        """json raises on it (TypeError, ValueError): the entry is still written, its other fields intact.
 
         Raising instead would replace the exception a caller is logging from inside its except block.
         """
@@ -242,6 +241,17 @@ class TestSynchronousEntries:
 
         assert (written[0]["message"], written[0]["detail"], written[0]["attempt"]) == ("boom", type_name, 1)
         assert "tenant-42" not in json.dumps(written)
+
+    def test_field_nested_past_the_recursion_limit_is_written_as_its_type_only(self, monkeypatch, written):
+        """RecursionError, forced through json's pure-Python encoder, whose limit is sys.getrecursionlimit() everywhere.
+
+        The C encoder's limit is the thread's stack: on an unlimited stack, 3.14 encodes a 100_000-deep nest.
+        """
+        monkeypatch.setattr(json.encoder, "c_make_encoder", None)
+
+        StructuredLogger("test.too_deep").error("boom", detail=_too_deep(), attempt=1)
+
+        assert (written[0]["message"], written[0]["detail"], written[0]["attempt"]) == ("boom", "<list>", 1)
 
     def test_generated_fields_win_over_same_named_caller_fields(self, written):
         """A caller's pid= cannot make the entry report a process other than the one that wrote it."""
