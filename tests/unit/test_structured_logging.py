@@ -49,10 +49,12 @@ def written():
 
 
 def _c_fork_child_outcome() -> object:
-    """What a child forked from C reports; run only in a fresh interpreter (test_child_of_a_c_fork_starts_no_thread).
+    """What a child forked from C reports; run only in a fresh interpreter (TestEntriesAfterFork's C-fork test).
 
     Importing cachekit must leave this interpreter single-threaded: a thread waiting for the GIL at a
-    fork made from C leaves the child hung at its first GIL release, in no cachekit code.
+    fork made from C leaves the child hung at its first GIL release, in no cachekit code. logging's
+    module lock and the handler's lock end held by threads the child lacks, and no level check is
+    cached: in the child, any call that takes either lock hangs, as no after-fork reset ran there.
     """
     import ctypes
     import faulthandler
@@ -64,6 +66,10 @@ def _c_fork_child_outcome() -> object:
     sink.setLevel(logging.DEBUG)
     before = get_structured_logger("test.c_fork.parent")  # built pre-fork, as a module-level _logger is
     before._sampling_threshold = 100  # never sampled away
+    for lock in (logging._lock, capture.lock):  # held at fork by a thread the child lacks
+        holder = threading.Thread(target=lock.acquire)  # ends holding it
+        holder.start()
+        holder.join()
     if threading.active_count() != 1:  # not an assert: python -O strips those
         raise RuntimeError(f"a thread would be alive at fork: {threading.enumerate()}")
     faulthandler.register(signal.SIGALRM, chain=True)  # the child inherits it: a hang dumps its stack
@@ -81,14 +87,9 @@ def _c_fork_child_outcome() -> object:
                     requested.append(self.name)
 
             threading.Thread = _RecordingThread  # the child's copy only; it never returns
-            after = get_structured_logger("test.c_fork.child")  # first built in the child, as after --lazy-apps
-            before.debug("parent-built debug")
-            before.error("parent-built error")
-            after.error("child-built error")
-            outcome: object = {
-                "requested": requested,
-                "written": [(e["logger"], e["message"], e["pid"] == os.getpid()) for e in capture.entries],
-            }
+            before.debug("child debug")
+            before.error("child error")
+            outcome: object = {"requested": requested, "written": capture.entries}
         except BaseException as e:
             outcome = {"error": repr(e)}
         try:
@@ -337,10 +338,11 @@ class TestEntriesAfterFork:
 
         assert child_outcome(child, r) == [("child-error", child)]
 
-    def test_child_of_a_c_fork_starts_no_thread(self):
-        """A real fork from C: no at-fork hook runs. The child writes every entry, and requests no thread.
+    def test_child_of_a_c_fork_writes_nothing_and_starts_no_thread(self):
+        """A real fork from C: no at-fork hook runs, so logging's locks may be held by threads the child lacks.
 
-        The fork runs in a fresh interpreter (_c_fork_child_outcome): this one has threads it cannot end
+        The child's calls return without taking them: they write nothing and request no thread. The fork
+        runs in a fresh interpreter (_c_fork_child_outcome): this one has threads it cannot end
         (pytest-xdist's, other tests'), and one waiting for the GIL at fork hangs the child.
         """
         code = "from tests.unit.test_structured_logging import _print_c_fork_child_outcome as f; f()"
@@ -350,14 +352,7 @@ class TestEntriesAfterFork:
         )
 
         assert run.returncode == 0, run.stderr
-        assert ast.literal_eval(run.stdout) == {
-            "requested": [],
-            "written": [
-                ("test.c_fork.parent", "parent-built debug", True),
-                ("test.c_fork.parent", "parent-built error", True),
-                ("test.c_fork.child", "child-built error", True),
-            ],
-        }, run.stderr  # a hung child's stack, dumped on its alarm
+        assert ast.literal_eval(run.stdout) == {"requested": [], "written": []}, run.stderr  # a hung child's stack
 
 
 class TestFactoryFunction:

@@ -3,6 +3,10 @@
 Each entry is serialised and written on the caller's thread. There is no background writer: a thread
 started at import is not running in a forked child (Gunicorn ``--preload``, Celery prefork,
 ``multiprocessing``'s fork start method), so everything a child buffered for it was lost.
+
+A child forked from C without at-fork hooks (uWSGI without ``--py-call-uwsgi-fork-hooks``) writes no
+entry: ``logging``'s own after-fork lock reset did not run there, so a level check or a handler lock a
+parent thread held at fork would hang the caller.
 """
 
 import json
@@ -14,6 +18,7 @@ import threading
 import time
 from typing import Any
 
+from cachekit import l1_cache
 from cachekit.config import get_settings
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
@@ -53,6 +58,11 @@ def _encodable(value: object) -> object:
     except _UNENCODABLE:
         return _type_name(value)
     return value
+
+
+def _enabled(levelno: int) -> bool:
+    """Whether to write an entry at levelno: never in a child forked without at-fork hooks (module docstring)."""
+    return not l1_cache._forked_without_hooks() and logger.isEnabledFor(levelno)
 
 
 class StructuredLogger:
@@ -113,7 +123,7 @@ class StructuredLogger:
         """Main logging method with sampling."""
         level = level.upper()
         levelno = _LEVELS.get(level, logging.INFO)
-        if logger.isEnabledFor(levelno) and (levelno >= logging.ERROR or self._should_sample()):
+        if _enabled(levelno) and (levelno >= logging.ERROR or self._should_sample()):
             self._write(level, levelno, message, kwargs)
 
     def debug(self, message: str, **kwargs):
@@ -130,7 +140,7 @@ class StructuredLogger:
 
     def error(self, message: str, **kwargs):
         """Error level logging - never sampled."""
-        if logger.isEnabledFor(logging.ERROR):
+        if _enabled(logging.ERROR):
             self._write("ERROR", logging.ERROR, message, kwargs)
 
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
