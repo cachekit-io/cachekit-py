@@ -6,8 +6,12 @@ import ast
 import os
 import select
 import signal
+import subprocess
+import sys
 import threading
+import traceback
 from collections.abc import Callable
+from pathlib import Path
 from typing import NoReturn
 
 
@@ -45,3 +49,31 @@ def on_new_thread(fn: Callable[[], object], timeout: float = 5.0) -> object:
     thread.start()
     thread.join(timeout)
     return out[0] if out else "hung"
+
+
+def run_fresh(outcome: Callable[..., object], *args: object) -> subprocess.CompletedProcess[str]:
+    """Run outcome(*args) in a fresh interpreter; its stdout is the outcome's repr, for ast.literal_eval.
+
+    For a test that forks from C: pytest's own interpreter has threads it cannot end (pytest-xdist's,
+    other tests'), and one waiting for the GIL at such a fork hangs the child in no cachekit code.
+    outcome must be a module-level function under `tests`, and args literals.
+    """
+    code = (
+        f"from {outcome.__module__} import {outcome.__name__} as outcome; "
+        f"from tests.utils.fork_helpers import print_outcome; print_outcome(outcome, *{args!r})"
+    )
+    root = Path(__file__).resolve().parents[2]  # where `tests` imports from
+    return subprocess.run(  # noqa: S603 - trusted: sys.executable + code built from our own names and literals
+        [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60
+    )
+
+
+def print_outcome(outcome: Callable[..., object], *args: object) -> NoReturn:
+    """Print outcome(*args) for run_fresh and end without exit handlers: logging's would wait on a lock a gone thread holds."""
+    try:
+        print(repr(outcome(*args)), flush=True)
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
+    os._exit(0)

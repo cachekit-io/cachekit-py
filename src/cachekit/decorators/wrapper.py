@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
-from .. import invalidation
+from .. import invalidation, l1_cache
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
@@ -1741,9 +1741,12 @@ def create_cache_wrapper(
                     needs_refresh, version = False, 0
                 if found:
                     _stats.record_l1_hit()
-                    if needs_refresh:
-                        # SWR: serve the stale value now, refresh on a daemon thread
-                        # (sync functions have no event loop to schedule a task on)
+                    # SWR: serve the stale value now, refresh on a daemon thread (sync functions have no
+                    # event loop to schedule a task on). Not in a child forked without at-fork hooks: a
+                    # thread started there can hang in Thread.start(). The refreshing marker get_with_swr
+                    # set stays, so no later hit asks again; it goes with the entry, and the first read
+                    # after expiry recomputes it.
+                    if needs_refresh and not l1_cache._forked_without_hooks():
                         snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
                         if snapshot is not None:
                             slot, refresh_args, refresh_kwargs = snapshot
@@ -1981,7 +1984,9 @@ def create_cache_wrapper(
                     # SWR: stale hit — serve now, revalidate on a daemon thread.
                     # Gated on _l2_swr_active: without a configured stale window this
                     # decorator serves the mixed-reader hit but owns no revalidation.
-                    if _sync_l2_stale and _l2_swr_active:
+                    # Not in a child forked without at-fork hooks, where a thread can hang in
+                    # Thread.start(): stale is served until it hard-expires, then a miss recomputes.
+                    if _sync_l2_stale and _l2_swr_active and not l1_cache._forked_without_hooks():
                         _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
 
                     return result

@@ -13,17 +13,14 @@ import logging
 import os
 import random
 import signal
-import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
-from typing import NoReturn
 
 import pytest
 
 from cachekit.l1_cache import CacheEntry, L1Cache, L1CacheManager
-from tests.utils.fork_helpers import child_outcome, on_new_thread, report
+from tests.utils.fork_helpers import child_outcome, on_new_thread, report, run_fresh
 
 MB = 1024 * 1024
 
@@ -385,19 +382,6 @@ def _c_fork_child_outcome() -> object:
             os._exit(1)
     os.close(w)
     return child_outcome(child, r)
-
-
-def _print_c_fork_child_outcome() -> NoReturn:
-    """Print _c_fork_child_outcome() and end without exit handlers: logging's would wait on a lock a gone thread holds."""
-    import traceback
-
-    try:
-        print(repr(_c_fork_child_outcome()), flush=True)
-    except BaseException:
-        traceback.print_exc()
-        sys.stderr.flush()
-        os._exit(1)
-    os._exit(0)
 
 
 @pytest.mark.unit
@@ -1066,11 +1050,7 @@ class TestCleanupThreadAfterFork:
         The fork runs in a fresh interpreter (_c_fork_child_outcome): this one has threads it cannot end
         (pytest-xdist's, other tests'), and one waiting for the GIL at fork hangs the child.
         """
-        code = "from tests.unit.test_l1_memory_bounds import _print_c_fork_child_outcome as f; f()"
-        root = Path(__file__).resolve().parents[2]  # where `tests` imports from
-        run = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code
-            [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60
-        )
+        run = run_fresh(_c_fork_child_outcome)
 
         assert run.returncode == 0, run.stderr
         assert ast.literal_eval(run.stdout) == {
