@@ -3,8 +3,8 @@
 Wall-clock benchmarks on a shared host cannot gate a 1% regression: run-to-run noise is several
 percent. Instruction counts can, once these sources of run-to-run noise are handled:
 
-- ``import cachekit`` starts background threads (the log writer, the L1 cleanup worker) whose
-  counts swing by tens of percent between identical runs. Only the MAIN thread is counted
+- cachekit runs background threads (the L1 cleanup worker) whose counts swing by tens of
+  percent between identical runs. Only the MAIN thread is counted
   (callgrind ``--separate-threads=yes``, file ``-01``). Work a library runs on its own threads
   is not counted either: about half of the real-data Arrow round trip runs on pyarrow's threads.
 - Interpreter startup is ~2 billion instructions. Each path runs at two loop sizes and the
@@ -222,11 +222,10 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         "PYTHONNOUSERSITE": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
-        # cachekit's log writer wakes every 1 s and its L1 sweeper every 30 s of real time. A woken
-        # thread takes the GIL at a load-dependent moment, and the sweeper compares expiry times
-        # stamped by the pinned main-thread clock against the real one, so it evicts live entries
-        # mid-run. A day-long interval keeps both asleep for the whole run.
-        "CACHEKIT_LOG_FLUSH_INTERVAL": "86400",
+        # cachekit's L1 sweeper wakes every 30 s of real time. A woken thread takes the GIL at a
+        # load-dependent moment, and the sweeper compares expiry times stamped by the pinned
+        # main-thread clock against the real one, so it evicts live entries mid-run. A day-long
+        # interval keeps it asleep for the whole run.
         "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
     global _stopped

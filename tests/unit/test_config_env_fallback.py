@@ -115,6 +115,9 @@ class TestRedisBackendConfigEnv:
             "L1_ENABLED": "false",
             "ENABLE_PROMETHEUS_METRICS": "false",
             "BACKEND_PROVIDER_CLASS": "cachekit.backends.redis.provider.RedisBackendProvider",
+            "LOG_BUFFER_SIZE": "10000",
+            "LOG_BATCH_SIZE": "100",
+            "LOG_FLUSH_INTERVAL": "86400",
         }
         for name, value in removed.items():
             monkeypatch.setenv(f"CACHEKIT_{name}", value)
