@@ -196,21 +196,6 @@ class CachekitConfig(RedactingSettings):
         le=1.0,
         description="Log sampling rate (0.0 to 1.0, default 10%)",
     )
-    log_buffer_size: int = Field(
-        default=10000,
-        gt=0,
-        description="Ring buffer size for async logging",
-    )
-    log_batch_size: int = Field(
-        default=100,
-        gt=0,
-        description="Batch size for async log writes",
-    )
-    log_flush_interval: float = Field(
-        default=1.0,
-        gt=0,
-        description="Flush interval for async logging in seconds",
-    )
 
     # Deployment and feature flags
     deployment_uuid: Optional[str] = Field(

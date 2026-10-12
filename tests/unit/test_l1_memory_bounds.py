@@ -333,7 +333,6 @@ def _c_fork_child_outcome() -> object:
     import faulthandler
 
     from cachekit import l1_cache
-    from cachekit import logging as structured_logging
 
     manager = L1CacheManager(default_max_memory_mb=10)
     cache = manager.get_cache("c-fork-ns")  # captured pre-fork, like a decorator's _l1_cache
@@ -343,9 +342,6 @@ def _c_fork_child_outcome() -> object:
     assert cleanup is not None
     manager._stop_cleanup.set()  # ends it, still referenced: the parent ran cleanup
     cleanup.join()
-    for structured in structured_logging._logger_instances.values():  # their writers wake every flush interval
-        structured.writer.stop()
-        structured.writer.join()
     l1_logger = logging.getLogger("cachekit.l1_cache")
     l1_logger.addHandler(handler := logging.StreamHandler(open(os.devnull, "w")))  # noqa: SIM115 - ends with the process
     l1_logger.setLevel(logging.DEBUG)

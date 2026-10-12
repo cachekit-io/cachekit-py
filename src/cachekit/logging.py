@@ -1,7 +1,8 @@
-"""Structured logging with minimal overhead.
+"""Structured JSON logging with sampling.
 
-This module provides lock-free, sampling-based structured logging
-with asynchronous batch writes.
+Each entry is serialised and written on the caller's thread. There is no background writer: a thread
+started at import is not running in a forked child (Gunicorn ``--preload``, Celery prefork,
+``multiprocessing``'s fork start method), so everything a child buffered for it was lost.
 """
 
 import json
@@ -11,8 +12,7 @@ import platform
 import random
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from cachekit.config import get_settings
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
@@ -21,145 +21,37 @@ from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 logger = logging.getLogger(__name__)
 
 
-# Global configuration - loaded once at module import from the settings singleton
-_settings = get_settings()
-SAMPLING_RATE = _settings.log_sampling_rate
-RING_BUFFER_SIZE = _settings.log_buffer_size
-BATCH_SIZE = _settings.log_batch_size
-FLUSH_INTERVAL = _settings.log_flush_interval
-del _settings  # keep only the four scalars; don't pin a stale config past reset_settings()
+# Loaded once at module import from the settings singleton
+SAMPLING_RATE = get_settings().log_sampling_rate
 
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
 
-
-@dataclass
-class LogEntry:
-    """Lightweight log entry for ring buffer."""
-
-    timestamp: float
-    level: str
-    message: str
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "timestamp": self.timestamp,
-            "level": self.level,
-            "message": self.message,
-            **self.extra,
-        }
+_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
 
 
-class LockFreeRingBuffer:
-    """Lock-free ring buffer for log entries.
-
-    Uses atomic operations to minimize contention.
-    """
-
-    def __init__(self, size: int = RING_BUFFER_SIZE):
-        self.size = size
-        self.buffer: list[Optional[LogEntry]] = [None] * size
-        self.write_pos = 0
-        self.read_pos = 0
-
-    def append(self, entry: LogEntry) -> bool:
-        """Append entry to buffer without locks.
-
-        Returns True if successful, False if buffer full.
-        """
-        # Simple atomic increment (in CPython, int ops are atomic)
-        pos = self.write_pos
-        next_pos = (pos + 1) % self.size
-
-        # Check if buffer is full (would overwrite unread data)
-        if next_pos == self.read_pos:
-            return False
-
-        # Write entry
-        self.buffer[pos] = entry
-        self.write_pos = next_pos
-        return True
-
-    def drain(self, max_items: int = BATCH_SIZE) -> list[LogEntry]:
-        """Drain up to max_items from buffer."""
-        items = []
-        count = 0
-
-        while count < max_items and self.read_pos != self.write_pos:
-            entry = self.buffer[self.read_pos]
-            if entry is not None:
-                items.append(entry)
-                self.buffer[self.read_pos] = None  # Clear reference
-            self.read_pos = (self.read_pos + 1) % self.size
-            count += 1
-
-        return items
-
-
-class AsyncLogWriter(threading.Thread):
-    """Background thread for async log writing."""
-
-    def __init__(self, buffer: LockFreeRingBuffer):
-        super().__init__(daemon=True, name="cachekit-LogWriter")
-        self.buffer = buffer
-        self.running = True
-        self._stop_event = threading.Event()
-
-    def run(self):
-        """Main loop - batch write logs periodically."""
-        while self.running:
-            try:
-                # Wait for interval or stop signal
-                if self._stop_event.wait(timeout=FLUSH_INTERVAL):
-                    break
-
-                # Drain and write batch
-                entries = self.buffer.drain()
-                if entries:
-                    self._write_batch(entries)
-
-            except Exception as e:
-                logger.error(f"Error in async log writer: {redact_error_for_log(e)}")
-
-    def stop(self):
-        """Stop the writer thread."""
-        self.running = False
-        self._stop_event.set()
-
-    def _write_batch(self, entries: list[LogEntry]):
-        """Write a batch of entries to the logger."""
-        for entry in entries:
-            try:
-                # Convert to JSON for structured logging
-                msg = json.dumps(entry.to_dict(), separators=(",", ":"))
-                logger.log(getattr(logging, entry.level, logging.INFO), msg)
-            except Exception:
-                # Silently drop malformed entries
-                pass
+def _type_name(value: object) -> str:
+    """Stand in for a value JSON cannot encode: its type only, as its str() may embed a cache key (CWE-532)."""
+    return f"<{type(value).__name__}>"
 
 
 class StructuredLogger:
     """Structured logger.
 
+    Each entry is one JSON line on the ``cachekit.logging`` logger, written synchronously.
+
     Features:
-    - Lock-free ring buffer
-    - Sampling (10% default)
-    - Async batch writes
+    - Nothing is sampled or serialised below that logger's level
+    - Sampling (10% default) of DEBUG/INFO/WARNING; ERROR is never sampled
     - PII key-name masking (password/token/secret/key/auth kwargs)
     """
 
     def __init__(self, name: str):
         self.name = name
-        self.buffer = LockFreeRingBuffer()
-        self.writer = AsyncLogWriter(self.buffer)
-        self.writer.start()
 
         # Pre-computed values for performance
         self._sampling_threshold = int(SAMPLING_RATE * 100)
         self._hostname = platform.node()
-        self._pid = os.getpid()
 
         # PII patterns to mask (pre-compiled for speed)
         self._pii_keys = {"password", "token", "secret", "key", "auth"}
@@ -179,30 +71,26 @@ class StructuredLogger:
                 data[key] = "****"
         return data
 
+    def _write(self, level: str, levelno: int, message: str, fields: dict[str, Any]) -> None:
+        """Serialise one entry and log it now."""
+        entry = {
+            "timestamp": time.time(),
+            "level": level,
+            "message": message,
+            "logger": self.name,
+            "hostname": self._hostname,
+            "pid": os.getpid(),  # read per entry: a forked child reports its own
+            "thread_id": threading.get_ident(),
+            **self._mask_pii(fields),
+        }
+        logger.log(levelno, json.dumps(entry, separators=(",", ":"), default=_type_name))
+
     def log(self, level: str, message: str, **kwargs):
         """Main logging method with sampling."""
-        # Fast path - skip if not sampled
-        if not self._should_sample():
-            return
-
-        # Build entry
-        entry = LogEntry(
-            timestamp=time.time(),
-            level=level.upper(),
-            message=message,
-            extra={
-                "logger": self.name,
-                "hostname": self._hostname,
-                "pid": self._pid,
-                "thread_id": threading.get_ident(),
-                **self._mask_pii(kwargs),
-            },
-        )
-
-        # Append to lock-free buffer
-        if not self.buffer.append(entry):
-            # Buffer full - drop entry (non-blocking behavior)
-            pass
+        level = level.upper()
+        levelno = _LEVELS.get(level, logging.INFO)
+        if logger.isEnabledFor(levelno) and self._should_sample():
+            self._write(level, levelno, message, kwargs)
 
     def debug(self, message: str, **kwargs):
         """Debug level logging."""
@@ -217,21 +105,9 @@ class StructuredLogger:
         self.log("WARNING", message, **kwargs)
 
     def error(self, message: str, **kwargs):
-        """Error level logging - always sampled."""
-        # Errors bypass sampling
-        entry = LogEntry(
-            timestamp=time.time(),
-            level="ERROR",
-            message=message,
-            extra={
-                "logger": self.name,
-                "hostname": self._hostname,
-                "pid": self._pid,
-                "thread_id": threading.get_ident(),
-                **self._mask_pii(kwargs),
-            },
-        )
-        self.buffer.append(entry)
+        """Error level logging - never sampled."""
+        if logger.isEnabledFor(logging.ERROR):
+            self._write("ERROR", logging.ERROR, message, kwargs)
 
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
         """Log cache operation with standard fields."""
@@ -334,11 +210,6 @@ class StructuredLogger:
             "timestamp": time.time(),
             "thread_id": threading.get_ident(),
         }
-
-    def __del__(self):
-        """Cleanup on deletion."""
-        if hasattr(self, "writer"):
-            self.writer.stop()
 
 
 # Global logger instances cache

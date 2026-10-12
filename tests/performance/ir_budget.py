@@ -222,11 +222,10 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         "PYTHONNOUSERSITE": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
-        # cachekit's log writer wakes every 1 s and its L1 sweeper every 30 s of real time. A woken
-        # thread takes the GIL at a load-dependent moment, and the sweeper compares expiry times
-        # stamped by the pinned main-thread clock against the real one, so it evicts live entries
-        # mid-run. A day-long interval keeps both asleep for the whole run.
-        "CACHEKIT_LOG_FLUSH_INTERVAL": "86400",
+        # cachekit's L1 sweeper wakes every 30 s of real time. A woken thread takes the GIL at a
+        # load-dependent moment, and the sweeper compares expiry times stamped by the pinned
+        # main-thread clock against the real one, so it evicts live entries mid-run. A day-long
+        # interval keeps it asleep for the whole run.
         "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
     global _stopped

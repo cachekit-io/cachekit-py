@@ -3,8 +3,8 @@
 tracemalloc.start()/stop() swap the process-wide allocator hooks without synchronising with
 threads that are allocating at that moment, so on a free-threaded build a concurrent
 allocation can crash the process: https://github.com/python/cpython/issues/143143. The pytest
-process is never single-threaded (``import cachekit`` starts the log writer; pytest-xdist adds
-its I/O thread), so every tracemalloc start/stop in the test suite goes through here.
+process is never single-threaded (pytest-xdist adds its I/O thread), so every tracemalloc
+start/stop in the test suite goes through here.
 """
 
 from __future__ import annotations
@@ -19,14 +19,9 @@ from typing import Any
 
 import pytest
 
-from cachekit import logging as ck_logging
-
 
 def _run_alone(measure: Callable[[], Any]) -> Any:
-    """Subprocess side: stop cachekit's log writers, then measure with no other thread alive."""
-    for structured in ck_logging._logger_instances.values():
-        structured.writer.stop()
-        structured.writer.join()
+    """Subprocess side: measure with no other thread alive."""
     assert threading.active_count() == 1, f"tracemalloc must not start or stop beside {threading.enumerate()}"
     result = measure()
     assert threading.active_count() == 1, f"a thread started while measuring: {threading.enumerate()}"
