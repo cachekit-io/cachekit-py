@@ -27,12 +27,32 @@ SAMPLING_RATE = get_settings().log_sampling_rate
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
 
-_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.CRITICAL,
+}
+
+# What json.dumps raises on a value its default= never sees: a non-str dict key, a cycle, a too-deep nest
+_UNENCODABLE = (TypeError, ValueError, RecursionError)
 
 
 def _type_name(value: object) -> str:
     """Stand in for a value JSON cannot encode: its type only, as its str() may embed a cache key (CWE-532)."""
     return f"<{type(value).__name__}>"
+
+
+def _encodable(value: object) -> object:
+    """The value if json can encode it, else its type name."""
+    try:
+        json.dumps(value, default=_type_name)
+    except _UNENCODABLE:
+        return _type_name(value)
+    return value
 
 
 class StructuredLogger:
@@ -42,7 +62,7 @@ class StructuredLogger:
 
     Features:
     - Nothing is sampled or serialised below that logger's level
-    - Sampling (10% default) of DEBUG/INFO/WARNING; ERROR is never sampled
+    - Sampling (10% default) of DEBUG/INFO/WARNING; ERROR and CRITICAL are never sampled
     - PII key-name masking (password/token/secret/key/auth kwargs)
     """
 
@@ -73,7 +93,8 @@ class StructuredLogger:
 
     def _write(self, level: str, levelno: int, message: str, fields: dict[str, Any]) -> None:
         """Serialise one entry and log it now."""
-        entry = {
+        entry: dict[str, Any] = {
+            **self._mask_pii(fields),  # first, so a caller's pid= cannot replace the real one
             "timestamp": time.time(),
             "level": level,
             "message": message,
@@ -81,15 +102,18 @@ class StructuredLogger:
             "hostname": self._hostname,
             "pid": os.getpid(),  # read per entry: a forked child reports its own
             "thread_id": threading.get_ident(),
-            **self._mask_pii(fields),
         }
-        logger.log(levelno, json.dumps(entry, separators=(",", ":"), default=_type_name))
+        try:
+            line = json.dumps(entry, separators=(",", ":"), default=_type_name)
+        except _UNENCODABLE:  # raising would replace the exception a caller may be logging
+            line = json.dumps({k: _encodable(v) for k, v in entry.items()}, separators=(",", ":"), default=_type_name)
+        logger.log(levelno, line)
 
     def log(self, level: str, message: str, **kwargs):
         """Main logging method with sampling."""
         level = level.upper()
         levelno = _LEVELS.get(level, logging.INFO)
-        if logger.isEnabledFor(levelno) and self._should_sample():
+        if logger.isEnabledFor(levelno) and (levelno >= logging.ERROR or self._should_sample()):
             self._write(level, levelno, message, kwargs)
 
     def debug(self, message: str, **kwargs):

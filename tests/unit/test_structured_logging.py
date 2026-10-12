@@ -112,6 +112,19 @@ def _print_c_fork_child_outcome() -> NoReturn:
     os._exit(0)
 
 
+def _cycle() -> list:
+    cycle: list = ["ns:tenant-42:func:app.f:args:x"]
+    cycle.append(cycle)
+    return cycle
+
+
+def _too_deep() -> list:
+    nest: list = ["tenant-42"]
+    for _ in range(100_000):  # past json's recursion limit on every supported interpreter; 10_000 is not, on 3.14
+        nest = [nest]
+    return nest
+
+
 class TestStructuredLogger:
     """Test StructuredLogger functionality."""
 
@@ -212,6 +225,33 @@ class TestSynchronousEntries:
         assert "tenant-42" not in json.dumps(written)
 
     @pytest.mark.parametrize(
+        ("build", "type_name"),
+        [
+            (lambda: {(1, 2): "ns:tenant-42:func:app.f:args:x"}, "<dict>"),
+            (_cycle, "<list>"),
+            (_too_deep, "<list>"),
+        ],
+        ids=["tuple-key", "cycle", "too-deep"],
+    )
+    def test_field_json_raises_on_is_written_as_its_type_only(self, written, build, type_name):
+        """json raises on it (TypeError, ValueError, RecursionError): the entry is still written, its other fields intact.
+
+        Raising instead would replace the exception a caller is logging from inside its except block.
+        """
+        StructuredLogger("test.unwalkable").error("boom", detail=build(), attempt=1)
+
+        assert (written[0]["message"], written[0]["detail"], written[0]["attempt"]) == ("boom", type_name, 1)
+        assert "tenant-42" not in json.dumps(written)
+
+    def test_generated_fields_win_over_same_named_caller_fields(self, written):
+        """A caller's pid= cannot make the entry report a process other than the one that wrote it."""
+        StructuredLogger("test.reserved").error("boom", pid=1, thread_id=2, logger="spoofed", level="DEBUG")
+
+        entry = written[0]
+        assert (entry["pid"], entry["thread_id"]) == (os.getpid(), threading.get_ident())
+        assert (entry["logger"], entry["level"]) == ("test.reserved", "ERROR")
+
+    @pytest.mark.parametrize(
         ("level", "sampled", "builds"),
         [(logging.DEBUG, True, True), (logging.DEBUG, False, False), (logging.INFO, True, False)],
         ids=["enabled-sampled", "enabled-sampled-out", "disabled"],
@@ -230,14 +270,32 @@ class TestSynchronousEntries:
         assert sample.called is (level == logging.DEBUG)
         assert write.called is builds
 
-    def test_error_is_never_sampled(self, monkeypatch, written):
+    def test_error_and_above_are_never_sampled(self, monkeypatch, written):
         structured = StructuredLogger("test.unsampled")
         monkeypatch.setattr(structured, "_should_sample", lambda: False)
 
         structured.error("boom")
+        structured.log("error", "via log")
+        structured.log("CRITICAL", "critical")
         structured.warning("dropped")
 
-        assert [e["message"] for e in written] == ["boom"]
+        assert [e["message"] for e in written] == ["boom", "via log", "critical"]
+
+    @pytest.mark.parametrize(
+        ("name", "levelno"),
+        [("warn", logging.WARNING), ("CRITICAL", logging.CRITICAL), ("FATAL", logging.CRITICAL), ("NOTICE", logging.INFO)],
+    )
+    def test_log_writes_a_level_name_at_its_stdlib_level(self, monkeypatch, caplog, name, levelno):
+        """Each stdlib level name maps to its own level, as the old writer's getattr(logging, name) did; others are INFO."""
+        caplog.set_level(logging.DEBUG, logger="cachekit.logging")
+        structured = StructuredLogger("test.levels")
+        monkeypatch.setattr(structured, "_should_sample", lambda: True)
+
+        structured.log(name, "boom")
+
+        assert [(r.levelno, json.loads(r.getMessage())["level"]) for r in caplog.records if r.name == "cachekit.logging"] == [
+            (levelno, name.upper())
+        ]
 
     def test_constructing_a_logger_starts_no_thread(self, monkeypatch):
         started: list[str] = []

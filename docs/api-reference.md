@@ -844,7 +844,7 @@ cachekit writes two kinds of structured record through Python's `logging`, so yo
 
 With `enable_structured_logging=True` (the default), these cache operations are logged at INFO on the `cachekit.decorators.orchestrator` logger: L1 and L2 hits of a sync function that has a backend, failed operations and circuit-breaker rejections. Each record's `structured` attribute holds the operation, the namespace and the redacted cache key, plus the duration, hit, serializer and error type where they apply. The message is plain text; your formatter decides whether those fields are rendered.
 
-SDK diagnostics, such as the CachekitIO backend's debug lines, are one JSON object per record on the `cachekit.logging` logger, with `timestamp`, `level`, `message`, `logger`, `hostname`, `pid` and `thread_id`. Each is written when it is logged, on the calling thread. DEBUG, INFO and WARNING records are sampled at `CACHEKIT_LOG_SAMPLING_RATE` (default `0.1`), and ERROR records never are. Nothing is sampled or serialised below that logger's level. A forked child writes its own records, with its own `pid`.
+SDK diagnostics, such as the CachekitIO backend's debug lines, are one JSON object per record on the `cachekit.logging` logger, with `timestamp`, `level`, `message`, `logger`, `hostname`, `pid` and `thread_id`. Each is written when it is logged, on the calling thread. DEBUG, INFO and WARNING records are sampled at `CACHEKIT_LOG_SAMPLING_RATE` (default `0.1`), and ERROR and CRITICAL records never are. A field value JSON cannot encode is written as its type name, such as `"<dict>"`, never as its text. Nothing is sampled or serialised below that logger's level. A forked child writes its own records, with its own `pid`.
 
 ## Best Practices
 
