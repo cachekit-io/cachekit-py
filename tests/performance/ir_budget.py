@@ -3,8 +3,8 @@
 Wall-clock benchmarks on a shared host cannot gate a 1% regression: run-to-run noise is several
 percent. Instruction counts can, once these sources of run-to-run noise are handled:
 
-- ``import cachekit`` starts background threads (the log writer, the L1 cleanup worker) whose
-  counts swing by tens of percent between identical runs. Only the MAIN thread is counted
+- cachekit runs background threads (the L1 cleanup worker) whose counts swing by tens of
+  percent between identical runs. Only the MAIN thread is counted
   (callgrind ``--separate-threads=yes``, file ``-01``). Work a library runs on its own threads
   is not counted either: about half of the real-data Arrow round trip runs on pyarrow's threads.
 - Interpreter startup is ~2 billion instructions. Each path runs at two loop sizes and the

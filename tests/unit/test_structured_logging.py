@@ -7,11 +7,8 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 import threading
-from pathlib import Path
-from typing import NoReturn
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,7 +17,7 @@ from cachekit.logging import (
     StructuredLogger,
     get_structured_logger,
 )
-from tests.utils.fork_helpers import child_outcome, report
+from tests.utils.fork_helpers import child_outcome, report, run_fresh
 
 
 class _Capture(logging.Handler):
@@ -98,19 +95,6 @@ def _c_fork_child_outcome() -> object:
             os._exit(1)
     os.close(w)
     return child_outcome(child, r)
-
-
-def _print_c_fork_child_outcome() -> NoReturn:
-    """Print _c_fork_child_outcome() and end without exit handlers, as its sibling in test_l1_memory_bounds does."""
-    import traceback
-
-    try:
-        print(repr(_c_fork_child_outcome()), flush=True)
-    except BaseException:
-        traceback.print_exc()
-        sys.stderr.flush()
-        os._exit(1)
-    os._exit(0)
 
 
 def _cycle() -> list:
@@ -341,15 +325,9 @@ class TestEntriesAfterFork:
     def test_child_of_a_c_fork_writes_nothing_and_starts_no_thread(self):
         """A real fork from C: no at-fork hook runs, so logging's locks may be held by threads the child lacks.
 
-        The child's calls return without taking them: they write nothing and request no thread. The fork
-        runs in a fresh interpreter (_c_fork_child_outcome): this one has threads it cannot end
-        (pytest-xdist's, other tests'), and one waiting for the GIL at fork hangs the child.
+        The child's calls return without taking them: they write nothing and request no thread.
         """
-        code = "from tests.unit.test_structured_logging import _print_c_fork_child_outcome as f; f()"
-        root = Path(__file__).resolve().parents[2]  # where `tests` imports from
-        run = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code
-            [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60
-        )
+        run = run_fresh(_c_fork_child_outcome)
 
         assert run.returncode == 0, run.stderr
         assert ast.literal_eval(run.stdout) == {"requested": [], "written": []}, run.stderr  # a hung child's stack

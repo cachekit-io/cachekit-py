@@ -4,9 +4,9 @@ Each entry is serialised and written on the caller's thread. There is no backgro
 started at import is not running in a forked child (Gunicorn ``--preload``, Celery prefork,
 ``multiprocessing``'s fork start method), so everything a child buffered for it was lost.
 
-A child forked from C without at-fork hooks (uWSGI without ``--py-call-uwsgi-fork-hooks``) writes no
-entry: ``logging``'s own after-fork lock reset did not run there, so a level check or a handler lock a
-parent thread held at fork would hang the caller.
+In a child forked from C without at-fork hooks (uWSGI without ``--py-call-uwsgi-fork-hooks``),
+``log()`` and ``error()`` write no entry: ``logging``'s own after-fork lock reset did not run there, so
+a level check or a handler lock a parent thread held at fork would hang the caller.
 """
 
 import json
@@ -139,7 +139,7 @@ class StructuredLogger:
         self.log("WARNING", message, **kwargs)
 
     def error(self, message: str, **kwargs):
-        """Error level logging - never sampled."""
+        """Error level logging - never sampled. Not via log(): a caller field named level or message would collide."""
         if _enabled(logging.ERROR):
             self._write("ERROR", logging.ERROR, message, kwargs)
 
@@ -203,21 +203,7 @@ class StructuredLogger:
             # Silently ignore if Prometheus metrics not available
             pass
 
-        # For compatibility with tests that expect standard logging
-        import logging as std_logging
-
-        # Map string level to logging constant
-        level_map = {
-            "DEBUG": std_logging.DEBUG,
-            "INFO": std_logging.INFO,
-            "WARNING": std_logging.WARNING,
-            "ERROR": std_logging.ERROR,
-            "CRITICAL": std_logging.CRITICAL,
-        }
-        log_level = level_map.get(level.upper(), std_logging.INFO)
-
-        logger = std_logging.getLogger(self.name)
-        logger.log(log_level, "cache_operation", extra={"structured": context})
+        self.logger.log(_LEVELS[level], "cache_operation", extra={"structured": context})
 
     def connection_pool_utilization(self, utilization: float, **kwargs):
         """Log connection pool metrics."""

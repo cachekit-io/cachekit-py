@@ -342,7 +342,6 @@ def _forked_stale_hit_outcome(fork: str) -> object:
     import types
 
     from cachekit import l1_cache, object_cache
-    from cachekit import logging as structured_logging
     from cachekit.config import L1CacheConfig
 
     backend = FakeSWRBackend()
@@ -363,9 +362,6 @@ def _forked_stale_hit_outcome(fork: str) -> object:
     if manager._cleanup_thread is not None:  # ends it, still referenced: the parent ran cleanup
         manager._stop_cleanup.set()
         manager._cleanup_thread.join()
-    for structured in structured_logging._logger_instances.values():  # their writers wake every flush interval
-        structured.writer.stop()
-        structured.writer.join()
     if threading.active_count() != 1:  # not an assert: python -O strips those
         raise RuntimeError(f"a thread would be alive at fork: {threading.enumerate()}")
     faulthandler.register(signal.SIGALRM, chain=True)  # the child inherits it: a hang dumps its stack
