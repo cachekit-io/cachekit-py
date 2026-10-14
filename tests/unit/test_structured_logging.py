@@ -50,13 +50,15 @@ def _c_fork_child_outcome() -> object:
 
     Importing cachekit must leave this interpreter single-threaded: a thread waiting for the GIL at a
     fork made from C leaves the child hung at its first GIL release, in no cachekit code. logging's
-    module lock and the handler's lock end held by threads the child lacks, and no level check is
-    cached: in the child, any call that takes either lock hangs, as no after-fork reset ran there.
+    module lock, the handler's lock and cachekit's metrics lock end held by threads the child lacks,
+    and no level check is cached: in the child, any call that takes one of them hangs, as no
+    after-fork reset ran there.
     """
     import ctypes
     import faulthandler
 
     import cachekit  # noqa: F401 - everything an application's import starts
+    from cachekit.reliability import metrics_collection
 
     before = get_structured_logger("test.c_fork.parent")  # built pre-fork, as a module-level _logger is
     before._should_sample = lambda: True  # never sampled away
@@ -64,7 +66,7 @@ def _c_fork_child_outcome() -> object:
     for sink in (logging.getLogger("cachekit.logging"), before.logger):  # the JSON sink and the plain-text one
         sink.addHandler(capture)
         sink.setLevel(logging.DEBUG)
-    for lock in (logging._lock, capture.lock):  # held at fork by a thread the child lacks
+    for lock in (logging._lock, capture.lock, metrics_collection._metrics_lock()):  # held at fork by a thread the child lacks
         holder = threading.Thread(target=lock.acquire)  # ends holding it
         holder.start()
         holder.join()
@@ -89,7 +91,10 @@ def _c_fork_child_outcome() -> object:
             before.error("child error")
             before.cache_operation("get", "ns:tenant-42:func:app.f:args:x", hit=True)
             before.connection_pool_utilization(0.95)
-            outcome: object = {"requested": requested, "written": capture.entries}
+            hits = metrics_collection.cache_operations.get(
+                {"operation": "get", "status": "hit", "serializer": "", "namespace": "default"}
+            )
+            outcome: object = {"requested": requested, "written": capture.entries, "hits_counted": hits}
         except BaseException as e:
             outcome = {"error": repr(e)}
         try:
@@ -336,12 +341,14 @@ class TestEntriesAfterFork:
     def test_child_of_a_c_fork_writes_nothing_and_starts_no_thread(self):
         """A real fork from C: no at-fork hook runs, so logging's locks may be held by threads the child lacks.
 
-        The child's calls return without taking them: they write nothing and request no thread.
+        The child's calls return without taking them: they write nothing and request no thread, and its metrics still count.
         """
         run = run_fresh(_c_fork_child_outcome)
 
         assert run.returncode == 0, run.stderr
-        assert ast.literal_eval(run.stdout) == {"requested": [], "written": []}, run.stderr  # a hung child's stack
+        assert ast.literal_eval(run.stdout) == {"requested": [], "written": [], "hits_counted": 1.0}, (
+            run.stderr
+        )  # a hung child's stack
 
 
 class TestFactoryFunction:
