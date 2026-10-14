@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 import pytest
 
-from cachekit import cache
+from cachekit import InvalidationOutcome, cache
 from cachekit.backends.errors import BackendError
 from cachekit.backends.file import FileBackend, FileBackendConfig
 
@@ -404,7 +404,10 @@ FAILURES = [BackendError(_ERROR_TEXT), OSError(_ERROR_TEXT)]
 
 @pytest.mark.unit
 class TestInvalidateFailedDeleteVisibility:
-    """A failed L2 delete never raises, and a failing no-args sweep logs ONE visible counted record."""
+    """A failed L2 delete never raises, and a failing no-args sweep logs ONE visible counted record.
+
+    An exact-key call reports the failure as its return value; a no-args call returns None.
+    """
 
     @pytest.mark.parametrize("error", FAILURES, ids=lambda e: type(e).__name__)
     @pytest.mark.parametrize("with_args", [True, False], ids=["args", "no_args"])
@@ -417,7 +420,10 @@ class TestInvalidateFailedDeleteVisibility:
 
         f(1)
         backend.delete_error = error
-        assert (f.invalidate_cache(1) if with_args else f.invalidate_cache()) is None
+        if with_args:
+            assert f.invalidate_cache(1) is InvalidationOutcome.FAILED
+        else:
+            assert f.invalidate_cache() is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error", FAILURES, ids=lambda e: type(e).__name__)
@@ -431,7 +437,10 @@ class TestInvalidateFailedDeleteVisibility:
 
         await f(1)
         backend.delete_error = error
-        assert (await f.ainvalidate_cache(1) if with_args else await f.ainvalidate_cache()) is None
+        if with_args:
+            assert await f.ainvalidate_cache(1) is InvalidationOutcome.FAILED
+        else:
+            assert await f.ainvalidate_cache() is None
 
     @pytest.mark.parametrize("error", FAILURES, ids=lambda e: type(e).__name__)
     def test_sync_sweep_logs_one_counted_record(self, caplog: pytest.LogCaptureFixture, error: BaseException) -> None:

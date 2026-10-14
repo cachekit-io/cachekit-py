@@ -197,6 +197,20 @@ for uid in [1, 2, 3]:
 
 **Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. On a generated key with a non-default serializer it also deletes the key a pre-v0.20.0 release wrote for the same arguments (see [the v0.20.0 key change](../serializers/README.md#breaking-change-in-v0200-the-key-carries-the-real-serializer)). In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local. If the L2 delete fails, cachekit logs an ERROR `Failed to delete L2 key` and tracks the key in this process, so a later no-args `invalidate_cache()` from the same process retries it. On the backends the [whole-function table](#whole-function-invalidation) marks "any process", a key whose write was tracked also stays in the server-side set, so a later no-args drain from any process retries it, within the `Key tracking failed` and **Set lifetime** caveats below. On the backends it marks "this process", tracking is process-local: another process, or this one after a restart, does not retry it.
 
+**The outcome.** `invalidate_cache(args...)` and `await ainvalidate_cache(args...)` return an `InvalidationOutcome`, `SUCCEEDED`, `FAILED` or `NO_L2`, saying what the call did in L2, so a caller can tell a failed delete apart without reading logs. The [decorators reference](https://docs.cachekit.io/python/reference/decorators/#invalidation) defines each value. Only the key the call derives decides the outcome: the pre-v0.20.0 key it also deletes does not. A no-args call on a function that takes parameters (whole-function invalidation, below) returns `None`; a zero-parameter function's `invalidate_cache()` has one key and reports its outcome, and `@cache.local()` always returns `NO_L2`. A caller that ignores the return value sees the same deletes, logs and retries as before.
+
+```python
+from cachekit import InvalidationOutcome, cache
+
+# backend=None keeps this example self-contained; with a backend the outcome is SUCCEEDED or FAILED.
+@cache(backend=None)
+def get_price(sku: str) -> int:
+    return 100
+
+get_price("A1")
+assert get_price.invalidate_cache("A1") is InvalidationOutcome.NO_L2
+```
+
 ### Whole-Function Invalidation
 
 Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function. How far "every" reaches depends on the backend:
@@ -243,7 +257,7 @@ Things to know:
 
 **Custom `key=` functions.** Both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. No-args `invalidate_cache()` reaches what the table above says for the resolved backend — the registry tracks the key the write path actually wrote, custom or not. On the backends limited to "this process", tracked keys do not survive a restart, so after a deploy use the exact-args form.
 
-**Backend failures.** Invalidation never raises on a backend failure: `invalidate_cache()` and `ainvalidate_cache()` return `None` whether or not the L2 deletes succeed. (The interop prefix guard is not a backend failure and still raises its `ConfigurationError`; see [Interop Mode](interop-mode.md).) When a no-args invalidation deletes this process's own keys — on a backend without a key registry, or after a failed drain — and some of those deletes fail, cachekit logs one ERROR `Failed to delete N L2 key(s)` per call, with the count, rather than one line per key. A key counts as failed when its delete raised, or when a batch could not confirm it, for example because its Memcached server did not answer. Each of those keys stays tracked in this process, so this process's next no-args `invalidate_cache()` retries it. Until then, the entries are still served from L2.
+**Backend failures.** Invalidation never raises on a backend failure. An exact-key `invalidate_cache(args...)` or `ainvalidate_cache(args...)` reports a failed L2 delete in its return value, `InvalidationOutcome.FAILED` ([The outcome](#specific-call-invalidation)); a no-args invalidation of a function that takes parameters returns `None` whether or not its L2 deletes succeed. A backend that could not be resolved also reports `FAILED`, but logs only at DEBUG. (The interop prefix guard is not a backend failure and still raises its `ConfigurationError`; see [Interop Mode](interop-mode.md).) When a no-args invalidation deletes this process's own keys — on a backend without a key registry, or after a failed drain — and some of those deletes fail, cachekit logs one ERROR `Failed to delete N L2 key(s)` per call, with the count, rather than one line per key. A key counts as failed when its delete raised, or when a batch could not confirm it, for example because its Memcached server did not answer. Each of those keys stays tracked in this process, so this process's next no-args `invalidate_cache()` retries it. Until then, the entries are still served from L2.
 
 **`str` subclass namespaces.** A `str` subclass namespace is used as its plain `str` value everywhere, so a `StrEnum` or `(str, Enum)` member `USERS = "users"` is the namespace `users`. Earlier releases rendered a `(str, Enum)` member as `NS.USERS` in some places: in metrics labels on every Python version, and in custom `key=` keys, key registry set names and log-message prefixes on Python 3.11 and later. Plain `str` and `StrEnum` namespaces are unaffected. For a `(str, Enum)` namespace, upgrading changes the following.
 

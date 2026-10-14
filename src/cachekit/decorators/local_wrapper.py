@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
-from cachekit.decorators.wrapper import CacheInfo
+from cachekit.decorators.wrapper import CacheInfo, InvalidationOutcome
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.object_cache import ObjectCache
 
@@ -104,16 +104,17 @@ def create_local_wrapper(
     # Each invalidation also forgets the key's call in flight: a read that starts after it never
     # joins a miss that started before it.
 
-    def invalidate_cache(*args: Any, **kw: Any) -> None:
-        """Remove a specific cached entry by regenerating its key."""
+    def invalidate_cache(*args: Any, **kw: Any) -> InvalidationOutcome:
+        """Remove a specific cached entry by regenerating its key. There is no L2: always NO_L2."""
         cache_key = _make_key(args, kw)
         flights.forget([cache_key])
         thread_flights.forget([cache_key])
         object_cache.delete(cache_key)
+        return InvalidationOutcome.NO_L2
 
-    async def ainvalidate_cache(*args: Any, **kw: Any) -> None:
+    async def ainvalidate_cache(*args: Any, **kw: Any) -> InvalidationOutcome:
         """Async variant of invalidate_cache (operation is sync but API is async for consistency)."""
-        invalidate_cache(*args, **kw)
+        return invalidate_cache(*args, **kw)
 
     def cache_clear() -> None:
         """Remove all entries for this function. Works for both sync and async."""
