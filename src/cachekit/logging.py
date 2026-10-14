@@ -29,9 +29,6 @@ logger = logging.getLogger(__name__)
 # Loaded once at module import from the settings singleton
 SAMPLING_RATE = get_settings().log_sampling_rate
 
-# Performance and health thresholds
-HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
-
 _LEVELS = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -84,7 +81,7 @@ class StructuredLogger:
         # PII patterns to mask (pre-compiled for speed)
         self._pii_keys = {"password", "token", "secret", "key", "auth"}
 
-        # Sink for cache_operation and connection_pool_utilization: plain-text messages, fields in record.structured
+        # Sink for cache_operation: plain-text messages, fields in record.structured
         self.logger = logging.getLogger(name)
 
     def _should_sample(self) -> bool:
@@ -202,27 +199,6 @@ class StructuredLogger:
 
         if not l1_cache._forked_without_hooks():  # module docstring; the metrics above still count
             self.logger.log(levelno, "cache_operation", extra={"structured": context})
-
-    def connection_pool_utilization(self, utilization: float, **kwargs):
-        """Log connection pool metrics."""
-        if l1_cache._forked_without_hooks():  # module docstring
-            return
-
-        # Determine log level based on utilization
-        if utilization > HIGH_UTILIZATION_THRESHOLD:
-            self.logger.log(
-                logging.WARNING,
-                f"High connection pool utilization: {utilization:.1%}",
-                extra={"structured": {"utilization": utilization, **kwargs}},
-            )
-        else:
-            self.logger.log(
-                logging.INFO,
-                f"Connection pool utilization: {utilization:.1%}",
-                extra={"structured": {"utilization": utilization, **kwargs}},
-            )
-
-        self.log("INFO", "pool_utilization", utilization=round(utilization, 3), **kwargs)
 
     def _get_context(self) -> dict[str, Any]:
         """Get current logging context."""
