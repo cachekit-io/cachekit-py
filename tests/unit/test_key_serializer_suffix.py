@@ -20,7 +20,7 @@ from typing import Any, TypeVar
 
 import pytest
 
-from cachekit import cache
+from cachekit import InvalidationOutcome, cache
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
@@ -447,9 +447,11 @@ class TestInvalidationReachesPre020Keys:
         backend.fail_on = {legacy_key if failing == "legacy" else current_key}
         backend.deleted.clear()
 
-        fn.invalidate_cache(1)
+        outcome = fn.invalidate_cache(1)
 
         assert backend.deleted == [current_key, legacy_key]
+        # Only the current-format key's delete decides the outcome.
+        assert outcome is (InvalidationOutcome.FAILED if failing == "current" else InvalidationOutcome.SUCCEEDED)
         assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
 
     @pytest.mark.parametrize("failing", ["legacy", "current"])
@@ -467,9 +469,10 @@ class TestInvalidationReachesPre020Keys:
         backend.fail_on = {legacy_key if failing == "legacy" else current_key}
         backend.deleted.clear()
 
-        await fn.ainvalidate_cache(1)
+        outcome = await fn.ainvalidate_cache(1)
 
         assert backend.deleted == [current_key, legacy_key]
+        assert outcome is (InvalidationOutcome.FAILED if failing == "current" else InvalidationOutcome.SUCCEEDED)
         assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
 
     @pytest.mark.parametrize("mode", ["key=", "fast_mode", "interop"])

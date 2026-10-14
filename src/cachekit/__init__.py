@@ -83,7 +83,7 @@ from .config import DecoratorConfig
 
 # Import the intelligent cache decorator and CacheInfo
 from .decorators import cache
-from .decorators.wrapper import CacheInfo
+from .decorators.wrapper import CacheInfo, InvalidationOutcome
 
 # Import health check functionality
 from .health import (
@@ -129,4 +129,5 @@ __all__ = [
     "HealthLevel",
     "HealthStatus",
     "InteropError",
+    "InvalidationOutcome",
 ]

@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
@@ -298,6 +299,38 @@ class CacheInfo(NamedTuple):
     l2_avg_latency_ms: float  # Average L2 (Redis) latency in milliseconds
     last_operation_at: float | None  # Unix timestamp of last cache operation
     session_id: str | None = None  # Function-specific session ID for correlation
+
+
+class InvalidationOutcome(str, Enum):
+    """What one exact-key ``invalidate_cache(*args)`` or ``ainvalidate_cache(*args)`` call did in L2.
+
+    Invalidation never raises on a backend failure, so this return value is how a caller learns
+    whether the entry is gone from shared L2. Whole-function invalidation (no arguments on a function
+    that takes parameters) reports nothing and returns ``None``.
+
+    - ``SUCCEEDED``: the L2 delete of the key returned normally. The entry is no longer in L2; the
+      delete does not say whether one was there.
+    - ``FAILED``: the L2 delete raised, or the backend could not be resolved for the call. The entry
+      may still be served from L2.
+    - ``NO_L2``: there is no L2 to delete from: L1-only mode (``backend=None``) or ``@cache.local``.
+
+    Only the key the call derives counts. The pre-0.20.0 key that an invalidation also deletes does
+    not change the outcome.
+
+    Examples:
+        >>> from cachekit import InvalidationOutcome, cache
+        >>> @cache(backend=None)
+        ... def square(x: int) -> int:
+        ...     return x * x
+        >>> square(3)
+        9
+        >>> square.invalidate_cache(3) is InvalidationOutcome.NO_L2
+        True
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    NO_L2 = "no_l2"
 
 
 class _FunctionStats:
@@ -1575,15 +1608,16 @@ def create_cache_wrapper(
         _flights.forget(cache_keys)
         _thread_flights.forget(cache_keys)
 
-    def _delete_then_forget(cache_keys: list[str] | None) -> None:
+    def _delete_then_forget(cache_keys: list[str] | None) -> InvalidationOutcome | None:
         """Delete these keys (all, for None), then forget their calls in flight: one that started
         before the delete ended may have read the old entry. One call, so the forget runs after the
-        delete wherever the delete runs, even in a worker an async caller stopped waiting for."""
+        delete wherever the delete runs, even in a worker an async caller stopped waiting for.
+        Returns the keys' outcome; None for all."""
         try:
             if cache_keys is None:
                 _drain_all()
-            else:
-                _invalidate_keys(cache_keys)
+                return None
+            return _invalidate_keys(cache_keys)
         finally:
             _forget_flights(cache_keys)
 
@@ -2872,9 +2906,10 @@ def create_cache_wrapper(
         else:
             invalidation.publish(_backend, _registry_id, None)
 
-    def _invalidate_key(cache_key: str) -> bool:
+    def _invalidate_key(cache_key: str) -> InvalidationOutcome:
         """Single-key invalidation: untrack, L2 delete, then L1. Sync; ainvalidate_cache runs it
-        via asyncio.to_thread, like _drain_all. Returns whether the L2 delete returned normally.
+        via asyncio.to_thread, like _drain_all. SUCCEEDED only when the L2 delete returned normally;
+        FAILED also when the backend could not be resolved (_backend still None).
 
         Untrack BEFORE the delete: every write path calls _put_l1, which re-tracks the key, after
         its L2 set, so a concurrent write landing after the delete can never be left in L2 untracked.
@@ -2883,28 +2918,29 @@ def create_cache_wrapper(
         """
         entry = (_l2_scope(), cache_key)
         _cached_keys.discard(entry)
-        deleted = False
+        outcome = InvalidationOutcome.NO_L2 if _l1_only_mode else InvalidationOutcome.FAILED
         try:
             if _backend and not _l1_only_mode:
                 try:
                     _backend.delete(cache_key)
-                    deleted = True
+                    outcome = InvalidationOutcome.SUCCEEDED
                 except Exception as e:
                     # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
                     _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
                 finally:
                     # finally, not except: a BaseException (gevent Timeout, KeyboardInterrupt) must re-track too.
-                    if not deleted:
+                    if outcome is not InvalidationOutcome.SUCCEEDED:
                         _cached_keys.add(entry)
         finally:
             if _object_cache:
                 _object_cache.delete(cache_key)
             elif _l1_cache:
                 _l1_cache.invalidate(cache_key)
-        return deleted
+        return outcome
 
-    def _invalidate_keys(cache_keys: list[str]) -> None:
-        """_invalidate_key per key: each logs its own failure, so one never skips the next.
+    def _invalidate_keys(cache_keys: list[str]) -> InvalidationOutcome:
+        """_invalidate_key per key: each logs its own failure, so one never skips the next. Returns
+        the first (current-format) key's outcome, for the same reason it alone gates the announcement.
 
         Announced once, for the first (current-format) key and only if its L2 delete returned
         normally: L1 only ever holds current-format keys, and a peer evicting after a failed
@@ -2912,13 +2948,19 @@ def create_cache_wrapper(
         gates the announcement. A key= function's key embeds caller identifiers, so its event
         names the whole function instead.
         """
-        current_deleted = _invalidate_key(cache_keys[0])
+        outcome = _invalidate_key(cache_keys[0])
         for twin in cache_keys[1:]:
             _invalidate_key(twin)
-        if current_deleted and _is_trackable():
+        if outcome is InvalidationOutcome.SUCCEEDED and _is_trackable():
             invalidation.publish(_backend, _registry_id, None if custom_key_func is not None else cache_keys[0])
+        return outcome
 
-    def invalidate_cache(*args: Any, **kwargs: Any) -> None:
+    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
+        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
+        takes parameters, every entry of the function. Never raises on a backend failure.
+
+        Returns the call's InvalidationOutcome for one entry, and None for every entry.
+        """
         nonlocal _backend
 
         # L1-ONLY MODE: Skip backend lookup entirely
@@ -2942,15 +2984,15 @@ def create_cache_wrapper(
         # Calls in flight are forgotten after the deletes (_delete_then_forget): a read that starts
         # after this returns must not join a miss that started before it.
         if not args and not kwargs and _func_has_params:
-            _delete_then_forget(None)
-            return
+            return _delete_then_forget(None)
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288).
         cache_keys = _resolve_invalidation_keys(args, kwargs)
-        _delete_then_forget(cache_keys)
+        return _delete_then_forget(cache_keys)
 
-    async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
+    async def ainvalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
+        """Async invalidate_cache: the same deletes, run off the event loop, and the same return value."""
         nonlocal _backend
 
         # L1-ONLY MODE: Skip backend lookup entirely
@@ -2971,8 +3013,7 @@ def create_cache_wrapper(
         if not args and not kwargs and _func_has_params:
             # Off the event loop: every L2 call in here is a sync Redis/backend round-trip. The worker
             # forgets the calls in flight after its deletes even if this caller is cancelled while it runs.
-            await asyncio.to_thread(_delete_then_forget, None)
-            return
+            return await asyncio.to_thread(_delete_then_forget, None)
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288). The
@@ -2980,7 +3021,7 @@ def create_cache_wrapper(
         # async client per provider, whose pool stays bound to the first event loop that used it
         # (asyncio.run per job).
         cache_keys = _resolve_invalidation_keys(args, kwargs)
-        await asyncio.to_thread(_delete_then_forget, cache_keys)
+        return await asyncio.to_thread(_delete_then_forget, cache_keys)
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""

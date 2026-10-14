@@ -180,7 +180,7 @@ Function call with args A
 All cachekit decorators expose the same cache management interface:
 
 ```python
-from cachekit import cache
+from cachekit import InvalidationOutcome, cache
 
 @cache.local(ttl=300)
 def get_client(api_key: str):
@@ -195,7 +195,8 @@ assert info.misses == 1
 assert info.maxsize == 256
 assert info.currsize == 1
 
-get_client.invalidate_cache("key1")  # Remove specific entry
+# Remove specific entry: there is no L2, so the outcome is always NO_L2
+assert get_client.invalidate_cache("key1") is InvalidationOutcome.NO_L2
 assert get_client.cache_info().currsize == 0
 
 get_client("key2")
