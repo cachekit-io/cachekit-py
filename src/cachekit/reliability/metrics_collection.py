@@ -5,6 +5,7 @@ backpressure, and other reliability features.
 """
 
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -14,10 +15,18 @@ from cachekit.hash_utils import redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
-# Thread-safe metrics storage
-_metrics_lock = threading.RLock()
+# Thread-safe metrics storage. One lock per process, keyed by pid: a fork from C skips every at-fork
+# hook, so a child must never take a lock it inherited, possibly held by a thread that is gone.
+_metrics_locks: dict[int, threading.RLock] = {}
 _metrics_data = defaultdict(lambda: defaultdict(float))
 _metrics_timestamps = defaultdict(float)
+
+
+def _metrics_lock() -> threading.RLock:
+    """This process's metrics lock, created on first use; setdefault is atomic, so racing threads share one."""
+    pid = os.getpid()
+    lock = _metrics_locks.get(pid)
+    return lock if lock is not None else _metrics_locks.setdefault(pid, threading.RLock())
 
 
 class MetricsCollector:
@@ -70,7 +79,7 @@ class MetricsCollector:
         """Increment a counter metric."""
         all_labels = {**self._labels, **(labels or {})}
         key = self._make_key(all_labels)
-        with _metrics_lock:
+        with _metrics_lock():
             _metrics_data[self.name][key] += 1
             _metrics_timestamps[f"{self.name}:{key}"] = time.time()
 
@@ -78,7 +87,7 @@ class MetricsCollector:
         """Set a gauge metric."""
         all_labels = {**self._labels, **(labels or {})}
         key = self._make_key(all_labels)
-        with _metrics_lock:
+        with _metrics_lock():
             _metrics_data[self.name][key] = value
             _metrics_timestamps[f"{self.name}:{key}"] = time.time()
 
@@ -90,7 +99,7 @@ class MetricsCollector:
         """Get current metric value."""
         all_labels = {**self._labels, **(labels or {})}
         key = self._make_key(all_labels)
-        with _metrics_lock:
+        with _metrics_lock():
             return _metrics_data[self.name].get(key, 0)
 
     def _make_key(self, labels: dict[str, str]) -> str:
@@ -117,7 +126,7 @@ def get_all_metrics() -> dict[str, dict[str, Any]]:
         >>> "api_calls" in metrics
         True
     """
-    with _metrics_lock:
+    with _metrics_lock():
         return dict(_metrics_data)
 
 

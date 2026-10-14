@@ -135,7 +135,6 @@ class PoolMonitor:
         """
         self.pool_manager = pool_manager
         self.sampling_rate = sampling_rate
-        self._sampling_threshold = int(sampling_rate * 100)
 
         # Cached metrics for lazy evaluation
         self._cached_metrics = CachedPoolMetrics()
@@ -160,7 +159,7 @@ class PoolMonitor:
     def _should_sample(self) -> bool:
         """Fast sampling decision (~5ns)."""
         # Using random for non-cryptographic sampling - performance critical
-        return random.randint(0, 99) < self._sampling_threshold  # noqa: S311
+        return random.random() < self.sampling_rate  # noqa: S311
 
     def get_pool_stats(self) -> dict[str, Any]:
         """Get pool statistics with lazy caching.
