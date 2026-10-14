@@ -5,8 +5,8 @@ started at import is not running in a forked child (Gunicorn ``--preload``, Cele
 ``multiprocessing``'s fork start method), so everything a child buffered for it was lost.
 
 In a child forked from C without at-fork hooks (uWSGI without ``--py-call-uwsgi-fork-hooks``),
-``log()`` and ``error()`` write no entry: ``logging``'s own after-fork lock reset did not run there, so
-a level check or a handler lock a parent thread held at fork would hang the caller.
+no ``StructuredLogger`` method logs: ``logging``'s own after-fork lock reset did not run there, so a
+level check or a handler lock a parent thread held at fork would hang the caller.
 """
 
 import json
@@ -79,20 +79,18 @@ class StructuredLogger:
     def __init__(self, name: str):
         self.name = name
 
-        # Pre-computed values for performance
-        self._sampling_threshold = int(SAMPLING_RATE * 100)
         self._hostname = platform.node()
 
         # PII patterns to mask (pre-compiled for speed)
         self._pii_keys = {"password", "token", "secret", "key", "auth"}
 
-        # Standard logger for compatibility with tests
+        # Sink for cache_operation and connection_pool_utilization: plain-text messages, fields in record.structured
         self.logger = logging.getLogger(name)
 
     def _should_sample(self) -> bool:
         """Fast sampling decision."""
         # Using random for non-cryptographic sampling - performance critical
-        return random.randint(0, 99) < self._sampling_threshold  # noqa: S311
+        return random.random() < SAMPLING_RATE  # noqa: S311
 
     def _mask_pii(self, data: dict[str, Any]) -> dict[str, Any]:
         """Fast PII masking - only on sampled entries."""
@@ -160,8 +158,7 @@ class StructuredLogger:
         if isinstance(kwargs.get("error"), BaseException):
             kwargs["error"] = redact_error_for_log(kwargs["error"])
 
-        # Determine log level based on error presence
-        level = "ERROR" if "error" in kwargs else "INFO"
+        levelno = logging.ERROR if "error" in kwargs else logging.INFO
 
         # Build context
         context = self._get_context()
@@ -203,10 +200,13 @@ class StructuredLogger:
             # Silently ignore if Prometheus metrics not available
             pass
 
-        self.logger.log(_LEVELS[level], "cache_operation", extra={"structured": context})
+        if not l1_cache._forked_without_hooks():  # module docstring; the metrics above still count
+            self.logger.log(levelno, "cache_operation", extra={"structured": context})
 
     def connection_pool_utilization(self, utilization: float, **kwargs):
         """Log connection pool metrics."""
+        if l1_cache._forked_without_hooks():  # module docstring
+            return
 
         # Determine log level based on utilization
         if utilization > HIGH_UTILIZATION_THRESHOLD:

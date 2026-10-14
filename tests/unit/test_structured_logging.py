@@ -58,11 +58,12 @@ def _c_fork_child_outcome() -> object:
 
     import cachekit  # noqa: F401 - everything an application's import starts
 
-    sink = logging.getLogger("cachekit.logging")
-    sink.addHandler(capture := _Capture())
-    sink.setLevel(logging.DEBUG)
     before = get_structured_logger("test.c_fork.parent")  # built pre-fork, as a module-level _logger is
-    before._sampling_threshold = 100  # never sampled away
+    before._should_sample = lambda: True  # never sampled away
+    capture = _Capture()
+    for sink in (logging.getLogger("cachekit.logging"), before.logger):  # the JSON sink and the plain-text one
+        sink.addHandler(capture)
+        sink.setLevel(logging.DEBUG)
     for lock in (logging._lock, capture.lock):  # held at fork by a thread the child lacks
         holder = threading.Thread(target=lock.acquire)  # ends holding it
         holder.start()
@@ -86,6 +87,8 @@ def _c_fork_child_outcome() -> object:
             threading.Thread = _RecordingThread  # the child's copy only; it never returns
             before.debug("child debug")
             before.error("child error")
+            before.cache_operation("get", "ns:tenant-42:func:app.f:args:x", hit=True)
+            before.connection_pool_utilization(0.95)
             outcome: object = {"requested": requested, "written": capture.entries}
         except BaseException as e:
             outcome = {"error": repr(e)}
@@ -291,6 +294,14 @@ class TestSynchronousEntries:
         assert [(r.levelno, json.loads(r.getMessage())["level"]) for r in caplog.records if r.name == "cachekit.logging"] == [
             (levelno, name.upper())
         ]
+
+    @pytest.mark.parametrize(("draw", "sampled"), [(0.004, True), (0.006, False)])
+    def test_sampling_rate_below_one_percent_is_honoured(self, monkeypatch, draw, sampled):
+        """A rate of 0.005 keeps half a percent of entries, not none: the rate is never truncated to a whole percent."""
+        monkeypatch.setattr("cachekit.logging.SAMPLING_RATE", 0.005)
+        monkeypatch.setattr("cachekit.logging.random.random", lambda: draw)
+
+        assert StructuredLogger("test.rate")._should_sample() is sampled
 
     def test_constructing_a_logger_starts_no_thread(self, monkeypatch):
         started: list[str] = []

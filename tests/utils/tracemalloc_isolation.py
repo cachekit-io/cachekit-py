@@ -3,8 +3,9 @@
 tracemalloc.start()/stop() swap the process-wide allocator hooks without synchronising with
 threads that are allocating at that moment, so on a free-threaded build a concurrent
 allocation can crash the process: https://github.com/python/cpython/issues/143143. The pytest
-process is never single-threaded (pytest-xdist adds its I/O thread), so every tracemalloc
-start/stop in the test suite goes through here.
+process cannot be relied on to be single-threaded: under ``-n`` (as CI runs it) pytest-xdist adds
+its I/O thread, and a test that builds an L1 cache leaves its cleanup thread running. So every
+tracemalloc start/stop in the test suite goes through here.
 """
 
 from __future__ import annotations
