@@ -4,8 +4,9 @@ tracemalloc.start()/stop() swap the process-wide allocator hooks without synchro
 threads that are allocating at that moment, so on a free-threaded build a concurrent
 allocation can crash the process: https://github.com/python/cpython/issues/143143. The pytest
 process cannot be relied on to be single-threaded: under ``-n`` (as CI runs it) pytest-xdist adds
-its I/O thread, and a test that builds an L1 cache leaves its cleanup thread running. So every
-tracemalloc start/stop in the test suite goes through here.
+its I/O thread, and a test that builds an L1 cache leaves its cleanup thread running. So the unit
+and critical suites start and stop tracemalloc only through here;
+tests/performance/test_large_object_memory.py still does it in-process.
 """
 
 from __future__ import annotations
