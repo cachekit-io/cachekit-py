@@ -190,3 +190,10 @@ class TestWholeFunction:
         await afn()
         assert fn.invalidate_cache() is InvalidationOutcome.SUCCEEDED
         assert await afn.ainvalidate_cache() is InvalidationOutcome.SUCCEEDED
+
+
+def test_formats_the_same_on_every_python() -> None:
+    """A plain Enum, not (str, Enum): str() and f-strings of a str mixin differ between 3.10 and 3.11+."""
+    assert not isinstance(InvalidationOutcome.FAILED, str)
+    assert f"{InvalidationOutcome.FAILED}" == str(InvalidationOutcome.FAILED) == "InvalidationOutcome.FAILED"
+    assert InvalidationOutcome.FAILED.value == "failed"

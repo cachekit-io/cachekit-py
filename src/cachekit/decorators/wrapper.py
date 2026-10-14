@@ -301,7 +301,7 @@ class CacheInfo(NamedTuple):
     session_id: str | None = None  # Function-specific session ID for correlation
 
 
-class InvalidationOutcome(str, Enum):
+class InvalidationOutcome(Enum):
     """What one exact-key ``invalidate_cache(*args)`` or ``ainvalidate_cache(*args)`` call did in L2.
 
     Invalidation never raises on a backend failure, so this return value is how a caller learns
@@ -310,8 +310,8 @@ class InvalidationOutcome(str, Enum):
 
     - ``SUCCEEDED``: the L2 delete of the key returned normally. The entry is no longer in L2; the
       delete does not say whether one was there.
-    - ``FAILED``: the L2 delete raised, or the backend could not be resolved for the call. The entry
-      may still be served from L2.
+    - ``FAILED``: the L2 delete raised (logged at ERROR), or the backend could not be resolved for the
+      call (logged at DEBUG only). The entry may still be served from L2.
     - ``NO_L2``: there is no L2 to delete from: L1-only mode (``backend=None``) or ``@cache.local``.
 
     Only the key the call derives counts. The pre-0.20.0 key that an invalidation also deletes does
@@ -1612,7 +1612,7 @@ def create_cache_wrapper(
         """Delete these keys (all, for None), then forget their calls in flight: one that started
         before the delete ended may have read the old entry. One call, so the forget runs after the
         delete wherever the delete runs, even in a worker an async caller stopped waiting for.
-        Returns the keys' outcome; None for all."""
+        Returns the current-format key's outcome (see _invalidate_keys); None for all."""
         try:
             if cache_keys is None:
                 _drain_all()
