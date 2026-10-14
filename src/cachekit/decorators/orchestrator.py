@@ -3,7 +3,6 @@ import logging
 from typing import Any, Optional, Union
 
 from ..hash_utils import redact_error_for_log, redact_key_for_log
-from ..monitoring.pool_monitor import PoolMonitor
 
 # Import EXISTING modules - no duplication
 from ..reliability import (
@@ -67,7 +66,6 @@ class FeatureOrchestrator:
         self._circuit_breaker = None
         self._load_control = None
         self._metrics_collector = None
-        self._pool_monitor = None
 
         if circuit_breaker_enabled:
             # Handle both dict and CircuitBreakerConfig objects
@@ -89,9 +87,6 @@ class FeatureOrchestrator:
         if collect_stats:
             self._metrics_collector = AsyncMetricsCollector()
 
-        # Pool monitoring - initialized when pool manager is available
-        self._pool_monitor = None
-
     @property
     def circuit_breaker(self) -> Optional[CircuitBreaker]:
         """Get circuit breaker if enabled."""
@@ -106,16 +101,6 @@ class FeatureOrchestrator:
     def metrics_collector(self) -> Optional[AsyncMetricsCollector]:
         """Get metrics collector if enabled."""
         return self._metrics_collector
-
-    @property
-    def pool_monitor(self) -> Optional[PoolMonitor]:
-        """Get pool monitor."""
-        return self._pool_monitor
-
-    def set_pool_manager(self, pool_manager) -> None:
-        """Initialize pool monitor with pool manager."""
-        if pool_manager and not self._pool_monitor:
-            self._pool_monitor = PoolMonitor(pool_manager)
 
     def should_allow_request(self) -> bool:
         """Ask the circuit breaker to admit this request: ``admit`` as a bool."""
@@ -199,11 +184,6 @@ class FeatureOrchestrator:
         if self._load_control:
             lc_status = self._load_control.get_stats()
             components["load_control"] = lc_status
-
-        # Pool monitor health
-        if self._pool_monitor:
-            pool_status = self._pool_monitor.get_pool_stats()
-            components["pool_monitor"] = pool_status
 
         # Metrics collector health
         if self._metrics_collector:

@@ -90,7 +90,6 @@ def _c_fork_child_outcome() -> object:
             before.debug("child debug")
             before.error("child error")
             before.cache_operation("get", "ns:tenant-42:func:app.f:args:x", hit=True)
-            before.connection_pool_utilization(0.95)
             hits = metrics_collection.cache_operations.get(
                 {"operation": "get", "status": "hit", "serializer": "", "namespace": "default"}
             )
