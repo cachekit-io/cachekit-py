@@ -58,8 +58,9 @@ _CONFIRM_SECONDS = 5.0
 # The uWSGI option (2.0.21+) that runs CPython's whole fork protocol, at-fork hooks included, around each
 # worker fork. Not py-call-osafterfork: with enable-threads it aborts every worker on Python 3.13+, and on
 # earlier versions it does not hold the master's threads off at the fork. Not lazy-apps (or lazy) alone: a
-# worker that first imports cachekit after a fork made from C looks like a fresh process, and may start a
-# thread that hangs. enable-threads is not checked: uWSGI 2.0.27+ enables threads by default.
+# worker that first imports cachekit after the fork of a master that ran threads starts no cachekit thread
+# only if cachekit._fork detects them (on Linux, threads started with threading), and it can still hang in
+# its own imports, before cachekit runs. enable-threads is not checked: uWSGI 2.0.27+ enables threads by default.
 _UWSGI_FORK_HOOKS = "py-call-uwsgi-fork-hooks"
 
 Evictor = Callable[[Optional[str]], None]
@@ -453,8 +454,9 @@ def _stop_listener() -> None:
 def _uwsgi_forked_this_process(uwsgi: Any) -> bool:
     """Whether uWSGI forked this process from C (a worker, mule or spooler), or cannot say.
 
-    l1_cache._forked_without_hooks misses a process that first imports cachekit after such a fork:
-    a worker under lazy-apps, or one whose app imports cachekit on its first request. With --master,
+    l1_cache._forked_without_hooks misses a process that first imports cachekit after such a fork,
+    a worker under lazy-apps or one whose app imports cachekit on its first request, when the master
+    ran no Python threads at the fork (cachekit._fork). With --master,
     uWSGI forked every process but the master; without it, masterpid() is 0 and worker_id() stays 0
     in the process that loads the app until it forks the workers.
     """

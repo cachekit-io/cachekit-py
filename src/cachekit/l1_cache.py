@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Concatenate, Optional, ParamSpec
 
+from cachekit import _fork
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
 # Default L1 entry lifetime when the caller supplies no TTL. Shared with the
@@ -650,13 +651,13 @@ class L1CacheManager:
 # Every live manager, for the at-fork hook. Weak: tests and callers may create and drop managers.
 _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
-# The processes a thread may start in: the one that imported this module, and the latest child
-# _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
-# So import cachekit before any fork made from C: a process that first imports it after such a fork
-# (uWSGI --lazy-apps without --py-call-uwsgi-fork-hooks) is taken for safe, and cleanup starts a thread there.
-# No check made at import can tell it apart: a uWSGI master forks from its main thread, so the child's
-# thread idents match a fresh process's, and a fresh process may import on any thread.
-_import_pid = os.getpid()
+# The processes a thread may start in: the one that imported cachekit (_import_pid), and the latest
+# child _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
+# _import_pid is None in a process that first imported cachekit after such a fork (uWSGI --lazy-apps
+# without --py-call-uwsgi-fork-hooks) of a parent that ran threads (_fork.inherits_dead_threads), so
+# no thread starts there. Of a parent that ran none, it is taken for a fresh process, which is safe:
+# no parent thread held anything at the fork.
+_import_pid = _fork.IMPORT_PID
 _hooked_pid: Optional[int] = None
 
 # The L1 states a forked child inherited that no releaser has taken yet (_empty_caches_after_fork,

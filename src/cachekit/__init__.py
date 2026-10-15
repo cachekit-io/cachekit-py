@@ -73,9 +73,12 @@ __version__ = "0.22.0"
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-# Must run BEFORE any redis import: CACHEKIT_DISABLE_HIREDIS=true keeps hiredis out from here on.
-# The free-threaded default runs later, when cachekit.backends.redis loads (see cachekit.hiredis_compat).
-from . import hiredis_compat  # noqa: F401
+from . import (
+    _fork,  # noqa: F401 - first: whether this process inherited a threaded parent's dead threads (cachekit._fork)
+    # Must run BEFORE any redis import: CACHEKIT_DISABLE_HIREDIS=true keeps hiredis out from here on.
+    # The free-threaded default runs later, when cachekit.backends.redis loads (see cachekit.hiredis_compat).
+    hiredis_compat,  # noqa: F401
+)
 
 # Import the configuration classes
 # Redis client is automatically fast - no special import needed
