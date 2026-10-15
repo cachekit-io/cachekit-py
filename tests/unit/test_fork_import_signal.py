@@ -100,17 +100,18 @@ def fork_mod():
 
 @pytest.fixture
 def tasks(monkeypatch):
-    """Fake /proc/self/task: the listing holds this thread's native id plus whatever the test adds."""
-    listing = {str(threading.get_native_id())}
-    real_listdir = os.listdir
+    """Fake /proc/self/task: this process has the threads whose native ids are in the set, this one's included."""
+    present = {threading.get_native_id()}
+    real_exists = os.path.exists
 
-    def listdir(path="."):
-        if path == "/proc/self/task":
-            return list(listing)
-        return real_listdir(path)
+    def exists(path):
+        prefix = "/proc/self/task/"
+        if isinstance(path, str) and path.startswith(prefix):
+            return int(path[len(prefix) :]) in present
+        return real_exists(path)
 
-    monkeypatch.setattr(os, "listdir", listdir)
-    return listing
+    monkeypatch.setattr(os.path, "exists", exists)
+    return present
 
 
 def _list_threads(monkeypatch, *others: object) -> None:
@@ -129,14 +130,51 @@ class TestInheritsDeadThreads:
         assert fork_mod.inherits_dead_threads() is False
         assert fork_mod.IMPORT_PID == os.getpid()  # pytest imported cachekit in this process, not after a fork
 
+    def test_threads_starting_and_ending_meanwhile_never_count(self, fork_mod):
+        """Real threads come and go while it runs: a listing of /proc/self/task skips live tasks then (free-threaded)."""
+        import time
+
+        stop = threading.Event()
+
+        def churn():
+            while not stop.is_set():
+                batch = [threading.Thread(target=lambda: None) for _ in range(8)]
+                for thread in batch:
+                    thread.start()
+                for thread in batch:
+                    thread.join()
+
+        churners = [threading.Thread(target=churn, daemon=True) for _ in range(4)]
+        for thread in churners:
+            thread.start()
+        try:
+            deadline = time.monotonic() + 1.0
+            seen = []
+            while time.monotonic() < deadline:
+                seen.append(fork_mod.inherits_dead_threads())
+        finally:
+            stop.set()
+            for thread in churners:
+                thread.join(5)
+
+        assert not any(seen), f"{sum(seen)} of {len(seen)} checks took live threads for dead ones"
+
     def test_a_listed_thread_with_no_task_is_inherited(self, fork_mod, tasks, monkeypatch):
         _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
 
         assert fork_mod.inherits_dead_threads() is True
 
     def test_a_listed_thread_with_a_task_is_live(self, fork_mod, tasks, monkeypatch):
-        tasks.add(str(_STALE))
+        tasks.add(_STALE)
         _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
+
+        assert fork_mod.inherits_dead_threads() is False
+
+    def test_a_thread_that_ends_during_the_check_does_not_count(self, fork_mod, tasks, monkeypatch):
+        """Listed, then its task is gone, and threading no longer lists it: it ended meanwhile."""
+        ended = SimpleNamespace(native_id=_STALE)
+        listings = iter([[threading.current_thread(), ended], [threading.current_thread()]])
+        monkeypatch.setattr(threading, "enumerate", lambda: next(listings))
 
         assert fork_mod.inherits_dead_threads() is False
 
@@ -166,26 +204,16 @@ class TestInheritsDeadThreads:
 
         assert fork_mod.inherits_dead_threads() is False
 
-    @pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
-    def test_no_proc_view_cannot_tell(self, fork_mod, monkeypatch, error):
-        def listdir(path="."):
-            raise error(path)
-
-        monkeypatch.setattr(os, "listdir", listdir)
+    def test_no_proc_view_cannot_tell(self, fork_mod, tasks, monkeypatch):
+        tasks.clear()  # no /proc/self/task: nothing is found there, this thread included
         _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
 
         assert fork_mod.inherits_dead_threads() is False
 
-    def test_an_unreadable_listing_cannot_tell(self, fork_mod, tasks, monkeypatch):
-        tasks.add("not-a-tid")
-        _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
-
-        assert fork_mod.inherits_dead_threads() is False
-
-    def test_this_thread_absent_from_the_listing_cannot_tell(self, fork_mod, tasks, monkeypatch):
+    def test_this_thread_absent_from_proc_cannot_tell(self, fork_mod, tasks, monkeypatch):
         """Another PID namespace's /proc: this thread's own id is not in it."""
         tasks.clear()
-        tasks.add(str(_STALE - 1))
+        tasks.add(_STALE - 1)
         _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
 
         assert fork_mod.inherits_dead_threads() is False

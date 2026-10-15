@@ -25,26 +25,36 @@ def inherits_dead_threads() -> bool:
     The current thread does not count: after a fork made from C it keeps the forking thread's native id. Nor
     does any thread listed under that same id, such as a gevent green thread, which ran on the forking thread
     and not on a thread of its own. Nor does a ``_DummyThread``, which ``threading`` may keep listed after its
-    thread ends, nor a thread that has no native id yet. Threads ``threading`` never registered (``_thread.start_new_thread``, foreign C threads)
-    are not seen. Linux only: with no ``/proc/self/task``, or with this thread's own id absent from it
-    (another PID namespace, or a patched ``get_native_id``), it cannot tell and returns
-    False, as if fresh.
+    thread ends, nor a thread that has no native id yet. Threads ``threading`` never registered
+    (``_thread.start_new_thread``, foreign C threads) are not seen. Linux only: with no ``/proc/self/task``,
+    or with this thread's own id absent from it (another PID namespace, or a patched ``get_native_id``), it
+    cannot tell and returns False, as if fresh.
+
+    Other threads may start and end while this runs. Each thread's task is looked up by its id, never read off a
+    listing of ``/proc/self/task``, which can skip a live task while threads come and go. And a thread counts only if
+    ``threading`` still lists it after that lookup: a thread leaves the list before its task ends.
     """
-    try:
-        tasks = {int(task) for task in os.listdir("/proc/self/task")}
-    except (OSError, ValueError):
-        return False
-    if threading.get_native_id() not in tasks:
+    if not _has_task(threading.get_native_id()):
         return False
     current = threading.current_thread()
-    return any(
-        thread is not current
+    gone = [
+        thread
+        for thread in threading.enumerate()
+        if thread is not current
         and thread.native_id is not None
         and thread.native_id != current.native_id
         and not isinstance(thread, threading._DummyThread)
-        and thread.native_id not in tasks
-        for thread in threading.enumerate()
-    )
+        and not _has_task(thread.native_id)
+    ]
+    if not gone:
+        return False
+    listed = {id(thread) for thread in threading.enumerate()}  # identity: gone keeps each object alive
+    return any(id(thread) in listed for thread in gone)
+
+
+def _has_task(native_id: int) -> bool:
+    """Whether this process has a thread with this native id; False also when /proc cannot say."""
+    return os.path.exists(f"/proc/self/task/{native_id}")
 
 
 # The PID that imported cachekit, or None in a process that inherited a threaded parent's dead threads: no PID
