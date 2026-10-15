@@ -651,12 +651,12 @@ class L1CacheManager:
 # Every live manager, for the at-fork hook. Weak: tests and callers may create and drop managers.
 _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
-# The processes a thread may start in: the one that imported cachekit, and the latest child
-# _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
-# A process that first imports cachekit after such a fork (uWSGI --lazy-apps without
-# --py-call-uwsgi-fork-hooks) has no import PID when its parent ran threads at the fork
-# (_fork.inherits_dead_threads), so every PID of it counts as hookless. When its parent ran none,
-# it is taken for a fresh process, and that is safe: no parent thread held anything at the fork.
+# The processes a thread may start in: the one that imported cachekit (_import_pid), and the latest
+# child _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
+# _import_pid is None in a process that first imported cachekit after such a fork (uWSGI --lazy-apps
+# without --py-call-uwsgi-fork-hooks) of a parent that ran threads (_fork.inherits_dead_threads), so
+# no thread starts there. Of a parent that ran none, it is taken for a fresh process, which is safe:
+# no parent thread held anything at the fork.
 _import_pid = _fork.IMPORT_PID
 _hooked_pid: Optional[int] = None
 

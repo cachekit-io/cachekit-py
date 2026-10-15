@@ -394,8 +394,9 @@ class AsyncMetricsCollector:
                 collector records synchronously after ``shutdown()``. So does one inherited by a forked child,
                 until a mode check starts a worker of the child's own, which never happens with auto-detect off.
                 In the child of a fork made from C, every collector, inherited or built there, records
-                synchronously for good, including where cachekit was first imported after the fork (uWSGI
-                ``--lazy-apps``) of a parent that ran threads (see ``_in_hookless_child``).
+                synchronously for good. Where cachekit was first imported after that fork (uWSGI ``--lazy-apps``),
+                that holds only if the parent ran threads at the fork; a child of a parent that ran none is taken
+                for a fresh process and may batch (see ``_in_hookless_child``).
             auto_detect_mode: Automatically switch between sync/async based on frequency
         """
         self.batch_size = batch_size
@@ -825,7 +826,8 @@ class AsyncMetricsCollector:
         no at-fork hook, and the dead worker's ``Thread.is_alive()`` still returns True. It also skips CPython's
         own after-fork repair, so a thread started in that child can hang or crash the interpreter. A child the
         at-fork hook did not reach therefore never starts a worker, and records synchronously for good; ``__init__``
-        does the same for a collector built there (see ``_in_hookless_child``).
+        does the same for a collector built there. A child that first imported cachekit after the fork counts as
+        such only if its parent ran threads; otherwise it is taken for a fresh process (see ``_in_hookless_child``).
         """
         pid = os.getpid()
         if self._owner_pid == pid:

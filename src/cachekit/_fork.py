@@ -22,9 +22,13 @@ def inherits_dead_threads() -> bool:
     So this is False in a fresh process, live threads or not, and in the child of a parent that ran no Python
     threads, where a thread start is safe.
 
-    The current thread does not count: after a fork made from C it keeps the forking thread's native id. Nor
-    does any thread listed under that same id, such as a gevent green thread, which ran on the forking thread
-    and not on a thread of its own. Nor does a ``_DummyThread``, which ``threading`` may keep listed after its
+    Neither the current thread nor the main thread counts, nor any thread listed under either's native id.
+    After any fork, the forking thread's object may keep the parent's native id: always after a fork made
+    from C, and after ``os.fork()`` on Python before 3.13. It is the main thread after ``os.fork()``, and after
+    a fork made from C from the parent's main thread, as uWSGI's is; it is the current thread when cachekit is
+    imported on it. A thread under the same id, such as a gevent green thread, ran on that thread and not on
+    one of its own. So a fork made from C from a thread other than the main one loses the parent's main thread
+    as evidence: only its other threads count. Nor does a ``_DummyThread``, which ``threading`` may keep listed after its
     thread ends, nor a thread that has no native id yet. Threads ``threading`` never registered
     (``_thread.start_new_thread``, foreign C threads) are not seen. Linux only: with no ``/proc/self/task``,
     or with this thread's own id absent from it (another PID namespace, or a patched ``get_native_id``), it
@@ -36,13 +40,12 @@ def inherits_dead_threads() -> bool:
     """
     if not _has_task(threading.get_native_id()):
         return False
-    current = threading.current_thread()
+    forkers = {threading.current_thread().native_id, threading.main_thread().native_id}
     gone = [
         thread
         for thread in threading.enumerate()
-        if thread is not current
-        and thread.native_id is not None
-        and thread.native_id != current.native_id
+        if thread.native_id is not None
+        and thread.native_id not in forkers
         and not isinstance(thread, threading._DummyThread)
         and not _has_task(thread.native_id)
     ]

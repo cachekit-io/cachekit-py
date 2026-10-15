@@ -22,18 +22,37 @@ pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="th
 _STALE = 2**31 - 7  # a native id no task of this process has
 
 
-def _lazy_import_child_outcome(parent_threads: int, fork: str) -> object:
+def _wait_until_blocked(threads: list[threading.Thread], timeout: float = 5.0) -> None:
+    """Return once every thread is inside its wait: a thread still waiting for the GIL at a fork made from C hangs
+    the child at its first GIL release, in no cachekit code (fork_helpers.run_fresh)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        frames = sys._current_frames()
+        if all(frames.get(t.ident) is not None and frames[t.ident].f_code.co_name == "wait" for t in threads):
+            break
+        if time.monotonic() > deadline:  # not an assert: python -O strips those
+            raise RuntimeError("a parent thread never reached its wait")
+        time.sleep(0.01)
+    time.sleep(0.05)  # from wait's frame into its lock acquire, which releases the GIL
+
+
+def _lazy_import_child_outcome(parent_threads: int, fork: str, import_on: str) -> object:
     """What a child that first imports cachekit after a fork reports; run only in a fresh interpreter.
 
-    The parent never imports cachekit. Its threads wait on an Event through the fork, so none holds or waits for
-    the GIL. fork is "c" for a fork made from C (PyDLL keeps the GIL through the call), or "os" for os.fork().
+    The parent never imports cachekit. Its threads wait on an Event through the fork. fork is "c" for a fork made
+    from C (PyDLL keeps the GIL through the call), or "os" for os.fork(). import_on is "forker" to import on the
+    thread that forked, or "new" to import on a thread the child starts first, as a request thread would.
     """
     import ctypes
     import faulthandler
 
     stop = threading.Event()
-    for _ in range(parent_threads):
-        threading.Thread(target=stop.wait, daemon=True).start()
+    threads = [threading.Thread(target=stop.wait, daemon=True) for _ in range(parent_threads)]
+    for thread in threads:
+        thread.start()
+    _wait_until_blocked(threads)
     faulthandler.register(signal.SIGALRM, chain=True)  # the child inherits it: a hang dumps its stack
     r, w = os.pipe()
     child = ctypes.PyDLL(None).fork() if fork == "c" else os.fork()
@@ -41,21 +60,28 @@ def _lazy_import_child_outcome(parent_threads: int, fork: str) -> object:
         signal.alarm(10)
         os.close(r)
         requested: list[str] = []
+        start = threading.Thread.start
         threading.Thread.start = lambda self: requested.append(getattr(self._target, "__name__", self.name))  # type: ignore[method-assign]
+        outcome: dict[str, object] = {}
 
-        from cachekit import l1_cache
-        from cachekit.reliability import async_metrics
+        def first_import() -> None:
+            from cachekit import l1_cache
+            from cachekit.reliability import async_metrics
 
-        l1_cache.get_l1_cache_manager()  # a worker's first L1 use builds the global manager
-        async_metrics.AsyncMetricsCollector(sync_mode=False, auto_detect_mode=False)
-        report(
-            w,
-            {
-                "hookless": l1_cache._forked_without_hooks(),
-                "metrics_hookless": async_metrics._in_hookless_child(),
-                "requested": requested,
-            },
-        )
+            outcome["metric_locks_at_import"] = async_metrics._metric_locks_pid == os.getpid()
+            l1_cache.get_l1_cache_manager()  # a worker's first L1 use builds the global manager
+            async_metrics.AsyncMetricsCollector(sync_mode=False, auto_detect_mode=False)
+            outcome["metric_locks_after"] = async_metrics._metric_locks_pid == os.getpid()
+            outcome["hookless"] = l1_cache._forked_without_hooks()
+            outcome["metrics_hookless"] = async_metrics._in_hookless_child()
+
+        if import_on == "new":
+            importer = threading.Thread(target=first_import)
+            start(importer)  # the real start: only the threadless-parent cases import on a new thread
+            importer.join(5)
+        else:
+            first_import()
+        report(w, {**outcome, "requested": requested})
     os.close(w)
     try:
         return child_outcome(child, r)
@@ -63,29 +89,46 @@ def _lazy_import_child_outcome(parent_threads: int, fork: str) -> object:
         stop.set()
 
 
+_HOOKLESS = {
+    "metric_locks_at_import": False,  # None until the first collector replaces the inherited locks
+    "metric_locks_after": True,
+    "hookless": True,
+    "metrics_hookless": True,
+    "requested": [],
+}
+_FRESH = {
+    "metric_locks_at_import": True,
+    "metric_locks_after": True,
+    "hookless": False,
+    "metrics_hookless": False,
+    "requested": ["cleanup_worker", "_worker_loop"],
+}
+
+
 class TestLazyImportAfterFork:
     """AC: the child of a fork made from C that first imports cachekit starts no thread iff its parent ran threads."""
 
     @pytest.mark.parametrize(
-        ("parent_threads", "fork", "expected"),
+        ("parent_threads", "fork", "import_on", "expected"),
         [
-            (2, "c", {"hookless": True, "metrics_hookless": True, "requested": []}),
-            (
-                0,
-                "c",
-                {"hookless": False, "metrics_hookless": False, "requested": ["cleanup_worker", "_worker_loop"]},
-            ),
-            (
-                2,
-                "os",
-                {"hookless": False, "metrics_hookless": False, "requested": ["cleanup_worker", "_worker_loop"]},
-            ),
+            (2, "c", "forker", _HOOKLESS),
+            (0, "c", "forker", _FRESH),
+            (2, "os", "forker", _FRESH),
+            # The forking thread keeps the parent's native id (always after a C fork; after os.fork() before 3.13).
+            (0, "c", "new", _FRESH),
+            (0, "os", "new", _FRESH),
         ],
-        ids=["c-fork-threaded-parent", "c-fork-threadless-parent", "os-fork-threaded-parent"],
+        ids=[
+            "c-fork-threaded-parent",
+            "c-fork-threadless-parent",
+            "os-fork-threaded-parent",
+            "c-fork-threadless-parent-import-on-new-thread",
+            "os-fork-threadless-parent-import-on-new-thread",
+        ],
     )
-    def test_child_requests_threads_only_when_safe(self, parent_threads, fork, expected):
+    def test_child_requests_threads_only_when_safe(self, parent_threads, fork, import_on, expected):
         """A fresh interpreter: this one has imported cachekit and runs threads it cannot end (fork_helpers.run_fresh)."""
-        run = run_fresh(_lazy_import_child_outcome, parent_threads, fork)
+        run = run_fresh(_lazy_import_child_outcome, parent_threads, fork, import_on)
 
         assert run.returncode == 0, run.stderr
         assert ast.literal_eval(run.stdout) == expected, run.stderr  # a hung child's stack, dumped on its alarm
@@ -188,11 +231,11 @@ class TestInheritsDeadThreads:
 
         assert fork_mod.inherits_dead_threads() is False
 
-    def test_the_current_thread_does_not_count(self, fork_mod, tasks, monkeypatch):
-        """After a fork made from C the current thread keeps the forking thread's native id."""
-        current = SimpleNamespace(native_id=_STALE)
-        monkeypatch.setattr(threading, "current_thread", lambda: current)
-        monkeypatch.setattr(threading, "enumerate", lambda: [current])
+    def test_the_main_thread_with_a_stale_id_does_not_count(self, fork_mod, tasks, monkeypatch):
+        """After os.fork() before 3.13 the main thread keeps the parent's native id; cachekit imported off it."""
+        main = SimpleNamespace(native_id=_STALE)
+        monkeypatch.setattr(threading, "main_thread", lambda: main)
+        _list_threads(monkeypatch, main, SimpleNamespace(native_id=_STALE))  # and a green thread that ran on it
 
         assert fork_mod.inherits_dead_threads() is False
 
@@ -206,14 +249,6 @@ class TestInheritsDeadThreads:
 
     def test_no_proc_view_cannot_tell(self, fork_mod, tasks, monkeypatch):
         tasks.clear()  # no /proc/self/task: nothing is found there, this thread included
-        _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
-
-        assert fork_mod.inherits_dead_threads() is False
-
-    def test_this_thread_absent_from_proc_cannot_tell(self, fork_mod, tasks, monkeypatch):
-        """Another PID namespace's /proc: this thread's own id is not in it."""
-        tasks.clear()
-        tasks.add(_STALE - 1)
         _list_threads(monkeypatch, SimpleNamespace(native_id=_STALE))
 
         assert fork_mod.inherits_dead_threads() is False
@@ -248,15 +283,3 @@ class TestNoImportPid:
 
         monkeypatch.setattr(async_metrics, "_hooked_fork_pid", os.getpid())
         assert async_metrics._in_hookless_child() is False
-
-    def test_metric_locks_are_reset_once(self, monkeypatch):
-        """None is no PID, so such a process replaces prometheus_client locks a parent thread may have held."""
-        from cachekit.reliability import async_metrics
-
-        monkeypatch.setattr(async_metrics, "_metric_locks_pid", None)
-        calls: list[int] = []
-        monkeypatch.setattr(async_metrics, "_reset_metric_locks", lambda: calls.append(1))
-
-        async_metrics._reset_metric_locks_once()
-
-        assert calls == [1]
