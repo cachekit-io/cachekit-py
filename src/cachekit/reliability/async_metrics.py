@@ -186,10 +186,11 @@ def _in_hookless_child() -> bool:
     """Return whether this process is the child of a fork made from C, which ran no at-fork hook.
 
     Such a fork, as uWSGI's is without ``--py-call-uwsgi-fork-hooks``, also skips CPython's own after-fork repair, so a
-    thread started in that child can hang or crash the interpreter. No collector starts one there. That includes a
-    child that first imports cachekit after the fork, as under uWSGI ``--lazy-apps``, when its parent ran threads at
-    the fork (``cachekit._fork``). When its parent ran none, it looks like a fresh process, and starting a worker
-    there is safe.
+    thread started in that child can hang or crash the interpreter. No collector starts one there. A child that first
+    imports cachekit after the fork, as under uWSGI ``--lazy-apps``, counts only if ``cachekit._fork`` detects that
+    its parent ran threads at the fork: on Linux, for threads the parent started with ``threading``, and not after a
+    fork from a thread other than the main one when the parent ran no others. When its parent ran none, it looks like
+    a fresh process, and starting a worker there is safe.
     """
     pid = os.getpid()
     return pid != _import_pid and pid != _hooked_fork_pid

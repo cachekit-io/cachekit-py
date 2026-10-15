@@ -59,8 +59,8 @@ _CONFIRM_SECONDS = 5.0
 # worker fork. Not py-call-osafterfork: with enable-threads it aborts every worker on Python 3.13+, and on
 # earlier versions it does not hold the master's threads off at the fork. Not lazy-apps (or lazy) alone: a
 # worker that first imports cachekit after the fork of a master that ran threads starts no cachekit thread
-# (cachekit._fork), but it can still hang in its own imports, before cachekit runs. enable-threads is not
-# checked: uWSGI 2.0.27+ enables threads by default.
+# only if cachekit._fork detects them (on Linux, threads started with threading), and it can still hang in
+# its own imports, before cachekit runs. enable-threads is not checked: uWSGI 2.0.27+ enables threads by default.
 _UWSGI_FORK_HOOKS = "py-call-uwsgi-fork-hooks"
 
 Evictor = Callable[[Optional[str]], None]

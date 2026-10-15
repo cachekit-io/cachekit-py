@@ -22,12 +22,12 @@ pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="th
 _STALE = 2**31 - 7  # a native id no task of this process has
 
 
-def _wait_until_blocked(threads: list[threading.Thread], timeout: float = 5.0) -> None:
+def _wait_until_blocked(threads: list[threading.Thread]) -> None:
     """Return once every thread is inside its wait: a thread still waiting for the GIL at a fork made from C hangs
     the child at its first GIL release, in no cachekit code (fork_helpers.run_fresh)."""
     import time
 
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + 5.0
     while True:
         frames = sys._current_frames()
         if all(frames.get(t.ident) is not None and frames[t.ident].f_code.co_name == "wait" for t in threads):
