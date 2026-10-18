@@ -90,11 +90,14 @@ making it the right choice for caching DataFrames bigger than your RAM headroom:
   serialized record batch by record batch straight into the cache file (temp file + atomic
   rename), so the full serialized payload never exists in memory. Write peak RSS is ~2.3x the
   DataFrame's logical size, versus ~5.6x on the buffered path every other backend uses.
-- **Zero-copy reads** (`BufferReadableBackend.get_buffer`): with `compression="none"`, cached
-  entries are served back through a POSIX mmap without materializing the payload on the heap.
+- **Memory-mapped reads** (`BufferReadableBackend.get_buffer`): hits are served through a POSIX
+  mmap instead of being read onto the heap, and an uncompressed entry can then stay zero-copy.
+  What stays zero-copy per `return_format`, the Python-version and lifetime rules: [ArrowSerializer →
+  Zero-Copy Reads on the File Backend](../serializers/arrow.md#zero-copy-reads-on-the-file-backend).
 
-Both engage automatically — no API change — whenever the serializer is plaintext Arrow
-(`serializer_name="arrow"`, no encryption). **Encrypted values are excluded from both paths**:
+Both engage automatically — no API change — whenever the serializer is cachekit's plaintext
+Arrow serializer: `serializer="arrow"` or an `ArrowSerializer(...)` instance (not a subclass),
+with no encryption. Reads also need a synchronous cached function, and map `return_format="arrow"` and `"polars"` results only on Python 3.13+. **Encrypted values are excluded from both paths**:
 AES-256-GCM needs the whole ciphertext to produce/verify its auth tag, so the secure path
 stays on buffered `set()`/`get()`. Streamed values also intentionally skip the L1 in-memory
 cache — holding a multi-GB envelope in-process would defeat the point.

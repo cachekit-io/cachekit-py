@@ -152,9 +152,8 @@ class CachekitConfig(RedactingSettings):
         description=(
             "Arrow IPC compression codec for DataFrame caching (ArrowSerializer, compression='auto'). "
             "'zstd'/'lz4' shrink the stored payload but must be decompressed into the heap on read. "
-            "'none' stores uncompressed Arrow IPC, which lets the File backend serve plaintext "
-            "DataFrame reads via a zero-copy mmap (low steady-state read RSS; peak transiently "
-            "higher) at the cost of a larger payload. Writes are codec-independent: plaintext "
+            "'none' stores uncompressed Arrow IPC, at the cost of a larger payload, and lets plaintext "
+            "File-backend hits stay zero-copy, depending on return_format and Python version (see ArrowSerializer). Writes are codec-independent: plaintext "
             "Arrow streams to the File backend without materializing the payload (encrypted "
             "values stay buffered). Env: CACHEKIT_ARROW_COMPRESSION."
         ),
