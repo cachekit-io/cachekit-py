@@ -233,13 +233,15 @@ class DefaultBackendProvider(BackendProviderInterface):
 
         Names match in any case, as ``RedisBackendConfig`` reads them (``case_sensitive=False``):
         a lowercase ``redis_url`` always reached that Redis through ``get_backend()``'s fallback.
-        Never raises: two selectors count as configured, so ``get_backend()`` raises the
+        ``_detect()`` stays case-sensitive on purpose: a lowercase prefixed selector counts as
+        configured here and still resolves Redis there, as before; aligning either method changes routing.
+        Compared lowercased, as pydantic-settings does. Never raises: two selectors count as configured, so ``get_backend()`` raises the
         ambiguity error where the decorator already handles a backend that fails to build.
         """
         import os
 
-        names = {name.upper() for name, value in os.environ.items() if value}
-        return "REDIS_URL" in names or any(env_var in names for env_var, _ in self._SELECTORS)
+        names = {name.lower() for name, value in os.environ.items() if value}
+        return "redis_url" in names or any(env_var.lower() in names for env_var, _ in self._SELECTORS)
 
     def get_backend(self):
         """Get backend instance, auto-detected from environment on first call."""

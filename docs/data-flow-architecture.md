@@ -51,7 +51,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  STEP 1: DECORATOR ENTRY POINT                                              │
 │  File: src/cachekit/decorators/intent.py                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  @cache                          # Zero-config (90% of use cases, L1+L2)    │
+│  @cache                          # L1-only with nothing configured,         │
+│                                  # L1+L2 once a backend is set              │
 │  @cache.minimal                  # Speed-critical (low latency)             │
 │  @cache.production               # Reliability-critical (circuit breaker)   │
 │  @cache.secure                   # Security-critical (encrypted L1+L2)      │
@@ -333,7 +334,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 from cachekit import cache
 from cachekit.config.nested import CircuitBreakerConfig
 
-# Zero-config intelligent caching (90% of use cases, L1+L2 enabled)
+# L1-only, in process (what @cache does with nothing configured)
 @cache(backend=None)
 def expensive_function():
     return compute_result()  # illustrative - not defined
@@ -374,7 +375,7 @@ def custom_function():
 | **test** | ✗ | ✓ | Resolved¹ | ✗ | Test environments |
 | **io** | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
 
-¹ Per [Backend Resolution Priority](backends/README.md#backend-resolution-priority): `backend=`, `set_default_backend()`, then the environment (Redis from `REDIS_URL`, for example); with nothing configured, L1-only.
+¹ Per [Backend Resolution Priority](backends/README.md#backend-resolution-priority); with nothing configured, L1-only.
 ² As ¹, but never L1-only: with nothing configured, Redis at `redis://localhost:6379`.
 
 ---
@@ -549,18 +550,18 @@ def my_function():
 
 ### Configuration Modes
 
-**L1+L2 (default):** Fast L1 cache + distributed L2 backend
+**L1+L2:** Fast L1 cache + distributed L2 backend, once a backend is set (`REDIS_URL` or another selector)
 ```python
-@cache  # L1 enabled, L2 = RedisBackend
+@cache  # L1 enabled, L2 = the configured backend (e.g. Redis from REDIS_URL)
 def production_function():
     return result
 ```
 
-**L2-only:** Distributed caching without process memory
+**L2-only:** Distributed caching without process memory. Needs a backend set (`REDIS_URL` or another selector): with nothing configured this caches nothing
 ```python notest
 from cachekit.config.nested import L1CacheConfig
 
-@cache(l1=L1CacheConfig(enabled=False))  # L2 = RedisBackend, no L1
+@cache(l1=L1CacheConfig(enabled=False))  # L2 = the configured backend, no L1
 def memory_constrained_function():
     return result  # illustrative - not defined
 ```

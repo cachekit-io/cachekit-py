@@ -17,7 +17,7 @@
 Are you caching in Python?
 │
 ├─ Single process, no Redis needed? → @cache(backend=None) [L1-only]
-├─ Multiple pods, need distributed cache? → @cache [L1+L2, out-of-the-box]
+├─ Multiple pods, need distributed cache? → @cache with REDIS_URL set [L1+L2]
 ├─ Need to encrypt cached data? → @cache.secure [AES-256-GCM]
 ├─ Building libraries/packages? → cachekit batteries included
 │

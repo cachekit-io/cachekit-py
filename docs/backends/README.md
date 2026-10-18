@@ -231,7 +231,7 @@ set exactly one.
 | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
 | none of the above: `REDIS_URL` | Redis, as above |
-| nothing set at all | [L1-only](#4-nothing-configured-l1-only), no backend |
+| nothing set at all | plaintext, non-interop decorators: [L1-only](#4-nothing-configured-l1-only), no backend; secure, `encryption=True` and `interop=` decorators: Redis at `redis://localhost:6379` |
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
@@ -391,7 +391,8 @@ these still resolve a backend with nothing configured, and get Redis at
    again at first call if still unset)
 3. A backend provider of your own registered with the DI container, else environment
    auto-detection per the table above
-4. Nothing configured: L1-only
+4. Nothing configured: L1-only for a plaintext, non-interop decorator; secure, `encryption=True` and
+   `interop=` decorators still resolve Redis at `redis://localhost:6379`
 
 ## Performance Considerations
 
@@ -401,7 +402,7 @@ these still resolve a backend with nothing configured, and get Redis at
 |---------|---------|----------|-------|
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
 | **File** | set = fsync, flat in cache size, except eviction, rejection and the 30 s rescan, which scan the directory; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
-| **Redis** | 1-7ms | Shared cache across pods | Production default |
+| **Redis** | 1-7ms | Shared cache across pods | Recommended production backend |
 | **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
 | **HTTP API** | 10-100ms | Custom cloud services | Network dependent |
 | **DynamoDB** | 100-500ms | Serverless, low-traffic | High availability |

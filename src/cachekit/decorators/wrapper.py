@@ -1030,20 +1030,6 @@ def create_cache_wrapper(
     # mirroring L1CacheManager's resolution for the L2-backed path.
     _l1_budget_mb: int = _l1_config.max_size_mb if _l1_config.max_size_mb is not None else get_settings().l1_max_size_mb
 
-    # l1_enabled already merges the decorator param with config.l1.enabled (see
-    # config handling above) — with it False in L1-only mode there is no cache
-    # at all and the wrappers call the function directly.
-    def _new_object_cache() -> ObjectCache | None:
-        """The L1-only store; None when L1 is disabled."""
-        if not l1_enabled:
-            return None
-        return ObjectCache(
-            max_entries=None,
-            max_size_bytes=_l1_budget_mb * 1024 * 1024,
-            swr_threshold_ratio=_l1_config.swr_threshold_ratio,
-            swr_retry_interval=_l1_config.swr_retry_interval,
-        )
-
     # Set by _enter_l1_only(), below: backed wrappers keep these.
     _object_cache: ObjectCache | None = None
     _l1_swr_active = False
@@ -1579,7 +1565,18 @@ def create_cache_wrapper(
         """Set every piece of state L1-only mode derives, in one place: for backend=None at decoration,
         and for a zero-config candidate at its first call (_settle_zero_config)."""
         nonlocal _l1_only_mode, _object_cache, _l1_swr_active, _records_twin
-        _object_cache = _new_object_cache()
+        # l1_enabled already merges the decorator param with config.l1.enabled (see config handling
+        # above): with it False there is no cache at all and the wrappers call the function directly.
+        _object_cache = (
+            ObjectCache(
+                max_entries=None,
+                max_size_bytes=_l1_budget_mb * 1024 * 1024,
+                swr_threshold_ratio=_l1_config.swr_threshold_ratio,
+                swr_retry_interval=_l1_config.swr_retry_interval,
+            )
+            if l1_enabled
+            else None
+        )
         _l1_swr_active = _object_cache is not None and _l1_swr_wanted
         _records_twin = False  # L1-only writes no L2 entry, so it has no twin to record
         _l1_only_mode = True

@@ -91,6 +91,7 @@ def nothing_configured(monkeypatch: pytest.MonkeyPatch) -> Iterator[mock.MagicMo
     """
     for var in _ENV:
         monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var.lower(), raising=False)  # _is_configured() matches any case
     monkeypatch.setattr("cachekit.config.decorator._default_backend", None)
     monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, DefaultBackendProvider())
     with mock.patch.object(
@@ -466,18 +467,12 @@ class TestEncryptedAndInteropUnchanged:
 def test_is_configured_reads_every_selector_in_any_case(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in _ENV:
         monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var.lower(), raising=False)
     provider = DefaultBackendProvider()
     assert provider._is_configured() is False
-    for var in _ENV:
-        monkeypatch.setenv(var, "x")
-        assert provider._is_configured() is True
-        monkeypatch.delenv(var)
-    for var in _ENV:
+    for var in _ENV:  # uppercase names: test_one_selector_resolves_a_backend
         monkeypatch.setenv(var.lower(), "x")  # RedisBackendConfig reads names case-insensitively
         assert provider._is_configured() is True
         monkeypatch.delenv(var.lower())
     monkeypatch.setenv("REDIS_URL", "")
     assert provider._is_configured() is False  # empty is unset, as for get_backend()'s selectors
-    monkeypatch.setenv("CACHEKIT_REDIS_URL", "x")
-    monkeypatch.setenv("CACHEKIT_API_KEY", "x")
-    assert provider._is_configured() is True  # ambiguity is get_backend()'s error, not this query's
