@@ -107,11 +107,11 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │      # L1-only mode - skip to STEP 11 (execute function)                    │
 │      jump to STEP 11                                                        │
 │                                                                             │
-│  # L2 backend enabled (default: RedisBackend)                               │
+│  # L2 backend enabled (e.g. RedisBackend from REDIS_URL)                    │
 │  l2_backend.get(cache_key) → bytes or None                                  │
 │                                                                             │
 │  Backend types:                                                             │
-│  • RedisBackend: Distributed Redis storage (default)                        │
+│  • RedisBackend: Distributed Redis storage                                  │
 │  • CachekitIOBackend: Managed cloud storage via HTTPS (api.cachekit.io)     │
 │  • Future: DynamoDBBackend, etc.                                            │
 │                                                                             │
@@ -366,13 +366,16 @@ def custom_function():
 
 | Profile | Circuit Breaker | L1 Cache | L2 Backend | Stats Collection | Use Case |
 |---------|----------------|----------|------------|------------------|----------|
-| **default** | ✓ | ✓ | RedisBackend | ✓ | General purpose caching (L1+L2) |
-| **minimal** | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
-| **production** | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
-| **secure** | ✓ | ✓ | RedisBackend | ✓ | Encrypted sensitive data (L1 stores ciphertext) |
-| **dev** | ✓ | ✓ | None | ✗ | Local development (no Redis) |
-| **test** | ✗ | ✓ | None | ✗ | Test environments (no Redis) |
+| **default** | ✓ | ✓ | Resolved¹ | ✓ | General purpose caching (L1+L2) |
+| **minimal** | ✗ | ✓ | Resolved¹ | ✗ | Low-latency hot paths |
+| **production** | ✓ | ✓ | Resolved¹ | ✓ | Mission-critical reliability |
+| **secure** | ✓ | ✓ | Resolved² | ✓ | Encrypted sensitive data (L1 stores ciphertext) |
+| **dev** | ✓ | ✓ | Resolved¹ | ✗ | Local development |
+| **test** | ✗ | ✓ | Resolved¹ | ✗ | Test environments |
 | **io** | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
+
+¹ Per [Backend Resolution Priority](backends/README.md#backend-resolution-priority): `backend=`, `set_default_backend()`, then the environment (Redis from `REDIS_URL`, for example); with nothing configured, L1-only.
+² As ¹, but never L1-only: with nothing configured, Redis at `redis://localhost:6379`.
 
 ---
 
@@ -458,7 +461,7 @@ def _blake2b_pickle_hash(args, kwargs):
             ↓ (on miss)
 ┌─────────────────────────────────────────┐
 │ L2 Backend (Pluggable Storage Layer)    │
-│ • RedisBackend (default)                │
+│ • RedisBackend                          │
 │ • CachekitIOBackend (HTTPS, managed)    │
 │ • Network call (~1-2ms latency)         │
 │ • Bytes-based protocol (BaseBackend)    │
@@ -517,7 +520,7 @@ class BaseBackend(Protocol):
 - **Simple and focused**: Four operations only (get/set/delete/exists)
 - **Works for any backend**: Redis, CachekitIO, File, Memcached, custom implementations
 
-### RedisBackend (Default Implementation)
+### RedisBackend
 
 **File:** `src/cachekit/backends/redis_backend.py`
 

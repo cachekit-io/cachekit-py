@@ -2,7 +2,7 @@
 
 # Redis Backend
 
-The default L2 backend. Connects to Redis via environment variable or explicit configuration. Production-grade shared caching across multiple processes and pods.
+The recommended production L2 backend. Connects to Redis via environment variable or explicit configuration. Production-grade shared caching across multiple processes and pods.
 
 ## Basic Usage
 

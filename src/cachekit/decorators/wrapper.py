@@ -1044,12 +1044,12 @@ def create_cache_wrapper(
             swr_retry_interval=_l1_config.swr_retry_interval,
         )
 
-    _object_cache: ObjectCache | None = _new_object_cache() if _l1_only_mode else None
-
+    # Set by _enter_l1_only(), below: backed wrappers keep these.
+    _object_cache: ObjectCache | None = None
+    _l1_swr_active = False
     # SWR needs a TTL: freshness is measured against ttl * swr_threshold_ratio.
     # With ttl=None entries never go stale, so there is nothing to revalidate.
     _l1_swr_wanted = _l1_config.swr_enabled and ttl is not None and ttl > 0
-    _l1_swr_active = _object_cache is not None and _l1_swr_wanted
 
     # ZERO-CONFIG: with no backend stated, a plaintext non-interop decorator that finds nothing configured
     # at its first call (no set_default_backend(), no non-default backend provider, no CACHEKIT_* selector,
@@ -1571,11 +1571,21 @@ def create_cache_wrapper(
 
     # Whether a generated key differs from its pre-0.20.0 twin: only when the serializer code is
     # not the default's. Fixed at decoration, so the default serializer pays nothing per call.
-    _records_twin = (
-        _generated_key_mode
-        and not _l1_only_mode
-        and key_generator.serializer_code(serialization_handler.serializer_key_name) != key_generator.serializer_code("default")
-    )
+    _records_twin = _generated_key_mode and key_generator.serializer_code(
+        serialization_handler.serializer_key_name
+    ) != key_generator.serializer_code("default")
+
+    def _enter_l1_only() -> None:
+        """Set every piece of state L1-only mode derives, in one place: for backend=None at decoration,
+        and for a zero-config candidate at its first call (_settle_zero_config)."""
+        nonlocal _l1_only_mode, _object_cache, _l1_swr_active, _records_twin
+        _object_cache = _new_object_cache()
+        _l1_swr_active = _object_cache is not None and _l1_swr_wanted
+        _records_twin = False  # L1-only writes no L2 entry, so it has no twin to record
+        _l1_only_mode = True
+
+    if _l1_only_mode:
+        _enter_l1_only()
 
     def _twin_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str | None:
         """The call's pre-0.20.0 twin key for the write or L2 hit to record, or None when it has none.
@@ -1758,22 +1768,29 @@ def create_cache_wrapper(
             if get_default_backend() is not None:
                 return False
             provider = get_backend_provider()
-            return type(provider) is DefaultBackendProvider and not provider.is_configured()
-        except Exception:
+            return type(provider) is DefaultBackendProvider and not provider._is_configured()
+        except Exception as e:  # whatever a provider's construction raises: failing toward a backend is the safe side
+            _logger.debug(
+                "Zero-config check failed for %s; resolving a backend instead: %s", function_identifier, redact_error_for_log(e)
+            )
             return False
 
     def _settle_zero_config() -> None:
         """Decide once whether this zero-config candidate runs L1-only, before its first call's lookup or
         its first invalidation. The answer holds for the wrapper's life, as a resolved backend does."""
-        nonlocal _zero_config_pending, _l1_only_mode, _object_cache, _l1_swr_active, _records_twin
+        nonlocal _zero_config_pending
         with invalidation._pid_lock(_zero_config_locks):
             if not _zero_config_pending:
                 return
             if _nothing_configured():
-                _object_cache = _new_object_cache()
-                _l1_swr_active = _object_cache is not None and _l1_swr_wanted
-                _records_twin = False
-                _l1_only_mode = True
+                _enter_l1_only()
+                # DEBUG, not WARNING: no config is a supported setup. Still traceable when a deployment
+                # that lost its REDIS_URL quietly caches per process.
+                _logger.debug(
+                    "Zero-config: %s caches L1-only, in process (no set_default_backend(), backend provider, "
+                    "CACHEKIT_* selector or REDIS_URL)",
+                    function_identifier,
+                )
             elif _l1_cache is not None:
                 invalidation.register(_registry_id, _evict)  # deferred from decoration: see the register below
             # Last: a caller that reads it False without the lock then reads the state set above.

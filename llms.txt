@@ -9,7 +9,7 @@ cachekit provides decorator-based caching with circuit breaker, distributed lock
 ```python
 from cachekit import cache
 
-@cache                    # Uses Redis backend by default
+@cache                    # L1-only with nothing configured; Redis once REDIS_URL is set
 def get_user(user_id: int):
     return db.fetch(user_id)
 

@@ -14,7 +14,7 @@ Public API:
     - BackendError: Exception raised by backend operations
     - BackendErrorType: Error classification enum
     - CapabilityNotAvailableError: Exception for missing optional capabilities
-    - RedisBackend: Redis implementation (default)
+    - RedisBackend: Redis implementation
     - MemcachedBackend: Memcached implementation (requires pymemcache)
 
 Usage:

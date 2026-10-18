@@ -2,13 +2,13 @@
 
 # Backend Guide
 
-Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis (default), File (local), Memcached, and CachekitIO (managed SaaS). You can also run in [L1-only mode](none.md) with `backend=None`, or implement custom backends for any key-value store.
+Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis, File (local), Memcached, and CachekitIO (managed SaaS). With no backend configured, a plaintext decorator runs in [L1-only mode](none.md), as `backend=None` does; encrypted and interop decorators still need a backend ([Nothing Configured](#4-nothing-configured-l1-only)). You can also implement custom backends for any key-value store.
 
 ## Overview
 
 cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. The `BaseBackend` protocol defines a minimal synchronous interface — five methods — that any backend must implement to be compatible with cachekit.
 
-**Key insight**: Backends are completely optional. If you don't specify a backend, cachekit uses RedisBackend with your configured Redis connection.
+**Key insight**: Backends are optional. A decorator without `backend=` resolves one at its first call per [Backend Resolution Priority](#backend-resolution-priority): Redis when `CACHEKIT_REDIS_URL` or `REDIS_URL` is set, and L1-only for a plaintext, non-interop decorator when nothing is configured.
 
 ## BaseBackend Protocol
 
@@ -272,51 +272,6 @@ circuit breaker is open before the backend was ever resolved, which runs the fun
 The check is on the id's type only. L1 is shared by every tenant (see
 above), so do not rely on the `TypeError` to keep tenants apart.
 
-### 4. Nothing Configured: L1-only
-
-With no explicit backend, no module-level default, no backend provider of your own
-registered, no `CACHEKIT_*` selector and no `REDIS_URL`, a decorator caches in L1 only,
-exactly as if it had been written with [`backend=None`](none.md). It makes no connection
-attempt and logs no warning:
-
-```python
-from cachekit import cache
-
-@cache
-def square(x: int) -> int:
-    return x * x
-
-for _ in range(20):
-    square(4)
-
-info = square.cache_info()
-assert (info.misses, info.l1_hits) == (1, 19)  # ran once, then served from L1
-```
-
-That cache is per process: nothing is shared with other processes, and an
-`invalidate_cache()` in one process does not reach another. Values are held by reference,
-so mutating a returned object mutates the cached one. With `l1_enabled=False` nothing is
-cached at all. The choice is made at the function's first call and kept: set a backend
-(any tier above) before a decorated function is first called.
-
-This tier does not apply to `@cache.secure`, `encryption=True` or `interop=`. L1-only
-holds raw Python objects, which cannot be ciphertext or the shared interop format, so
-these still resolve a backend with nothing configured, and get Redis at
-`RedisBackendConfig`'s default URL, `redis://localhost:6379`.
-
-> [!WARNING]
-> Earlier releases connected to `redis://localhost:6379` when nothing was configured. If
-> you relied on that, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`) to
-> keep using that Redis.
-
-**Resolution order**:
-1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
-2. Module-level default via `set_default_backend()` (checked at decoration, and
-   again at first call if still unset)
-3. A backend provider of your own registered with the DI container, else environment
-   auto-detection per the table above
-4. Nothing configured: L1-only
-
 #### Upgrading to 0.20.0
 
 If your deployment used cachekit under more than one tenant, purge the Redis entries that
@@ -391,6 +346,52 @@ Other changes you may notice:
   `t:42:`). No earlier release supported them. Any type other than `str`, `bytes`, `int` and
   `uuid.UUID` raises `TypeError`, as above; this includes a `bool`, an `IntEnum` member and a
   `bytearray`. Convert an `IntEnum` member with `int()` and a `bytearray` with `bytes()` first.
+
+### 4. Nothing Configured: L1-only
+
+With no explicit backend, no module-level default, no backend provider of your own
+registered, no `CACHEKIT_*` selector and no `REDIS_URL`, a decorator caches in L1 only,
+exactly as if it had been written with [`backend=None`](none.md). It makes no connection
+attempt and logs no warning:
+
+```python
+from cachekit import cache
+
+@cache
+def square(x: int) -> int:
+    return x * x
+
+for _ in range(20):
+    square(4)
+
+info = square.cache_info()
+assert (info.misses, info.l1_hits) == (1, 19)  # ran once, then served from L1
+```
+
+That cache is per process: nothing is shared with other processes, and an
+`invalidate_cache()` in one process does not reach another. Values are held by reference,
+so mutating a returned object mutates the cached one. With `l1_enabled=False` nothing is
+cached at all. The choice is made at the function's first call and kept: set a backend
+(any tier above) before a decorated function is first called.
+
+This tier does not apply to `@cache.secure`, `encryption=True` or `interop=`. L1-only
+holds raw Python objects, which cannot be ciphertext or the shared interop format, so
+these still resolve a backend with nothing configured, and get Redis at
+`RedisBackendConfig`'s default URL, `redis://localhost:6379`.
+
+> [!WARNING]
+> Earlier releases connected to `redis://localhost:6379` when nothing was configured. If
+> you relied on that, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`) to
+> keep using that Redis.
+
+### Resolution Order
+
+1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
+2. Module-level default via `set_default_backend()` (checked at decoration, and
+   again at first call if still unset)
+3. A backend provider of your own registered with the DI container, else environment
+   auto-detection per the table above
+4. Nothing configured: L1-only
 
 ## Performance Considerations
 

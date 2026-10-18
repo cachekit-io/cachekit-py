@@ -22,9 +22,10 @@ result = expensive_computation(42)
 
 No environment variables needed. No services to run. Works everywhere.
 
-A decorator with no `backend=` at all runs in exactly this mode when nothing is configured: no
-`set_default_backend()`, no `CACHEKIT_*` selector and no `REDIS_URL` at its first call
-([Nothing Configured](README.md#4-nothing-configured-l1-only)). Write `backend=None` when the
+A plaintext, non-interop decorator with no `backend=` at all runs in exactly this mode when nothing
+is configured at its first call: no `set_default_backend()`, no backend provider of your own, no
+`CACHEKIT_*` selector and no `REDIS_URL` ([Nothing Configured](README.md#4-nothing-configured-l1-only)).
+`@cache.secure`, `encryption=True` and `interop=` never run L1-only: they still resolve a backend. Write `backend=None` when the
 function must stay in-process even after a backend is configured.
 
 ## When to Use

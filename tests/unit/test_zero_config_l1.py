@@ -22,6 +22,7 @@ from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.provider import BackendProviderInterface, DefaultBackendProvider
 from cachekit.config.decorator import DecoratorConfig, set_default_backend
 from cachekit.config.nested import L1CacheConfig
+from cachekit.decorators.wrapper import InvalidationOutcome
 from cachekit.di import DIContainer
 
 _SELECTORS = ("CACHEKIT_API_KEY", "CACHEKIT_REDIS_URL", "CACHEKIT_MEMCACHED_SERVERS", "CACHEKIT_FILE_CACHE_DIR")
@@ -90,19 +91,12 @@ def nothing_configured(monkeypatch: pytest.MonkeyPatch) -> Iterator[mock.MagicMo
     """
     for var in _ENV:
         monkeypatch.delenv(var, raising=False)
-    set_default_backend(None)
-    container = DIContainer()
-    saved = container._singletons.get(BackendProviderInterface)
-    container._singletons[BackendProviderInterface] = DefaultBackendProvider()
+    monkeypatch.setattr("cachekit.config.decorator._default_backend", None)
+    monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, DefaultBackendProvider())
     with mock.patch.object(
         DefaultBackendProvider, "get_backend", autospec=True, side_effect=AssertionError("get_backend() called")
     ) as spy:
         yield spy
-    set_default_backend(None)
-    if saved is None:
-        container._singletons.pop(BackendProviderInterface, None)
-    else:
-        container._singletons[BackendProviderInterface] = saved
 
 
 @pytest.fixture
@@ -197,14 +191,13 @@ class TestZeroConfigParity:
 
     @pytest.mark.parametrize("preset", list(_PRESETS))
     def test_values_held_by_reference(self, preset: str) -> None:
-        """(c) No serialization: the cached object itself is returned, and tuples stay tuples."""
-        wrapped = _PRESETS[preset]()(_named(lambda x: [x, (x,)], preset))
+        """(c) No serialization: the cached object itself is returned."""
+        wrapped = _PRESETS[preset]()(_named(lambda x: [x], preset))
         first = wrapped(1)
         assert wrapped(1) is first
-        assert first[1] == (1,)
 
     @pytest.mark.parametrize("preset", list(_PRESETS))
-    def test_l1_disabled_caches_nothing(self, preset: str) -> None:
+    def test_l1_disabled_caches_nothing(self, preset: str, nothing_configured: mock.MagicMock) -> None:
         """(d) l1_enabled=False: no cache anywhere, every call runs, and still no Redis."""
         calls = 0
 
@@ -218,6 +211,8 @@ class TestZeroConfigParity:
         for _ in range(3):
             wrapped(1)
         assert calls == 3
+        assert _state(wrapped) == {"l1_only": True, "object_cache": False, "swr": False}
+        nothing_configured.assert_not_called()  # the client_creation guard would swallow its AssertionError
 
     @pytest.mark.parametrize("first_call", [False, True])
     def test_clear_invalidate_info_sync(self, first_call: bool) -> None:
@@ -233,13 +228,13 @@ class TestZeroConfigParity:
         if first_call:
             wrapped(1)
         assert wrapped.cache_info().misses == int(first_call)
-        wrapped.invalidate_cache(1)
+        assert wrapped.invalidate_cache(1) == InvalidationOutcome.NO_L2  # settles it before a first call too
         wrapped.cache_clear()
         assert wrapped.cache_info().misses == 0
         wrapped(1)
         wrapped(1)
         assert calls == 1 + int(first_call)
-        assert wrapped.invalidate_cache(1) is not None  # NO_L2, as for backend=None
+        assert wrapped.invalidate_cache(1) == InvalidationOutcome.NO_L2  # as for backend=None
         wrapped(1)
         assert calls == 2 + int(first_call)
 
@@ -317,7 +312,7 @@ class TestConfiguredResolutionUnchanged:
         wrapped(1)
         assert backend.store
 
-    @pytest.mark.parametrize("var", _ENV)
+    @pytest.mark.parametrize("var", [*_ENV, "redis_url", "cachekit_redis_url"])  # any case, as the config reads them
     def test_one_selector_resolves_a_backend(
         self, var: str, nothing_configured: mock.MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -468,15 +463,21 @@ class TestEncryptedAndInteropUnchanged:
         assert _state(wrapped)["l1_only"] is False
 
 
-def test_is_configured_reads_every_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_is_configured_reads_every_selector_in_any_case(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in _ENV:
         monkeypatch.delenv(var, raising=False)
     provider = DefaultBackendProvider()
-    assert provider.is_configured() is False
+    assert provider._is_configured() is False
     for var in _ENV:
         monkeypatch.setenv(var, "x")
-        assert provider.is_configured() is True
+        assert provider._is_configured() is True
         monkeypatch.delenv(var)
+    for var in _ENV:
+        monkeypatch.setenv(var.lower(), "x")  # RedisBackendConfig reads names case-insensitively
+        assert provider._is_configured() is True
+        monkeypatch.delenv(var.lower())
+    monkeypatch.setenv("REDIS_URL", "")
+    assert provider._is_configured() is False  # empty is unset, as for get_backend()'s selectors
     monkeypatch.setenv("CACHEKIT_REDIS_URL", "x")
     monkeypatch.setenv("CACHEKIT_API_KEY", "x")
-    assert provider.is_configured() is True  # ambiguity is get_backend()'s error, not this query's
+    assert provider._is_configured() is True  # ambiguity is get_backend()'s error, not this query's

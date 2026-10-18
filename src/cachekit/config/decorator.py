@@ -109,8 +109,8 @@ class DecoratorConfig:
     Intent-based presets with kwargs overrides for customization.
     - Frozen dataclass ensures immutability
     - Nested configs group related settings
-    - Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit backend=,
-      then set_default_backend(), then one env selector at first call, else L1-only (nothing configured)
+    - Backend resolves per docs/backends/README.md, "Backend Resolution Priority", at first call; with
+      nothing configured, a plaintext non-interop decorator is L1-only
 
     Examples:
         # Zero-config: backend auto-detected from the environment at first call, L1-only if none is set
@@ -327,9 +327,8 @@ class DecoratorConfig:
         Use cases: Read-heavy workloads, non-critical caching, high-performance scenarios
         Trade-offs: Circuit breaker disabled, no monitoring, NO integrity checking
 
-        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call, else
-              L1-only (nothing configured).
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority", at
+              first call; with nothing configured, L1-only.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -375,9 +374,8 @@ class DecoratorConfig:
         Use cases: Payment systems, APIs, production services, critical workloads
         Trade-offs: Additional latency from circuit breaker, monitoring, integrity validation
 
-        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call, else
-              L1-only (nothing configured).
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority", at
+              first call; with nothing configured, L1-only.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -525,9 +523,8 @@ class DecoratorConfig:
         Use cases: Local development, debugging production issues
         Trade-offs: Verbose logs, Prometheus metrics disabled for simplicity except circuit_breaker_state
 
-        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call, else
-              L1-only (nothing configured).
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority", at
+              first call; with nothing configured, L1-only.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -571,9 +568,8 @@ class DecoratorConfig:
         Use cases: Unit tests, integration tests (with fakeredis)
         Trade-offs: No circuit breaker, no stats, no integrity (reproducible, fast)
 
-        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call, else
-              L1-only (nothing configured).
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority", at
+              first call; with nothing configured, L1-only.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
