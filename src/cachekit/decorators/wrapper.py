@@ -816,6 +816,8 @@ def create_cache_wrapper(
         _interop_sig = inspect.signature(func)
 
     # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
+    # _registry_hash is also the identity every custom key= key starts with (_resolve_cache_key):
+    # changing it re-keys every key= entry, and the golden-vector test pins it.
     # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
     # drain another's keys. namespace=None and namespace="default" write different auto-mode
     # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:
@@ -1501,7 +1503,13 @@ def create_cache_wrapper(
             custom_key = custom_key_func(*call_args, **call_kwargs)
             if not isinstance(custom_key, str):
                 raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
-            return f"{namespace or 'default'}:{custom_key}"
+            # The function's 16-hex identity goes first, at a fixed width no namespace or key can shift, so
+            # two functions whose key functions return the same string never share an entry. First also keeps
+            # every key apart from the pre-fix "{namespace}:{key}" keys an earlier release writes, which start
+            # with a configured namespace: a crafted argument cannot plant one (unless a plain RedisBackend
+            # sharing the database uses namespace t or t:*, which can spell a tenant-scoped key). Generated
+            # keys start ns: or func:, so this key never equals one. CachekitIO files it in its default namespace.
+            return f"{_registry_hash}-{namespace or 'default'}:{custom_key}"
         # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.
         # Minimal key generation - no string formatting overhead (10-50μs savings)
         from ..hash_utils import cache_key_hash

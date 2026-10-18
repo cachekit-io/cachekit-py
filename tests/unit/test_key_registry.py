@@ -868,7 +868,8 @@ class TestNamespaceExactStr:
             return x
 
         f(1)
-        assert set(backend.store) == {"users:k"}
+        identity = hash_utils.blake3_hash(f"{f.__module__}.{f.__qualname__}", digest_size=8)
+        assert set(backend.store) == {f"{identity}-users:k"}
         (rid,) = _registry_ids(backend)
         assert rid.startswith("ck:reg:users:")
 
@@ -880,7 +881,8 @@ class TestNamespaceExactStr:
             return x
 
         f(1)
-        assert set(backend.store) == {"x:k"}
+        identity = hash_utils.blake3_hash(f"{f.__module__}.{f.__qualname__}", digest_size=8)
+        assert set(backend.store) == {f"{identity}-x:k"}
         (rid,) = _registry_ids(backend)
         assert rid.startswith("ck:reg:x:")
 

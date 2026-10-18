@@ -52,7 +52,7 @@ change identity on upgrade, with no change on your side, for:
 
 Not affected: the default serializer (no `serializer=`, `"std"`, `"default"`, `"standard"` —
 `:1s` before and after), `@cache.local()` (always `:0l`), a custom `key=` function (no
-suffix), and `interop_mode=True` (separate key format).
+serializer code), and `interop_mode=True` (separate key format).
 
 Each affected function on a shared backend gets a one-time cold cache at cut-over, and its
 pre-upgrade entries are never read again. Two decorators over one function that differed only
