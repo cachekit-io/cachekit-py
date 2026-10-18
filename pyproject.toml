@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.22.0"
+version = "0.23.0"
 description = "Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CachekitIO."
 readme = "README.md"
 license = {text = "MIT"}
@@ -81,7 +81,9 @@ dependencies = [
 # User-facing optional features only - dev deps are in [dependency-groups]
 data = [
     "numpy>=2.0.2",
-    "pandas>=1.3.0",
+    # 2.2.2 is the first pandas release built against numpy 2, so an older pandas cannot install
+    # beside the numpy floor above.
+    "pandas>=2.2.2",
     "pyarrow>=21.0.0",
 ]
 json = [
@@ -245,7 +247,7 @@ dev = [
     "pip-audit>=2.7.0",
     # Data science support (for testing AutoSerializer with numpy/pandas)
     "numpy>=2.0.2",
-    "pandas>=1.3.0",
+    "pandas>=2.2.2",
     "pyarrow>=21.0.0",
     # OrjsonSerializer support — now the [json] optional extra; kept here so the
     # orjson tests, doctests, and markdown-docs still resolve it in dev/CI.
