@@ -238,9 +238,9 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
 | `serializer_auto` | `AutoSerializer` round trip | 68,147 | 69,040 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,679 | 23,775 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,953,212 | 1,953,407 |
-| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 60,350,891 | 59,871,161 |
-| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 60,354,776 | 59,877,670 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,975,014 | 1,970,889 |
+| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,849,178 | 61,414,623 |
+| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,813,019 | 61,434,085 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 114,998 | 118,412 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,556 | 73,669 |
 
