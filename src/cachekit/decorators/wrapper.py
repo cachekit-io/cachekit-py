@@ -816,6 +816,8 @@ def create_cache_wrapper(
         _interop_sig = inspect.signature(func)
 
     # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
+    # _registry_hash is also the identity every custom key= key ends in (_resolve_cache_key):
+    # changing it re-keys every key= entry, and the golden-vector test pins it.
     # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
     # drain another's keys. namespace=None and namespace="default" write different auto-mode
     # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:

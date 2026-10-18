@@ -210,11 +210,13 @@ class TestNoSharedInvalidation:
             runs.append("k2")
             return "k2"
 
-        k1(1), k2(1)
+        assert (k1(1), k2(1)) == ("k1", "k2")
         k1._cachekit_evict(None)  # what the listener runs for k1's announcement
-        backend.store.clear()  # so only L1 can serve k2 now
+        backend.store.clear()  # so only L1 can serve either function now
         assert k2(1) == "k2"
-        assert runs == ["k1", "k2"]
+        assert runs == ["k1", "k2"]  # k2's L1 entry survived k1's eviction
+        assert k1(1) == "k1"
+        assert runs == ["k1", "k2", "k1"]  # and k1's own was evicted
 
 
 @pytest.mark.unit
@@ -300,7 +302,8 @@ class TestNoLegacyKey:
             return x
 
         f(1)
-        ((registry_id, new_key),) = backend.track_calls
+        ((registry_id, _),) = backend.track_calls
+        assert registry_id == f"ck:reg::{_identity(f)}"  # the pre-fix name: None namespace, empty segment
         backend.store["default:2"] = b"pre-fix"
         backend.sets[registry_id].add("default:2")  # tracked by a pre-fix process
 

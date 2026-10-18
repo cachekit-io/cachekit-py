@@ -144,12 +144,13 @@ class DecoratorConfig:
              Use for numpy arrays, DataFrames and other arguments the default key cannot hash.
              The stored key is "{namespace or 'default'}:{returned str}:{identity}", where identity
              is 16 hex of the blake3 hash of the function's module.qualname, so functions with
-             different qualnames never share an entry. Functions sharing a qualname (closures from
+             different module.qualnames never share an entry. Functions sharing one (closures from
              one factory, lambdas, __main__ in two scripts) still do: give them distinct namespaces.
              Not for cross-SDK sharing: interop mode rejects key=.
-             Return a str that differs whenever the arguments differ, e.g. for a numpy array:
-             @cache(key=lambda arr: f"{arr.dtype}:{arr.shape}:{hashlib.blake2b(arr.tobytes()).hexdigest()}")
-             (tobytes() alone ignores dtype and shape)
+             Return a str that differs whenever the arguments differ and uses only [A-Za-z0-9_.:-]
+             (CachekitIO rejects other characters, Memcached whitespace), e.g. for a numeric numpy array:
+             @cache(key=lambda arr: hashlib.blake2b(f"{arr.dtype.str}{arr.shape}".encode() + arr.tobytes()).hexdigest())
+             (tobytes() alone ignores dtype and shape; an object array's bytes are pointers)
         refresh_ttl_on_get: Extend TTL on cache hit
         ttl_refresh_threshold: Minimum remaining TTL fraction (0.0-1.0) to trigger refresh
         backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
