@@ -15,7 +15,7 @@
 
 **Performance characteristics:**
 - Payload: Arrow IPC, compressed with zstd by default (`CACHEKIT_ARROW_COMPRESSION`), so a read decompresses it
-- Zero-copy reads: only with `ArrowSerializer(compression=None)` on the File backend, where a plaintext read memory-maps the stored payload; the stored payload is then larger
+- Zero-copy reads: only for uncompressed, plaintext payloads on the File backend, which memory-maps the stored file; what stays zero-copy depends on `return_format` (see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend)). The stored payload is then larger
 - Network overhead: Efficient columnar format
 
 StandardSerializer (MessagePack) does not accept DataFrames, so there is no MessagePack figure to compare against. Sizes and instruction counts measured on a real dataset are in [Performance on Real Data](#performance-on-real-data).
@@ -37,11 +37,15 @@ def load_stock_data(symbol: str):
 
 ```python notest
 from cachekit import cache
+from cachekit.backends.file import FileBackend, FileBackendConfig
 from cachekit.serializers import ArrowSerializer
 import pandas as pd
 
-# Explicit ArrowSerializer for DataFrame caching
-@cache(serializer=ArrowSerializer(), backend=None)
+# Explicit ArrowSerializer for DataFrame caching. backend=None would keep only the L1
+# in-memory copy, which stores the DataFrame object itself and never runs the serializer.
+backend = FileBackend(FileBackendConfig(cache_dir="/tmp/cachekit"))
+
+@cache(serializer=ArrowSerializer(), backend=backend)
 def get_large_dataset(date: str):
     # Load 100K+ row DataFrame (illustrative - file may not exist)
     df = pd.read_csv(f"data/{date}.csv")
@@ -65,7 +69,7 @@ serializer = ArrowSerializer(return_format="pandas")
 # Return as polars DataFrame (requires polars installed)
 serializer = ArrowSerializer(return_format="polars")
 
-# Return as pyarrow.Table (zero-copy, fastest)
+# Return as pyarrow.Table (no conversion; zero-copy on an uncompressed File-backend hit)
 serializer = ArrowSerializer(return_format="arrow")
 ```
 
@@ -73,9 +77,12 @@ serializer = ArrowSerializer(return_format="arrow")
 ```python notest
 import polars as pl
 from cachekit import cache
+from cachekit.backends.file import FileBackend, FileBackendConfig
 from cachekit.serializers import ArrowSerializer
 
-@cache(serializer=ArrowSerializer(return_format="polars"), backend=None)
+backend = FileBackend(FileBackendConfig(cache_dir="/tmp/cachekit"))
+
+@cache(serializer=ArrowSerializer(return_format="polars"), backend=backend)
 def get_polars_data():
     return pl.DataFrame({
         "id": [1, 2, 3],
@@ -135,7 +142,7 @@ For comprehensive performance analysis including decorator overhead, concurrent 
 
 ### Memory Usage
 
-A read of a compressed payload (the default) decompresses it into new buffers. With `ArrowSerializer(compression=None)` on the File backend, a plaintext read memory-maps the stored file instead of copying it, at the cost of a larger stored payload. Wire backends always copy the payload in.
+A read of a compressed payload (the default) decompresses it into new buffers. An uncompressed, plaintext payload on the File backend is memory-mapped instead of copied in, at the cost of a larger stored payload: see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend). Wire backends always copy the payload in.
 
 **Writes stream on the File backend.** When the cache backend supports streaming writes
 (File backend only today) and the value is plaintext (no encryption), serialization streams
@@ -144,16 +151,62 @@ IPC payload in memory first — cutting write peak RSS from ~5.6x to ~2.3x the D
 logical size. Wire backends (Redis, CachekitIO, Memcached) and encrypted values use the
 buffered path unchanged. See [File Backend](../backends/file.md#bounded-memory-large-values-arrow).
 
+### Zero-Copy Reads on the File Backend
+
+A cache hit memory-maps the cache file when all of these hold:
+
+- the backend is a `FileBackend` on a POSIX system, and the stored file is at most 512 MB;
+- the serializer is cachekit's `ArrowSerializer`, as `serializer="arrow"` or an `ArrowSerializer(...)` instance (a subclass reads the buffered way);
+- the payload is uncompressed: `ArrowSerializer(compression=None)`, or `CACHEKIT_ARROW_COMPRESSION=none` for `serializer="arrow"`;
+- the value is not encrypted, and the cached function is synchronous (hits of an `async def` function copy the file in).
+
+What the hit then costs depends on `return_format`:
+
+| `return_format` | Uncompressed File-backend hit |
+|---|---|
+| `"arrow"` | Zero-copy. Every buffer of the returned `pyarrow.Table` points into the mapped cache file, and the hit allocates no heap memory for the data. |
+| `"polars"` | Numeric, boolean and temporal columns are zero-copy. String columns are converted to polars' own layout, which copies them. The frame keeps one chunk per stored record batch (about 8 MiB each); call `.rechunk()` if you need contiguous columns. |
+| `"pandas"` | One copy: the result is an ordinary, writable pandas DataFrame. |
+
+A zero-copy result keeps the mapping alive for as long as you hold it, and it is unmapped when the result is garbage-collected. Deleting, overwriting or evicting the entry meanwhile does not change the result: cachekit replaces a cache file by renaming a new one over it and deletes by unlinking, so the held result keeps reading the old data. The disk space of a replaced or deleted entry is reclaimed only after the last result that maps it is dropped. Do not truncate or rewrite cache files in place from outside cachekit while results are held: touching a truncated mapping raises `SIGBUS`.
+
+Uncompressed entries are written with their Arrow data starting on a 64-byte boundary of the cache file, which polars needs to import columns without copying. Entries written by cachekit-py releases before this alignment still read correctly; polars copies their numeric columns.
+
+```python
+import tempfile
+
+import pandas as pd
+import pyarrow as pa
+from cachekit import cache
+from cachekit.backends.file import FileBackend, FileBackendConfig
+from cachekit.serializers import ArrowSerializer
+
+backend = FileBackend(FileBackendConfig(cache_dir=tempfile.mkdtemp()))
+
+@cache(serializer=ArrowSerializer(return_format="arrow", compression=None), backend=backend, l1_enabled=False)
+def load_prices():
+    return pd.DataFrame({"price": [float(i) for i in range(100_000)]})
+
+load_prices()  # miss: streams the uncompressed Arrow IPC into the cache file
+pool_before = pa.total_allocated_bytes()
+table = load_prices()  # hit: a pyarrow.Table over the mapped file
+assert table.num_rows == 100_000
+assert pa.total_allocated_bytes() == pool_before  # no Arrow buffers were allocated for the hit
+```
+
 ## Polars Support
 
-Polars DataFrames are supported via the `__arrow_c_stream__` interface (Arrow C Data Interface). This means zero-copy interchange between polars and Arrow — no intermediate conversion.
+Polars DataFrames are written through the `__arrow_c_stream__` interface (Arrow C Data Interface), with no intermediate pandas conversion. Reads with `return_format="polars"` build the frame with `polars.from_arrow(table, rechunk=False)`, which keeps one chunk per stored record batch; see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend) for which columns stay zero-copy.
 
 ```python notest
 import polars as pl
 from cachekit import cache
+from cachekit.backends.file import FileBackend, FileBackendConfig
 from cachekit.serializers import ArrowSerializer
 
-@cache(serializer=ArrowSerializer(return_format="polars"), backend=None)
+backend = FileBackend(FileBackendConfig(cache_dir="/tmp/cachekit"))
+
+@cache(serializer=ArrowSerializer(return_format="polars", compression=None), backend=backend)
 def get_polars_data():
     return pl.DataFrame({
         "id": [1, 2, 3],
@@ -168,21 +221,24 @@ pip install polars
 uv add polars
 ```
 
-If polars is not installed and `return_format="polars"` is specified, an `ImportError` is raised.
+If polars is not installed, deserializing with `return_format="polars"` raises `SerializationError` ("polars not installed"). Under `@cache`, every hit then logs that error and runs the function again, as for a corrupt entry.
 
 ## Performance Optimization Tips
 
-1. **Use return_format="arrow"** for zero-copy access:
+1. **Use return_format="arrow"** to skip the pandas conversion, and add `compression=None` on the File backend for zero-copy hits:
 
    ```python notest
    from cachekit import cache
+   from cachekit.backends.file import FileBackend, FileBackendConfig
    from cachekit.serializers import ArrowSerializer
 
-   @cache(serializer=ArrowSerializer(return_format="arrow"), backend=None)
+   backend = FileBackend(FileBackendConfig(cache_dir="/tmp/cachekit"))
+
+   @cache(serializer=ArrowSerializer(return_format="arrow", compression=None), backend=backend)
    def get_data():
        return df  # illustrative - df not defined
 
-   # Result is pyarrow.Table (no pandas conversion overhead)
+   # Result is a pyarrow.Table over the mapped cache file (no pandas conversion, no copy)
    table = get_data()
    ```
 
@@ -201,7 +257,7 @@ If polars is not installed and `return_format="polars"` is specified, an `Import
    from cachekit.serializers import ArrowSerializer
    import pandas as pd
 
-   @cache(serializer=ArrowSerializer(), backend=None)
+   @cache(serializer=ArrowSerializer(), backend=backend)  # backend as in tip 1
    def get_data_batch(date_range):
        # Return one large DataFrame instead of many small ones
        return pd.concat([load_day(d) for d in date_range])  # illustrative - load_day not defined

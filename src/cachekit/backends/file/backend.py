@@ -134,9 +134,19 @@ class _MmapHandle:
     """Owns a read-only mmap of a cache file plus a memoryview of its payload (past the 14-byte
     header). Zero-copy: the view aliases mapped pages, never a heap copy.
 
-    The CALLER must ``close()`` once the consumer is done (after Arrow deserialize has copied the
-    data out via to_pandas). The view DANGLES after close — touching it segfaults — so the handle
-    must never escape the deserialize call frame and must never be stored in L1 (#171 blocker C).
+    The CALLER must ``close()`` once deserialize returns. Lifetime contract (CPython):
+
+    - ``close()`` releases the handle's own view, so touching ``handle.view`` afterwards raises
+      ``ValueError``; the handle must still never escape the read call frame nor reach L1
+      (#171 blocker C).
+    - Anything deserialize built over the mapping (an Arrow table, a polars frame, or pandas
+      columns that are views) holds buffer exports of it. ``mmap.close()`` refuses with
+      ``BufferError`` while any export lives; ``close()`` swallows that, and the mapping is
+      unmapped when the last export is released. A result therefore never dangles.
+    - The file's pages stay valid while mapped because cachekit never rewrites a cache file in
+      place: writes go to a temp file and ``rename``, eviction and delete ``unlink``, and both
+      leave an existing mapping intact. A process that truncates a cache file in place while a
+      result is held makes the next touch of those pages raise ``SIGBUS``.
     """
 
     __slots__ = ("_mm", "view")
@@ -151,11 +161,11 @@ class _MmapHandle:
         """Release the view then the mapping. Idempotent (safe to call more than once)."""
         try:
             self.view.release()  # must release exports before mmap.close(), else BufferError
-        except (ValueError, BufferError):  # pragma: no cover - defensive (already released / lingering sub-export)
+        except BufferError:  # a consumer exported this view itself; it keeps the mapping alive
             pass
         try:
             self._mm.close()
-        except (ValueError, BufferError):  # pragma: no cover - defensive (already closed)
+        except BufferError:  # a result still holds exports of the mapping: refcounting unmaps it later
             pass
 
 

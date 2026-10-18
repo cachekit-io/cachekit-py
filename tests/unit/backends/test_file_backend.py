@@ -2212,6 +2212,31 @@ class TestMmapBuffer:
         with pytest.raises((ValueError, BufferError)):
             bytes(handle.view)  # mapping released; the view is dead
 
+    def test_close_leaves_a_mapping_a_consumer_still_exports(self, backend: FileBackend) -> None:
+        """A consumer's sub-view of the payload holds an export of the mapping: close() swallows
+        mmap.close()'s BufferError and the consumer's bytes stay valid until it drops them."""
+        backend.set("k", b"held-payload", ttl=60)
+        handle = backend.get_buffer("k")
+        assert handle is not None
+        held = memoryview(handle.view)[5:]
+        handle.close()
+        assert not handle._mm.closed
+        assert bytes(held) == b"payload"
+        held.release()
+        handle.close()
+        assert handle._mm.closed
+
+    def test_close_leaves_a_view_a_consumer_exported_directly(self, backend: FileBackend) -> None:
+        """An export of handle.view itself makes view.release() raise BufferError; close() swallows it too."""
+        pa = pytest.importorskip("pyarrow")
+        backend.set("k", b"held-payload", ttl=60)
+        handle = backend.get_buffer("k")
+        assert handle is not None
+        held = pa.py_buffer(handle.view)
+        handle.close()
+        assert not handle._mm.closed
+        assert held.to_pybytes() == b"held-payload"
+
     @pytest.mark.skipif(os.name != "posix", reason="rename-replace inode pinning is POSIX-only")
     def test_open_mmap_unaffected_by_concurrent_set(self, backend: FileBackend) -> None:
         """The load-bearing invariant: a set() that renames over the key while a reader holds the

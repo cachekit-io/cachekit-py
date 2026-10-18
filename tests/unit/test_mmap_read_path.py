@@ -1,7 +1,7 @@
 """#171 mmap read-path wiring.
 
 Three units compose the zero-copy Arrow read fast path:
-- ``CacheSerializationHandler.supports_mmap_read()`` — eligibility (plaintext Arrow -> pandas).
+- ``CacheSerializationHandler.supports_mmap_read()`` — eligibility (plaintext cachekit Arrow).
 - ``StandardCacheHandler.get_buffer()`` — delegates to a backend that exposes ``get_buffer``.
 - ``CacheOperationHandler.get_cached_value(_async)`` — when eligible, reads via the mmap handle,
   deserializes over the view, and closes the handle in a ``finally``. Crucially the mmap NEVER
@@ -41,15 +41,42 @@ class TestSupportsMmapRead:
         sh.encryption = True
         assert sh.supports_mmap_read() is False
 
-    def test_arrow_return_format_not_eligible(self) -> None:
-        """A pyarrow.Table aliases the mmap; closing the handle would be a use-after-free. Pandas only."""
+    @pytest.mark.parametrize("return_format", ["pandas", "arrow", "polars"])
+    def test_every_return_format_is_eligible(self, return_format) -> None:
+        """An Arrow or polars result keeps the mapping alive through its buffer exports, so the
+        handle's close() cannot free pages it still uses: every return_format may mmap."""
         pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
         sh = CacheSerializationHandler(serializer_name="arrow")
         # Swap in a throwaway serializer rather than mutating the process-wide cached instance, so
-        # this test can never leak an "arrow" return_format into another test (no shared state).
-        sh._base_serializer = ArrowSerializer(return_format="arrow")
+        # this test can never leak a return_format into another test (no shared state).
+        sh._base_serializer = ArrowSerializer(return_format=return_format)
+        assert sh.supports_mmap_read() is True
+
+    def test_arrow_serializer_instance_is_eligible(self) -> None:
+        """Eligibility is by serializer object: an instance's frame tag is its class name, not "arrow"."""
+        pytest.importorskip("pyarrow")
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        assert CacheSerializationHandler(serializer_name=ArrowSerializer(return_format="arrow")).supports_mmap_read() is True
+
+    def test_arrow_serializer_subclass_not_eligible(self) -> None:
+        """Exact type: a subclass may override serialize/deserialize, so it stays on the buffered path."""
+        pytest.importorskip("pyarrow")
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        class Custom(ArrowSerializer):
+            pass
+
+        assert CacheSerializationHandler(serializer_name=Custom()).supports_mmap_read() is False
+
+    def test_encrypted_arrow_instance_not_eligible(self) -> None:
+        pytest.importorskip("pyarrow")
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        sh = CacheSerializationHandler(serializer_name=ArrowSerializer())
+        sh.encryption = True
         assert sh.supports_mmap_read() is False
 
 

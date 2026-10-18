@@ -92,6 +92,20 @@ class TestSupportsStreamingWrite:
         sh.encryption = True
         assert sh.supports_streaming_write() is False
 
+    def test_arrow_serializer_instance_is_eligible(self) -> None:
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        assert CacheSerializationHandler(serializer_name=ArrowSerializer(compression=None)).supports_streaming_write() is True
+
+    def test_arrow_serializer_subclass_not_eligible(self) -> None:
+        """Exact type: a subclass may override serialize, which the streaming path bypasses."""
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        class Custom(ArrowSerializer):
+            pass
+
+        assert CacheSerializationHandler(serializer_name=Custom()).supports_streaming_write() is False
+
     def test_backend_type_guard(self, file_backend) -> None:
         assert supports_streaming_write(file_backend) is True
         assert supports_streaming_write(_PlainBackend()) is False

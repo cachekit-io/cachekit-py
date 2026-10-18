@@ -634,7 +634,7 @@ def create_cache_wrapper(
         ttl: Cache time-to-live in seconds (None = no expiration)
         namespace: Cache key namespace prefix
         serializer: Serializer instance or name. Accepts either:
-                   - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
+                   - String name: "default" (MessagePack), "arrow" (DataFrames as Arrow IPC)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
                    An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError:
                    encrypt with encryption=True (@cache.secure) and pass the inner serializer here.

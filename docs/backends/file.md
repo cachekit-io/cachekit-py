@@ -90,11 +90,17 @@ making it the right choice for caching DataFrames bigger than your RAM headroom:
   serialized record batch by record batch straight into the cache file (temp file + atomic
   rename), so the full serialized payload never exists in memory. Write peak RSS is ~2.3x the
   DataFrame's logical size, versus ~5.6x on the buffered path every other backend uses.
-- **Zero-copy reads** (`BufferReadableBackend.get_buffer`): with `compression="none"`, cached
-  entries are served back through a POSIX mmap without materializing the payload on the heap.
+- **Zero-copy reads** (`BufferReadableBackend.get_buffer`): uncompressed entries
+  (`compression=None`, or `CACHEKIT_ARROW_COMPRESSION=none`) are served back through a POSIX
+  mmap without materializing the payload on the heap. A `return_format="arrow"` result points
+  into the mapped file, `"polars"` keeps its fixed-width columns there, and `"pandas"` copies
+  once; a result that points into the mapping keeps it alive until it is dropped. Details,
+  limits and the lifetime rules: [ArrowSerializer → Zero-Copy Reads on the File
+  Backend](../serializers/arrow.md#zero-copy-reads-on-the-file-backend).
 
-Both engage automatically — no API change — whenever the serializer is plaintext Arrow
-(`serializer_name="arrow"`, no encryption). **Encrypted values are excluded from both paths**:
+Both engage automatically — no API change — whenever the serializer is cachekit's plaintext
+Arrow serializer: `serializer="arrow"` or an `ArrowSerializer(...)` instance (not a subclass),
+with no encryption. Reads also need a synchronous cached function. **Encrypted values are excluded from both paths**:
 AES-256-GCM needs the whole ciphertext to produce/verify its auth tag, so the secure path
 stays on buffered `set()`/`get()`. Streamed values also intentionally skip the L1 in-memory
 cache — holding a multi-GB envelope in-process would defeat the point.

@@ -132,7 +132,8 @@ class DecoratorConfig:
         ttl: Time-to-live in seconds (None = no expiration; every preset sets its own default — see each classmethod)
         namespace: Optional namespace prefix for cache keys
         serializer: Serializer instance or name. Accepts either:
-                   - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
+                   - String name: "default" (MessagePack), "arrow" (DataFrames as Arrow IPC; zero-copy reads on
+                     the File backend when uncompressed)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
                    Default: "default" (MessagePack+LZ4+xxHash3-64 via Rust)
                    An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError when

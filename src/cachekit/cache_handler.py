@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import sys
 import threading
 import types
 import warnings
@@ -27,6 +28,7 @@ from cachekit.backends.base import (
     LockableBackend,
     TTLInspectableBackend,
 )
+from cachekit.backends.file.backend import HEADER_SIZE as FILE_HEADER_SIZE
 from cachekit.backends.provider import (
     BackendProviderInterface,
     DefaultBackendProvider,
@@ -71,6 +73,11 @@ if TYPE_CHECKING:
 # format after decryption, as protocol ENC-2 requires. 'auto' is intentionally excluded:
 # it chooses its decoder by inspecting the bytes.
 CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
+
+# Uncompressed Arrow IPC alignment: the body follows the File header, the CK frame
+# prefix and ArrowSerializer's 8-byte xxHash3-64 checksum; 64 is Arrow's recommended alignment.
+_ARROW_IPC_ALIGN = 64
+_ARROW_CHECKSUM_SIZE = 8
 
 # Global DI container instance with default registrations
 container = DIContainer()
@@ -659,7 +666,7 @@ class CacheSerializationHandler:
 
         Args:
             serializer_name: Serializer instance or name. Accepts either:
-                            - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy), "orjson" (JSON)
+                            - String name: "default" (MessagePack), "arrow" (DataFrames as Arrow IPC), "orjson" (JSON)
                             - SerializerProtocol instance: Custom serializer implementing the protocol
             encryption: Tri-state encryption control (wraps serializer with EncryptionWrapper):
                         - None (default): no intent stated. Plaintext when no master key is present;
@@ -1137,7 +1144,9 @@ class CacheSerializationHandler:
             else:
                 # Convert metadata to dict if needed
                 metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
-                wrapped = SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
+                # One prefix builder for this path and write_serialized_to, so buffered and streamed
+                # entries stay byte-identical (the payload is copied once, as in wrap()).
+                wrapped = self._frame_prefix(metadata_dict) + serialized_data
         except ValueError:
             # Tenant extraction, cache_key missing, or an interop data-model
             # rejection (InteropError) — FAIL CLOSED / fail loud (re-raise).
@@ -1162,28 +1171,54 @@ class CacheSerializationHandler:
             )
         return wrapped
 
+    def _is_cachekit_arrow(self) -> bool:
+        """True iff the base serializer is exactly cachekit's ArrowSerializer, by object, not frame tag.
+
+        ``serializer="arrow"`` and an ``ArrowSerializer(...)`` instance both qualify; the instance's
+        frame tag is its class name, which is why the old ``== "arrow"`` test missed it. Exact type:
+        a subclass may override ``serialize`` and stays on the buffered paths. Read through
+        ``sys.modules`` so a handler that never loaded the module never imports pyarrow here.
+        """
+        module = sys.modules.get("cachekit.serializers.arrow_serializer")
+        return module is not None and type(self._base_serializer) is module.ArrowSerializer
+
+    def _frame_prefix(self, metadata: dict[str, Any]) -> bytes:
+        """The CK frame prefix for a plaintext payload with ``metadata``.
+
+        Uncompressed cachekit Arrow gets its header padded so the Arrow IPC body starts on a
+        64-byte boundary of a File-backend cache file (File header + prefix + 8-byte checksum):
+        polars copies every misaligned numeric column, and pyarrow prefers aligned buffers.
+        Compressed, encrypted and every other payload are left unpadded. The prefix depends only on
+        the serializer configuration, so other backends carry the same padding (and an unaligned body).
+        """
+        if not self.encryption and self._is_cachekit_arrow() and not metadata.get("compressed"):
+            return SerializationWrapper.wrap_prefix(
+                metadata, self._serializer_string_name, align=_ARROW_IPC_ALIGN, offset=FILE_HEADER_SIZE + _ARROW_CHECKSUM_SIZE
+            )
+        return SerializationWrapper.wrap_prefix(metadata, self._serializer_string_name)
+
     def supports_mmap_read(self) -> bool:
         """True iff reads can use the zero-copy mmap fast path (#171).
 
-        Eligible only for PLAINTEXT Arrow that returns pandas:
+        Eligible only for PLAINTEXT cachekit Arrow (``serializer="arrow"`` or an
+        ``ArrowSerializer(...)`` instance), for every return_format:
         - encrypted values can never mmap (AES-GCM decrypt owns its buffer);
-        - non-Arrow serializers gain nothing (they copy at the Rust/C boundary, rebuild objects);
-        - the "arrow" return_format yields a table that ALIASES the mapped pages, so closing the
-          handle would be a use-after-free — pandas (which copies out via to_pandas) only.
+        - non-Arrow serializers gain nothing (they copy at the Rust/C boundary, rebuild objects).
+
+        An "arrow" or "polars" result keeps the mapping alive: its buffers hold exports of the
+        mapped pages, so the handle's close() leaves the mapping in place and it is unmapped when
+        the result's last buffer is released (see ``_MmapHandle``).
 
         The backend must also support buffer reads (File/POSIX); that is checked separately, so a
         True here on a non-File backend simply means get_buffer returns None and we fall back.
         """
-        return (
-            not self.encryption
-            and self._serializer_string_name == "arrow"
-            and getattr(self._base_serializer, "return_format", None) == "pandas"
-        )
+        return not self.encryption and self._is_cachekit_arrow()
 
     def supports_streaming_write(self) -> bool:
         """True iff writes can stream the envelope to a capable backend (LAB-766).
 
-        Eligible only for PLAINTEXT Arrow:
+        Eligible only for PLAINTEXT cachekit Arrow (``serializer="arrow"`` or an
+        ``ArrowSerializer(...)`` instance):
         - encrypted values can never stream (AES-256-GCM emits its auth tag only after the
           whole ciphertext exists, so the secure path stays on buffered ``set(bytes)``);
         - interop/v1 stores raw documents with no CK envelope (different serializer, no benefit);
@@ -1193,7 +1228,7 @@ class CacheSerializationHandler:
         separately at the cache-handler layer, so True here on a non-streaming backend simply
         means the write falls back to the buffered path.
         """
-        return not self.encryption and not self.interop_mode and self._serializer_string_name == "arrow"
+        return not self.encryption and not self.interop_mode and self._is_cachekit_arrow()
 
     def write_serialized_to(self, sink: BinaryIO, data: Any) -> None:
         """Streaming twin of :meth:`serialize_data` (LAB-766): write the SAME envelope bytes into
@@ -1223,7 +1258,7 @@ class CacheSerializationHandler:
             raise SerializationError(f"write_serialized_to requires the arrow serializer, got {type(serializer).__name__}")
 
         metadata = serializer.serialization_metadata()
-        prefix = SerializationWrapper.wrap_prefix(metadata.to_dict(), self._serializer_string_name)
+        prefix = self._frame_prefix(metadata.to_dict())
         sink.write(prefix)
         budget = get_settings().max_value_size - len(prefix)
         serializer.serialize_to_sink(data, sink, max_bytes=budget)
@@ -1734,10 +1769,12 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value")
 
-            # mmap fast path (#171): plaintext Arrow -> pandas on a buffer-readable backend (File,
+            # mmap fast path (#171): plaintext cachekit Arrow on a buffer-readable backend (File,
             # POSIX) reads zero-copy. The handle is confined to this frame and closed in `finally`,
-            # so the mmap never becomes the returned value and never reaches L1 (blocker C). A None
-            # from get_buffer (ineligible file, or a non-buffer backend) falls through to bytes.
+            # so the mmap never becomes the returned value and never reaches L1 (blocker C). An
+            # Arrow or polars result that aliases the mapping keeps it alive past that close (see
+            # _MmapHandle). A None from get_buffer (ineligible file, or a non-buffer backend)
+            # falls through to bytes.
             if self.serialization_handler.supports_mmap_read():
                 handle = self._cache_handler.get_buffer(cache_key)
                 if handle is not None:

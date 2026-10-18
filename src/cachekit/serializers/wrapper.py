@@ -7,7 +7,8 @@ Backend-agnostic: works with Redis, CachekitIO, Memcached, File, L1.
 Wire format (v3 binary frame)
 -----------------------------
     MAGIC b"CK" | VERSION u8 | HDR_LEN u32-BE | HEADER(json utf-8) | PAYLOAD(raw bytes)
-    HEADER = {"s": serializer_name, "m": metadata, "v": envelope_version}
+    HEADER = {"s": serializer_name, "m": metadata, "v": envelope_version}, optionally followed by
+             ASCII spaces (counted in HDR_LEN) that align the payload; see ``wrap_prefix``
 
 The payload (serializer output: MessagePack/Arrow IPC/ciphertext) is stored
 **raw** — no base64, no JSON-embedding. This matters because the previous
@@ -169,12 +170,26 @@ class SerializationWrapper:
     """
 
     @staticmethod
-    def wrap_prefix(metadata: dict[str, Any], serializer_name: str, version: str = "2.0") -> bytes:
+    def wrap_prefix(
+        metadata: dict[str, Any], serializer_name: str, version: str = "2.0", *, align: int = 1, offset: int = 0
+    ) -> bytes:
         """Build the v3 frame prefix (everything before the payload): MAGIC | VERSION | HDR_LEN | HEADER.
 
         The prefix depends only on the metadata/serializer name, never on the payload bytes, so
         the streaming write path (LAB-766) can emit it before a single payload byte exists and
         the stored frame stays byte-identical to a buffered ``wrap`` of the same payload.
+
+        ``align`` pads HEADER with trailing ASCII spaces, counted in HDR_LEN, until
+        ``offset + len(prefix)`` is a multiple of ``align``; ``offset`` counts the bytes outside the
+        prefix that precede the position to align. JSON allows trailing whitespace, so every reader
+        parses a padded header unchanged. The default (``align=1``) never pads.
+
+        >>> padded = SerializationWrapper.wrap_prefix({}, "arrow", align=64, offset=22)
+        >>> (22 + len(padded)) % 64
+        0
+        >>> payload, _, name = SerializationWrapper.unwrap(padded + b"payload")
+        >>> bytes(payload), name
+        (b'payload', 'arrow')
         """
         items = tuple(metadata.items())
         if (
@@ -182,8 +197,14 @@ class SerializationWrapper:
             and type(version) is str
             and all(type(k) is str and type(v) in _MEMO_VALUE_TYPES for k, v in items)
         ):
-            return _encode_prefix_memo(serializer_name, items, version)
-        return _encode_prefix(serializer_name, metadata, version)
+            prefix = _encode_prefix_memo(serializer_name, items, version)
+        else:
+            prefix = _encode_prefix(serializer_name, metadata, version)
+        pad = -(offset + len(prefix)) % align
+        if not pad:
+            return prefix
+        header = prefix[_PREFIX_LEN:] + b" " * pad
+        return b"".join((prefix[: _PREFIX_LEN - _HEADER_LEN_BYTES], len(header).to_bytes(_HEADER_LEN_BYTES, "big"), header))
 
     @staticmethod
     def wrap(data: bytes, metadata: dict[str, Any], serializer_name: str, version: str = "2.0") -> bytes:
