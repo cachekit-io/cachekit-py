@@ -76,7 +76,7 @@ class TestHealthChecker:
     def test_sync_redis_health_check_success(self, health_checker):
         """Test successful Redis health check."""
         with patch("cachekit.health.container") as mock_container:
-            with patch("cachekit.health.RedisBackend") as mock_backend_class:
+            with patch("cachekit.backends.redis.RedisBackend") as mock_backend_class:
                 mock_backend = Mock()
                 mock_backend.health_check.return_value = (
                     True,
@@ -104,7 +104,7 @@ class TestHealthChecker:
     def test_sync_redis_health_check_failure(self, health_checker):
         """Test Redis health check with connection failure."""
         with patch("cachekit.health.container") as mock_container:
-            with patch("cachekit.health.RedisBackend") as mock_backend_class:
+            with patch("cachekit.backends.redis.RedisBackend") as mock_backend_class:
                 mock_backend_class.side_effect = Exception("Connection refused")
                 mock_provider = Mock()
                 mock_container.get.return_value = mock_provider
@@ -120,7 +120,7 @@ class TestHealthChecker:
     async def test_async_redis_health_check_success(self, health_checker):
         """Test successful async Redis health check."""
         with patch("cachekit.health.container") as mock_container:
-            with patch("cachekit.health.RedisBackend") as mock_backend_class:
+            with patch("cachekit.backends.redis.RedisBackend") as mock_backend_class:
                 mock_backend = Mock()
                 mock_backend.health_check.return_value = (
                     True,

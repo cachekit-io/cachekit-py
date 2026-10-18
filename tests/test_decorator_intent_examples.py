@@ -76,7 +76,6 @@ class TestIntentBasedProduction:
         """Production preset enables full monitoring."""
         config = DecoratorConfig.production(backend=None)
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
         assert config.monitoring.enable_structured_logging is True
 
     def test_production_config_backpressure_enabled(self):
@@ -112,7 +111,6 @@ class TestIntentBasedSecure:
         """Secure preset enables full monitoring for audit trail."""
         config = DecoratorConfig.secure(master_key="a" * 64)
         assert config.monitoring.collect_stats is True
-        assert config.monitoring.enable_tracing is True
 
     def test_secure_decorator_requires_master_key(self, monkeypatch):
         """@cache.secure raises when no master_key param AND no env var."""
@@ -223,14 +221,15 @@ class TestROROConfiguration:
 
         assert reliable_function() == {"result": "value"}
 
-    def test_roro_with_secure_preset(self):
-        """RORO pattern with secure preset."""
+    def test_roro_secure_preset_refuses_l1_only(self):
+        """backend=None in a config is L1-only, which holds raw objects, so secure refuses it."""
+        from cachekit.config.validation import ConfigurationError
 
-        @cache(config=DecoratorConfig.secure(master_key="a" * 64, ttl=600, backend=None))
-        def secure_function() -> str:
-            return "encrypted"
+        with pytest.raises(ConfigurationError, match="encryption requires a backend"):
 
-        assert secure_function() == "encrypted"
+            @cache(config=DecoratorConfig.secure(master_key="a" * 64, ttl=600, backend=None))
+            def secure_function() -> str:
+                return "encrypted"
 
 
 class TestManualOverride:

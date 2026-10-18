@@ -43,21 +43,6 @@ class TestErrorHandlerOrchestration:
 
         # If we get here, test passes - no exceptions raised
 
-    def test_handle_cache_error_works_with_none_span(self):
-        """Error handler must work when span is None (common case)."""
-        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=False)
-
-        # Async wrapper often doesn't have span - must not crash
-        orchestrator.handle_cache_error(
-            error=Exception("test"),
-            operation="client_creation",
-            cache_key="unknown",
-            span=None,  # Common case in async wrapper
-            duration_ms=0.0,
-        )
-
-        # Test passes if no exception
-
     def test_handle_cache_error_uses_default_namespace(self):
         """Error handler should use orchestrator namespace when not provided."""
         orchestrator = FeatureOrchestrator(namespace="default_namespace")
@@ -73,21 +58,6 @@ class TestErrorHandlerOrchestration:
         # Implicit test: if it logged with wrong namespace, we'd see it in logs
         # But we're not testing logs directly (implementation detail)
         # Just verify it doesn't crash
-
-    def test_handle_cache_error_accepts_correlation_id(self):
-        """Error handler should accept and use correlation IDs for distributed tracing."""
-        orchestrator = FeatureOrchestrator(namespace="test", enable_structured_logging=True)
-
-        # Should accept correlation ID for distributed tracing
-        orchestrator.handle_cache_error(
-            error=RuntimeError("distributed system error"),
-            operation="redis_connection",
-            cache_key="test:key",
-            correlation_id="trace-123-456-789",
-            duration_ms=150.0,
-        )
-
-        # Test passes if no exception
 
     def test_handle_cache_error_accepts_extra_context(self):
         """Error handler should accept arbitrary extra context via kwargs."""
@@ -155,26 +125,37 @@ class TestErrorHandlerOrchestration:
 class TestErrorHandlerContract:
     """Test error handler contract guarantees."""
 
-    def test_error_handler_records_failure_in_circuit_breaker(self):
-        """Error handler must record failures in circuit breaker when enabled."""
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("test error"), BackendError("backend unreachable", error_type=BackendErrorType.TRANSIENT)],
+        ids=["plain-exception", "non-excluded-backend-error"],
+    )
+    def test_error_handler_records_failure_in_circuit_breaker(self, error):
+        """Error handler must record failures in circuit breaker when enabled.
+
+        A BackendError takes the breaker's excluded_error_types check, which excludes nothing by default.
+        """
         orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=True)
 
-        # Get initial failure count
-        initial_stats = orchestrator.circuit_breaker.get_stats()
-        initial_failures = initial_stats.get("failure_count", 0)
+        orchestrator.handle_cache_error(error=error, operation="cache_get", cache_key="test:key")
 
-        # Trigger error
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 1
+
+    def test_error_handler_can_skip_circuit_breaker_but_keeps_metrics(self, monkeypatch):
+        """count_toward_breaker=False records the failure metric without breaker accounting."""
+        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=True, collect_stats=True)
+        metrics: list[dict] = []
+        monkeypatch.setattr(orchestrator.metrics_collector, "record_cache_operation", lambda **kw: metrics.append(kw))
+
         orchestrator.handle_cache_error(
-            error=ValueError("test error"),
-            operation="cache_get",
+            error=ValueError("undecodable entry"),
+            operation="cache_get_deserialize",
             cache_key="test:key",
+            count_toward_breaker=False,
         )
 
-        # Verify failure was recorded
-        updated_stats = orchestrator.circuit_breaker.get_stats()
-        updated_failures = updated_stats.get("failure_count", 0)
-
-        assert updated_failures > initial_failures, "Error handler must record failures in circuit breaker"
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 0
+        assert [(m["operation"], m["success"]) for m in metrics] == [("cache_get_deserialize", False)]
 
     def test_error_handler_preserves_operation_context(self):
         """Error handler must set operation context correctly."""
@@ -208,10 +189,12 @@ class TestErrorHandlerContract:
                 duration_ms=float(i),
             )
 
-        # Should handle all without crashing or memory leaks
-        # Circuit breaker should have recorded all failures
+        # Should handle all without crashing or memory leaks. The first
+        # failure_threshold errors open the breaker; the rest arrive while it is
+        # OPEN, where they are not counted (they would push the timeout forward).
         stats = orchestrator.circuit_breaker.get_stats()
-        assert stats.get("failure_count", 0) >= 10
+        assert stats["state"] == "OPEN"
+        assert stats["failure_count"] == stats["config"]["failure_threshold"]
 
 
 @pytest.mark.unit

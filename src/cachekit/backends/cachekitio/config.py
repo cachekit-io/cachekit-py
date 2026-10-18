@@ -6,84 +6,103 @@ Includes SSRF protection to prevent requests to private/internal networks.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse
+import socket
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+from urllib.parse import ParseResult, urlparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
+from urllib3.util import parse_url
 
 from cachekit.backends.base_config import BaseBackendConfig, inherit_config
 
 # Allowed hostnames for API URL (SSRF protection)
 ALLOWED_HOSTS: tuple[str, ...] = ("api.cachekit.io", "api.staging.cachekit.io")
 
+# RFC 6750 §2.1 b64token: every character a bearer token may carry. Issued keys (ASCII letters, digits and
+# underscores) sit inside it. Explicit ASCII ranges, not \w, so no non-ASCII letter matches.
+_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
+
+# Loopback, private, link-local (cloud metadata), "this network" and unspecified addresses. An IPv4-mapped IPv6
+# address is checked as the IPv4 address it maps to.
+_PRIVATE_NETWORKS = tuple(
+    ip_network(net)
+    for net in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "0.0.0.0/8",
+        "::1/128",
+        "::/128",
+        "fe80::/10",
+        "fc00::/7",
+    )
+)
+
 
 def is_private_ip(hostname: str) -> bool:
     """Check if hostname is a private/internal IP address (SSRF protection).
 
-    Uses string pattern matching for standard IP notation. This is defense-in-depth;
-    the hostname allowlist is the primary security control.
+    The address is read the way the platform resolver reads it, so every IPv4 spelling it accepts is checked:
+    dotted, abbreviated (``127.1``), decimal (``2130706433``), hex (``0x7f.1``) and octal (``0177.0.0.1``).
+    ``localhost`` and its subdomains (RFC 6761) count as loopback.
 
     Note:
-        Does NOT perform DNS resolution to avoid network dependencies during config
-        loading. Alternative IP encodings (hex, decimal, abbreviated) are not blocked.
-        When allow_custom_host=True, ensure URLs come from trusted configuration only.
+        Does NOT perform DNS resolution to avoid network dependencies during config loading: a hostname that
+        resolves to a private address passes. When allow_custom_host=True, ensure URLs come from trusted
+        configuration only.
 
     Args:
         hostname: Hostname or IP address to check
 
     Returns:
-        True if the hostname matches a private/internal IP pattern
+        True if the hostname is a private/internal address
     """
-    # Normalize: remove brackets from IPv6
-    normalized = hostname.strip("[]").lower()
-
-    # Localhost variants
-    if normalized in ("localhost", "127.0.0.1", "::1"):
+    # A trailing dot is stripped: over-blocking a name the resolver would not read as an address is harmless.
+    host = hostname.strip("[]").lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
         return True
+    try:
+        # Anything after a % is ignored: a zone id (fe80::1%eth0) does not change which network an address is in.
+        addr: IPv4Address | IPv6Address = ip_address(host.split("%", 1)[0])
+    except ValueError:
+        try:
+            addr = IPv4Address(socket.inet_aton(host))
+        except (OSError, ValueError):  # Not an address; ValueError for an embedded NUL.
+            return False
+    if isinstance(addr, IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in _PRIVATE_NETWORKS)
 
-    # IPv6 link-local (fe80::/10)
-    if normalized.startswith("fe80:"):
-        return True
 
-    # IPv6 unique local (fc00::/7 = fc00:: through fdff::)
-    if normalized[:2] in ("fc", "fd"):
-        return True
+def _parse_api_url(url: str) -> tuple[str, ParseResult]:
+    """The host the HTTP client connects to for ``url`` (lowercase, IPv6 without brackets), and the stdlib parse.
 
-    # IPv4-mapped IPv6 (::ffff:x.x.x.x)
-    if normalized.startswith("::ffff:"):
-        ipv4_part = normalized[7:]  # Remove "::ffff:" prefix
-        return is_private_ip(ipv4_part)
+    The client builds its connection pool with urllib3, so the host is read with urllib3's parser, the one every
+    check must see. A URL that the standard library reads with a different host, or that holds a backslash, is
+    rejected: its host depends on which parser reads it. A non-ASCII host is rejected too (urllib3 reads it as ``xn--``,
+    or refuses it without the ``idna`` package; the standard library does neither), so a custom host must be given
+    in its ASCII ``xn--`` form.
 
-    # Check for IPv4 private ranges
-    ipv4_match = re.match(r"^(\d+)\.(\d+)\.(\d+)\.(\d+)$", normalized)
-    if ipv4_match:
-        a, b = int(ipv4_match.group(1)), int(ipv4_match.group(2))
-
-        # 127.0.0.0/8 - Loopback
-        if a == 127:
-            return True
-
-        # 10.0.0.0/8 - Private
-        if a == 10:
-            return True
-
-        # 172.16.0.0/12 - Private
-        if a == 172 and 16 <= b <= 31:
-            return True
-
-        # 192.168.0.0/16 - Private
-        if a == 192 and b == 168:
-            return True
-
-        # 169.254.0.0/16 - Link-local (includes cloud metadata endpoints)
-        if a == 169 and b == 254:
-            return True
-
-        # 0.0.0.0/8 - Current network
-        if a == 0:
-            return True
-
-    return False
+    Raises:
+        ValueError: If the URL cannot be parsed, holds a backslash, or the two parsers disagree on its host.
+            The message never quotes the URL, whose userinfo may carry credentials (CWE-532).
+    """
+    if "\\" in url:
+        raise ValueError("Invalid API URL: must not contain a backslash")
+    # Each parser's own error can quote the whole netloc, so it is kept off the chain: raised outside the except.
+    try:
+        host = (parse_url(url).host or "").lower().strip("[]")
+        parsed = urlparse(url)
+    except ValueError:  # urllib3's LocationParseError is a ValueError
+        pass
+    else:
+        if host == (parsed.hostname or ""):
+            return host, parsed
+    raise ValueError("Invalid API URL: could not be parsed")
 
 
 class CachekitIOBackendConfig(BaseBackendConfig):
@@ -96,7 +115,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         - Require HTTPS protocol
         - Reject credentials in the URL (user:password@); the API key is the only credential
         - Reject private/internal IP addresses (10.x, 172.16-31.x, 192.168.x, etc.)
-        - Only allow known hostnames (api.cachekit.io, api.staging.cachekit.io)
+        - Only allow the two API hostnames, exactly (api.cachekit.io, api.staging.cachekit.io)
 
         To use a custom host (e.g., for testing), set CACHEKIT_ALLOW_CUSTOM_HOST=true
     """
@@ -104,9 +123,6 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     model_config = SettingsConfigDict(
         **inherit_config(BaseBackendConfig),
         env_prefix="CACHEKIT_",
-        # This class is public: built directly (or via from_env()), a failed validation would
-        # print the raw api_key in str(ValidationError) — tracebacks, logs (CWE-532).
-        hide_input_in_errors=True,
     )
 
     api_url: str = Field(
@@ -115,7 +131,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     )
     api_key: SecretStr = Field(
         ...,  # Required field
-        min_length=1,  # an empty key would go out as "Bearer " and fail on the first call, not here
+        min_length=1,  # fullmatch rejects "" too, but only too_short makes the backend add its missing-key hint
         description="API key (ck_live_...) - required for authentication",
     )
     timeout: float = Field(
@@ -123,15 +139,12 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         gt=0,
         description="Request timeout in seconds",
     )
-    max_retries: int = Field(
-        default=3,
-        ge=0,
-        description="Maximum retry attempts for transient errors",
-    )
+    # 32 = the most threads the default executor runs (min(32, cpu + 4)), which every async L2 op uses. One request
+    # per HTTP/1.1 connection; more concurrent requests than this open short-lived extra connections.
     connection_pool_size: int = Field(
-        default=10,
+        default=32,
         gt=0,
-        description="Maximum HTTP connections in pool",
+        description="HTTP connections kept in the shared pool",
     )
     allow_custom_host: bool = Field(
         default=False,
@@ -141,11 +154,16 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     @field_validator("api_key")
     @classmethod
     def validate_api_key(cls, v: SecretStr) -> SecretStr:
-        # A bearer token never contains whitespace (RFC 6750); a key read from a secrets file
-        # usually carries a trailing newline. Accepted, it fails on the first request with an h11
-        # error that echoes "Bearer <key>". Reject rather than strip: never rewrite a credential.
-        if any(c.isspace() for c in v.get_secret_value()):
-            raise ValueError("contains whitespace (a trailing newline from a secrets file is the usual cause)")
+        # A key outside the RFC 6750 b64token charset never authenticates, and it fails later with the key
+        # in the error: a trailing newline on the first request (an h11 error echoing "Bearer <key>"), a
+        # UTF-8 BOM or non-ASCII letter at client build (a UnicodeEncodeError whose repr holds it).
+        # Reject rather than strip: never rewrite a credential. Never echo it: the message is static.
+        if not _BEARER_TOKEN.fullmatch(v.get_secret_value()):
+            raise ValueError(
+                "is not a valid bearer token (RFC 6750 allows only A-Z a-z 0-9 - . _ ~ + / and any number of trailing =); "
+                "the usual cause is a trailing newline or other whitespace, a byte-order mark from a file saved "
+                "on Windows, a control character, or a non-ASCII letter"
+            )
         return v
 
     @field_validator("api_url")
@@ -154,19 +172,13 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         """Validate API URL with SSRF protection.
 
         Raises:
-            ValueError: If URL is invalid, carries credentials, uses non-HTTPS, or targets private IP
+            ValueError: If URL is invalid, carries credentials, uses non-HTTPS, names no host, or targets private IP
         """
-        # Never echo the URL: its userinfo may carry credentials (CWE-532). urlparse's own error can
-        # quote the whole netloc, so it is kept off the chain too: raised outside the except block.
-        try:
-            parsed = urlparse(v)
-        except ValueError:
-            parsed = None
-        if parsed is None:
-            raise ValueError("Invalid API URL: could not be parsed")
+        # Never echo the URL: its userinfo may carry credentials (CWE-532).
+        hostname, parsed = _parse_api_url(v)
 
-        # Userinfo never authenticates here: httpx sends it as Basic auth in place of the Bearer key,
-        # and its INFO log prints the full request URL, password included (CWE-532).
+        # Userinfo never authenticates here (the client sends only the Bearer key), and a password in
+        # the URL reaches any log or error that prints it (CWE-532).
         if "@" in parsed.netloc:
             raise ValueError("API URL must not contain credentials (user:password@)")
 
@@ -175,8 +187,10 @@ class CachekitIOBackendConfig(BaseBackendConfig):
             # No scheme echo: in "user:pw@host" urlparse reads the username as the scheme.
             raise ValueError("API URL must use HTTPS protocol")
 
+        if not hostname:
+            raise ValueError("API URL must name a host")
+
         # Reject private/internal IP addresses
-        hostname = parsed.hostname or ""
         if is_private_ip(hostname):
             raise ValueError(f"API URL cannot use private/internal IP address: {hostname}")
 
@@ -193,12 +207,8 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         if self.allow_custom_host:
             return
 
-        parsed = urlparse(self.api_url)
-        hostname = parsed.hostname or ""
-
-        is_allowed = any(hostname == allowed or hostname.endswith(f".{allowed}") for allowed in ALLOWED_HOSTS)
-
-        if not is_allowed:
+        hostname = _parse_api_url(self.api_url)[0]
+        if hostname not in ALLOWED_HOSTS:
             raise ValueError(
                 f"API URL hostname '{hostname}' not in allowlist. "
                 f"Allowed: {', '.join(ALLOWED_HOSTS)}. "

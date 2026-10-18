@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Reference caching (`@cache.local()`) caches opaque, non-serializable objects — things that can't be converted to bytes. Perfect for SDK connections, ML models, database connections, and language runtime objects that must maintain identity.
+Reference caching (`@cache.local()`, a Python-only, SDK-local preset) caches opaque, non-serializable objects — things that can't be converted to bytes. Perfect for SDK connections, ML models, database connections, and language runtime objects that must maintain identity.
 
 ```python notest
 from cachekit import cache
@@ -130,6 +130,12 @@ assert client_a is not client_c  # Different args, different object
 - Use `@cache` (which serializes) if you need isolation
 - Or manually copy on retrieval
 
+### Concurrent misses share one call
+
+Calls that miss the same key at the same time (a cold key, or one past its `ttl`) run the function once, and every one of them gets that call's object. This holds across threads for a sync function and across tasks on one event loop for an async one. The same-object guarantee above therefore holds for a concurrent cold herd too, not only for calls made after the first one returns.
+
+Failure, cancellation, invalidation, `cache_info()` counting and the caveats work as described in [in-process single-flight](distributed-locking.md#in-process-single-flight-before-the-lock).
+
 ---
 
 ## Object Lifecycle
@@ -141,7 +147,7 @@ Function call with args A
   ↓
 [Check cache]
   ├─ Hit: Return cached object (reference count unchanged)
-  └─ Miss: Call function, store result
+  └─ Miss: Call function (once for every concurrent miss on the key), store result
   ↓
 [Store in LRU cache (max_entries)]
   ↓
@@ -174,7 +180,7 @@ Function call with args A
 All cachekit decorators expose the same cache management interface:
 
 ```python
-from cachekit import cache
+from cachekit import InvalidationOutcome, cache
 
 @cache.local(ttl=300)
 def get_client(api_key: str):
@@ -189,7 +195,8 @@ assert info.misses == 1
 assert info.maxsize == 256
 assert info.currsize == 1
 
-get_client.invalidate_cache("key1")  # Remove specific entry
+# Remove specific entry: there is no L2, so the outcome is always NO_L2
+assert get_client.invalidate_cache("key1") is InvalidationOutcome.NO_L2
 assert get_client.cache_info().currsize == 0
 
 get_client("key2")

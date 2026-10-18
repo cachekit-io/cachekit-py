@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer
+from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer, StandardSerializer
 
 
 class TestEncryptionWrapperComposability:
@@ -119,16 +119,17 @@ class TestEncryptionWrapperComposability:
         decrypted = client_wrapper.deserialize(encrypted_blob, metadata, cache_key=cache_key)
         assert decrypted == sensitive_data
 
-    def test_auto_serializer_binds_true_compressed_flag_into_aad(self, master_key):
-        """Regression (#166): AutoSerializer's ByteStorage paths must bind compressed="True" into AAD v0x03.
+    def test_bytestorage_payload_binds_true_compressed_flag_into_aad(self, master_key):
+        """Regression (#166): a ByteStorage-enveloped payload must bind compressed="True" into AAD v0x03.
 
-        AutoSerializer LZ4-compresses via ByteStorage but never set compressed=True in its
-        metadata, so EncryptionWrapper authenticated "False" while a conformant reader
+        #166 was found on AutoSerializer, which LZ4-compressed via ByteStorage but never set
+        compressed=True, so EncryptionWrapper authenticated "False" while a conformant reader
         (protocol spec/encryption.md: create_aad(..., compressed=true) for enveloped
-        payloads) computes "True" — AES-GCM authentication failed on legitimate entries.
+        payloads) computed "True". AutoSerializer can no longer be encrypted (ENC-2), so the
+        check runs on the default StandardSerializer, which takes the same ByteStorage path.
         """
-        wrapper = EncryptionWrapper(serializer=AutoSerializer(), master_key=master_key, tenant_id="test-tenant")
-        cache_key = "test:encryption:auto:compressed"
+        wrapper = EncryptionWrapper(master_key=master_key, tenant_id="test-tenant")
+        cache_key = "test:encryption:standard:compressed"
         data = {"user": "alice", "score": 100}
 
         encrypted, metadata = wrapper.serialize(data, cache_key=cache_key)
@@ -137,13 +138,13 @@ class TestEncryptionWrapperComposability:
         assert metadata.compressed is True
 
         # Conformant reader: hand-built AAD v0x03 per spec (compressed="True") must authenticate.
-        # AutoSerializer's msgpack path sets original_type="msgpack", appended as 5th component.
+        # StandardSerializer sets original_type="msgpack", appended as 5th component.
         components = [b"test-tenant", cache_key.encode(), b"msgpack", b"True", b"msgpack"]
         spec_aad = bytes([0x03]) + b"".join(len(c).to_bytes(4, "big") + c for c in components)
         envelope = wrapper.encryptor.decrypt_with_keys(encrypted, spec_aad, wrapper.tenant_keys)
 
         # Recovered ByteStorage envelope round-trips to the original object
-        assert AutoSerializer().deserialize(bytes(envelope), metadata) == data
+        assert StandardSerializer().deserialize(bytes(envelope), metadata) == data
 
         # Full wrapper round-trip still works with the stored metadata
         assert wrapper.deserialize(encrypted, metadata, cache_key=cache_key) == data
@@ -186,7 +187,7 @@ class TestEncryptionWrapperComposability:
     def test_encryption_metadata_preserves_format_information(self, master_key):
         """Encryption metadata correctly preserves underlying serialization format."""
         serializers = [
-            (AutoSerializer(), "msgpack"),
+            (StandardSerializer(), "msgpack"),
             (OrjsonSerializer(), "orjson"),
             (ArrowSerializer(), "arrow"),
         ]

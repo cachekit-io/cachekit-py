@@ -3,7 +3,7 @@
 This module provides a production-ready filesystem-based cache backend with:
 - Thread-safe operations using reentrant locks and file-level locking
 - Atomic writes via write-then-rename pattern
-- LRU eviction based on disk usage thresholds
+- Oldest-written-first (mtime) eviction based on size and entry-count thresholds
 - TTL-based expiration with secure header format
 - Security features (O_NOFOLLOW, symlink prevention)
 

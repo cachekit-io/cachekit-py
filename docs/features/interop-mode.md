@@ -4,6 +4,9 @@
 
 **Released** — see the [changelog](../../CHANGELOG.md) for the interop entry · Implements [interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)
 
+> [!NOTE]
+> **Canonical reference:** the cross-SDK rules live in the docs.cachekit.io guide [Using Interop Mode](https://docs.cachekit.io/concepts/using-interop-mode/) and the normative [interop/v1 specification](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md). This page covers the Python API in detail; where it and those two disagree, they win.
+
 ## TL;DR
 
 Interop mode is the opt-in path that lets cachekit-py share cache entries **byte-identically** with cachekit-rs and cachekit-ts. Keys become `{namespace}:{operation}:{args_hash}` and values become one plain MessagePack document — no Python-internal framing, readable by any language with a MessagePack library.
@@ -41,7 +44,7 @@ Default behavior is completely unchanged: functions that don't pass `interop=` k
 | `@cache.production(interop=..., ...)` | ✅ Spec-identical | **Recommended.** Reliability profile (circuit breaker, monitoring) affects runtime only, never bytes |
 | `@cache.minimal(interop=..., ...)` | ✅ Spec-identical | Its `integrity_checking=False` is a no-op here — see [Encryption](#encryption) |
 | `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key (and the same explicit tenant, if one is configured) |
-| `@cache.io(interop=..., ...)` | ✅ Composes in code | ⚠️ Don't run against CachekitIO until the saas#91 validator deploy is live — see the note at the bottom |
+| `@cache.io(interop=..., ...)` | ✅ Spec-identical | The CachekitIO key validator accepts interop keys ([spec → SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations)) |
 | `@cache.local(...)` / `@cache(backend=None)` | ❌ Rejected loudly | No shared medium: `.local` raises `TypeError` (it accepts no `interop=`), `backend=None` raises `ConfigurationError` at decoration time |
 
 **Recommended form** — spec-identical bytes plus the production reliability profile:
@@ -79,9 +82,10 @@ Treat operation names like queue names or topic names: a **cross-team contract**
 
 The contract for one operation is the operation name **plus** the effective argument list (arity, order, types):
 
-- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized).
+- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized). `ns` and `nsapi` are reserved as namespaces (operations, and namespaces such as `nsx`, are unaffected), because the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed ([cache-key-format.md → Server-Side Requirements](https://github.com/cachekit-io/protocol/blob/main/spec/cache-key-format.md#server-side-requirements)). Neither segment may contain `..` (`a..b` raises; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key. Both rules apply on every backend, so a namespace valid on one backend is valid on all.
+- A `str` subclass is checked and keyed as its plain `str` value, so a `StrEnum` or `(str, Enum)` member `USERS = "users"` is the namespace `users`. Earlier releases put a `(str, Enum)` member's formatted name into the key on Python 3.11 and later (`NS.USERS:get_user:…`, a key no other SDK derives). Upgrading moves those functions to the correct key. The old entries are not deleted: they retire only by TTL (never, if none was set). To erase them on Redis, `SCAN` for the old prefix (here `NS.USERS:get_user:*`) and `UNLINK` the matches.
 - Named arguments bind to their declared positions and **introspectable defaults are applied**: `get_user(42)`, `get_user(user_id=42)` and `get_user(42, include_profile=False)` all produce the same key.
-- Arguments must fit the closed interop data model (int in `[-2^63, 2^64-1]`, float, str, bytes, bool, None, list/tuple, dict with str keys, set, tz-aware datetime, UUID; Python conveniences: Enum → value, Path → POSIX string, Decimal → string). Anything else raises `InteropError` **at call time** — interop mode never silently degrades to uncached execution.
+- Arguments must fit the closed interop data model (int in `[-2^63, 2^64-1]`, float, str, bytes, bool, None, list/tuple, dict with str keys, set, tz-aware datetime, UUID; Python conveniences: Enum → value, Path → POSIX string, Decimal → string). Anything else raises `InteropError` **at call time** — interop mode never silently degrades to uncached execution. A subclass of `str`, `int`, `float`, `bytes` or `bytearray` is keyed as its plain base-type value, whatever methods it overrides; a dict whose keys become equal that way (possible only through an overridden `__eq__`/`__hash__`) raises `InteropError`. An object that only *reports* one of those types through `__class__` without subclassing it, such as a lazy proxy, is hashed through its own forwarded methods.
 - Values are plain MessagePack: None, bool, int, float, str, bytes, list/tuple, dict with str keys, plus datetime/date/time as portable sentinel maps. Python-specific values (sets, custom classes, NumPy/pandas) raise `InteropError` at store time — they would not round-trip cross-SDK.
 
 ## Encryption
@@ -103,7 +107,7 @@ def get_user(user_id: int):
 Three constraints, all fail-closed:
 
 - **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. With no tenant configured, every SDK derives under the protocol literal `"default"` ([intent-presets.md § Master Key Input](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#master-key-input), rule 5), so the same master key alone is enough to share encrypted entries across py, rs and ts.
-- **An explicit tenant must be shared and canonical.** To scope keys to a deployment, set the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) in every SDK, already in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys). There is no machine-local fallback: a per-host value in a key-derivation input is a permanent cross-SDK authentication failure, not a miss.
+- **An explicit tenant must be shared and canonical.** To scope keys to a deployment, set the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) in every SDK, already in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys). There is no machine-local fallback: a per-host value in a key-derivation input makes every cross-SDK read fail authentication, and that never heals. Under the default fail-open policy each failure is a miss that recomputes and overwrites the entry, so the services evict each other on every read; with `fail_closed=True` it raises a decryption error instead.
 - **Config decides, bytes never do.** With encryption enabled, stored bytes are always treated as ciphertext and authenticated before any decode. There is no header to forge, so the CWE-757 downgrade class (see the auto-mode fail-closed read path in [zero-knowledge-encryption.md](zero-knowledge-encryption.md)) cannot exist here.
 
 One thing no guardrail can catch: two *binders* of the same `(namespace, operation)` with different encryption configs. That mismatch is silent — see [Operation Names Are a Contract](#operation-names-are-a-contract-shared-entries).
@@ -114,12 +118,12 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 
 | Situation | Behavior |
 | :--- | :--- |
-| Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
+| Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` and a segment containing `..` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
-| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
+| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` and `ainvalidate_cache()`, with or without arguments (a prefixed key is invisible to other SDKs, and the encryption AAD would bind the prefix, which no other SDK includes) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
-| Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
+| Out-of-model return value | `InteropError` after the function runs (never "computed but silently never cached"), also when the call runs uncached because the circuit breaker rejected it, the backend could not be created, or the cache read failed |
 | CK v3 frame found at an interop key | Diagnostic error, treated as a miss, entry overwritten (self-healing) |
 
 ## Manual Key/Value Helpers
@@ -138,8 +142,10 @@ assert data.hex() == "82a36167651ea46e616d65a5616c696365"  # canonical: sorted k
 assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 ```
 
+`decode_interop_value` accepts any well-formed document, canonical or not, in which no map holds more than 32 entries keyed by neither a string nor bytes. Padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. The bound counts every key that is not a string or bytes, whatever its type: an int, a float, a bool, `None`, a MessagePack timestamp, another ext type or a revived datetime. Some of those (an int, a float, a MessagePack timestamp) hash without a random seed, so a forged entry could choose hashes that make one read quadratic in its key count; the data model writes only string keys. A map over the bound raises `InteropDecodeError`, as do trailing bytes after the one document. Under `@cache(interop=...)` that error reads as a cache miss: the function runs and its result overwrites the entry.
+
 ## Conformance
 
-Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 33 key vectors, 4 value vectors, 9 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
+Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 44 key vectors, 6 value vectors, 34 must-error vectors, 6 non-canonical documents the reader must decode and 1 it must reject, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
-> **CachekitIO note**: the deployed api.cachekit.io cache-key validator predates interop keys and rejects them until the saas#91 validator shrink is live in production. Redis and other self-hosted backends are unaffected.
+> **CachekitIO note**: the api.cachekit.io cache-key validator accepts interop keys. The segment rules above (reserved `ns`/`nsapi` namespaces, no `..`) are what keep every interop key inside what it accepts — see the spec's [SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations).

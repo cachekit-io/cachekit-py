@@ -27,6 +27,7 @@ Types that the default `StandardSerializer` (MessagePack) loses, but `AutoSerial
 
 | Type | Default (`"default"`) | Auto (`"auto"`) |
 |------|:---------------------:|:---------------:|
+| `tuple` | → `list` | Preserved |
 | `set` | → `list` | Preserved |
 | `frozenset` | → `list` | Preserved |
 | `datetime` | → string | Preserved (ISO-8601 roundtrip) |
@@ -35,9 +36,6 @@ Types that the default `StandardSerializer` (MessagePack) loses, but `AutoSerial
 | `numpy.ndarray` | Not supported | Preserved (zero-copy binary) |
 | `pandas.DataFrame` | Not supported | Preserved (columnar format) |
 | `pandas.Series` | Not supported | Preserved |
-
-> [!NOTE]
-> **Tuples** are not yet preserved by AutoSerializer — they still become lists through MessagePack. This is tracked in [#78](https://github.com/cachekit-io/cachekit-py/issues/78).
 
 ## How It Works
 
@@ -51,10 +49,19 @@ AutoSerializer uses **type markers** in the serialized data to preserve Python t
 {"__set__": True, "value": [1, 2, 3], "frozen": True}
 
 # datetime is serialized as:
-{"__datetime__": "2026-03-28T12:00:00+00:00"}
+{"__datetime__": True, "value": "2026-03-28T12:00:00+00:00"}
+
+# tuple (1, 2) is serialized as:
+{"__tuple__": True, "value": [1, 2]}
 ```
 
+In a general value, tuples keep their marker at any depth, including inside a set or frozenset, so `frozenset({(1, 2)})` reads back as written. A tuple used as a dict key is not supported. The columnar DataFrame and Series format is the exception: a tuple in an index, a name or a column label is stored as a plain array.
+
 These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP) will see them as plain dicts, not as the original types.
+
+`import cachekit` never imports numpy, pandas or pyarrow, even when they are installed. Writing an array, DataFrame or Series uses the module your code already imported. The first read of such an entry in a process imports the module it needs, so that read pays the import cost once. If that module is missing or fails to import, the read raises `SerializationError`, whose message names `pip install 'cachekit[data]'`, so a caller that treats `SerializationError` as a miss recomputes.
+
+Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is installed but fails to import, the first DataFrame write or Arrow read on each `AutoSerializer` logs a warning on the `cachekit.serializers.auto_serializer` logger. New DataFrames are then written in the columnar format, and reading an Arrow entry raises `SerializationError`.
 
 ## When to Use
 
@@ -88,6 +95,29 @@ def fn(): return {1, 2, 3}
 @cache(backend=memcached_backend, serializer='auto', ttl=300)
 def fn(): return {1, 2, 3}
 ```
+
+## Cross-Config Reads (integrity_checking Mismatch)
+
+**When this applies.** With the default key derivation a mismatch isn't reachable through `@cache`: `integrity_checking` is part of the generated cache key, so a reader configured differently from the writer misses the entry and recomputes it. That segregation does **not** hold when the key is built with `key=` or `fast_mode` — those keys omit the flag, so two `@cache` sites differing only in `integrity_checking` share an entry and everything below applies. It also applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata. Omitting the metadata is not a way around a mismatch raise: an integrity-off reader given an enveloped entry and no metadata raises `EnvelopeShapeError` (a `SerializationError`) rather than return the envelope's internal fields as your value.
+
+What happens when the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's depends on which path the value takes, not on the direction of the mismatch:
+
+| Value | Path | Mismatch in either direction |
+|---|---|---|
+| dict, list, str, set, datetime, … | MessagePack (+ envelope when integrity checking is on) | Raises `SerializationError` |
+| `pandas.Series`; `pandas.DataFrame` without pyarrow | Columnar MessagePack (+ envelope when on) | Raises `SerializationError` |
+| `pandas.DataFrame` with pyarrow | [ArrowSerializer](arrow.md) — always checksummed | Decodes; corruption always detected |
+| `numpy.ndarray` | Raw buffer, checksummed only when the **writer** had it on | Decodes; corruption detected only if the writer had it on |
+
+**MessagePack paths** fail closed. A reader with integrity checking off has no way to verify or unwrap an envelope, and a reader with it on treats bytes that fail envelope verification as corruption rather than guessing they might be plain MessagePack. (Only when no metadata is passed at all does an integrity-on reader fall back to decoding plain MessagePack.)
+
+**DataFrames with pyarrow installed** (`pip install 'cachekit[data]'`) have no mismatch to fail on: ArrowSerializer always writes and validates an 8-byte xxHash3-64 checksum regardless of `integrity_checking`, so either reader decodes the entry and both still raise on corruption. What is *not* interchangeable on this path is pyarrow itself: a DataFrame written with pyarrow installed raises `SerializationError` when read by an install without it.
+
+**NumPy arrays** are the exception to watch. The checksum is a prefix the *writer* adds when its flag is on; the reader verifies it if present and otherwise decodes the raw buffer. An array written with `integrity_checking=False` is therefore never verified — a flipped byte decodes into wrong values even for a reader with the flag on. The reader's setting buys it nothing here; protection depends entirely on the writer's.
+
+In every case the checksum is unkeyed xxHash3-64: it detects corruption, not tampering. Anyone who can write to the backend can recompute it — see [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch) for the encrypted path that does resist tampering.
+
+See [Deserialization failed](../error-codes.md#deserialization-failed) for the exact error messages.
 
 ## Unsupported Types
 

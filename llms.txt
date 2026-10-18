@@ -9,7 +9,7 @@ cachekit provides decorator-based caching with circuit breaker, distributed lock
 ```python
 from cachekit import cache
 
-@cache                    # Uses Redis backend by default
+@cache                    # L1-only with nothing configured; Redis once REDIS_URL is set
 def get_user(user_id: int):
     return db.fetch(user_id)
 
@@ -32,14 +32,14 @@ def get_patient(id: int):
 
 | Backend | Install | Use Case | Latency |
 |---------|---------|----------|---------|
-| **Redis** (default) | included | Production, distributed | 1-7ms |
+| **Redis** | included | Production, distributed | 1-7ms |
 | **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra | 1-5ms |
 | **File** | included | Single-machine, zero-dependency | 1-10ms |
 | **CachekitIO** | included | Managed SaaS, zero infrastructure | 10-50ms |
 
-### Redis (default)
+### Redis
 ```python
-# Configure via environment:
+# Configure via environment (with no backend configured at all, @cache is L1-only, in process):
 # REDIS_URL=redis://localhost:6379  (or CACHEKIT_REDIS_URL)
 
 @cache
@@ -107,10 +107,10 @@ class MyBackend:
 
 | Serializer | Speed | Use Case |
 |------------|:-----:|----------|
-| **StandardSerializer** | Fast | General Python types, NumPy, Pandas (MessagePack + LZ4) |
+| **StandardSerializer** | Fast | General Python types (MessagePack + LZ4); not NumPy arrays or pandas objects |
 | **OrjsonSerializer** | Fastest | JSON APIs (2-5x faster than stdlib) |
-| **ArrowSerializer** | Fastest | Large DataFrames (6-23x faster for 10K+ rows) |
-| **EncryptionWrapper** | Fast | Wraps any serializer with AES-256-GCM |
+| **ArrowSerializer** | — | pandas DataFrames (columnar, exact round trip) |
+| **+ Encryption** | Fast | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
 ```python
 from cachekit.serializers import OrjsonSerializer
@@ -127,7 +127,6 @@ All configuration via environment variables with `CACHEKIT_` prefix:
 ```bash
 # Redis
 CACHEKIT_REDIS_URL=redis://localhost:6379
-CACHEKIT_DEFAULT_TTL=3600
 
 # Memcached
 CACHEKIT_MEMCACHED_SERVERS=mc1:11211,mc2:11211
@@ -159,7 +158,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 
 ### Backends
 - [Backend Overview](docs/backends/README.md): Comparison and selection guide
-- [Redis](docs/backends/redis.md): Production default
+- [Redis](docs/backends/redis.md): Recommended production backend
 - [File](docs/backends/file.md): Local filesystem caching
 - [Memcached](docs/backends/memcached.md): High-throughput caching
 - [CachekitIO](docs/backends/cachekitio.md): Managed SaaS backend
@@ -180,7 +179,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md): Client-side AES-256-GCM
 - [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability
 - [Interop Mode](docs/features/interop-mode.md): Cross-SDK cache sharing (interop/v1)
-- [L1 Invalidation & SWR](docs/features/l1-invalidation.md): Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), stale-while-revalidate
+- [L1 Invalidation & SWR](docs/features/l1-invalidation.md): Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), opt-in cross-process L1 eviction, stale-while-revalidate
 - [Reference Caching](docs/features/reference-caching.md): @cache.local() for non-serializable objects
 - [Rust Serialization](docs/features/rust-serialization.md): ByteStorage layer (LZ4, xxHash3, AES-256-GCM)
 - [SSRF Protection](docs/features/ssrf-protection.md): CachekitIO URL allowlisting

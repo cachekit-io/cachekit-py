@@ -8,20 +8,19 @@ Zero-config L1 in-memory by default; pluggable backends: Redis, Memcached,
 File, CachekitIO SaaS, and custom via the BaseBackend protocol.
 
 Key Features:
-- **Intelligent @cache decorator** with auto-detection and intent-based optimization
+- **@cache decorator** with intent-based presets
 - **Circuit breaker protection** against cascading failures
 - **Backpressure control** to prevent backend overload
 - **Connection pooling** for optimized performance
 - **Health check methods** for comprehensive monitoring
-- **Structured logging** with correlation IDs and distributed tracing
+- **Structured logging** with per-operation fields
 - **Statistics collection** for Prometheus metrics integration
 
 Architecture Overview:
-cachekit provides a modular decorator architecture with intelligent
-auto-detection and intent-based optimization:
+cachekit provides a modular decorator architecture with intent-based presets:
 
 - FeatureOrchestrator: Manages enterprise-grade reliability and monitoring features
-- Flexible configuration interface with intelligent auto-detection
+- Flexible configuration interface with intent-based presets
 - Enhanced error handling with comprehensive safety checks
 - Pluggable backend abstraction (Redis, Memcached, File, CachekitIO, custom)
 
@@ -50,7 +49,7 @@ Example Usage:
     def process_payment(amount: Decimal):
         return payment_gateway.charge(amount)
 
-    @cache.secure    # Security-critical functions
+    @cache.secure(master_key=secret_key)    # Security-critical; key from your secret store
     def get_user_data(user_id: int) -> UserProfile:
         return db.fetch_user(user_id)
 
@@ -69,17 +68,17 @@ Example Usage:
     ```
 """
 
-__version__ = "0.19.0"
+__version__ = "0.23.0"
 
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-# Configure hiredis compatibility BEFORE any Redis imports
-# This prevents GIL warnings in Python 3.13+ free-threading mode
-try:
-    from . import hiredis_compat
-except ImportError:
-    pass
+from . import (
+    _fork,  # noqa: F401 - first: whether this process inherited a threaded parent's dead threads (cachekit._fork)
+    # Must run BEFORE any redis import: CACHEKIT_DISABLE_HIREDIS=true keeps hiredis out from here on.
+    # The free-threaded default runs later, when cachekit.backends.redis loads (see cachekit.hiredis_compat).
+    hiredis_compat,  # noqa: F401
+)
 
 # Import the configuration classes
 # Redis client is automatically fast - no special import needed
@@ -87,7 +86,7 @@ from .config import DecoratorConfig
 
 # Import the intelligent cache decorator and CacheInfo
 from .decorators import cache
-from .decorators.wrapper import CacheInfo
+from .decorators.wrapper import CacheInfo, InvalidationOutcome
 
 # Import health check functionality
 from .health import (
@@ -100,7 +99,7 @@ from .health import (
 )
 
 # Interop mode (interop/v1): cross-SDK key generation and value codec.
-# The decorator API is @cache(interop="op", namespace="ns"); these helpers are
+# The decorator API is @cache(interop="op", namespace="users"); these helpers are
 # for manual key/value handling (debugging, out-of-band writers, migrations).
 from .interop import (
     InteropError,
@@ -133,4 +132,5 @@ __all__ = [
     "HealthLevel",
     "HealthStatus",
     "InteropError",
+    "InvalidationOutcome",
 ]

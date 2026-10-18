@@ -56,7 +56,7 @@ class TestCircuitBreakerConfiguration:
         assert config.failure_threshold == 5
         assert config.success_threshold == 3
         assert config.timeout_seconds == 30.0
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
         # No error types excluded by default
         assert len(config.excluded_error_types) == 0
 
@@ -80,6 +80,10 @@ class TestCircuitBreakerConfiguration:
 
         with pytest.raises(ValueError):
             CircuitBreakerConfig(timeout_seconds=-1)
+
+        # Zero would restart a spent HALF_OPEN cycle on every clock tick: no probe cap
+        with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+            CircuitBreakerConfig(timeout_seconds=0)
 
 
 class TestCircuitBreakerStates:

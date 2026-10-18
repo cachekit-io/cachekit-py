@@ -44,7 +44,7 @@ class TestReliabilityFallback:
 
         with (
             patch("cachekit.health.container") as mock_container,
-            patch("cachekit.health.RedisBackend", return_value=mock_backend),
+            patch("cachekit.backends.redis.RedisBackend", return_value=mock_backend),
         ):
             mock_container.get.return_value = mock_provider
 

@@ -22,6 +22,7 @@ Type checker cannot statically verify optional imports; suppressed via pyright c
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .base import SerializationError, SerializationFormat, SerializationMetadata
@@ -190,7 +191,8 @@ class ArrowSerializer:
         SerializationError: Checksum validation failed - data corruption detected
     """
 
-    # Apache Arrow IPC is a cross-language columnar format (Python, R, Julia, Rust) — safe under encryption.
+    # Safe under encryption (ENC-2): after decryption it accepts only its fixed checksummed container,
+    # [xxHash3-64][Arrow IPC], so the configured serializer, not the bytes, decides how to decode.
     cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, return_format: str = "pandas", enable_integrity_checking: bool = True, compression: str | None = "auto"):
@@ -198,7 +200,8 @@ class ArrowSerializer:
 
         Args:
             return_format: Output format for deserialized data ("pandas", "polars", "arrow")
-                - "pandas": Convert to pandas.DataFrame (default)
+                - "pandas": Convert to pandas.DataFrame (default). Every column accepts in-place
+                  edits, as on an uncached result: none is a read-only view of the cached bytes.
                 - "polars": Convert to polars.DataFrame
                 - "arrow": Return pyarrow.Table (zero-copy, no conversion)
             enable_integrity_checking: Retained for API compatibility. The 8-byte xxHash3-64
@@ -263,6 +266,14 @@ class ArrowSerializer:
             # (e.g. dict-of-scalars -> "'int' object is not iterable") into the
             # documented TypeError so callers get a consistent, actionable message.
             try:
+                for name, column in obj.items():
+                    # pa.table iterates these instead of rejecting them, storing a wrong column:
+                    # a str as its characters, bytes as byte values, a dict as its keys only.
+                    # A value with an Arrow array protocol is converted through it, not iterated.
+                    if isinstance(column, (str, bytes, bytearray, Mapping)) and not (
+                        hasattr(column, "__arrow_array__") or hasattr(column, "__arrow_c_array__")
+                    ):
+                        raise TypeError(f"value for {name!r} is {type(column).__name__}, not a list or array")
                 return pa.table(obj)
             except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as e:
                 raise TypeError(
@@ -300,8 +311,7 @@ class ArrowSerializer:
 
         Returns:
             Tuple of (Arrow IPC bytes, metadata)
-            Format (integrity ON): [8-byte xxHash3-64 checksum][Arrow IPC bytes]
-            Format (integrity OFF): [Arrow IPC bytes]
+            Format: [8-byte xxHash3-64 checksum][Arrow IPC bytes]
 
         Raises:
             TypeError: If obj is not a DataFrame or dict of arrays
@@ -394,7 +404,8 @@ class ArrowSerializer:
 
         Args:
             data: Bytes from serialize() (with or without checksum envelope)
-            metadata: Optional metadata (ignored - Arrow IPC is self-describing)
+            metadata: Optional metadata. Only ``encrypted`` is read: ``True`` means ``data`` is
+                decrypted plaintext, which must be the checksummed form (see below).
 
         Returns:
             Deserialized DataFrame (format depends on return_format setting)
@@ -402,35 +413,59 @@ class ArrowSerializer:
         Raises:
             SerializationError: If data is malformed, Arrow deserialization fails, or checksum validation fails
         """
-        try:
-            # Detect the envelope by sniffing the Arrow IPC file magic (b"ARROW1") rather
-            # than trusting an integrity flag — this auto-handles checksummed, raw (legacy
-            # integrity-off), and version-mismatch data, and never feeds a checksum prefix
-            # into the IPC reader (which previously leaked a bare OSError). memoryview slicing
-            # avoids the full-body copy that `data[8:]` used to make.
-            mv = memoryview(data)
-            n = mv.nbytes
-            if n >= 14 and bytes(mv[8:14]) == b"ARROW1":
-                # [8-byte xxHash3-64 checksum][Arrow IPC]
-                expected_checksum = bytes(mv[:8])
-                body = mv[8:]
-                if xxhash.xxh3_64_digest(body) != expected_checksum:
-                    raise SerializationError("Checksum validation failed - data corruption detected")
-            elif n >= 6 and bytes(mv[:6]) == b"ARROW1":
-                # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry)
-                body = mv
-            else:
-                raise SerializationError(
-                    f"Invalid data: not a recognized Arrow envelope "
-                    f"(expected [8-byte checksum][Arrow IPC] or raw Arrow IPC); got {n} bytes"
-                )
+        # Detect the envelope by sniffing the Arrow IPC file magic (b"ARROW1") rather
+        # than trusting an integrity flag — this auto-handles checksummed, raw (legacy
+        # integrity-off), and version-mismatch data, and never feeds a checksum prefix
+        # into the IPC reader (which previously leaked a bare OSError). memoryview slicing
+        # avoids the full-body copy that `data[8:]` used to make.
+        mv = memoryview(data)
+        n = mv.nbytes
+        if n >= 14 and bytes(mv[8:14]) == b"ARROW1":
+            # [8-byte xxHash3-64 checksum][Arrow IPC]
+            expected_checksum = bytes(mv[:8])
+            body = mv[8:]
+            if xxhash.xxh3_64_digest(body) != expected_checksum:
+                raise SerializationError("Checksum validation failed - data corruption detected")
+        elif n >= 6 and bytes(mv[:6]) == b"ARROW1":
+            # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry).
+            # Plaintext only. The protocol selects the post-decryption container from the
+            # reader's configuration, never by sniffing (spec/encryption.md), and no release
+            # wrote this form under encryption through the cache handler. After a decrypt it is
+            # a container mismatch, refused like any other (miss + evict in the handler).
+            if metadata is not None and metadata.encrypted:
+                raise SerializationError("Invalid data: decrypted Arrow payload lacks the checksum prefix")
+            body = mv
+        else:
+            raise SerializationError(
+                f"Invalid data: not a recognized Arrow envelope "
+                f"(expected [8-byte checksum][Arrow IPC] or raw Arrow IPC); got {n} bytes"
+            )
+        return self._read_verified_ipc(body)
 
+    def _read_verified_ipc(self, body: memoryview) -> Any:
+        """Decode an Arrow IPC ``body`` whose checksum the caller has ALREADY verified.
+
+        Never hashes: :meth:`deserialize` verifies before calling this, and
+        ``AutoSerializer.deserialize`` calls it only after its routing gate has checked the same
+        digest, so a healthy read hashes the body once instead of twice. Every caller must hand
+        it gate-verified or bare (legacy, unchecksummed) bytes — an unverified body passed here
+        is decoded as-is.
+        """
+        try:
             # pa.py_buffer over the memoryview is zero-copy; open_file decompresses transparently.
             reader = pa.ipc.open_file(pa.py_buffer(body))
             table = reader.read_all()
 
             # Convert to requested format
             if self.return_format == "pandas":
+                if reader.num_record_batches == 1:
+                    # pyarrow converts a single-chunk column (and categorical codes) zero-copy, as a
+                    # READ-ONLY numpy view of the IPC buffers, which alias the backend's bytes or the
+                    # File backend's mmap. A second, empty chunk makes it concatenate into fresh
+                    # arrays instead, as it already does for a multi-batch frame, so the caller gets
+                    # a frame it can edit in place and that owns its memory, like an uncached call's
+                    # (cachekit-py#157). One batch is at most _TARGET_BATCH_BYTES, so the copy is small.
+                    table = pa.concat_tables([table.slice(0, 0), table])
                 # self_destruct frees each Arrow column as it is converted (the table is a
                 # throwaway local here, so the experimental-invalidation caveat does not apply);
                 # split_blocks avoids the transient 2x of consolidated-block construction.

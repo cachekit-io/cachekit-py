@@ -4,7 +4,7 @@
 
 The **StandardSerializer** is cachekit's general-purpose serializer. It is used automatically when no serializer is specified on a `@cache` decorator. It combines MessagePack encoding with optional LZ4 compression and xxHash3-64 integrity checksums via cachekit's Rust ByteStorage layer.
 
-The registry alias for this serializer is `"default"` (and `"auto"`). The class name is `StandardSerializer`.
+The registry aliases for this serializer are `"default"` and `"std"` (`"auto"` is [AutoSerializer](./auto.md)). The class name is `StandardSerializer`.
 
 ## Overview
 
@@ -54,6 +54,8 @@ StandardSerializer can be referenced by alias when configuring serializers:
 
 ## Type Support Matrix
 
+❌ means `serialize()` raises `TypeError` when you call the serializer directly. A `@cache`-decorated call with a backend does not raise: it returns the value, caches nothing, and logs the failure ([Troubleshooting → Serialization Failures](../troubleshooting.md#common-errors)).
+
 | Type | Supported | Notes |
 |------|-----------|-------|
 | `dict` | ✅ | Nested structures |
@@ -66,25 +68,27 @@ StandardSerializer can be referenced by alias when configuring serializers:
 | `None` | ✅ | |
 | `bytes` | ✅ | Binary data — only serializer that handles raw bytes |
 | `datetime` | ✅ | Via MessagePack extension |
-| `numpy.ndarray` | ✅ | Auto-detected, binary format |
-| `pandas.DataFrame` | ✅ | Auto-detected, column-wise |
-| `pandas.Series` | ✅ | Auto-detected |
+| `numpy.ndarray` | ❌ | Use [AutoSerializer](./auto.md) (`serializer="auto"`) |
+| `pandas.DataFrame` | ❌ | Use [ArrowSerializer](./arrow.md) or [AutoSerializer](./auto.md) |
+| `pandas.Series` | ❌ | Use [AutoSerializer](./auto.md) |
 | Pydantic models | ❌ | See [Caching Pydantic Models](./pydantic.md) |
 | `set` / `frozenset` | ❌ | Convert to `list` first |
-| Custom classes | ❌ | Implement `__dict__` or use custom serializer |
+| Custom classes | ❌ | Convert to a dict (`dataclasses.asdict`, `model_dump`) or use a [custom serializer](./custom.md) |
 
 ## Compression and Integrity
 
 StandardSerializer automatically handles:
-- **LZ4 compression** — fast compression reducing storage footprint (~30% smaller than raw msgpack)
+- **LZ4 compression** — shrinks repetitive or record-heavy payloads; a very small value grows by the envelope's fixed overhead (about 25 bytes)
 - **xxHash3-64 checksums** — integrity verification on deserialization
 
-Both are handled by the Rust ByteStorage layer. No configuration required — it's always on.
+Both are handled by the Rust ByteStorage layer and are on by default. With `integrity_checking=False` (as `@cache.minimal` sets) the serializer writes plain MessagePack instead: no compression, no checksum.
+
+**Cross-config reads.** A reader with integrity checking off does not unwrap envelopes. Handed an entry written with integrity checking on, it raises `SerializationError` (`Cache entry was written with integrity checking on but this reader has integrity checking disabled`) instead of returning the envelope's internal fields as your value. Under default key generation this never happens through `@cache`, because the integrity flag is part of the key. A custom `key=`, `fast_mode` or the direct serializer API can cross the two configs. Through `@cache` the entry's header records the envelope, so it is refused at any size. Without that header, as in a direct `deserialize(data)` call, the reader verifies the envelope's checksum instead, and never judges by the value's shape. So a cached value that merely looks like an envelope, such as `[b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "rgb"]`, still round-trips. Verifying means decompressing, so the reader only verifies entries that declare at most 256 KiB. A larger integrity-on entry read with no metadata comes back as its fields, and so does one whose checksum no longer matches. An encrypted read checks only for the legacy envelope layout. The entry's `compressed` flag is bound into the encryption AAD, and the only writer that ever sealed an envelope with it false was `AutoSerializer` before 0.12.0, which used the legacy layout. So such an old entry is refused and recomputed when it declares at most 256 KiB (a larger one comes back as its fields), and any other decrypted value comes back whatever its shape.
 
 > **Corruption detection, not tamper resistance.** xxHash3-64 is non-cryptographic: an
 > attacker with backend write access can forge a valid checksum for arbitrary bytes. The
 > checksum catches bit rot and storage bugs. For tamper resistance, use encryption
-> (`@cache.secure` / `CACHEKIT_MASTER_KEY`), which authenticates every byte with AES-256-GCM.
+> (`@cache.secure`, or an explicit `encryption=` option), which authenticates every byte with AES-256-GCM.
 
 ```python
 @cache
@@ -94,16 +98,14 @@ def get_large_dict():
 
 ## Performance Optimization Tips
 
-1. **Compression is handled automatically** by the Rust layer (LZ4 + xxHash3-64 checksums) — no action needed.
-
-2. **Use appropriate TTL** to balance freshness vs cache hit rate:
+1. **Use appropriate TTL** to balance freshness vs cache hit rate:
    ```python
    @cache(ttl=3600)  # 1 hour
    def get_cached_data():
        return expensive_computation()
    ```
 
-3. **For DataFrames with 10K+ rows**, consider switching to [ArrowSerializer](./arrow.md) for significant speedups.
+2. **For DataFrames**, use [ArrowSerializer](./arrow.md): StandardSerializer rejects them.
 
 ---
 

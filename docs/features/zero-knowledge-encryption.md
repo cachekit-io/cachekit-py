@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. Redis never sees plaintext. Perfect for sensitive data (PII, credentials, health info).
+Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. The backend never sees plaintext values. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # AES-256-GCM encryption
@@ -32,7 +32,8 @@ data = get_sensitive_data(123)  # Encrypted in Redis
 ```
 
 Later examples pass the key explicitly as `master_key=secret_key`: your 64-hex-char key string,
-loaded from a secret store. Never a literal in source.
+loaded from a secret store. Never a literal in source. A bytes key raises `TypeError`: pass
+`key.hex()` ([details](../error-codes.md#bytes-key-where-a-hex-string-is-taken)).
 
 > **`@cache.secure` needs a backend.** `backend=None` (L1-only) stores raw Python objects,
 > which cannot be ciphertext, so the combination is refused at decoration time with a
@@ -43,7 +44,7 @@ loaded from a secret store. Never a literal in source.
 
 ## What It Does
 
-**Encryption pipeline** (works with ANY serializer):
+**Encryption pipeline** (works with any allowed serializer, see [Serializer requirement](#serializer-requirement)):
 ```
 Python object (plaintext)
     ↓
@@ -53,7 +54,7 @@ AES-256-GCM encryption
     ↓
 Derive per-tenant key (optional)
     ↓
-Storage backend (ciphertext only - Redis/HTTP/Custom)
+Storage backend (ciphertext values; the key stays cleartext - Redis/HTTP/Custom)
     ↓
 On cache hit:
     ↓
@@ -70,7 +71,7 @@ Python object (plaintext, in-app only)
 - **AES-256-GCM**: Authenticated encryption, 256-bit key
 - **Client-side**: Encryption happens in Python, before Redis
 - **Master key**: CACHEKIT_MASTER_KEY environment variable
-- **Per-tenant isolation**: Optional key derivation for multi-tenant
+- **Per-tenant key derivation**: Optional, and *not* a tenancy boundary on its own (see Multi-Tenant Isolation)
 - **Nonce uniqueness**: Counter-based, prevents nonce reuse
 - **Authentication**: GCM mode prevents tampering
 
@@ -93,9 +94,10 @@ Python object (plaintext, in-app only)
 # Network intercept → attacker reads plaintext credentials
 
 # With @cache.secure:
-# Redis memory dump → attacker sees ciphertext only
-# Redis backup → attacker sees ciphertext only
-# Network intercept → attacker sees ciphertext only
+# Redis memory dump → attacker sees ciphertext values
+# Redis backup → attacker sees ciphertext values
+# Network intercept → attacker sees ciphertext values
+# (cache keys stay cleartext in all three)
 # Encryption key in environment → separate from data
 ```
 
@@ -106,7 +108,7 @@ Python object (plaintext, in-app only)
 **Scenarios where encryption overhead matters**:
 
 1. **No sensitive data**: Public caching (prices, menus)
-2. **High-volume, low-margin**: Encryption adds 100-500μs
+2. **High-volume, low-margin**: every cache read and write pays a decrypt or encrypt step (see [Performance Impact](#performance-impact))
 3. **Already encrypted at transport**: TLS + encryption is redundant
 
 **Mitigation**: state `encryption=False` for non-sensitive data:
@@ -125,27 +127,45 @@ def get_user_ssn(user_id):
 
 ## Activation: the Master Key Is a Source, Not a Switch
 
-From the next minor release encryption turns on only where the code says so —
-`@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
-below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
-ciphertext on read (not in an interop cache — see the `encryption=False` row); in this
-release its presence can still auto-activate encryption where no intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+Encryption turns on only where the code says so — `@cache.secure(...)`, or an explicit
+encryption option on another preset (exact spellings below). `CACHEKIT_MASTER_KEY` supplies
+the key for those spellings and decrypts stale ciphertext on read (not in an interop cache —
+see the `encryption=False` row). A master key present with no stated intent is an error at
+construction, not a default. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
 
-| Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
+| Call site | No key (neither `master_key=` nor `CACHEKIT_MASTER_KEY`) | Key available (`master_key=` or `CACHEKIT_MASTER_KEY`) |
 |---|---|---|
 | `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
 | `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
 | `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Not in an [interop cache](#turning-encryption-off-in-an-interop-cache): its stale entries are never decrypted |
-| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process, except that an L1-only cache (explicit `backend=None`) warns but stores raw objects, unencrypted. The next minor release raises at construction instead. `@cache.local` never encrypts and never warns. |
-| No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning; the next minor release raises at construction |
+| No encryption intent — no `encryption=`, or an `EncryptionConfig` without `enabled=` — on `@cache`, `.minimal`, `.production`, `.io`, `.dev`, `.test`, including `backend=None` and caches with a tenant extractor (flat `tenant_extractor=` on bare `@cache`, inside `EncryptionConfig` on a preset) | Plaintext | **Raises** `ConfigurationError` at decoration, naming the explicit spellings. `@cache.local` never encrypts and never raises. |
 
-The deprecated row was the earlier "fleet-wide convenience" guidance. It goes because a
+The raising row replaces the earlier "fleet-wide convenience" rule, under which the key's
+presence auto-enabled encryption wherever no `master_key=` or `tenant_extractor=` was passed
+(deprecated with a warning in 0.20.0; those two stayed plaintext, and `backend=None` caches
+stored raw objects). It went because a
 call site's encryption state was unreadable from the code — it depended on which pod
 carried which variable — and a pod *missing* the variable wrote plaintext to the backend
 with no error (issue #128). Migrate by writing the intent. Both explicit spellings fail closed
 on a missing key (`.secure` → `ValueError`, the encryption option → `ConfigurationError`);
 every other row can store plaintext, and the compliance argument below holds only on an
 explicit path.
+
+**The key is read when the decorator is applied** — at import, for a module-level function —
+not at call time. A key that arrives later (`load_dotenv()` in `main()`, a startup hook that
+fetches it from a vault) is never seen by a function decorated before it: `@cache.secure`
+without `master_key=` has already raised `ValueError`, and a cache with no `encryption=` stays
+plaintext. It works the other way too: unsetting the variable later does not turn a
+`@cache.secure` cache off, because it keeps the key it read. Load the key before the modules
+that define cached functions are imported.
+
+> [!IMPORTANT]
+> **Failing closed on a missing key is not failing closed on a bad entry.** A decrypt
+> failure at read time — an AES-GCM tag mismatch from a tampered entry or the wrong key — is
+> governed by a separate setting, `fail_closed`. It defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
+> which defaults to off, so even under `@cache.secure` such an entry is evicted and the function
+> recomputes unless you opt in. See
+> [Corruption vs Tamper](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ### Turning Encryption Off in an Interop Cache
 
@@ -185,9 +205,29 @@ def operation(x):
 ### Invalid Key Format
 ```bash
 export CACHEKIT_MASTER_KEY="not_hex"  # Invalid
-# Error: "CACHEKIT_MASTER_KEY must be hex-encoded, minimum 32 bytes"
+# Error: "CACHEKIT_MASTER_KEY must be hex-encoded: ..."
 # Solution: Use 64-char hex string
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
+```
+
+### `@cache.secure` Does Not Pin a Backend
+
+`@cache.secure` resolves its backend the way every preset does ([Backend Resolution
+Priority](../backends/README.md#backend-resolution-priority)), so without an explicit backend or a
+`set_default_backend()` default, the environment decides where the ciphertext goes. With `REDIS_URL` set and `CACHEKIT_API_KEY` unset,
+`@cache.secure` encrypts to Redis, not to the SaaS. The values are still ciphertext; what changes
+is which system holds them.
+
+When a particular backend is a requirement, pass it explicitly:
+
+```python notest
+# notest: CachekitIOBackend needs the network and CACHEKIT_API_KEY
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+@cache.secure(master_key=secret_key, backend=CachekitIOBackend(), ttl=3600)
+def get_patient_record(patient_id: str):
+    return fetch_phi(patient_id)  # illustrative - fetch_phi not defined
 ```
 
 ### Key Rotation
@@ -202,48 +242,46 @@ checks — for the rotation itself.
 ### Enabling Encryption on an Existing (Plaintext) Cache
 
 When you turn encryption on over a cache that already holds plaintext entries, those
-entries are **rejected, never read**. The read path fails closed: the entry raises a
-`SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
-and re-stores the value encrypted. Migration is therefore lazy and self-healing:
+entries are **rejected, never read**: the entry raises a `SerializationError` internally, the
+caller treats it as a miss, evicts the stale entry, recomputes, and re-stores the value
+encrypted, whatever `fail_closed` says. Migration is therefore lazy and self-healing:
 
 ```text
-read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
+read plaintext entry → SerializationError (rejected, never deserialized) → evict → recompute → re-store encrypted
 ```
 
+That holds for CK-framed entries. An [interop cache](interop-mode.md) stores no header, so a
+plaintext entry there reaches the decrypt step and fails authentication: a miss that recomputes
+by default, but with `fail_closed=True` every read of it raises `DecryptionAuthenticationError`
+until it expires. Turn encryption on in an interop cache by moving the operation to a new
+`namespace`, as in [Turning Encryption Off in an Interop Cache](#turning-encryption-off-in-an-interop-cache).
+
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
-plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
-an attacker with backend write access is indistinguishable from a legacy one — any
-"accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
-fail-closed read path exists to prevent. If you need to read plaintext entries, use a
-handler with `encryption=False` (which never had keys to protect).
+plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
+plaintext entry forged by an attacker with backend write access is indistinguishable
+from a legacy one — any "accept plaintext" escape hatch would reintroduce the
+encryption-downgrade attack the downgrade-protected read path exists to prevent. If you need to
+read plaintext entries, use a handler with `encryption=False` (which never had keys to
+protect).
 
 For large caches, choose between lazy migration and eager eviction based on your
 workload: lazy migration spreads recomputation over reads (each legacy entry pays one
 recompute on first access), while an eager flush concentrates it into a cold-start miss
 wave — throttle or batch the eviction if the recompute cost is high. Either way, scope
-eviction to cachekit's keys so unrelated data in the same Redis database survives:
-
-```bash
-# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
-# (an int or UUID tenant as its str() first):
-# tenant org:123 is stored as t:org%3A123:...
-# Evict only this function's or namespace's cachekit entries.
-# Namespaced function (@cache.secure(namespace="users", ...)):
-redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
-# No namespace (the default): keys start with func:<module>.<qualname>
-redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
-
-# FLUSHDB is only safe when the database is dedicated to cachekit
-# then deploy with CACHEKIT_MASTER_KEY set
-```
+eviction to cachekit's keys so unrelated data in the same Redis database survives: run the
+`scan_iter` + `unlink` script under *Option 3: Data corruption* in
+[Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch), once per
+tenant and per namespace or function, and evict functions with a custom `key=` as it describes.
+`FLUSHDB` is only safe when the database is dedicated to cachekit. Then deploy the encrypting
+decorator (`@cache.secure` or an explicit `encryption=` option), with `CACHEKIT_MASTER_KEY` set
+if it supplies the key.
 
 ### L1 Cache Conflict
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
     # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
-    # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
+    # Encryption is orthogonal: wraps any allowed serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined
 ```
@@ -272,10 +310,10 @@ profile = get_user_profile(123)
 ### Encrypted JSON (Zero-Knowledge API Caching)
 ```python notest
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
+from cachekit.serializers import OrjsonSerializer
 
 # Encrypt JSON API responses (webhooks, sessions, API keys)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()))
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer())
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_abcdef123456",
@@ -284,17 +322,17 @@ def get_api_keys(tenant_id: str):
     }
 
 keys = get_api_keys("customer-123")
-# JSON encrypted client-side, backend never sees plaintext (illustrative)
+# JSON encrypted client-side, backend never sees plaintext values (illustrative)
 ```
 
 ### Encrypted DataFrames (Zero-Knowledge ML Caching)
 ```python notest
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, ArrowSerializer
+from cachekit.serializers import ArrowSerializer
 import pandas as pd
 
 # Encrypt DataFrames with patient data, ML features, analytics
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
+@cache.secure(master_key=secret_key, serializer=ArrowSerializer())
 def get_patient_records(hospital_id: int):
     # illustrative - conn not defined
     return pd.read_sql(
@@ -304,33 +342,43 @@ def get_patient_records(hospital_id: int):
     )
 
 df = get_patient_records(42)
-# DataFrame encrypted client-side, HIPAA-compliant zero-knowledge storage
+# DataFrame encrypted client-side, zero-knowledge storage
 ```
+
+### Serializer Requirement
+Encryption takes only a serializer whose class declares `cross_sdk_compatible = True`: `StandardSerializer`
+(the default), `OrjsonSerializer`, `ArrowSerializer`, or a custom serializer that sets the flag. Anything
+else, `AutoSerializer` included, raises `ConfigurationError` in the decorators and in a directly built
+`EncryptionWrapper` ([details](../error-codes.md#serializer-refused-under-encryption)). The reason is the
+protocol's rule that the step after decryption is chosen by the reader's configured serializer, never by
+inspecting the decrypted bytes, on every backend. `AutoSerializer` picks its decoder by inspecting them.
 
 ### Multi-Tenant Isolation
-```python notest
-from cachekit import cache
-from contextvars import ContextVar
 
-tenant_context = ContextVar("tenant_id")
+> [!CAUTION]
+> **`tenant_extractor` is not a tenancy boundary.** Cache keys carry no tenant
+> component — the key is `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so tenants
+> calling with identical arguments address the same entry. Give each tenant its own
+> `namespace` or its own deployment, or make the tenant id a keyword argument of the
+> cached function so it is part of the args hash.
+>
+> `tenant_extractor` requires an object implementing `.extract(args, kwargs)`, such as
+> `ArgumentNameExtractor` or `ContextVarExtractor`, and tenant ids must be valid UUIDs.
+> `ContextVarExtractor.set_tenant_id()` rejects a non-UUID id with `ValueError`. With
+> `ArgumentNameExtractor` a non-UUID id fails at store time, and a bare `lambda` fails on
+> every call; either way the failure is logged and the result is not written to the cache.
 
-@cache.secure(
-    ttl=3600,
-    master_key=secret_key,
-    tenant_extractor=lambda user_id: tenant_context.get(),
-)
-def get_user_data(user_id):
-    tenant_id = tenant_context.get()
-    return db.get_user_data(tenant_id, user_id)  # illustrative - db not defined
-
-# Each tenant gets separate encryption key
-# Tenant A can't decrypt Tenant B's data
-tenant_context.set("tenant_1")
-data_a = get_user_data(123)
-
-tenant_context.set("tenant_2")
-data_b = get_user_data(123)  # Same user_id, different tenant, different encryption
-```
+On an encrypted cache, a shared entry is never decrypted for the wrong tenant. A read
+decrypts as the caller's tenant, resolved by `tenant_extractor` exactly as on the write.
+It refuses a backend entry encrypted for any other tenant as `auth_tamper` (see Corruption
+vs Tamper below). By default that read is a miss: the function runs and its result
+overwrites the entry, so tenants that share a key keep evicting each other. With
+`fail_closed=True` the read raises `DecryptionAuthenticationError` (its subclass
+`TenantMismatchError`) instead, until the entry expires or is invalidated. That lets
+whichever tenant calls a shared-key function first block every other tenant for the
+entry's TTL, and seed it again once it expires. In L1 such an entry is only a miss (see
+[Cache Key Binding](#cache-key-binding)). A read whose tenant cannot be resolved decrypts nothing and is a plain miss
+that keeps the entry. Either way, keep tenants on separate keys as the caution above says.
 
 ### Key Rotation Pattern
 
@@ -358,12 +406,18 @@ export CACHEKIT_MASTER_KEY=<new-key-hex>
 export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
 ```
 
-Rules enforced at config load — rejected, never truncated or silently fixed:
+Rules enforced at config load or cache build — rejected, never truncated or silently fixed:
 
 - **Cap**: at most 3 decrypt-only keys.
-- **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, ≥32 bytes).
+- **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, at least 32 bytes; use exactly 32).
 - **Current key not in the list**: the current master key must not re-appear in
   the decrypt-only list — the detectable signature of re-promoting a retired key.
+  Keys compare as decoded bytes, so hex case makes no difference. A
+  `CACHEKIT_MASTER_KEY` is checked when settings load (`pydantic.ValidationError`).
+  A `master_key=` given to `@cache.secure`, to an `EncryptionConfig` or to an
+  encrypting `@cache` or `CacheSerializationHandler` is checked when the cache is
+  built, against the previous keys as they stand then, before any backend call
+  (`ConfigurationError`).
 
 Operator rule, which no SDK detects: **never re-promote a key that has
 encrypted**, including by rolling back a Phase 2 deploy. Rolling back restores
@@ -408,7 +462,7 @@ Decryption:
 ### Per-Tenant Key Derivation
 ```
 Master key: CACHEKIT_MASTER_KEY
-Tenant ID: tenant_context.get()
+Tenant ID: tenant_extractor.extract(args, kwargs)  (or the single-tenant id below)
 
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
@@ -419,11 +473,13 @@ Single-tenant mode (no tenant_extractor):
   § Master Key Input, rule 5), used identically for HKDF and AAD — one master
   key is enough for py, rs and ts to share ciphertext.
 
-Properties:
+Properties of the derivation itself:
 - Tenant A's key ≠ Tenant B's key
 - Derived keys are unique per tenant
-- Tenant A can't decrypt Tenant B's data
-- Enables secure multi-tenant with single master key
+
+This is not a tenancy boundary: the cache key carries no tenant component, so
+tenants calling with identical arguments address the same entry. See Multi-Tenant
+Isolation above.
 ```
 
 ### Nonce Generation (Uniqueness)
@@ -436,16 +492,58 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
            Prevents nonce reuse even across reboots
 ```
 
-### Fail-Closed Read Path (Encryption Downgrade Protection)
+### Cache Key Binding
+
+The AAD binds the cache key, so ciphertext moved to another key fails authentication: a
+backend-write attacker cannot serve one entry's value at another entry's key. The key bound is
+the one the backend is handed, with the backend's `key_prefix` in front of it: the namespace is
+already part of the key, a `MemcachedBackend` reports its configured `key_prefix`, and the
+tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`; `t:default:` with no
+tenant set) reports the calling tenant's `t:{tenant}:`. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
+`t:globex:`, is refused. A custom backend that prefixes keys must expose that prefix as
+`key_prefix` for it to be bound. Backend encodings of the key (the File backend's hashed file
+name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the tenant
+scoping the CachekitIO server applies.
+
+There is one AAD per read. A read never retries with another form of the key, such as the key
+without its prefix, so a failed authentication is final.
+
+L1 is shared by every function in a namespace and keyed by the bare cache key, so it can hold
+an entry bound to another prefix: another tenant's behind the tenant-scoped Redis backend, or
+another function's behind a different Memcached `key_prefix`. On a
+backend with a key prefix that read is an L1 miss and goes on to the backend, never an
+`auth_tamper`. An L1 entry encrypted for another tenant (`tenant_extractor`) is a miss on any
+backend. Two encrypted functions that share a namespace and a cache key but not a backend
+prefix (one on a prefixing backend, one on an unprefixed one) read each other's L1 entries as
+failed authentication on the unprefixed side; give them separate namespaces.
+
+**Upgrading.** Releases before this binding left the backend's prefix out of the AAD. Their
+encrypted entries written through a prefixing backend fail authentication after the upgrade:
+`MemcachedBackend` with a `key_prefix`, the tenant-scoped Redis backend, which includes the
+default Redis backend env auto-detection builds (`t:default:` with no tenant set), and any custom
+backend with a non-empty `key_prefix`. By default each such
+entry is read once as a miss, counted as `auth_tamper` with a WARNING, recomputed and
+overwritten. With `fail_closed=True`, every read of one raises `DecryptionAuthenticationError`
+until it expires or is deleted. So delete those entries, or move the cache to a fresh key space
+(a new `namespace`, or a new Memcached `key_prefix`), rather than wait out the TTL. During a
+rolling upgrade, processes on the earlier release and on this one each read the other's writes
+as failed authentication, and deleting entries does not help while both run. Give the upgraded
+release a fresh key space, or stop every earlier-release process first. Unaffected: a
+`RedisBackend` you construct yourself, `FileBackend`, `CachekitIOBackend`, and interop mode.
+
+### Encryption Downgrade Protection (Read Path)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
-and the serializer name — is plaintext and is **not** covered by the AES-GCM
-authentication tag. AAD v0x03 binds tenant, cache key, wire format, and compression
-into the tag, but the header itself stays outside that boundary so a reader can parse
-it before it has a key.
+and the serializer name — is plaintext, so a reader can parse it before it has a key.
+Its JSON bytes are not what the AES-GCM tag covers; the tag covers the ciphertext and
+the AAD. AAD v0x03 is built from the tenant, the cache key (with any
+[key prefix the backend adds](#cache-key-binding)), and the header's wire format,
+compression flag and (when set) original type, so a change to one of those header
+values that alters the AAD fails authentication. The `encrypted` flag is **not** an
+AAD input: nothing authenticates it.
 
 An attacker with backend write access (the threat actor in the protocol's threat
-model) could exploit that gap by planting a frame whose header claims
+model) could exploit that unauthenticated flag by planting a frame whose header claims
 `encrypted: false` plus an arbitrary plaintext payload — a classic encryption
 downgrade (CWE-757). cachekit therefore never lets header metadata select the read
 path when encryption is configured:
@@ -453,7 +551,7 @@ path when encryption is configured:
 ```text
 Handler configured with encryption:
   entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
-  entry header claims plaintext  → SerializationError (fail closed, entry evicted)
+  entry header claims plaintext  → SerializationError (plaintext never returned; miss + evict, whatever `fail_closed` says)
 ```
 
 The plaintext deserializer is unreachable on an encryption-enabled handler, regardless
@@ -466,10 +564,15 @@ Encrypted entries expose three fields in the plaintext header: `tenant_id`,
 `encryption_algorithm`, and `key_fingerprint`. This exposure is deliberate and
 accepted:
 
-- **`tenant_id`** — required *before* decryption to derive the per-tenant key
-  (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
-  opaque identifier, not secret material, and it *is* tamper-protected: AAD v0x03
-  binds it into the GCM tag, so a modified header fails authentication.
+- **`tenant_id`** — the tenant the entry was encrypted for, needed *before*
+  decryption; moving it inside the ciphertext is a chicken-and-egg problem. It is an
+  opaque identifier, not secret material, and it *is* tamper-protected. A cache with a
+  `tenant_extractor` derives the per-tenant key (HKDF) from the caller's tenant and
+  refuses an entry whose `tenant_id` differs (`auth_tamper`) before attempting to
+  decrypt. A cache without one derives the key from the header's `tenant_id`, so a
+  modified value selects a different key and the read fails authentication
+  (`auth_tamper`) — a key-fingerprint mismatch under fail-closed, a GCM tag failure
+  otherwise.
 - **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
   clearer diagnostics during key rotation. It reveals nothing about key material.
 - **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
@@ -479,32 +582,72 @@ Relocating these fields would be a cross-SDK wire-format change owned by the
 [protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
 exposure rather than diverging from the shared frame format.
 
+### Cleartext Cache Key (Accepted Exposure)
+
+The cache key is cleartext too. By default it carries the namespace (when set), the function's
+`module.qualname` and an unkeyed, unsalted blake2b-256 hash of the arguments
+(`[ns:{ns}:]func:{mod.fn}:args:{64-hex}:{flags}`), so over a small or guessable argument space the
+hash can be enumerated offline. A custom `key=` function is not hashed: its return value becomes
+the key verbatim, after the function's identity and the namespace
+(`{identity}-{namespace}:{value}`, with `default` when no namespace is set and `{identity}` the
+16-hex blake3 hash of the function's `module.qualname`), so never return raw identifiers or
+personal data from it — derive them with an HMAC whose key never reaches the backend.
+
+Whoever operates the backend can therefore learn which record was read or written, when and how
+often, without decrypting anything. On the CachekitIO backend the key travels percent-encoded in
+the URL path (`/v1/cache/{key}`), so it also lands in access logs along the request path and stays
+there for their retention period, not the cache TTL. Ciphertext length reveals the approximate
+plaintext size, and because the default serializer compresses before encrypting, it also tracks
+how compressible the content is. Encryption protects values, not access patterns: keep secrets
+out of namespaces, function names and `key=` return values, and count argument-identifiable
+access as metadata exposure in your threat model.
+
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
-Three failure classes surface on the decrypt read path, and cachekit distinguishes
+Four failure classes surface on the decrypt read path, and cachekit distinguishes
 them (cachekit-py#170):
 
-- **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
+- **`auth_tamper`** — the entry failed authentication: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys), or the entry claims a different tenant. Raised as
+  between cache keys or [key prefixes](#cache-key-binding)), or, on a cache with a
+  `tenant_extractor`, a backend entry was encrypted for a tenant other than the caller's
+  (`TenantMismatchError`, refused before any decrypt attempt). In L1, another tenant's entry,
+  or behind a prefixing backend one bound to another prefix, is a plain miss instead
+  ([Cache Key Binding](#cache-key-binding)). The
+  plaintext frame header fields built into the AAD
+  (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
+  them is authenticated by the tag: a header change that produces different AAD bytes
+  also fails here. (The tag authenticates the constructed AAD, not the header's JSON
+  bytes.) Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the
   CWE-757 downgrade guard) or a missing `tenant_id`. Benign during a lazy
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
+- **`envelope_shape`** — an entry nothing verified decoded to the *shape* of a ByteStorage
+  envelope and was refused. Either a rotted integrity-on envelope or a legitimate top-level
+  4-element list that merely looks like one; the read path cannot tell them apart, so this
+  is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
+  An integrity-off `AutoSerializer` refuses to write the second case, so the same redacted key repeating in the
+  WARNING log is another writer still storing it (see *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
-  serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
-  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
-  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
-  AAD construction before any tag check runs — it is corruption, not tamper, and the
-  entry is evicted and recomputed even in fail-closed mode.
+  serializer mismatch, a deserialize failure on *already-authenticated* plaintext (including
+  plaintext in a container other than the one the serializer writes, which is refused, never
+  decoded: Arrow IPC without its checksum prefix, or, for an integrity-off `StandardSerializer`,
+  a legacy-layout envelope like those `AutoSerializer` sealed under `compressed=False` before
+  0.12.0, when it declares at most 256 KiB; a larger one comes back as its fields), or a
+  non-string or non-UTF-8-encodable `original_type`, or a non-UTF-8-encodable `compressed`,
+  in the frame header. Such a value
+  cannot be built into the AAD at all, so no tag check runs — the read is
+  corruption-class, and the entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter
 `cachekit_decrypt_failures_total{reason, tier="l1"|"l2"}` — alert on
 `reason="auth_tamper"` specifically; a nonzero rate there is a security event, not
-noise. Baseline `suspicious_envelope` around migration windows.
+noise. Baseline `suspicious_envelope` around migration windows; a flat, steady
+`envelope_shape` rate is a writer still storing a value the shape rule refuses, not rot.
 
 **Default (fail open):** a decrypt failure of any class logs a warning, evicts the
 poisoned entry, and recomputes the value. Availability-first — a tampered cache entry
@@ -533,6 +676,34 @@ from cachekit.config.nested import EncryptionConfig
 config = EncryptionConfig(enabled=True, master_key=secret_key,
                           single_tenant_mode=True, fail_closed=True)
 ```
+
+**Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
+raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
+passed directly that is not exactly 32 bytes, more than three previous keys, or the current
+key repeated among them. Settings check all three at load and refuse an assignment that breaks
+them, leaving the settings as they were (`previous_master_keys` is a tuple, so a change has to
+be an assignment), and an encrypting cache checks its current key against the previous keys when
+it is built. Behind the decorators this surfaces on a config-drift read (below), or when a
+previous key assigned to the settings repeats the `master_key=` of a cache already built: the
+settings never see that key, so its next wrapper build refuses it. Outside config-drift reads, the
+fault never evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users
+and callers of the `CacheOperationHandler` read and write methods receive it in both fail modes. Behind
+the `@cache` decorators, a read of an existing encrypted entry raises it too, from L1 or L2 and
+from the re-read after a distributed-lock wait, so the function does not run and no
+circuit-breaker failure is counted. A key with no entry yet reads as a miss before the keyring
+is built, so the fault surfaces at the write instead, and the write raises it too, sync or async:
+the function has already run, but its result is neither cached nor returned, and no
+circuit-breaker failure is counted. Two cases take other paths: a missing *current* master key,
+or one of the wrong length, raises `EncryptionError`, and an encryption-disabled handler reading an entry that
+claims encryption treats the fault as corruption (miss + evict), because only the
+unauthenticated header sent it down the decrypt path.
+
+A wrapper keeps the keyring it built. A cache builds one per tenant, on that tenant's first use and
+after LRU eviction, so a key change in the settings reaches only wrappers built after it: their
+previous keys, and their current key too unless the cache was given `master_key=`. One multi-tenant
+cache can therefore run the old keyring for some tenants and the new one for others. To apply a key
+change everywhere at once, change the environment and restart the process.
 
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key
@@ -565,18 +736,25 @@ didn't recently disable encryption for that function, investigate.
 
 ## Compliance Implications
 
+> [!IMPORTANT]
+> Client-side encryption may *reduce* GDPR, HIPAA or PCI DSS scope, subject to assessment and
+> your other controls, and only on an explicit path (see
+> [Activation](#activation-the-master-key-is-a-source-not-a-switch)); it is not a compliance
+> guarantee. Encryption covers values only: the cache key is cleartext (and, on CachekitIO, lands
+> in access logs; see [Cleartext Cache Key](#cleartext-cache-key-accepted-exposure)).
+
 ### GDPR
-- ✅ Encryption satisfies "processing security" requirement
-- ✅ Client-side encryption satisfies "technical measures"
+- ✅ Encryption supports the "processing security" requirement
+- ✅ Client-side encryption supports the "technical measures" requirement
 - ⚠️  Key management still required (rotation, access control)
 
 ### HIPAA
-- ✅ AES-256-GCM satisfies encryption requirement
+- ✅ AES-256-GCM supports the encryption requirement
 - ⚠️  Audit logging required (access to decrypted data)
 - ⚠️  Key management plan required
 
 ### PCI-DSS
-- ✅ Encryption satisfies "encryption at rest" requirement
+- ✅ Encryption supports the "encryption at rest" requirement
 - ⚠️  Key management plan required
 - ⚠️  Regular key rotation required
 
@@ -614,6 +792,8 @@ didn't recently disable encryption for that function, investigate.
 
 Run benchmarks: `pytest tests/performance/test_encryption_overhead.py -v -s`
 
+Through the decorator, a wall-clock comparison of an L1 hit of a 23.5KB dict with and without encryption is inconclusive: the difference stayed inside run-to-run noise. See [Not Measured Here](../performance.md#not-measured-here) in the Performance Guide.
+
 ### Key Derivation (Per-Tenant)
 ```
 Per-tenant key derivation: 50-100μs (HKDF operation)
@@ -628,10 +808,19 @@ Cached after first use: No additional overhead
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # Both enabled
 def get_data():
-    # Decryption error → Circuit breaker catches
-    # Encryption happens before circuit breaker (at write time)
+    # Decrypt or integrity failure on read → cache miss, entry evicted, function runs.
+    # It does NOT count toward the circuit breaker.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
+
+A decrypt or integrity failure says nothing about backend health, so the breaker ignores it. For
+fail-open reads, the warning log and the failure metric,
+`cache_operations_total{operation="cache_get_deserialize", success="False"}`, still fire. This keeps a
+lazy plaintext→encrypted migration, where every pre-encryption entry is refused once, from opening
+the breaker. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError`
+to the caller instead of recomputing. It emits `cachekit_decrypt_failures_total` and the
+authentication error log, but not the `operation="cache_get_deserialize"` sample or warning log. It does not
+count toward the breaker either.
 
 **Encryption + L1 Cache**:
 ```python notest
@@ -652,7 +841,7 @@ A: Key mismatch or data corruption. Check CACHEKIT_MASTER_KEY hasn't changed.
 
 **Q: Key rotation failing**
 A: Check `CACHEKIT_PREVIOUS_MASTER_KEYS` — comma-separated hex, each key subject to
-the same rules as `CACHEKIT_MASTER_KEY` (≥32 bytes), at most 3 entries, and the
+the same rules as `CACHEKIT_MASTER_KEY` (at least 32 bytes; use exactly 32), at most 3 entries, and the
 current `CACHEKIT_MASTER_KEY` must **not** appear in the list. Follow the keyring
 rotation pattern above: keep the retiring key decrypt-only until the runbook's
 [Phase 3](https://docs.cachekit.io/concepts/key-rotation/#scheduled-rotation-three-phases)
@@ -665,19 +854,17 @@ A: Expected 100-500μs overhead. Profile to confirm acceptable.
 
 ## Zero-Knowledge Architecture
 
-**Use case**: Building a caching system where the backend never sees user data.
+**Use case**: Building a caching system where the backend never sees plaintext values.
 
 ### Client-Side Encryption Flow
 ```python notest
 # Client application (user's infrastructure)
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
+from cachekit.backends.cachekitio import CachekitIOBackend
+from cachekit.serializers import OrjsonSerializer
 
-# Configure for HTTP API backend
-@cache(
-    backend="https://cache.example.com/api",
-    serializer=EncryptionWrapper(serializer=OrjsonSerializer())
-)
+# An HTTP API backend: CachekitIOBackend talks to cachekit.io over HTTPS
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer(), backend=CachekitIOBackend())
 def get_api_secrets(tenant_id: str):
     return {"api_key": "sk_live_...", "secret": "..."}  # illustrative
 
@@ -698,20 +885,17 @@ export default {
     const { key, value } = await request.json();
 
     // Backend receives encrypted blob
-    // NEVER sees plaintext (no decryption key)
+    // NEVER sees plaintext values (no decryption key); the key is cleartext
     await KV.put(key, value);
 
-    // Compliance: GDPR, HIPAA, PCI-DSS satisfied
-    // Backend cannot read user data even if compromised
     return new Response("OK");
   }
 }
 ```
 
 **Benefits**:
-- ✅ Backend compromise doesn't expose user data
-- ✅ Multi-tenant isolation (per-tenant encryption keys)
-- ✅ GDPR/HIPAA/PCI-DSS compliance out of the box
+- ✅ Backend compromise doesn't expose cached values
+- ✅ Supports a compliance scope-reduction argument on an explicit path (see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
 ---
@@ -720,7 +904,7 @@ export default {
 
 - [Comparison Guide](../comparison.md) - Only cachekit has zero-knowledge encryption
 - [Security Policy](../../SECURITY.md)
-- [Multi-Tenant Encryption](../getting-started.md#multi-tenant)
+- [Multi-Tenant Isolation](#multi-tenant-isolation) - why per-tenant keys are not a tenancy boundary
 - [Serializer Guide](../serializers/README.md) - Encryption with custom serializers
 - [Performance Benchmarks](../../tests/performance/test_encryption_overhead.py) - Evidence-based overhead measurements
 

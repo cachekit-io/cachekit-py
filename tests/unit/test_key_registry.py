@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import logging
 import os
+import sys
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
 import pytest
 
-from cachekit import cache
+from cachekit import cache, hash_utils
 from cachekit.backends.errors import BackendError
 from cachekit.cache_handler import supports_key_tracking
 from cachekit.config.validation import ConfigurationError
@@ -45,10 +48,25 @@ def _closure_cell(fn: Any, name: str) -> Any:
     raise LookupError(name)
 
 
+class FakeRedisClient:
+    """The slice of redis.Redis the invalidation channel publishes through: records each PUBLISH."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes]] = []
+        self.fail_publish: Optional[BaseException] = None
+
+    def publish(self, channel: str, message: bytes) -> int:
+        if self.fail_publish is not None:
+            raise self.fail_publish
+        self.published.append((channel, message))
+        return 0
+
+
 class TrackingBackend:
     """In-memory L2 with a key registry: sets of raw keys per registry id."""
 
     def __init__(self) -> None:
+        self._client = FakeRedisClient()  # where PerRequestRedisBackend keeps its shared client
         self.store: dict[str, bytes] = {}
         self.sets: dict[str, set[str]] = {}
         self.track_calls: list[tuple[str, str]] = []
@@ -103,6 +121,33 @@ class PlainBackend(TrackingBackend):
 
     track_key = None  # type: ignore[assignment]
     drain_tracked = None  # type: ignore[assignment]
+
+
+_tenant: contextvars.ContextVar[str] = contextvars.ContextVar("_tenant", default="a")
+
+
+class ScopedBackend(TrackingBackend):
+    """TrackingBackend under a per-context tenant prefix, like the tenant-scoped Redis backend."""
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{_tenant.get()}:"
+
+    def get(self, key: str) -> Optional[bytes]:
+        return super().get(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        super().set(self.key_prefix + key, value, ttl)
+
+    def delete(self, key: str) -> bool:
+        return super().delete(self.key_prefix + key)
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        super().track_key(self.key_prefix + registry_id, self.key_prefix + key)
+
+    def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+        out = super().drain_tracked(self.key_prefix + registry_id, {self.key_prefix + k for k in local_keys})
+        return {k.removeprefix(self.key_prefix) for k in out}
 
 
 def _registry_ids(backend: TrackingBackend) -> set[str]:
@@ -239,8 +284,6 @@ class TestTrackingSites:
     def test_track_failure_warning_is_throttled_per_function(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        import cachekit.decorators.wrapper as wrapper_module
-
         backend = TrackingBackend()
         backend.fail_track = True
 
@@ -251,7 +294,7 @@ class TestTrackingSites:
         with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
             for i in range(50):
                 assert f(i) == i
-            monkeypatch.setattr(wrapper_module, "_TRACK_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             assert f(50) == 50
         warnings = [r.getMessage() for r in caplog.records if "Key tracking failed" in r.getMessage()]
         # A registry outage is one WARNING per window, not one per write, and none is lost from the count.
@@ -312,7 +355,7 @@ class TestTrackingSites:
             writer.join(5)
             q.put(not writer.is_alive())
 
-        with _closure_cell(f, "_track_warn_lock").cell_contents:  # a parent writer is mid-claim at fork
+        with _closure_cell(f, "_track_warn").cell_contents._lock:  # a parent writer is mid-claim at fork
             process = ctx.Process(target=child, args=(queue,))
             process.start()
         try:
@@ -377,6 +420,22 @@ class TestDrain:
         assert backend.store == {}
         assert backend.drain_calls[0][1] == set()  # it knew no keys itself
 
+    def test_fresh_process_drains_custom_keys(self) -> None:
+        """The registry tracks the key the write path wrote, custom key= included (LAB-4387)."""
+        backend = TrackingBackend()
+
+        def f(x: int) -> int:
+            return x
+
+        writer = cache(backend=backend, ttl=60, namespace="drain_custom", key=lambda x: f"user:{x}")(f)
+        writer(1)
+        writer(2)
+        assert set(backend.store) == {key for _, key in backend.track_calls}
+
+        fresh = cache(backend=backend, ttl=60, namespace="drain_custom", key=lambda x: f"user:{x}")(f)
+        fresh.invalidate_cache()
+        assert backend.store == {}
+
     def test_untracked_key_removed_by_next_drain(self) -> None:
         """A key whose track_key failed is gone from L2 and L1 after a drain."""
         backend = TrackingBackend()
@@ -397,6 +456,177 @@ class TestDrain:
         assert backend.store == {}
         f(1)
         assert calls == 2  # L1 was evicted too
+
+    def test_same_key_rewrite_during_drain_stays_recorded(self) -> None:
+        """A key re-recorded while a drain is in flight survives that drain's trim.
+
+        The drain snapshots k and unlinks its old value; a concurrent miss then rewrites k
+        and its track_key fails. The new L2 value is in no registry, so the local record is
+        the only thing that can reach it: the next drain must still delete it."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="drain_rerecord", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)  # k recorded and tracked
+        (key,) = backend.store
+        backend.fail_track = True
+        unlinked, rewritten = threading.Event(), threading.Event()
+        real_drain = backend.drain_tracked
+
+        def drain_then_wait(registry_id: str, local_keys: Any) -> set[str]:
+            out = real_drain(registry_id, local_keys)  # old value of k unlinked
+            unlinked.set()
+            assert rewritten.wait(5)
+            return out
+
+        backend.drain_tracked = drain_then_wait  # type: ignore[method-assign]
+        drainer = threading.Thread(target=f.invalidate_cache)
+        drainer.start()
+        assert unlinked.wait(5)
+        f(1)  # concurrent miss: L2 set succeeds, track_key fails
+        rewritten.set()
+        drainer.join(5)
+        assert not drainer.is_alive()
+
+        assert key in backend.store and backend.sets == {}  # the rewrite is in no registry
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
+        backend.drain_tracked = real_drain  # type: ignore[method-assign]
+        f.invalidate_cache()
+        assert backend.store == {}
+
+    def test_same_key_rewrite_during_local_invalidate_stays_recorded(self) -> None:
+        """The per-key loop (no registry, or a failed drain) has the same race between a
+        key's L2 delete and its discard: a rewrite landing there must stay recorded."""
+        backend = PlainBackend()
+
+        @cache(backend=backend, ttl=60, namespace="local_rerecord", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (key,) = backend.store
+        deleted, rewritten = threading.Event(), threading.Event()
+        real_delete = backend.delete
+
+        def delete_then_wait(k: str) -> bool:
+            out = real_delete(k)
+            deleted.set()
+            assert rewritten.wait(5)
+            return out
+
+        backend.delete = delete_then_wait  # type: ignore[method-assign]
+        invalidator = threading.Thread(target=f.invalidate_cache)
+        invalidator.start()
+        assert deleted.wait(5)
+        f(1)  # concurrent miss rewrites k after its delete
+        rewritten.set()
+        invalidator.join(5)
+        assert not invalidator.is_alive()
+
+        assert key in backend.store
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
+        backend.delete = real_delete  # type: ignore[method-assign]
+        f.invalidate_cache()
+        assert backend.store == {}
+
+    @pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["Exception", "BaseException"])
+    def test_single_key_delete_that_raises_keeps_key_tracked(
+        self, error: type[BaseException], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """invalidate_cache(args) untracks before its L2 delete. A delete that raises anything,
+        not only an Exception, re-tracks the key so a later no-args call retries it, and the L1
+        copy is still evicted. Only an Exception is caught and logged; the rest propagates."""
+        backend = PlainBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=60, namespace="single_key_raise")
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        f(1)
+        (key,) = backend.store
+        real_delete = backend.delete
+
+        def delete_raises(k: str) -> bool:
+            raise error("delete interrupted")
+
+        backend.delete = delete_raises  # type: ignore[method-assign]
+        with caplog.at_level(logging.ERROR, logger="cachekit.decorators.wrapper"):
+            if issubclass(error, Exception):
+                f.invalidate_cache(1)
+            else:
+                with pytest.raises(error):
+                    f.invalidate_cache(1)
+        backend.delete = real_delete  # type: ignore[method-assign]
+
+        errors = [r for r in caplog.records if "Failed to delete L2 key" in r.getMessage()]
+        assert len(errors) == (1 if issubclass(error, Exception) else 0)
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
+        value = backend.store.pop(key)
+        f(1)  # L1 evicted and L2 emptied: the function runs again
+        assert calls == 2
+        backend.store[key] = value
+        f.invalidate_cache()  # no-args retry reaches the re-tracked key
+        assert backend.store == {}
+
+    def test_other_tenant_rewrite_during_drain_keeps_only_its_own_entry(self) -> None:
+        """Watches hold (scope, key): tenant b rewriting the same key during tenant a's drain
+        keeps b's entry recorded and does not keep a's drained entry alive."""
+        backend = ScopedBackend()
+
+        @cache(backend=backend, ttl=60, namespace="drain_tenants", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)  # tenant a
+        (a_key,) = backend.store
+        key = a_key.removeprefix("t:a:")
+        unlinked, rewritten = threading.Event(), threading.Event()
+        real_drain = backend.drain_tracked
+
+        def drain_then_wait(registry_id: str, local_keys: Any) -> set[str]:
+            out = real_drain(registry_id, local_keys)
+            unlinked.set()
+            assert rewritten.wait(5)
+            return out
+
+        backend.drain_tracked = drain_then_wait  # type: ignore[method-assign]
+        drainer = threading.Thread(target=contextvars.copy_context().run, args=(f.invalidate_cache,))
+        drainer.start()
+        assert unlinked.wait(5)
+        token = _tenant.set("b")
+        try:
+            f(1)  # tenant b writes the same cache key under its own prefix
+        finally:
+            _tenant.reset(token)
+        rewritten.set()
+        drainer.join(5)
+        assert not drainer.is_alive()
+
+        assert set(backend.store) == {f"t:b:{key}"}
+        assert _closure_cell(f, "_cached_keys").cell_contents == {("t:b:", key)}
+
+    def test_drain_leaves_no_watch_behind(self) -> None:
+        """A drain unregisters its watch whether it succeeds or fails, and drops watches a
+        forked child inherited from a parent drain that never finished there."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="drain_watches")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        watches = _closure_cell(f, "_drain_watches").cell_contents
+        watches[(-1, object())] = {("", "orphan")}  # another pid's drain, in flight at fork
+        f.invalidate_cache()
+        assert watches == {}
+        backend.fail_drain = True
+        f.invalidate_cache()
+        assert watches == {}
 
     def test_drain_failure_falls_back_to_local_with_l2_delete(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = TrackingBackend()
@@ -538,17 +768,11 @@ class TestSingleL1WriteSite:
         assert owners == ["_put_l1"]
 
         put_l1 = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_put_l1")
-        adds = [
-            n
-            for n in ast.walk(put_l1)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "add"
-            and isinstance(n.func.value, ast.Name)
-            and n.func.value.id == "_cached_keys"
+        records = [
+            n for n in ast.walk(put_l1) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_record"
         ]
-        assert len(adds) == 1
-        assert adds[0].lineno > puts[0].lineno
+        assert len(records) == 1
+        assert records[0].lineno > puts[0].lineno
 
 
 @pytest.mark.unit
@@ -561,12 +785,12 @@ class TestL1InvalidateMany:
         assert l1.get("a") == (False, None)
         assert l1.get("b") == (False, None)
         assert l1.get("c") == (True, b"v")
-        assert l1._current_memory_bytes == 1
+        assert l1._state.memory_bytes == 1
 
     def test_invalidate_many_releases_the_lock_between_batches(self) -> None:
         l1 = L1Cache(namespace="inv_many_batches")
         l1.put("k2499", b"v", redis_ttl=60)
-        real_lock, acquisitions = l1._lock, 0
+        real_lock, acquisitions = l1._state.lock, 0
 
         class CountingLock:
             def __enter__(self) -> None:
@@ -577,8 +801,176 @@ class TestL1InvalidateMany:
             def __exit__(self, *exc: object) -> None:
                 real_lock.release()
 
-        l1._lock = CountingLock()  # type: ignore[assignment]
+        l1._state.lock = CountingLock()  # type: ignore[assignment]
         l1.invalidate_many(f"k{i}" for i in range(2_500))  # a one-shot iterable, like a drain result
-        l1._lock = real_lock
+        l1._state.lock = real_lock
         assert acquisitions == 3  # 1 000-key batches: a large drain never holds every get/put off at once
         assert l1.get("k2499") == (False, None)
+
+
+class _NS(str, Enum):
+    USERS = "users"
+
+
+class _StrEnumNS(str, Enum):
+    """enum.StrEnum's rendering (3.11+), spelled out so the test also runs on 3.10."""
+
+    USERS = "users"
+    __str__ = str.__str__
+    __format__ = str.__format__
+
+
+class _FormatsAs(str):
+    """A str whose __format__ lies: f-strings render ``rendered``, "".join the real value."""
+
+    rendered = "ck:reg:users"
+
+    def __format__(self, spec: str) -> str:
+        return self.rendered
+
+
+class _LegacyFormat(_FormatsAs):
+    rendered = "legacy"
+
+
+class _HidesCk(str):
+    """A str that claims not to be "ck" and not to start with it."""
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+    def startswith(self, *args: Any, **kwargs: Any) -> bool:  # type: ignore[override]
+        return False
+
+
+@pytest.mark.unit
+class TestNamespaceExactStr:
+    """A str-subclass namespace keys and names its registry set by its underlying str (LAB-6197)."""
+
+    def test_str_enum_registry_id_uses_value(self) -> None:
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_NS.USERS, l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith("ck:reg:users:")
+
+    def test_str_enum_custom_key_uses_value(self) -> None:
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_NS.USERS, key=lambda *a, **kw: "k", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        identity = hash_utils.blake3_hash(f"{f.__module__}.{f.__qualname__}", digest_size=8)
+        assert set(backend.store) == {f"{identity}-users:k"}
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith("ck:reg:users:")
+
+    def test_format_override_cannot_forge_registry_shape(self) -> None:
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_FormatsAs("x"), key=lambda *a, **kw: "k", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        identity = hash_utils.blake3_hash(f"{f.__module__}.{f.__qualname__}", digest_size=8)
+        assert set(backend.store) == {f"{identity}-x:k"}
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith("ck:reg:x:")
+
+    @pytest.mark.parametrize("value", ["ck", "ck:reg"])
+    def test_eq_and_startswith_override_cannot_bypass_ck_reservation(self, value: str) -> None:
+        ns = _HidesCk(value)
+        assert not ns == "ck" and not ns.startswith("ck:")  # the overrides the old check trusted
+        with pytest.raises(ConfigurationError, match="reserved"):
+
+            @cache(backend=TrackingBackend(), ttl=60, namespace=ns)
+            def f(x: int) -> int:
+                return x
+
+    def test_drain_also_empties_pre_fix_registry_set(self) -> None:
+        """Entries tracked under the pre-fix f-string registry id go on a no-args drain."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_LegacyFormat("x"), l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (rid,) = _registry_ids(backend)
+        legacy_rid = "ck:reg:legacy:" + rid.rsplit(":", 1)[1]
+        backend.store["pre-upgrade-key"] = b"x"  # written and tracked by pre-fix code
+        backend.sets[legacy_rid] = {"pre-upgrade-key"}
+
+        f.invalidate_cache()
+        assert backend.store == {}
+        assert [r for r, _ in backend.drain_calls] == [rid, legacy_rid]
+
+    def test_legacy_drain_failure_still_applies_primary_drain(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A failed legacy drain must not discard what the primary drain deleted: another
+        wrapper's shared-L1 copy of a drained key is still evicted, and the old set is kept."""
+
+        class LegacyFails(TrackingBackend):
+            def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+                if registry_id.startswith("ck:reg:legacy:"):
+                    raise BackendError("legacy drain failed")
+                return super().drain_tracked(registry_id, local_keys)
+
+        backend = LegacyFails()
+        calls: list[int] = []
+
+        def f(x: int) -> int:
+            calls.append(x)
+            return x
+
+        ns = _LegacyFormat("legacy_fail")
+        writer = cache(backend=backend, ttl=60, namespace=ns)(f)
+        writer(1)  # this wrapper's L1 now holds the entry
+        (rid,) = _registry_ids(backend)
+        legacy_rid = "ck:reg:legacy:" + rid.rsplit(":", 1)[1]
+        backend.sets[legacy_rid] = {"pre-upgrade-key"}
+
+        fresh = cache(backend=backend, ttl=60, namespace=ns)(f)  # knows no keys itself
+        with caplog.at_level(logging.WARNING):
+            fresh.invalidate_cache()
+
+        assert "Legacy key registry drain failed" in caplog.text
+        assert "invalidating local keys only" not in caplog.text
+        assert legacy_rid in backend.sets  # retried by the next drain
+        writer(1)
+        assert calls == [1, 1]  # the shared L1 copy was evicted, so it recomputed
+
+    @pytest.mark.parametrize(
+        ("namespace", "interop", "legacy"),
+        [
+            ("users", None, None),
+            (_StrEnumNS.USERS, None, None),
+            (None, None, None),
+            # f"{member}" is "_NS.USERS" only from 3.11; on 3.10 the set name never moved.
+            (_NS.USERS, None, "_NS.USERS" if sys.version_info >= (3, 11) else None),
+            # 0.20.0 shipped the registry with interop's exact-str rebind: no pre-fix set exists.
+            (_NS.USERS, "get_user", None),
+        ],
+    )
+    def test_no_args_drain_ids(self, namespace: Optional[str], interop: Optional[str], legacy: Optional[str]) -> None:
+        """Only a namespace whose set name actually moved gets a second drain."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=namespace, interop=interop, l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith(f"ck:reg:{'users' if namespace is not None else ''}:")
+        f.invalidate_cache()
+        expected = [rid] if legacy is None else [rid, f"ck:reg:{legacy}:{rid.rsplit(':', 1)[1]}"]
+        assert [r for r, _ in backend.drain_calls] == expected

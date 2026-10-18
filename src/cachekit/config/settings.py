@@ -17,17 +17,21 @@ Note:
 
 from __future__ import annotations
 
+import functools
+import threading
+import uuid
 from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
+    BaseModel,
     Field,
     SecretStr,
-    ValidationError,
     field_validator,
     model_validator,
 )
-from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from .validation import RedactingSettings, _redacting, refuse_current_key_in_previous_keys
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
 # at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
@@ -35,8 +39,24 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # MAX_DECRYPT_ONLY_KEYS, which re-validates behind the FFI boundary.
 MAX_PREVIOUS_MASTER_KEYS = 3
 
+# Serializes CachekitConfig assignments: each validates the whole state it would leave, so two
+# assignments that are each valid alone (a new master_key, and that key added to previous_master_keys)
+# cannot land together unchecked. An assignment commits by swapping in its copy's whole state, so every
+# other change (a private attribute, a delete) takes the lock too, or the swap would undo it. Reentrant:
+# a subclass's validator or property setter may assign a field or a private attribute while it is held.
+_ASSIGNMENT_LOCK = threading.RLock()
 
-class CachekitConfig(BaseSettings):
+
+def _parses_as_uuid(value: str) -> bool:
+    # A bool, so the caller raises outside this except: the parse error can quote the value (CWE-532).
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+class CachekitConfig(RedactingSettings):
     """Backend-agnostic cache configuration.
 
     This configuration class provides validation for generic cache parameters
@@ -46,15 +66,10 @@ class CachekitConfig(BaseSettings):
     handled by backend-specific config classes.
 
     Attributes:
-        enable_prometheus_metrics: Whether to enable Prometheus metrics collection
-        default_ttl: Default time-to-live for cache entries in seconds
-        ttl_min: Minimum allowed TTL in seconds
-        ttl_max: Maximum allowed TTL in seconds
         max_value_size: Maximum cache value size in bytes
-        l1_enabled: Enable L1 in-memory cache for performance
-        l1_max_size_mb: Maximum L1 cache size per namespace in megabytes
+        l1_max_size_mb: Maximum L1 cache size per namespace in megabytes. With a backend, one value
+            larger than an eighth of it is not kept in L1
         l1_cleanup_interval_seconds: Background cleanup interval for expired entries
-        backend_provider_class: Backend provider class path (for testing)
 
     Examples:
         Create with defaults:
@@ -70,13 +85,6 @@ class CachekitConfig(BaseSettings):
         >>> custom = CachekitConfig(l1_max_size_mb=256)
         >>> custom.l1_max_size_mb
         256
-
-        TTL validation (default_ttl must be within ttl_min/ttl_max bounds):
-
-        >>> CachekitConfig(default_ttl=30, ttl_min=60)  # doctest: +IGNORE_EXCEPTION_DETAIL
-        Traceback (most recent call last):
-            ...
-        pydantic_core._pydantic_core.ValidationError: ... default_ttl (30) cannot be less than ttl_min (60)...
 
         Master key is masked in repr for security:
 
@@ -128,47 +136,15 @@ class CachekitConfig(BaseSettings):
         extra="forbid",
         populate_by_name=True,  # Allow using field names in addition to validation aliases
         # SECURITY (CWE-532): never echo raw inputs in str(ValidationError).
-        # Without this, any validation failure on this model (bad TTL bounds,
+        # Without this, any validation failure on this model (an out-of-range size limit,
         # keyring misconfig, ...) embeds the full raw input — including
         # env-sourced master_key and previous_master_keys hex — in startup
-        # logs. errors()/json() ignore this flag; __init__ below sanitizes
+        # logs. errors()/json() ignore this flag; RedactingSettings sanitizes
         # those surfaces.
         hide_input_in_errors=True,
+        # Assignment after load runs every field and model validator; __setattr__ makes a refusal write nothing.
+        validate_assignment=True,
     )
-
-    def __init__(self, **kwargs: Any) -> None:
-        """Construct settings, sanitizing validation errors (CWE-532).
-
-        hide_input_in_errors only affects __str__; ValidationError.errors() and
-        .json() still snapshot the raw input — for env-sourced settings that is
-        the cleartext master_key and previous_master_keys hex, which error
-        trackers serialize. Rebuild the error with every input redacted and
-        drop the original from the exception chain (it holds the raw values).
-        The re-raised error is still a ValidationError (a ValueError), so
-        fail-loud propagation paths are unchanged.
-        """
-        sanitized_error: ValidationError | None = None
-        try:
-            super().__init__(**kwargs)
-        except ValidationError as e:
-            sanitized: list[InitErrorDetails] = []
-            for err in e.errors(include_url=False):
-                detail: InitErrorDetails = {
-                    "type": err["type"],
-                    "loc": err["loc"],
-                    "input": "[REDACTED]",
-                }
-                ctx = err.get("ctx")
-                if ctx:
-                    detail["ctx"] = ctx
-                sanitized.append(detail)
-            sanitized_error = ValidationError.from_exception_data(e.title, sanitized, hide_input=True)
-        # Raised OUTSIDE the except block so __context__/__cause__ stay None —
-        # `raise ... from None` only suppresses display; the original (with raw
-        # inputs recoverable via .errors()) would still hang off __context__
-        # for anything that walks exception chains.
-        if sanitized_error is not None:
-            raise sanitized_error
 
     # Generic cache configuration (backend-agnostic)
     arrow_compression: Literal["zstd", "lz4", "none"] = Field(
@@ -183,27 +159,6 @@ class CachekitConfig(BaseSettings):
             "values stay buffered). Env: CACHEKIT_ARROW_COMPRESSION."
         ),
     )
-    enable_prometheus_metrics: bool = Field(
-        default=True,
-        description="Whether to enable Prometheus metrics collection",
-    )
-
-    # TTL configuration
-    default_ttl: int = Field(
-        default=3600,
-        gt=0,
-        description="Default time-to-live for cache entries in seconds",
-    )
-    ttl_min: int = Field(
-        default=60,
-        gt=0,
-        description="Minimum allowed TTL in seconds",
-    )
-    ttl_max: int = Field(
-        default=86400,  # 24 hours
-        gt=0,
-        description="Maximum allowed TTL in seconds",
-    )
 
     # Size limits
     max_value_size: int = Field(
@@ -213,19 +168,25 @@ class CachekitConfig(BaseSettings):
     )
 
     # L1 (In-Memory) Cache Configuration
-    l1_enabled: bool = Field(
-        default=True,
-        description="Enable L1 in-memory cache for performance (eliminates network latency)",
-    )
     l1_max_size_mb: int = Field(
         default=100,
         gt=0,
-        description="Maximum L1 cache size per namespace in megabytes (prevents OOM)",
+        description="Maximum L1 cache size per namespace in megabytes (prevents OOM); with a backend, one value larger than an eighth of it is not kept in L1",
     )
     l1_cleanup_interval_seconds: int = Field(
         default=30,
         gt=0,
         description="Background cleanup interval for expired L1 entries",
+    )
+    invalidation_listener_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the cross-process L1 invalidation listener in this process (env: "
+            "CACHEKIT_INVALIDATION_LISTENER_ENABLED): one background thread and one dedicated Redis "
+            "connection that evict this process's L1 copies of keys other processes invalidate. "
+            "Needs the tenant-scoped Redis backend (env-resolved Redis or RedisBackendProvider). "
+            "Publishing needs no setting: every process on that backend announces its invalidations."
+        ),
     )
 
     # Logging configuration
@@ -234,21 +195,6 @@ class CachekitConfig(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Log sampling rate (0.0 to 1.0, default 10%)",
-    )
-    log_buffer_size: int = Field(
-        default=10000,
-        gt=0,
-        description="Ring buffer size for async logging",
-    )
-    log_batch_size: int = Field(
-        default=100,
-        gt=0,
-        description="Batch size for async log writes",
-    )
-    log_flush_interval: float = Field(
-        default=1.0,
-        gt=0,
-        description="Flush interval for async logging in seconds",
     )
 
     # Deployment and feature flags
@@ -264,17 +210,18 @@ class CachekitConfig(BaseSettings):
     # Encryption configuration
     master_key: Optional[SecretStr] = Field(
         default=None,
-        description="Master encryption key (hex-encoded, minimum 32 bytes for AES-256)",
+        description="Master encryption key (hex-encoded; use exactly 32 bytes, 64 hex characters)",
     )
-    previous_master_keys: Annotated[list[SecretStr], NoDecode] = Field(
-        default_factory=list,
+    # A tuple, so the keyring cannot be edited in place, where no validator runs: a change is an assignment.
+    previous_master_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(
+        default_factory=tuple,
         description=(
             "Decrypt-only previous master keys for key rotation (env: "
             "CACHEKIT_PREVIOUS_MASTER_KEYS, comma-separated hex). Entries written "
             "under a listed key stay readable through the rotation window; writes "
             "always use master_key. At most 3 keys — more is rejected at load, "
             "never truncated. Per-key validation is identical to master_key "
-            "(hex-encoded, minimum 32 bytes). Spec: protocol spec/encryption.md "
+            "(hex-encoded, at least 32 bytes; use exactly 32). Spec: protocol spec/encryption.md "
             "→ 'Key Rotation (Keyring)'."
         ),
     )
@@ -288,11 +235,17 @@ class CachekitConfig(BaseSettings):
         ),
     )
 
-    # Backend provider configuration (for testing)
-    backend_provider_class: Optional[str] = Field(
-        default=None,
-        description="Backend provider class path (e.g., 'cachekit.backends.redis.provider.RedisBackendProvider')",
-    )
+    @field_validator("deployment_uuid")
+    @classmethod
+    def _refuse_malformed_deployment_uuid(cls, value: Optional[str]) -> Optional[str]:
+        """Refuse what ``uuid.UUID()`` refuses, at load and on assignment, and return the rest unchanged.
+
+        A key-derivation input, so no accepted form is narrowed or rewritten; ``None`` and ``""`` stay unset. The message
+        names the field, never the value: a pasted master key would otherwise ship in it (CWE-532).
+        """
+        if value and not _parses_as_uuid(value):
+            raise ValueError("deployment_uuid must be a valid UUID")
+        return value
 
     @field_validator("previous_master_keys", mode="before")
     @classmethod
@@ -329,54 +282,60 @@ class CachekitConfig(BaseSettings):
                 f"drop retired keys explicitly (protocol spec/encryption.md → 'Key Rotation (Keyring)')."
             )
 
-        previous_key_bytes: list[bytes] = []
         for position, key in enumerate(self.previous_master_keys):
             try:
-                decoded = bytes.fromhex(key.get_secret_value())
+                key_length = len(bytes.fromhex(key.get_secret_value()))
             except ValueError as e:
                 raise ValueError(f"previous_master_keys[{position}] is not valid hex: {e}") from e
-            if len(decoded) < 32:
+            if key_length < 32:
                 raise ValueError(
-                    f"previous_master_keys[{position}] must be at least 32 bytes (256 bits) decoded, got {len(decoded)}"
+                    f"previous_master_keys[{position}] must be at least 32 bytes (256 bits) decoded, got {key_length}"
                 )
-            previous_key_bytes.append(decoded)
 
-        if self.master_key is not None:
-            try:
-                master_key_bytes = bytes.fromhex(self.master_key.get_secret_value())
-            except ValueError:
-                # An invalid master_key is not this validator's concern — it fails
-                # loudly at EncryptionWrapper setup, exactly as before this field
-                # existed. Only the subset check is skipped.
-                master_key_bytes = None
-            if master_key_bytes is not None and master_key_bytes in previous_key_bytes:
-                raise ValueError(
-                    "master_key must not appear in previous_master_keys: this configuration is the "
-                    "detectable signature of re-promoting a retired key to the current (encrypting) "
-                    "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
-                    "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
-                )
+        # Shared with CacheSerializationHandler, which applies it to a master_key= this validator never sees.
+        refuse_current_key_in_previous_keys(self.master_key, self.previous_master_keys)
 
         return self
 
-    @model_validator(mode="after")
-    def validate_interdependent_fields(self) -> CachekitConfig:
-        """Validate interdependent field relationships.
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Validate an assignment on a copy first, and write it only if the copy passes.
 
-        Returns:
-            The validated configuration instance
-
-        Raises:
-            ValueError: If field combinations are invalid
+        validate_assignment alone writes the new value before the model validator runs, so a refused keyring
+        assignment would stay on the instance, readable by other threads until the error surfaces. The value
+        is dropped in a finally: the raised error's traceback holds this frame (CWE-532).
         """
-        # Check TTL bounds
-        if self.default_ttl < self.ttl_min:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be less than ttl_min ({self.ttl_min})")
+        # A private attribute: nothing to validate, so no copy. It still takes the lock, so it cannot land between
+        # another thread's model_copy() and swap and be lost. Any other name goes through the guard, so a mistyped
+        # field's value is refused inside _redacting too.
+        if name in type(self).__private_attributes__:
+            with _ASSIGNMENT_LOCK:
+                super().__setattr__(name, value)
+            return
+        candidate = None
+        try:
+            with _ASSIGNMENT_LOCK:
+                # A subclass property: run its setter once, on this instance. Each field it assigns comes back
+                # through this guard; replaying it on a copy would apply a non-idempotent setter twice. Redacted like
+                # the copy path, so a refused key leaves no pydantic frame holding it.
+                if isinstance(getattr(type(self), name, None), property):
+                    _redacting(functools.partial(BaseSettings.__setattr__, self, name, value), type(self).__name__)
+                    return
+                candidate = self.model_copy()
+                # BaseSettings.__setattr__, not this override: pydantic's validated assignment, on the copy.
+                _redacting(functools.partial(BaseSettings.__setattr__, candidate, name, value), type(self).__name__)
+                # Commit the state the copy validated, with no second validation: `value` may be a spent generator,
+                # and a non-idempotent validator would change it again. Every slot pydantic keeps instance state in, as
+                # model_copy() fills them: __dict__, the fields set, an extra="allow" subclass's undeclared names, and
+                # the private state a subclass's model validator may have derived on the copy.
+                for slot in BaseModel.__slots__:
+                    object.__setattr__(self, slot, getattr(candidate, slot))
+        finally:
+            del value, candidate  # the copy holds the refused value
 
-        if self.default_ttl > self.ttl_max:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be greater than ttl_max ({self.ttl_max})")
-
-        return self
+    def __delattr__(self, name: str) -> None:
+        """Delete under the assignment lock, so an assignment's swap cannot undo the delete."""
+        with _ASSIGNMENT_LOCK:
+            super().__delattr__(name)
 
     def __repr__(self) -> str:
         """Return string representation with sensitive information masked.

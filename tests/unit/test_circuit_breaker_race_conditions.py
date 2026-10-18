@@ -24,6 +24,14 @@ from cachekit.reliability import (
 from ..utils.circuit_breaker_helpers import guarded_call
 
 
+class _InjectedError(Exception):
+    """The failure a test injects on purpose.
+
+    Not ``RuntimeError``: ``threading.BrokenBarrierError`` subclasses it, and a broken
+    barrier must surface as itself rather than be tallied as an injected failure.
+    """
+
+
 class TestCircuitBreakerRaceConditions:
     """Test circuit breaker race condition prevention."""
 
@@ -237,8 +245,8 @@ class TestCircuitBreakerRaceConditions:
     def test_rapid_concurrent_state_transitions(self):
         """Test rapid state transitions under high concurrent load.
 
-        This verifies that the double-checked locking pattern works correctly
-        when many threads are simultaneously checking and potentially transitioning states.
+        This verifies that admission and transitions stay consistent when many threads
+        are simultaneously checking and potentially transitioning states.
 
         The clock is frozen and the threads run in lockstep rounds. Within a round every
         thread attempts one call, and an admitted operation does not complete until every
@@ -251,12 +259,14 @@ class TestCircuitBreakerRaceConditions:
         """
         config = CircuitBreakerConfig(
             failure_threshold=1,
-            success_threshold=1,  # Quick recovery for rapid transitions
+            success_threshold=1,
             timeout_seconds=0.05,
             half_open_requests=1,
         )
         breaker = CircuitBreaker(config, namespace="test")
         num_threads, num_rounds = 10, 10
+        # Otherwise the recovery round admits every thread and the permit cap goes untested.
+        assert config.half_open_requests < num_threads
 
         admitted_per_round = [0] * num_rounds
         observed_states: set[CircuitState] = set()
@@ -279,7 +289,7 @@ class TestCircuitBreakerRaceConditions:
 
             def fail():
                 arrivals.wait(timeout=30)
-                raise RuntimeError("Failure")
+                raise _InjectedError("Failure")
 
             def lockstep_operations():
                 for i in range(num_rounds):
@@ -289,11 +299,10 @@ class TestCircuitBreakerRaceConditions:
                     except BackendError:  # rejected by the breaker before the operation ran
                         arrivals.wait(timeout=30)
                         admitted = False
-                    except RuntimeError:  # admitted; the injected failure was recorded
+                    except _InjectedError:  # admitted; the injected failure was recorded
                         admitted = True
 
-                    with breaker._lock:
-                        state = breaker._state
+                    state = breaker.state
                     with tally_lock:
                         if admitted:
                             admitted_per_round[i] += 1
@@ -309,16 +318,42 @@ class TestCircuitBreakerRaceConditions:
         # A failure round admits every thread: the breaker stays CLOSED until the first
         # failure is recorded, which cannot happen before all have been admitted. The round
         # after it finds the clock past the timeout and admits exactly half_open_requests
-        # probes — the double-checked OPEN -> HALF_OPEN transition and the permit cap under
+        # probes — the OPEN -> HALF_OPEN transition and the permit cap under
         # contention. Every other round runs CLOSED and admits everyone.
         expected = [config.half_open_requests if i % 3 == 1 else num_threads for i in range(num_rounds)]
         assert admitted_per_round == expected, f"Admitted per round {admitted_per_round} != {expected}"
 
-        assert observed_states <= {CircuitState.CLOSED, CircuitState.OPEN, CircuitState.HALF_OPEN}
         # Round 0 trips the breaker and round 1 recovers it, so both are seen on every run.
         assert {CircuitState.OPEN, CircuitState.CLOSED} <= observed_states, (
             f"Should have observed the breaker trip and recover, saw only {observed_states}"
         )
+
+    def test_late_failure_from_call_admitted_before_trip_does_not_extend_recovery(self):
+        """A failure recorded after another caller tripped the breaker leaves its deadline alone.
+
+        Two calls are admitted while CLOSED; one fails and trips the breaker, the other
+        records its failure later, while OPEN. Run as one fixed interleaving on a frozen
+        clock rather than on threads: every step takes the breaker lock, so thread
+        identity adds nothing but scheduling noise.
+        """
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=1.0)
+        breaker = CircuitBreaker(config, namespace="test_late_failure")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            assert breaker.should_attempt_call()  # the late caller, admitted first
+            assert breaker.should_attempt_call()  # the caller that trips the breaker
+            breaker.record_failure(_InjectedError("trips"))
+            assert breaker.state == CircuitState.OPEN
+            tripped_at = breaker.get_stats()["last_failure_time"]
+
+            traveller.shift(timedelta(seconds=config.timeout_seconds * 0.6))
+            breaker.record_failure(_InjectedError("late"))
+            assert breaker.get_stats()["last_failure_time"] == tripped_at
+
+            # Past the original deadline, inside the one the late failure would have set.
+            traveller.shift(timedelta(seconds=config.timeout_seconds * 0.5))
+            assert breaker.should_attempt_call()
+            assert breaker.state == CircuitState.HALF_OPEN
 
     def test_timeout_race_condition_prevention(self):
         """Test that timeout checks don't create race conditions.
@@ -387,9 +422,8 @@ class TestCircuitBreakerRaceConditions:
     def test_circuit_breaker_allow_request_race_condition(self):
         """Test that CircuitBreaker._allow_request() prevents race conditions.
 
-        This test specifically validates the double-checked locking pattern fix
-        in the CircuitBreaker._allow_request() method to ensure only one thread
-        can transition from OPEN to HALF_OPEN state.
+        This test specifically validates that CircuitBreaker._allow_request()
+        lets only one thread transition from OPEN to HALF_OPEN state.
 
         Requirements: 1.1, 1.2
         """

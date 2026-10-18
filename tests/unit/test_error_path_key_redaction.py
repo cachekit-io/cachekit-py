@@ -13,6 +13,7 @@ the exception renders as a type name, never its text.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -22,7 +23,6 @@ import pytest
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import (
-    CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
@@ -217,38 +217,65 @@ class TestStandardCacheHandlerRedaction:
         _assert_redacted(caplog, TENANT_KEY)
 
 
-class TestCacheInvalidatorRedaction:
-    """Invalidation failures (sync + async) log the digest of the generated key."""
-
-    def _invalidator(self, error: Exception) -> tuple[CacheInvalidator, _FailingBackend]:
-        backend = _FailingBackend(error)
-        return CacheInvalidator(key_generator=CacheKeyGenerator(), backend=backend, serializer_type="default"), backend
+class TestInvalidationRedaction:
+    """Single-key invalidation failures (sync + async) log the digest of the resolved key."""
 
     @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     def test_sync_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
-        invalidator, backend = self._invalidator(error)
+        backend = _FailingBackend(error)
 
+        @cache(backend=backend, l1_enabled=False, namespace="tenant-42-secret")
         def cached_func(user: str) -> str:
             return user
 
         with caplog.at_level(logging.ERROR):
-            invalidator.invalidate_cache(cached_func, ("alice",), {}, namespace="tenant-42-secret")
+            cached_func.invalidate_cache("alice")
 
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])
 
     @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     async def test_async_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
-        invalidator, backend = self._invalidator(error)
+        backend = _FailingBackend(error)
 
-        def cached_func(user: str) -> str:
+        @cache(backend=backend, l1_enabled=False, namespace="tenant-42-secret")
+        async def cached_func(user: str) -> str:
             return user
 
         with caplog.at_level(logging.ERROR):
-            await invalidator.invalidate_cache_async(cached_func, ("alice",), {}, namespace="tenant-42-secret")
+            await cached_func.ainvalidate_cache("alice")
 
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])
+
+    async def test_legacy_key_failure_logs_redacted_at_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A non-default serializer also deletes the pre-0.20.0 key (LAB-5288); both failures log redacted at ERROR."""
+        error = ValueError(f"illegal input: {TENANT_KEY}")
+
+        for invoke in ("sync", "async"):
+            backend = _FailingBackend(error)
+
+            @cache(backend=backend, l1_enabled=False, namespace="tenant-42-secret", serializer="auto")
+            def cached_func(user: str) -> str:
+                return user
+
+            @cache(backend=backend, l1_enabled=False, namespace="tenant-42-secret", serializer="auto")
+            async def acached_func(user: str) -> str:
+                return user
+
+            caplog.clear()
+            with caplog.at_level(logging.ERROR):
+                if invoke == "sync":
+                    cached_func.invalidate_cache("alice")
+                else:
+                    await acached_func.ainvalidate_cache("alice")
+
+            current_key, legacy_key = backend.received_keys
+            assert legacy_key.endswith(":1s") and not current_key.endswith(":1s")
+            error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(error_records) == 2, invoke
+            _assert_redacted(caplog, current_key)
+            _assert_redacted(caplog, legacy_key)
 
 
 class TestKeyCarryingBackendErrorRedaction:
@@ -447,7 +474,7 @@ class TestClassifierMessagesAreKeyFree:
     """Every backend classifier must build a key-free BackendError.message (CWE-532).
 
     This is the invariant ``redact_error_for_log`` relies on when it logs a BackendError
-    verbatim: provider exception text (redis ACL/WRONGTYPE, httpx URL, pymemcache) can
+    verbatim: provider exception text (redis ACL/WRONGTYPE, urllib3 URL, pymemcache) can
     echo the raw key, so no classifier may interpolate ``str(exc)`` into the message —
     only ``type(exc).__name__``. Detail stays on ``original_exception``; the key rides
     the ``.key`` attribute, which ``_format_message`` redacts. Guards against the wrapped
@@ -467,15 +494,16 @@ class TestClassifierMessagesAreKeyFree:
         assert redact_cache_key(TENANT_KEY) in str(err)  # key present only as its digest
 
     def test_http_classifier_does_not_leak_key(self) -> None:
-        import httpx
+        from urllib3.exceptions import NewConnectionError, ReadTimeoutError
 
         from cachekit.backends.cachekitio.error_handler import classify_http_error
 
-        # httpx exception text carries the request URL, which embeds the raw key in its path.
-        exc = httpx.ConnectError(f"Connection refused to https://api.cachekit.io/v1/cache/{TENANT_KEY}")
-        err = classify_http_error(exc, operation="get", key=TENANT_KEY)
-        assert TENANT_KEY not in str(err)
-        assert redact_cache_key(TENANT_KEY) in str(err)
+        # urllib3 exception text can carry the request URL, which embeds the raw key in its path.
+        url = f"https://api.cachekit.io/v1/cache/{TENANT_KEY}"
+        for exc in (NewConnectionError(None, f"Connection refused to {url}"), ReadTimeoutError(None, url, f"timed out: {url}")):  # type: ignore[arg-type]
+            err = classify_http_error(exc, operation="get", key=TENANT_KEY)
+            assert TENANT_KEY not in str(err)
+            assert redact_cache_key(TENANT_KEY) in str(err)
 
     def test_memcached_classifier_does_not_leak_key(self) -> None:
         from cachekit.backends.memcached.error_handler import classify_memcached_error
@@ -675,3 +703,46 @@ class TestDecoratorWrapperRedaction:
 
         _assert_redacted(caplog, interop_key)
         _assert_error_text_redacted(caplog, error)
+
+
+class TestUnpairedSurrogateKeys:
+    """A key holding an unpaired surrogate degrades like any other key (LAB-7624).
+
+    Such a key cannot be strictly UTF-8 encoded. The redaction digest must still be minted, or
+    an L2 failure raises UnicodeEncodeError from the error handler instead of degrading.
+    """
+
+    NAMESPACE = "sur\ud800ns"
+
+    def test_redact_cache_key_digests_surrogates_distinctly(self) -> None:
+        digests = {redact_cache_key("sur\ud800ns:k"), redact_cache_key("a\udcffb"), redact_cache_key("a\udcfeb")}
+        assert len(digests) == 3
+        assert all(re.fullmatch(r"<redacted:[0-9a-f]{16}>", d) for d in digests)
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    def test_sync_call_with_failing_l2_returns_the_result(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _FailingBackend(error)
+
+        @cache(backend=backend, l1_enabled=False, namespace=self.NAMESPACE)
+        def cached_func(user: str) -> str:
+            return user.upper()
+
+        with caplog.at_level(logging.WARNING):
+            assert cached_func("alice") == "ALICE"
+
+        assert backend.received_keys
+        _assert_redacted(caplog, backend.received_keys[0])
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    def test_invalidation_with_failing_delete_logs_redacted(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _FailingBackend(error)
+
+        @cache(backend=backend, l1_enabled=False, namespace=self.NAMESPACE)
+        def cached_func(user: str) -> str:
+            return user
+
+        with caplog.at_level(logging.ERROR):
+            cached_func.invalidate_cache("alice")
+
+        assert len(backend.received_keys) == 1
+        _assert_redacted(caplog, backend.received_keys[0])

@@ -120,7 +120,7 @@ def test_full_roundtrip_through_cache_handler_is_correct_and_compact():
     from cachekit.cache_handler import CacheSerializationHandler
 
     df = _numeric_df(20)
-    handler = CacheSerializationHandler(serializer_name="arrow")
+    handler = CacheSerializationHandler(serializer_name="arrow", encryption=False)
     blob = handler.serialize_data(df, cache_key="k")
     assert blob[:2] == b"CK"  # new binary frame, not legacy JSON
     assert len(blob) / _logical(df) < 1.1
@@ -167,7 +167,7 @@ def test_streaming_write_path_peak_rss_bounded():
 
         with tempfile.TemporaryDirectory() as d:
             backend = FileBackend(FileBackendConfig(cache_dir=d, max_size_mb=4096, max_value_mb=2048))
-            sh = CacheSerializationHandler(serializer_name="arrow")
+            sh = CacheSerializationHandler(serializer_name="arrow", encryption=False)
             sh._base_serializer = ArrowSerializer(compression=None)  # uncompressed: on-disk ~1x, mmap-readable
             op = CacheOperationHandler(sh, CacheKeyGenerator())
             op.set_cache_handler(StandardCacheHandler(backend))

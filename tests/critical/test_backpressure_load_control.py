@@ -279,6 +279,7 @@ class TestBackpressureLoadControl:
 
         exception_count = {"value": 0}
         success_count = {"value": 0}
+        lock = threading.Lock()  # += is not atomic; without the GIL, concurrent increments get lost
 
         def failing_operation():
             """Operation that raises exception."""
@@ -286,12 +287,14 @@ class TestBackpressureLoadControl:
                 with controller.acquire():
                     raise ValueError("Intentional failure")
             except ValueError:
-                exception_count["value"] += 1
+                with lock:
+                    exception_count["value"] += 1
 
         def successful_operation():
             """Operation that succeeds."""
             with controller.acquire():
-                success_count["value"] += 1
+                with lock:
+                    success_count["value"] += 1
 
         # Run failing operations
         threads = [threading.Thread(target=failing_operation) for _ in range(5)]

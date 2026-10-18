@@ -1,53 +1,39 @@
 """SWR transport layer (LAB-381, protocol spec/saas-api.md#stale-while-revalidate).
 
 Covers the freshness-aware read (X-CacheKit-Freshness mapping), the stale-grace
-write headers (X-CacheKit-Stale-TTL + canonical/legacy TTL dual-send), and the
+write headers (X-CacheKit-Stale-TTL + the canonical TTL), and the
 StandardCacheHandler plumbing incl. the non-SWR-backend fallbacks.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import json
+from collections.abc import Iterator
+from unittest.mock import patch
 
-import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import (
     FRESH_FOR_HEADER,
     FRESHNESS_HEADER,
-    LEGACY_TTL_HEADER,
     STALE_TTL_HEADER,
     TTL_HEADER,
     CachekitIOBackend,
+    _parse_fresh_for,
 )
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import StandardCacheHandler, supports_swr
-
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
-
-_DUMMY_REQUEST = httpx.Request("GET", "https://api.cachekit.io/v1/cache/key")
-
-
-def _response(status: int, content: bytes = b"", headers: dict[str, str] | None = None) -> httpx.Response:
-    response = httpx.Response(status, content=content, headers=headers)
-    response.request = _DUMMY_REQUEST
-    return response
+from tests.utils.cachekitio_fakes import fake_backend
+from tests.utils.cachekitio_fakes import response as _response
 
 
 @pytest.fixture
-def backend() -> CachekitIOBackend:
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
-            return_value=MagicMock(spec=httpx.AsyncClient),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def backend() -> Iterator[CachekitIOBackend]:
+    """A backend whose tests patch ``_request_sync``, so its pool must never be reached."""
+    backend, pool = fake_backend(lambda request: _response(500))
+    yield backend
+    assert pool.requests == [], f"a request bypassed the patched _request_sync: {pool.requests}"
 
 
 class TestFreshnessRead:
@@ -64,24 +50,20 @@ class TestFreshnessRead:
         ],
     )
     def test_header_mapping(self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_stale: bool) -> None:
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             result = backend.get_with_freshness("k")
         assert result == (b"payload", expected_stale, None)
 
     def test_miss_returns_none(self, backend: CachekitIOBackend) -> None:
-        err = BackendError(
-            "not found",
-            error_type=BackendErrorType.PERMANENT,
-            original_exception=httpx.HTTPStatusError("404", request=_DUMMY_REQUEST, response=_response(404)),
-        )
-        with patch.object(backend, "_request_sync", side_effect=err):
+        with patch.object(backend, "_request_sync", return_value=_response(404)) as request:
             assert backend.get_with_freshness("k") is None
+        assert request.call_args.kwargs["miss_on_404"] is True
 
     def test_non_404_error_propagates(self, backend: CachekitIOBackend) -> None:
         err = BackendError(
             "boom",
             error_type=BackendErrorType.TRANSIENT,
-            original_exception=httpx.HTTPStatusError("500", request=_DUMMY_REQUEST, response=_response(500)),
+            original_exception=HTTPStatusError(500, _response(500)),
         )
         with patch.object(backend, "_request_sync", side_effect=err):
             with pytest.raises(BackendError):
@@ -90,8 +72,8 @@ class TestFreshnessRead:
 
 class TestFreshForRead:
     """X-CacheKit-Fresh-For mapping (LAB-557, spec/saas-api.md#remaining-freshness):
-    absent = None (pre-signal server, legacy); unparseable/negative = 0 (never
-    extend local service on drift — mirrors unrecognized-freshness → stale)."""
+    absent = None (pre-signal server, legacy); anything but 1-7 ASCII digits at most
+    2,592,000 = 0 (never extend local service on drift — mirrors unrecognized-freshness → stale)."""
 
     @pytest.mark.parametrize(
         ("headers", "expected_fresh_for"),
@@ -107,28 +89,63 @@ class TestFreshForRead:
     def test_fresh_for_mapping(
         self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_fresh_for: int | None
     ) -> None:
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             result = backend.get_with_freshness("k")
         assert result is not None
         assert result[2] == expected_fresh_for
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, None),  # absent header: no bound
+            ("30", 30),
+            ("0", 0),
+            ("2592000", 2592000),  # exactly the 30-day cap
+            ("", 0),
+            ("+5", 0),  # int() accepts a sign
+            ("1_0", 0),  # int() accepts underscores
+            (" 5", 0),  # int() strips whitespace
+            ("00000005", 0),  # eight digits: the length check runs first
+            ("3000000", 0),  # seven digits, over the cap
+            ("4297559296", 0),  # wraps to 2,592,000 under a 32-bit atoi
+            ("٥", 0),  # Arabic-Indic five: int() and str.isdigit() accept it
+            ("²", 0),  # superscript two: str.isdigit() accepts it
+        ],
+    )
+    def test_parse_fresh_for_grammar(self, value: str | None, expected: int | None) -> None:
+        """LAB-7838: 1-7 ASCII digits at most 2,592,000, else 0 — the header string alone, no response."""
+        assert _parse_fresh_for(value) == expected
+
     def test_fresh_for_rides_alongside_staleness(self, backend: CachekitIOBackend) -> None:
         """A stale-window read carries 0 remaining freshness (server emits both headers)."""
         headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"}
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             assert backend.get_with_freshness("k") == (b"payload", True, 0)
 
 
 class TestStaleGraceWrite:
-    """PUT timing headers: canonical+legacy TTL dual-send, stale window rules."""
+    """PUT timing headers: the canonical TTL alone, stale window rules."""
 
-    def test_ttl_dual_send(self, backend: CachekitIOBackend) -> None:
+    def test_ttl_sent_canonical_only(self, backend: CachekitIOBackend) -> None:
+        """API-44: SDKs send X-CacheKit-TTL only, never the legacy X-TTL."""
         with patch.object(backend, "_request_sync") as req:
             backend.set("k", b"v", ttl=300)
         headers = req.call_args.kwargs["headers"]
-        assert headers[TTL_HEADER] == "300"
-        assert headers[LEGACY_TTL_HEADER] == "300"
-        assert STALE_TTL_HEADER not in headers
+        assert headers == {TTL_HEADER: "300"}
+
+    @pytest.mark.parametrize(
+        ("ttl", "stale_ttl", "wire_ttl", "wire_stale"),
+        [(0.5, 0.5, "1", "1"), (0.001, None, "1", None), (1.5, 2.25, "2", "3"), (60, 30, "60", "30")],
+    )
+    def test_ttls_ceiled_to_whole_seconds(
+        self, backend: CachekitIOBackend, ttl: float, stale_ttl: float | None, wire_ttl: str, wire_stale: str | None
+    ) -> None:
+        """API-42 / API-54: a sub-second TTL or stale window goes out as 1, never 0 or a fraction."""
+        with patch.object(backend, "_request_sync") as req:
+            backend.set("k", b"v", ttl=ttl, stale_ttl=stale_ttl)  # type: ignore[arg-type]  # nothing enforces the int annotation
+        headers = req.call_args.kwargs["headers"]
+        assert headers[TTL_HEADER] == wire_ttl
+        assert headers.get(STALE_TTL_HEADER) == wire_stale
 
     def test_stale_ttl_sent_with_ttl(self, backend: CachekitIOBackend) -> None:
         with patch.object(backend, "_request_sync") as req:
@@ -136,6 +153,13 @@ class TestStaleGraceWrite:
         headers = req.call_args.kwargs["headers"]
         assert headers[STALE_TTL_HEADER] == "600"
         assert headers[TTL_HEADER] == "300"
+
+    @pytest.mark.parametrize(("ttl", "wire"), [(0.5, 1), (90, 90)])
+    async def test_refresh_ttl_ceiled_to_whole_seconds(self, backend: CachekitIOBackend, ttl: float, wire: int) -> None:
+        """PATCH /ttl takes the same validation as X-CacheKit-TTL, so a sub-second value goes out as 1."""
+        with patch.object(backend, "_request_async") as req:
+            assert await backend.refresh_ttl("k", ttl) is True  # type: ignore[arg-type]
+        assert json.loads(req.call_args.kwargs["body"]) == {"ttl": wire}
 
     @pytest.mark.parametrize(("ttl", "stale_ttl"), [(None, 600), (300, 0), (300, None), (None, None)])
     def test_stale_ttl_omitted(self, backend: CachekitIOBackend, ttl: int | None, stale_ttl: int | None) -> None:

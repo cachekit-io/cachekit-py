@@ -10,6 +10,7 @@ import time_machine
 
 from cachekit import cache
 from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
+from cachekit.config.validation import ConfigurationError
 from cachekit.reliability.circuit_breaker import (
     CacheOperationMetrics,
     CircuitBreaker,
@@ -30,7 +31,7 @@ class TestCircuitBreakerConfig:
         assert config.failure_threshold == 5
         assert config.success_threshold == 3
         assert config.timeout_seconds == 30.0
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
         # No error types excluded by default
         assert len(config.excluded_error_types) == 0
 
@@ -61,6 +62,12 @@ class TestCircuitBreakerConfig:
 
         # Empty tuple is valid
         assert len(config.excluded_error_types) == 0
+
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+    def test_timeout_that_never_recovers_or_never_caps_probes_is_rejected(self, timeout):
+        """NaN or inf never leaves OPEN (NaN compares False, inf never elapses); <= 0 removes the probe cap."""
+        with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+            CircuitBreakerConfig(timeout_seconds=timeout)
 
 
 class TestCacheOperationMetrics:
@@ -331,6 +338,75 @@ class TestCircuitBreaker:
             assert "Circuit breaker is OPEN" in str(exc_info.value)
             fast_operation.assert_not_called()
 
+    def test_released_probe_slot_goes_to_the_next_call(self):
+        """A HALF_OPEN probe that ends with no outcome gives its slot back, and records nothing."""
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1, half_open_requests=1)
+        breaker = CircuitBreaker(config, namespace="test")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            breaker.record_failure()
+            traveller.shift(timedelta(seconds=0.2))
+            probe = breaker.admit()  # enters HALF_OPEN and takes the only slot
+            assert probe
+            assert breaker.should_attempt_call() is False
+
+            breaker.release_probe(probe)
+            breaker.release_probe(probe)  # a second release cannot mint a slot nobody took
+
+            assert breaker.admit() == probe  # the same cycle
+            assert breaker.should_attempt_call() is False
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert (breaker.success_count, breaker.failure_count) == (0, 1)
+
+    def test_release_outside_half_open_does_nothing(self):
+        """Only a HALF_OPEN cycle has probe slots: an OPEN breaker stays OPEN for its full cooldown."""
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=10.0)
+        breaker = CircuitBreaker(config, namespace="test")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            closed = breaker.admit()
+            assert closed == 0  # admitted, before any HALF_OPEN cycle
+            breaker.release_probe(closed)
+            assert breaker.state == CircuitState.CLOSED
+
+            breaker.record_failure()
+            breaker.release_probe(closed)
+            traveller.shift(timedelta(seconds=5))
+            assert breaker.should_attempt_call() is False
+            assert breaker.state == CircuitState.OPEN
+
+    def test_release_from_another_cycle_mints_no_slot(self):
+        """Only a probe of the current cycle gives a slot back, so the probe cap holds.
+
+        A call admitted while CLOSED, or by a cycle that expired, never took one of
+        this cycle's slots. Refunded anyway, each such call would let one more probe
+        through to the backend under test.
+        """
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=10.0, half_open_requests=2)
+        breaker = CircuitBreaker(config, namespace="test")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            closed = [breaker.admit() for _ in range(3)]
+            breaker.record_failure()
+            traveller.shift(timedelta(seconds=11))
+            first = [breaker.admit() for _ in range(2)]  # cycle 1's probes never report back
+            traveller.shift(timedelta(seconds=11))
+            second = [breaker.admit() for _ in range(2)]  # the spent cycle expired: cycle 2
+            assert breaker.admit() is None
+            assert closed == [0] * 3
+            assert first[0] == first[1] != second[0] == second[1]
+
+            for cycle in closed + first:
+                assert cycle is not None
+                breaker.release_probe(cycle)
+            assert breaker.admit() is None
+
+            assert second[0] is not None
+            breaker.release_probe(second[0])
+            assert breaker.admit() == second[0]
+            assert breaker.admit() is None
+            assert breaker.state == CircuitState.HALF_OPEN
+
     @pytest.mark.asyncio
     async def test_async_call_functionality(self):
         """Test async call functionality."""
@@ -398,7 +474,7 @@ class TestCircuitBreaker:
 
     def test_thread_safety_state_transitions(self):
         """Test thread safety during state transitions."""
-        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1)
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1, half_open_requests=1)
         breaker = CircuitBreaker(config, namespace="test")
 
         with time_machine.travel(0, tick=False) as traveller:
@@ -537,7 +613,7 @@ class TestDecoratorConfiguresLiveBreaker:
         ("knob", "value", "live_key"),
         [
             ("failure_threshold", 1, "failure_threshold"),
-            ("success_threshold", 9, "success_threshold"),
+            ("success_threshold", 2, "success_threshold"),
             ("recovery_timeout", 1.5, "timeout_seconds"),
             ("half_open_requests", 7, "half_open_requests"),
         ],
@@ -547,6 +623,19 @@ class TestDecoratorConfiguresLiveBreaker:
 
         # Whole-dict equality: the knob moved and nothing else did.
         assert _live_breaker_config(wrapped) == {**_LIVE_BREAKER_DEFAULTS, live_key: value}
+
+    @pytest.mark.parametrize(
+        ("knobs", "match"),
+        [
+            ({"success_threshold": 3, "half_open_requests": 1}, r"half_open_requests \(1\) must be >= success_threshold \(3\)"),
+            ({"success_threshold": 5}, r"half_open_requests \(3\) must be >= success_threshold \(5\)"),
+            ({"recovery_timeout": 0}, "recovery_timeout must be a finite number > 0"),
+        ],
+    )
+    def test_breaker_that_cannot_recover_is_rejected_at_decoration(self, is_async, knobs, match):
+        """Settings the live breaker could never close with, or probe without a cap, fail before first use."""
+        with pytest.raises(ConfigurationError, match=match):
+            _decorate(is_async, ttl=300, backend=None, circuit_breaker=NestedCircuitBreakerConfig(**knobs))
 
     def test_no_breaker_argument_keeps_live_defaults(self, is_async):
         assert _live_breaker_config(_decorate(is_async, ttl=300, backend=None)) == _LIVE_BREAKER_DEFAULTS
@@ -583,3 +672,207 @@ class TestIntentPresetsKeepLiveBreakerDefaults:
         wrapped = getattr(cache, preset)(ttl=300, backend=None)(lambda: 1)
 
         assert wrapped.get_health_status()["circuit_breaker"] is None
+
+
+class _Clock:
+    """Stand-in for circuit_breaker.monotonic, which time_machine does not move."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class TestClosedFailureWindow:
+    """CLOSED opens on failure_threshold failures within a 60 s rolling window (LAB-5352).
+
+    Parity with cachekit-ts and cachekit-rs: successes in CLOSED neither reset the count
+    nor extend the window, and failures older than the window stop counting.
+    """
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        clock = _Clock()
+        monkeypatch.setattr("cachekit.reliability.circuit_breaker.monotonic", clock)
+        return clock
+
+    @pytest.fixture
+    def breaker(self):
+        return CircuitBreaker(CircuitBreakerConfig(), namespace="test")
+
+    def _fail_at(self, breaker, clock, seconds):
+        clock.now = seconds
+        assert breaker.should_attempt_call()
+        breaker.record_failure()
+
+    def test_threshold_failures_within_window_open(self, breaker, clock):
+        for t in (0, 10, 20, 30):
+            self._fail_at(breaker, clock, t)
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == 4
+
+        self._fail_at(breaker, clock, 40)
+        assert breaker.state == CircuitState.OPEN
+
+    def test_failure_every_30s_for_10_minutes_stays_closed(self, breaker, clock):
+        for t in range(0, 601, 30):
+            self._fail_at(breaker, clock, t)
+            assert breaker.state == CircuitState.CLOSED, f"opened at t={t}s"
+        # t-60, t-30 and t: a failure exactly 60 s old still counts, as in cachekit-rs.
+        assert breaker.failure_count == 3
+        assert breaker.get_stats()["failure_count"] == 3
+
+    def test_successes_between_failures_do_not_reset_the_count(self, breaker, clock):
+        for t in (0, 12, 24, 36):
+            self._fail_at(breaker, clock, t)
+            for _ in range(100):
+                assert breaker.should_attempt_call()
+                breaker.record_success()
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == 4
+
+        self._fail_at(breaker, clock, 48)
+        assert breaker.state == CircuitState.OPEN
+
+    def test_sparse_failures_on_a_healthy_backend_never_open(self, breaker, clock):
+        """The reported defect: five failures an hour apart used to open a default breaker."""
+        for hour in range(5):
+            self._fail_at(breaker, clock, hour * 3600)
+            for _ in range(100):
+                breaker.record_success()
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == 1
+
+    def test_expired_failures_leave_the_count(self, breaker, clock):
+        for t in (0, 1, 2, 3):
+            self._fail_at(breaker, clock, t)
+        clock.now = 64
+        assert breaker.failure_count == 0
+
+        self._fail_at(breaker, clock, 64)
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == 1
+
+    def test_backward_wall_clock_correction_keeps_old_failures_out(self, breaker, clock):
+        """Four failures, an hour passes, then the wall clock steps back an hour."""
+        with time_machine.travel(3600, tick=False) as traveller:
+            for t in (0, 10, 20, 30):
+                self._fail_at(breaker, clock, t)
+            traveller.move_to(0)
+            self._fail_at(breaker, clock, 3630)
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == 1
+
+
+class TestOutcomesFromAnotherCycle:
+    """A HALF_OPEN cycle closes or reopens only on outcomes of the probes it admitted.
+
+    A slow probe of an earlier cycle can report after that cycle ended and a new one
+    began. Its outcome carries the cycle ``admit`` gave it, so the new cycle ignores it.
+    An outcome with no cycle counts toward the current state.
+    """
+
+    @staticmethod
+    def _breaker() -> CircuitBreaker:
+        config = CircuitBreakerConfig(failure_threshold=1, success_threshold=3, half_open_requests=3, timeout_seconds=30)
+        return CircuitBreaker(config, namespace="test")
+
+    @staticmethod
+    def _second_cycle(breaker, traveller) -> tuple[list, int]:
+        """Open at t=1000; cycle 1 admits 3 probes at t=1031 and one fails; cycle 2 admits one at t=1062."""
+        breaker.record_failure()
+        traveller.move_to(1031)
+        first = [breaker.admit() for _ in range(3)]
+        assert first[0] is not None and first == [first[0]] * 3
+        breaker.record_failure(cycle=first[0])
+        assert breaker.state == CircuitState.OPEN
+        traveller.move_to(1062)
+        fresh = breaker.admit()
+        assert fresh is not None and fresh != first[0]
+        assert breaker.state == CircuitState.HALF_OPEN
+        return first, fresh
+
+    def test_stale_successes_do_not_close_the_breaker(self):
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            first, fresh = self._second_cycle(breaker, traveller)
+
+            for cycle in (first[1], first[2], fresh):
+                breaker.record_success(cycle=cycle)
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.success_count == 1
+
+            for _ in range(2):  # the cycle's own probes still close it
+                breaker.record_success(cycle=breaker.admit())
+            assert breaker.state == CircuitState.CLOSED
+
+    def test_stale_failure_does_not_reopen_the_breaker(self):
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            first, _ = self._second_cycle(breaker, traveller)
+            last_failure, failures = breaker.get_stats()["last_failure_time"], breaker.failure_count
+
+            breaker.record_failure(cycle=first[1])
+
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.get_stats()["last_failure_time"] == last_failure == 1031  # the cooldown did not restart
+            assert breaker.failure_count == failures
+
+    def test_outcomes_from_an_expired_cycle_change_nothing(self):
+        """The expiry restart begins cycle 2 while cycle 1's probes may still be in flight."""
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            breaker.record_failure()
+            traveller.move_to(1031)
+            first = [breaker.admit() for _ in range(3)]  # cycle 1's budget, no outcome yet
+            traveller.move_to(1062)  # more than timeout_seconds after cycle 1 began
+            fresh = breaker.admit()
+            assert first[0] is not None and fresh is not None and fresh != first[0]
+            before = breaker.get_stats()
+
+            breaker.record_success(cycle=first[0])
+            breaker.record_success(cycle=first[1])
+
+            assert breaker.get_stats() == before
+
+    def test_outcome_without_a_cycle_counts_toward_the_current_one(self):
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            self._second_cycle(breaker, traveller)
+
+            for _ in range(3):
+                breaker.record_success()
+            assert breaker.state == CircuitState.CLOSED
+
+    def test_call_admitted_while_closed_does_not_reopen_a_cycle(self):
+        """A call admitted before the breaker opened holds no probe of the cycle that follows."""
+        breaker = self._breaker()
+        with time_machine.travel(1000, tick=False) as traveller:
+            slow = breaker.admit()  # admitted while CLOSED, before any cycle
+            breaker.record_failure()
+            traveller.move_to(1031)
+            assert breaker.admit() not in (None, slow)
+            last_failure = breaker.get_stats()["last_failure_time"]
+
+            breaker.record_failure(cycle=slow)
+
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.get_stats()["last_failure_time"] == last_failure
+
+    def test_late_failure_still_counts_while_closed(self):
+        """Only HALF_OPEN tells cycles apart: CLOSED counts every failure, whichever call reports it."""
+        config = CircuitBreakerConfig(failure_threshold=1, success_threshold=1, half_open_requests=1, timeout_seconds=30)
+        breaker = CircuitBreaker(config, namespace="test")
+        with time_machine.travel(1000, tick=False) as traveller:
+            slow = breaker.admit()  # admitted while CLOSED, before any cycle
+            breaker.record_failure()
+            traveller.move_to(1031)
+            probe = breaker.admit()
+            assert slow is not None and probe is not None and probe != slow
+            breaker.record_success(cycle=probe)
+            assert breaker.state == CircuitState.CLOSED
+
+            breaker.record_failure(cycle=slow)
+
+            assert breaker.state == CircuitState.OPEN

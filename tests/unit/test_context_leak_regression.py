@@ -6,7 +6,6 @@ These tests verify that stats context is properly reset in ALL code paths:
 3. Function raises exception
 4. Multiple sequential calls don't pollute context
 5. Async wrapper exception handling
-6. Async correlation ID cleanup
 
 Critical for preventing context leaks that cause cross-function stats pollution.
 
@@ -15,12 +14,6 @@ Historical Context:
 - Symptom: Inner function stats leaked into outer function stats
 - Root cause: Exception paths didn't reset context
 - Fix: Always reset token in finally block, even on exception
-
-Async Context (added 2025-12):
-- Bug: Async wrapper missing clear_correlation_id() in finally block
-- Symptom: Correlation IDs leaked across async requests
-- Root cause: Async wrapper (line 1247) didn't match sync wrapper cleanup (line 841)
-- Fix: Add features.clear_correlation_id() to async finally block
 """
 
 from __future__ import annotations
@@ -32,8 +25,24 @@ import pytest
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.monitoring.correlation_tracking import get_correlation_id
+from cachekit.decorators.stats_context import (
+    get_current_function_stats,
+    reset_current_function_stats,
+    set_current_function_stats,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_stats_context():
+    """Start each test with no stats context and restore the outer one after it.
+
+    A leak stays set in the pytest thread's context, so without it, one leaking
+    test would also fail every later test here that checks for None, and the
+    failure would point at the wrong test.
+    """
+    token = set_current_function_stats(None)
+    yield
+    reset_current_function_stats(token)
 
 
 @pytest.mark.unit
@@ -46,7 +55,7 @@ class TestContextLeakOnBackendFailure:
         Simulates backend provider.get_backend() raising exception.
         Function should execute uncached and context should be clean.
         """
-        with patch("cachekit.cache_handler.get_backend_provider") as mock_provider:
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
             # Mock backend provider to fail
             mock_provider.return_value.get_backend.side_effect = RuntimeError("Backend init failed")
 
@@ -57,6 +66,7 @@ class TestContextLeakOnBackendFailure:
             # Call function (should fallback to uncached execution)
             result = test_func(5)
             assert result == 10
+            mock_provider.return_value.get_backend.assert_called_once()
 
             # Verify context is None (no leak)
             assert get_current_function_stats() is None
@@ -364,6 +374,32 @@ class TestEdgeCaseContextLeaks:
         # Verify context is None (no leak)
         assert get_current_function_stats() is None
 
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+    @pytest.mark.parametrize("site", ["l2_read", "backend_resolution"])
+    def test_context_reset_on_interrupt_from_backend_io(self, mock_backend, site, interrupt):
+        """An interrupt from the decorator's own backend I/O must reset context too.
+
+        KeyboardInterrupt and SystemExit are BaseExceptions, so the decorator's
+        `except Exception` degrade handlers never see them; only a finally does.
+        The call runs in this test's own context: a copied one would hide a leak.
+        """
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            if site == "l2_read":
+                mock_backend.get = Mock(side_effect=interrupt)
+                decorator = cache(backend=mock_backend)
+            else:
+                mock_provider.return_value.get_backend.side_effect = interrupt
+                decorator = cache()
+
+            @decorator
+            def test_func(x):
+                return x * 2
+
+            with pytest.raises(interrupt):
+                test_func(5)
+
+        assert get_current_function_stats() is None
+
     def test_context_reset_after_recursive_calls(self, mock_backend):
         """Recursive decorated functions should maintain context isolation.
 
@@ -426,50 +462,9 @@ def async_mock_backend():
 class TestAsyncContextLeaks:
     """Test that async wrapper properly cleans up context in all code paths.
 
-    These tests verify the fix for async wrapper missing clear_correlation_id()
-    which existed in sync wrapper but was absent from async wrapper.
-
     Note: Uses async_mock_backend fixture (defined above) to test the non-locking
     code path with proper sync mock methods.
     """
-
-    @pytest.mark.asyncio
-    async def test_async_clears_correlation_id_on_success(self, async_mock_backend):
-        """Async wrapper should clear correlation ID after successful execution.
-
-        Bug: Line 1247 was missing features.clear_correlation_id() which exists
-        in sync wrapper at line 841.
-
-        Fix: Add features.clear_correlation_id() to async finally block.
-        """
-
-        @cache(backend=async_mock_backend)
-        async def async_func(x):
-            return x * 2
-
-        # Execute async function
-        result = await async_func(5)
-        assert result == 10
-
-        # Correlation ID should be cleared (not leaked)
-        assert get_correlation_id() is None
-
-    @pytest.mark.asyncio
-    async def test_async_clears_correlation_id_on_exception(self, async_mock_backend):
-        """Async wrapper should clear correlation ID even when function raises."""
-
-        @cache(backend=async_mock_backend)
-        async def failing_async_func(x):
-            if x < 0:
-                raise ValueError("Negative not allowed")
-            return x * 2
-
-        # Execute failing async function
-        with pytest.raises(ValueError):
-            await failing_async_func(-1)
-
-        # Correlation ID should be cleared even after exception
-        assert get_correlation_id() is None
 
     @pytest.mark.asyncio
     async def test_async_clears_context_on_key_generation_failure(self, async_mock_backend):
@@ -498,41 +493,6 @@ class TestAsyncContextLeaks:
             assert get_current_function_stats() is None
 
     @pytest.mark.asyncio
-    async def test_async_context_reset_matches_sync(self, async_mock_backend):
-        """Async wrapper finally block should match sync wrapper cleanup.
-
-        Sync wrapper (lines 839-843):
-            finally:
-                features.clear_correlation_id()
-                reset_current_function_stats(token)
-
-        Async wrapper (lines 1245-1247) should have SAME cleanup:
-            finally:
-                features.clear_correlation_id()  # Was missing - fixed
-                reset_current_function_stats(token)
-        """
-
-        @cache(backend=async_mock_backend)
-        def sync_func(x):
-            return x * 2
-
-        @cache(backend=async_mock_backend)
-        async def async_func(x):
-            return x * 2
-
-        # Call sync function
-        sync_func(5)
-        sync_correlation = get_correlation_id()
-
-        # Call async function
-        await async_func(5)
-        async_correlation = get_correlation_id()
-
-        # Both should have cleared correlation ID
-        assert sync_correlation is None, "Sync wrapper should clear correlation ID"
-        assert async_correlation is None, "Async wrapper should clear correlation ID"
-
-    @pytest.mark.asyncio
     async def test_async_stats_context_reset_after_exception(self, async_mock_backend):
         """Stats context should be None after async function raises exception."""
 
@@ -544,6 +504,29 @@ class TestAsyncContextLeaks:
             await error_func()
 
         # Stats context should be reset
+        assert get_current_function_stats() is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+    async def test_async_context_reset_on_interrupt_from_backend_resolution(self, interrupt):
+        """An interrupt from backend resolution must reset context, as on the sync path.
+
+        Awaited directly, so the wrapper runs in this test's task and a leak would
+        show here; a separate task would run in a copied context. Raised from backend
+        resolution, not the L2 read: a miss reads L2 in its single-flight task, and
+        asyncio re-raises an interrupt from a task out of the event loop, not into
+        the awaiting caller.
+        """
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_provider.return_value.get_backend.side_effect = interrupt
+
+            @cache()
+            async def async_func(x):
+                return x * 2
+
+            with pytest.raises(interrupt):
+                await async_func(5)
+
         assert get_current_function_stats() is None
 
 
@@ -569,7 +552,6 @@ class TestAsyncContextLeaksIntegration:
 
         # No context leaks
         assert get_current_function_stats() is None
-        assert get_correlation_id() is None
 
     @pytest.mark.asyncio
     async def test_mixed_success_and_failure_no_leaks(self, async_mock_backend):
@@ -590,7 +572,6 @@ class TestAsyncContextLeaksIntegration:
 
         # No leaks after all operations
         assert get_current_function_stats() is None
-        assert get_correlation_id() is None
 
 
 # =============================================================================
@@ -935,4 +916,3 @@ class TestAsyncWrapperCacheSetError:
 
         # Context should be clean
         assert get_current_function_stats() is None
-        assert get_correlation_id() is None

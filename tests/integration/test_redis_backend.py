@@ -851,3 +851,139 @@ class TestRedisBinaryRoundtrip(RedisIsolationMixin):
         finally:
             rc._pool_instance = None
             reset_settings()
+
+
+@pytest.fixture
+def tcp_redis_url(request):
+    """TCP URL of the test Redis: CI's external service, else the pytest-redis process's port."""
+    import os
+
+    proc = request.getfixturevalue("redis_noproc" if os.environ.get("REDIS_URL") else "redis_proc")
+    return f"redis://{proc.host}:{proc.port}/0"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("keepalive", [True, False])
+class TestPoolSocketKeepaliveOnLiveTcpSocket:
+    """A connection checked out of each pool has SO_KEEPALIVE exactly as configured.
+
+    Proves the setting reaches the kernel, not just the pool kwargs. Asserts nonzero,
+    not == 1: BSD and macOS return the flag value.
+    """
+
+    @staticmethod
+    def _config(keepalive):
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        # The default arm uses the untouched default, so a changed default fails here too.
+        return RedisBackendConfig() if keepalive else RedisBackendConfig(socket_keepalive=False)
+
+    @staticmethod
+    def _assert_keepalive(sock, keepalive):
+        import socket
+
+        flag = sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        assert (flag != 0) is keepalive
+
+    def test_sync_pool(self, tcp_redis_url, keepalive):
+        from cachekit.backends.redis.client import create_connection_pool
+
+        pool = create_connection_pool(tcp_redis_url, self._config(keepalive))
+        conn = pool.get_connection()
+        try:
+            self._assert_keepalive(conn._sock, keepalive)
+        finally:
+            pool.release(conn)
+            pool.disconnect()
+
+    async def test_async_pool(self, tcp_redis_url, keepalive):
+        from cachekit.backends.redis.client import create_async_connection_pool
+
+        pool = create_async_connection_pool(tcp_redis_url, self._config(keepalive))
+        conn = await pool.get_connection()
+        try:
+            self._assert_keepalive(conn._writer.get_extra_info("socket"), keepalive)
+        finally:
+            await pool.release(conn)
+            await pool.disconnect()
+
+
+@pytest.mark.integration
+class TestExhaustedPoolWaitsForAConnection:
+    """An exhausted sync pool waits up to socket_timeout for a connection instead of raising at once.
+
+    Async decorated calls run their L2 get/set on default-executor threads that share one
+    sync pool, so a burst wider than the pool is ordinary load, not a fault.
+    """
+
+    @staticmethod
+    def _backend(url, **knobs):
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        return RedisBackend(RedisBackendConfig(redis_url=url, **knobs))
+
+    def test_waiting_operation_succeeds_once_the_connection_is_released(self, tcp_redis_url):
+        from concurrent.futures import ThreadPoolExecutor, wait
+
+        backend = self._backend(tcp_redis_url, connection_pool_size=1, socket_timeout=5.0)
+        pool = backend._client_provider._pool
+        held = pool.get_connection()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                pending = executor.submit(lambda: backend.set("pool:wait", b"v") or backend.get("pool:wait"))
+                done, _ = wait([pending], timeout=0.3)
+                assert not done, "the operation raised or ran instead of waiting for the held connection"
+            finally:
+                pool.release(held)
+            assert pending.result(timeout=5) == b"v"
+
+    def test_connection_held_past_the_timeout_fails_as_backend_error(self, tcp_redis_url):
+        import time
+
+        backend = self._backend(tcp_redis_url, connection_pool_size=1, socket_timeout=0.3)
+        pool = backend._client_provider._pool
+        held = pool.get_connection()
+        try:
+            start = time.monotonic()
+            with pytest.raises(BackendError):
+                backend.get("pool:timeout")
+            assert time.monotonic() - start >= 0.3
+        finally:
+            pool.release(held)
+
+    @pytest.mark.parametrize("calls", [20, 64])
+    async def test_concurrent_async_calls_do_not_exhaust_the_default_pool(self, tcp_redis_url, calls, caplog, monkeypatch):
+        """20 exceeds the old default of 10; 64 exceeds the new default of 50 and must wait, not raise."""
+        import logging
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from cachekit import cache
+
+        monkeypatch.delenv("CACHEKIT_CONNECTION_POOL_SIZE", raising=False)
+        # One executor thread per call, so every L2 operation is in flight at once whatever the host's CPU count.
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=calls))
+        backend = RedisBackend(redis_url=tcp_redis_url)
+
+        # A loopback GET returns its connection in ~100 us, before the next call checks one out.
+        # Hold each checkout for one 50 ms round trip, as a remote Redis would, so the calls overlap.
+        pool = backend._client_provider._pool
+        checkout = pool.get_connection
+
+        def checkout_one_rtt_away(*args, **kwargs):
+            conn = checkout(*args, **kwargs)
+            time.sleep(0.05)
+            return conn
+
+        monkeypatch.setattr(pool, "get_connection", checkout_one_rtt_away)
+
+        @cache(backend=backend, ttl=60)
+        async def compute(x):
+            await asyncio.sleep(0.05)
+            return x
+
+        with caplog.at_level(logging.ERROR):
+            results = await asyncio.gather(*(compute(1) for _ in range(calls)))
+
+        assert results == [1] * calls
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []

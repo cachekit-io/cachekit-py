@@ -62,9 +62,11 @@ These functions are provided for documentation examples and return mock data:
 #### Configuration
 - `secret_key` - Test encryption key (value: `"a" * 64`). `@cache.secure` examples must
   pass it explicitly (`master_key=secret_key`); the conftest does **not** set
-  `CACHEKIT_MASTER_KEY` in the environment because an ambient key can still auto-activate
-  encryption (deprecated) and breaks plain `@cache` fences that use `serializer="auto"` or custom
-  serializers.
+  `CACHEKIT_MASTER_KEY` in the environment because an ambient key makes every fence that
+  states no encryption intent raise `ConfigurationError` at decoration.
+- `master_key_env` - opt-in pytest fixture for a fence that binds its own key the way an
+  application does (`secret_key = os.environ["CACHEKIT_MASTER_KEY"]`). Request it in the info
+  string, `` ```python fixture:master_key_env ``; it sets `CACHEKIT_MASTER_KEY` for that fence only.
 
 ## Skipping Examples with `notest`
 
@@ -101,18 +103,20 @@ Before submitting documentation changes, test your examples:
 
 ### Quick Test (Quiet Mode)
 ```bash
-pytest --markdown-docs docs/ -q
+pytest --markdown-docs README.md docs/ -q
 ```
 
 ### Verbose Test (Detailed Output)
 ```bash
-pytest --markdown-docs docs/ -v
+pytest --markdown-docs README.md docs/ -v
 ```
 
 ### Test Specific File
 ```bash
 pytest --markdown-docs docs/getting-started.md -v
 ```
+
+`README.md` fences get their globals (`cache`, `secret_key`, stubs) from `docs/conftest.py`, so run the README together with `docs/` as above — on its own it fails with `NameError`s.
 
 ### Using Make Targets
 ```bash

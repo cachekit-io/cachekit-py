@@ -25,7 +25,7 @@ class MemcachedBackendConfig(BaseBackendConfig):
         connect_timeout: Connection timeout in seconds.
         timeout: Operation timeout in seconds.
         max_pool_size: Maximum connections per server.
-        retry_attempts: Number of retries on transient failures.
+        retry_attempts: Failures pymemcache's HashClient allows a server before marking it dead.
         key_prefix: Optional prefix prepended to all cache keys.
 
     Examples:
@@ -73,13 +73,16 @@ class MemcachedBackendConfig(BaseBackendConfig):
         default=10,
         ge=1,
         le=100,
-        description="Maximum connections per server",
+        description=(
+            "Maximum pooled connections per server, i.e. concurrent operations per server per "
+            "process. The pool does not wait: an operation beyond this limit raises a TRANSIENT BackendError."
+        ),
     )
     retry_attempts: int = Field(
         default=2,
         ge=0,
         le=10,
-        description="Retries on transient failures",
+        description="Failures pymemcache's HashClient allows a server before marking it dead",
     )
     key_prefix: str = Field(
         default="",
@@ -112,16 +115,17 @@ class MemcachedBackendConfig(BaseBackendConfig):
         """
         if not v:
             raise ValueError("At least one Memcached server must be specified")
-        for server in v:
+        # Messages name the entry by index, never quote it: a malformed entry may carry a credential.
+        for i, server in enumerate(v):
             if ":" not in server:
-                raise ValueError(f"Server address must be in 'host:port' format, got: {server!r}")
+                raise ValueError(f"servers[{i}]: address must be in 'host:port' format")
             _, port_str = server.rsplit(":", 1)
             try:
                 port = int(port_str)
             except ValueError:
-                raise ValueError(f"Port must be numeric, got: {server!r}") from None
+                raise ValueError(f"servers[{i}]: port must be numeric") from None
             if not (1 <= port <= 65535):
-                raise ValueError(f"Port must be 1-65535, got {port} in {server!r}")
+                raise ValueError(f"servers[{i}]: port must be 1-65535")
         return v
 
     @classmethod

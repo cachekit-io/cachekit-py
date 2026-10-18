@@ -15,11 +15,14 @@ import asyncio
 import logging
 import threading
 from typing import Optional
+from urllib.parse import urlparse
 
 import redis
 import redis.asyncio as redis_async
+from pydantic import SecretStr
 
 from cachekit.backends.redis.config import RedisBackendConfig
+from cachekit.config.validation import hide_secret, reveal_secret
 
 _logger = logging.getLogger(__name__)
 
@@ -60,40 +63,67 @@ def _resolve_max_connections(override: Optional[int], cfg: RedisBackendConfig) -
     return override
 
 
+def _tcp_only_kwargs(redis_url: SecretStr, cfg: RedisBackendConfig) -> dict[str, bool]:
+    """Pool kwargs that only TCP connections accept.
+
+    redis-py's from_url builds a UnixDomainSocketConnection for exactly the unix
+    scheme, and that class raises TypeError on socket_keepalive, with either
+    value, every time the pool makes a connection. The URL arrives wrapped: urlparse can raise on it.
+    """
+    if urlparse(redis_url.get_secret_value()).scheme == "unix":
+        return {}
+    return {"socket_keepalive": cfg.socket_keepalive}
+
+
 def create_connection_pool(
-    redis_url: str,
+    redis_url: str | SecretStr,
     config: Optional[RedisBackendConfig] = None,
     max_connections: Optional[int] = None,
-) -> redis.ConnectionPool:
+) -> redis.BlockingConnectionPool:
     """Create a sync connection pool bound to an explicit URL.
 
     Single source of truth for pool kwargs: every sync pool in cachekit is
-    built here so binary-safety (decode_responses=False) and finite socket
+    built here so binary-safety (decode_responses=False), finite socket
     timeouts (fail fast on an unreachable Redis instead of blocking on the
-    OS TCP timeout) apply uniformly.
+    OS TCP timeout) and the configured TCP keepalive apply uniformly.
+
+    The pool blocks: when every connection is checked out, an operation waits
+    up to the effective socket_timeout for one to be released, then fails
+    with a redis ConnectionError. Executor threads share this pool, so a
+    burst wider than it is ordinary load; a non-blocking pool would turn it
+    into errors and cache misses. A caller on an event loop must not run a
+    command from this pool on the loop thread: the wait would stall the loop.
 
     Args:
-        redis_url: Redis connection URL the pool is bound to
+        redis_url: Redis connection URL the pool is bound to. Its query
+            options (e.g. ?socket_timeout=1) override the config-derived
+            kwargs below: redis-py's from_url lets querystring arguments win.
         config: Pool tuning knobs; defaults to env-derived config. Its
             redis_url field is ignored — the explicit URL argument wins.
         max_connections: Override for config.connection_pool_size
 
     Returns:
-        redis.ConnectionPool bound to redis_url (no connection is made here;
-        the pool connects lazily on first use)
+        redis.BlockingConnectionPool bound to redis_url (no connection is made
+        here; the pool connects lazily on first use)
     """
+    redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inline (CWE-532)
     cfg = config or RedisBackendConfig.from_env()
-    return redis.ConnectionPool.from_url(
-        redis_url,
+    pool = redis.BlockingConnectionPool.from_url(
+        reveal_secret(redis_url),
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
         max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
+        **_tcp_only_kwargs(redis_url, cfg),
     )
+    # Wait for a free connection no longer than one socket operation may take. Read the
+    # effective value back from the pool: a ?socket_timeout= query option overrides cfg.
+    pool.timeout = pool.connection_kwargs["socket_timeout"]
+    return pool
 
 
 def create_async_connection_pool(
-    redis_url: str,
+    redis_url: str | SecretStr,
     config: Optional[RedisBackendConfig] = None,
     max_connections: Optional[int] = None,
 ) -> redis_async.ConnectionPool:
@@ -101,13 +131,15 @@ def create_async_connection_pool(
 
     Async twin of create_connection_pool() — same kwargs, same rationale.
     """
+    redis_url = hide_secret(redis_url)
     cfg = config or RedisBackendConfig.from_env()
     return redis_async.ConnectionPool.from_url(
-        redis_url,
+        reveal_secret(redis_url),
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
         max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
+        **_tcp_only_kwargs(redis_url, cfg),
     )
 
 

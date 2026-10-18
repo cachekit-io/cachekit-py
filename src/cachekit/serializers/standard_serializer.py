@@ -27,7 +27,25 @@ import msgpack
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
+from .base import (
+    PAYLOAD_DECODE_ERRORS,
+    SerializationError,
+    SerializationFormat,
+    SerializationMetadata,
+    immutable_buffer,
+    unpackb_bounded,
+)
+
+# Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
+# marker: bin8/16/32 in the current encoding, an int array (fixarray, array16, array32) in the legacy one.
+_BIN_PAYLOAD_MARKERS = frozenset((0xC4, 0xC5, 0xC6))
+_LEGACY_PAYLOAD_MARKERS = frozenset((*range(0x90, 0xA0), 0xDC, 0xDD))
+_ENVELOPE_PAYLOAD_MARKERS = _BIN_PAYLOAD_MARKERS | _LEGACY_PAYLOAD_MARKERS
+# Largest declared payload an integrity-off reader verifies; verifying costs a full decompress (see deserialize).
+_ENVELOPE_PROBE_MAX_SIZE = 256 * 1024
+# lz4_flex's get_maximum_output_size for that budget: the most compressed bytes any envelope within it carries.
+_ENVELOPE_PROBE_MAX_COMPRESSED = 20 + _ENVELOPE_PROBE_MAX_SIZE * 110 // 100
+_CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -139,7 +157,11 @@ def _standard_object_hook(obj: Any) -> Any:
     Returns:
         Restored Python object or original obj if not a datetime marker
     """
-    if isinstance(obj, dict):
+    # msgpack calls this once per decoded map. Every marker has exactly two keys (sentinel and
+    # value, as _standard_default writes them), so the length check returns any other map without
+    # the .get() calls. Keep it inline: a wrapper call costs more than it saves on text-heavy values.
+    # AutoSerializer's hook must not copy it: its set and ndarray markers have 3 and 4 keys.
+    if isinstance(obj, dict) and len(obj) == 2:
         if obj.get("__datetime__"):
             value = obj.get("value")
             if value is None:
@@ -226,7 +248,8 @@ class StandardSerializer:
         TypeError: StandardSerializer does not support NumPy arrays...
     """
 
-    # MessagePack is a language-agnostic wire format — safe under encryption for cross-SDK reads.
+    # Safe under encryption (ENC-2): configuration (enable_integrity_checking), not the bytes, fixes the
+    # container it decodes after decryption.
     cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, enable_integrity_checking: bool = True):
@@ -243,8 +266,9 @@ class StandardSerializer:
         """
         self.enable_integrity_checking = enable_integrity_checking
 
-        if self.enable_integrity_checking:
-            self._byte_storage = ByteStorage("msgpack")
+        # Built with integrity off too: that reader verifies a would-be envelope before refusing
+        # it (see deserialize Raises:). Writes still gate on the flag.
+        self._byte_storage = ByteStorage("msgpack")
 
         # MessagePack configuration for cross-language compatibility
         self._msgpack_pack_opts = {
@@ -313,18 +337,27 @@ class StandardSerializer:
 
         Args:
             data: Bytes from serialize() (with or without ByteStorage envelope)
-            metadata: Optional metadata. Only ``compressed`` is read: with integrity checking
-                off, an entry the writer enveloped (``compressed=True``) is rejected rather
-                than decoded as plain MessagePack (see Raises).
+            metadata: Optional metadata. Only ``compressed`` and ``encrypted`` are read (see Raises).
 
         Returns:
             Deserialized Python object
 
         Raises:
             SerializationError: If data is malformed, not valid MessagePack, or integrity check
-                fails; also, with integrity checking off, if ``metadata.compressed`` says the
-                writer enveloped the entry — this reader has no ByteStorage to verify or unwrap
-                it, and unpackb on the envelope bytes would return its fields as the value.
+                fails. With integrity checking off, also if the entry is a ByteStorage envelope,
+                which this reader does not unwrap: ``metadata.compressed`` says so, or the bytes
+                have the layout ByteStorage writes, declare at most 256 KiB, and pass
+                ``ByteStorage.retrieve()``. Shape alone never refuses a value, unlike
+                :class:`AutoSerializer`: the docs send users here to escape that refusal, and a
+                look-alike cannot match the checksum by chance. So without a ``compressed=True``
+                header, a rotted envelope, one declaring more than 256 KiB, and one in another
+                layout come back decoded as their fields, and a value equal to a valid envelope's
+                fields (declaring at most 256 KiB) is refused on every plaintext read. A read with
+                ``metadata.encrypted`` (decrypted by :class:`EncryptionWrapper`, whose AAD binds
+                ``compressed``) probes only the legacy int-array layout, which AutoSerializer before
+                0.12.0 sealed under ``compressed=False``. So a value equal to a current (bin) envelope's
+                fields comes back there, while ``compressed=True`` and a legacy envelope declaring at
+                most 256 KiB still refuse; a larger legacy envelope comes back as its fields.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -339,21 +372,44 @@ class StandardSerializer:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
                 msgpack_data, _ = self._byte_storage.retrieve(data)
-            else:
-                # No ByteStorage — an enveloped entry cannot be verified or unwrapped here (see Raises).
-                if metadata is not None and metadata.compressed:
-                    raise SerializationError(
-                        "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
-                    )
-                msgpack_data = data
-
-            # Deserialize MessagePack
-            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+                return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+            # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
+            if metadata is not None and metadata.compressed:
+                raise SerializationError(_CROSS_CONFIG_ERROR)
+            data = immutable_buffer(data)  # the decode and the envelope probe must judge one snapshot
+            value = unpackb_bounded(data, **self._msgpack_unpack_opts)
+            # A decrypted read probes only the legacy layout. The AAD binds compressed, and the one writer
+            # that sealed an envelope under compressed=False (AutoSerializer before 0.12.0) predates bin.
+            decrypted = metadata is not None and metadata.encrypted
+            markers = _LEGACY_PAYLOAD_MARKERS if decrypted else _ENVELOPE_PAYLOAD_MARKERS
+            if self._is_verified_envelope(data, value, markers):
+                raise SerializationError(_CROSS_CONFIG_ERROR)
+            return value
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
+
+    def _is_verified_envelope(self, data: bytes | memoryview, value: Any, markers: frozenset[int]) -> bool:
+        """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope whose payload marker
+        is in ``markers`` and that passes ``retrieve()``."""
+        # Necessary conditions, never a verdict. The layout test spares ordinary reads the attempt. The
+        # size caps bound it: retrieve() copies the whole payload slot and decompresses the whole declared
+        # payload before it checks the checksum, and a caller can cache a value shaped like a large
+        # envelope. A 0x94 lead that decoded is a 4-element list whose slot 0 is bytes or a list, so
+        # value[2] is the declared original_size and len(value[0]) the compressed length.
+        if len(data) < 2 or data[0] != 0x94 or data[1] not in markers:
+            return False
+        if not isinstance(value[2], int) or value[2] > _ENVELOPE_PROBE_MAX_SIZE:
+            return False
+        if len(value[0]) > _ENVELOPE_PROBE_MAX_COMPRESSED:
+            return False
+        try:
+            self._byte_storage.retrieve(data)
+        except Exception:  # any failure (not an envelope, checksum, size) means "not verified"
+            return False
+        return True
 
 
 # Default instance for convenience

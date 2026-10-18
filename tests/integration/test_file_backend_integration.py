@@ -3,7 +3,7 @@
 Tests for backends/file/backend.py covering real-world scenarios:
 - Concurrent thread access without corruption
 - Atomic write guarantees (write-then-rename)
-- LRU eviction under load
+- Oldest-written-first eviction under load
 - Decorator integration with FileBackend
 - Large value handling near limits
 - File permission enforcement
@@ -197,14 +197,14 @@ class TestAtomicWrites:
 
 @pytest.mark.integration
 class TestEvictionUnderLoad:
-    """Test LRU eviction behavior under load."""
+    """Test oldest-written-first eviction behavior under load."""
 
     def test_eviction_under_load(self, tmp_path: Path) -> None:
         """Test eviction triggers at 90% and evicts to 70%.
 
         Verifies:
         - Cache fills to 90% capacity
-        - LRU eviction triggered automatically
+        - Eviction triggered automatically
         - Cache reduced to 70% capacity
         - Oldest files (by mtime) evicted first
         """
@@ -254,7 +254,7 @@ class TestEvictionUnderLoad:
             f"Expected ~{expected_size} bytes, got {size_bytes_after}"
         )
 
-        # Verify oldest keys were evicted (LRU behavior)
+        # Verify oldest-written keys were evicted
         # The first few keys should be missing
         missing_count = 0
         for i in range(min(20, num_entries_85pct)):

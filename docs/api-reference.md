@@ -15,9 +15,9 @@
 
 ### `@cache` - Intelligent Cache (Recommended)
 
-**Primary Interface**: The intelligent cache decorator that automatically optimizes based on function analysis and intent. This is the main interface for cachekit.
+**Primary Interface**: The cache decorator, configured by preset (intent) or by explicit arguments. This is the main interface for cachekit.
 
-The `@cache` decorator provides intelligent configuration selection based on function analysis or explicit intent.
+The `@cache` decorator takes its configuration from a preset or from explicit arguments.
 
 ```python notest
 from cachekit import cache
@@ -31,7 +31,7 @@ def expensive_function():
 # These are decorator syntax examples showing different presets:
 @cache.minimal(backend=None)      # Speed-critical: trading, gaming, real-time
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
-@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY)
+@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY — see Encryption Parameters below)
 
 # Manual control when needed (1% of use cases)
 @cache(ttl=3600, namespace="custom", backend=None)
@@ -39,22 +39,16 @@ def custom_function():
     return do_expensive_computation()
 ```
 
-**Architecture**: The `@cache` decorator uses intelligent profile selection (fast/safe/secure) or auto-detection to configure caching behavior, then delegates to the wrapper factory for actual caching implementation.
+**Architecture**: The `@cache` decorator resolves its configuration from the preset and arguments, then delegates to the wrapper factory for actual caching implementation.
 
-**Intent-Based Profiles:**
+**Intent-Based Profiles.** On every profile below, a backend that is down or unreachable never raises: the call logs the failure and runs your function. What gets cached meanwhile is in [Connection Errors](error-codes.md#connection-errors).
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
 - **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, backpressure, monitoring)
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
-- **`@cache.dev`** - Development profile: Verbose logging, easy debugging, Prometheus disabled for simplicity
-- **`@cache.test`** - Testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
+- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, Prometheus metrics disabled except `circuit_breaker_state`
+- **`@cache.test`** - SDK-local, Python-only testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
 - **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
-- **`@cache`** - Auto-detection: Analyzes function name and signature to select optimal profile
-
-**Implementation Details:**
-- Function analysis detects security-sensitive names (`user`, `auth`, `payment`, etc.) → secure profile (EncryptionWrapper)
-- High-frequency function patterns (`get`, `calc`, `compute`, etc.) → fast profile (StandardSerializer with optimizations)
-- All other functions → default balanced profile (StandardSerializer)
-- Manual overrides always take precedence over auto-detection
+- **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
 
 ### `@cache(...)` - Manual Configuration
 
@@ -78,7 +72,7 @@ from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, Backpres
     l1=L1CacheConfig(enabled=True),
     circuit_breaker=CircuitBreakerConfig(enabled=True),
     backpressure=BackpressureConfig(max_concurrent_requests=100),
-    monitoring=MonitoringConfig(collect_stats=True, enable_tracing=True),
+    monitoring=MonitoringConfig(collect_stats=True),
 )
 def your_function(args):
     return do_expensive_computation()
@@ -86,26 +80,26 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
+- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
-- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption)
-- **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
+- **`integrity_checking`** (`bool`, default: `True`; any non-bool raises `ConfigurationError`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Behaviour when a writer and reader disagree on this flag: [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
+- **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`. The stored key is `{16 hex}-{namespace or default}:{returned str}`, the 16 hex a hash of the function's `module.qualname`, so two functions share an entry only if they share a `module.qualname` and their `{namespace}:{returned str}` is the same ([upgrade note](features/l1-invalidation.md#upgrading-custom-key-keys-carry-the-functions-identity))
 
 #### Performance Parameters
 
-- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on cache hits when below threshold
+- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on async L2 hits when below threshold, in the background (no extra round trip on the hit). On CachekitIO the threshold is checked against the hit's remaining freshness; see [CachekitIO TTL inspection](backends/cachekitio.md#ttl-inspection-async-only)
 - **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Minimum remaining TTL fraction (0.0–1.0) to trigger refresh
 - **`l1`** (`L1CacheConfig`, default: `L1CacheConfig()`) - L1 in-memory cache configuration
 
 #### Reliability Parameters
 
-- **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`. Today only `failure_threshold` changes decorator behaviour: an OPEN circuit on the `@cache` path does not currently leave OPEN on its own, so the three recovery settings are reported but have no effect yet (see the limitation in [Circuit Breaker](features/circuit-breaker.md)):
+- **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`:
   - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
-  - `failure_threshold` (`int`, default: `5`) - Consecutive failures before opening circuit
+  - `failure_threshold` (`int`, default: `5`) - Failures within a 60 s rolling window that open the circuit; successes do not reset the count
   - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
-  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `>= 0`
-  - `half_open_requests` (`int`, default: `1`) - Total probe requests admitted per half-open cycle (not a concurrency limit)
+  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
+  - `half_open_requests` (`int`, default: `3`) - Probe slots per half-open cycle (not a concurrency limit). Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
@@ -116,13 +110,16 @@ def your_function(args):
 
 - **`monitoring`** (`MonitoringConfig`, default: `MonitoringConfig()`) - Observability configuration:
   - `collect_stats` (`bool`, default: `True`) - Collect cache hit/miss statistics
-  - `enable_tracing` (`bool`, default: `True`) - Enable distributed tracing
-  - `enable_structured_logging` (`bool`, default: `True`) - Enable structured JSON logging
+  - `enable_structured_logging` (`bool`, default: `True`) - Log cache operations at INFO, with their fields on each record ([Structured Logging](#structured-logging))
   - `enable_prometheus_metrics` (`bool`, default: `True`) - Export Prometheus metrics
 
 #### Encryption Parameters
 
-- **`encryption`** (`EncryptionConfig`, default: `EncryptionConfig()`) - Client-side encryption configuration (use `@cache.secure` preset instead of configuring directly)
+- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset (no `encryption=`, or an `EncryptionConfig` without `enabled=`) is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`), so with the variable set every plaintext cache states `encryption=False` (`@cache.local` takes no `encryption=` and never raises) ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)). `@cache.secure` is the preset spelling; it sets its own encryption, so `encryption=` raises `ConfigurationError` there and beside any encrypted `config=` ([details](error-codes.md#keyword-overrides-a-presets-encryption-or-backend))
+
+A keyword that none of these parameters names raises `ConfigurationError` when the decorator is applied, on `@cache`, on every preset but `@cache.local` and beside `config=` ([details](error-codes.md#unsupported-keyword-argument)).
+
+`master_key=` (on `@cache` and `@cache.secure`) takes a hex string. A bytes key raises `TypeError` when the decorator is applied: pass `key.hex()` ([details](error-codes.md#bytes-key-where-a-hex-string-is-taken)).
 
 #### Returns
 - Cached function result or fresh computation result
@@ -137,7 +134,7 @@ from cachekit import cache
 # First, set environment variable:
 # export REDIS_URL="redis://localhost:6379"
 
-@cache  # Auto-detects optimal configuration
+@cache  # Baseline: defaults, plaintext
 def analyze_dataset(dataset_id, filters=None):
     """Analyze large dataset with automatic caching."""
     return perform_analysis(dataset_id, filters)
@@ -146,7 +143,7 @@ def analyze_dataset(dataset_id, filters=None):
 def critical_business_function():
     return important_computation()
 
-@cache.dev  # Development: verbose logging, no Prometheus
+@cache.dev  # Development: verbose logging, no Prometheus except circuit_breaker_state
 def debug_function():
     return process_data()
 
@@ -192,7 +189,6 @@ def critical_business_logic():
 | `CACHEKIT_API_KEY` | **Yes** | — | API key (`ck_live_...`) for authentication |
 | `CACHEKIT_API_URL` | No | `https://api.cachekit.io` | API endpoint override |
 | `CACHEKIT_TIMEOUT` | No | `5.0` | HTTP request timeout in seconds |
-| `CACHEKIT_MAX_RETRIES` | No | `3` | Maximum retry attempts for transient errors |
 
 #### Usage
 
@@ -216,12 +212,13 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains whitespace, `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key is not an RFC 6750 bearer token ([rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed. `@cache(config=DecoratorConfig.io(...))` refuses `backend=` too
 
 #### Notes
 
 - Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
 - L1 in-memory cache is enabled — hot data is served at ~50ns without an HTTP round-trip
+- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` disables both expiry and SWR.
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
 ### Health Check Methods
@@ -324,12 +321,6 @@ Non-blocking metrics collection system that prevents performance degradation:
 - Self-healing worker thread management
 - Zero impact on critical path latency
 
-#### `RedisErrorClassifier`
-Intelligent error categorization for circuit breaker decisions:
-- Distinguishes transient vs. permanent failures
-- Prevents application errors from triggering circuit breaker
-- Enables targeted recovery strategies
-
 #### `get_cached_redis_client()`
 Thread-local Redis client caching (`cachekit.backends.redis.client`):
 - Eliminates repeated client creation overhead
@@ -379,8 +370,8 @@ Does your app need multi-language cache access (PHP/JS/Java/etc)?
     │   ├─ NumPy/UUID/set → Use AutoSerializer
     │   │   └─ Example: @cache(serializer="auto")
     │   │
-    │   └─ Large DataFrames (10K+ rows)?
-    │       └─ Use ArrowSerializer (6-23x faster)
+    │   └─ DataFrames?
+    │       └─ Use ArrowSerializer
     │       └─ Example: @cache(serializer="arrow")
     │
     └─ JSON API responses / JSON-heavy workloads?
@@ -433,12 +424,14 @@ result = compute_results(123)  # Multi-language compatible
 - Collections: `list`, `tuple`, `dict`
 - Dates: `datetime`, `date`, `time` (ISO-8601 format via MessagePack extension)
 
-**Explicitly NOT supported** (raises `TypeError`):
+**Explicitly NOT supported**:
 - NumPy arrays → Use `serializer="auto"`
 - pandas DataFrames/Series → Use `serializer="arrow"`
 - UUID, set, frozenset → Use `serializer="auto"`
 - Pydantic models, ORM models → Convert to dict first
 - Custom classes → Convert to dict first
+
+With a backend, a decorated call that returns one of these does not raise. It returns the result, caches nothing, and logs an ERROR and a WARNING on every call; see [Troubleshooting → Serialization Failures](troubleshooting.md#common-errors). Only interop mode raises, with `InteropError`. Calling `StandardSerializer.serialize` directly raises `TypeError`.
 
 ### Using AutoSerializer (Python-Only)
 
@@ -491,14 +484,14 @@ response = fetch_api_response("/users/123")
 
 ### Using ArrowSerializer (DataFrame-Optimized)
 
-Use ArrowSerializer for large DataFrames (10K+ rows):
+Use ArrowSerializer for DataFrames:
 
 ```python notest
 from cachekit import cache
 from cachekit.serializers import ArrowSerializer
 import pandas as pd
 
-# ArrowSerializer for DataFrames (6-23x faster for large data)
+# ArrowSerializer for DataFrames
 @cache(serializer="arrow", ttl=7200, backend=None)
 def load_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")  # illustrative - file may not exist
@@ -513,10 +506,7 @@ def load_polars_data():
     return pl.read_csv("data.csv")
 ```
 
-**Performance**:
-- **10K rows**: 5.0x faster than StandardSerializer
-- **100K rows**: 9.6x faster than StandardSerializer
-- **1M rows**: 20x+ faster than StandardSerializer
+**Performance**: StandardSerializer does not accept DataFrames. For encoded sizes and instruction counts measured on a real 12,535-row dataset, see [ArrowSerializer: Performance on Real Data](serializers/arrow.md#performance-on-real-data).
 
 > [!CAUTION]
 > ArrowSerializer is **NOT PHP-compatible**. Use StandardSerializer or OrjsonSerializer if you need PHP support.
@@ -567,9 +557,9 @@ def get_data():
 
 See [Changing Serializers](serializers/README.md#changing-serializers-separate-keyspaces)
 for the code table, the cold-cache warning, and the data-retention caveat on orphaned entries.
-Upgrading from v0.18 or earlier? Keys for non-default serializers change identity without any
+Upgrading from v0.19 or earlier? Keys for non-default serializers change identity without any
 change on your side — see
-[Breaking change in v0.19.0](serializers/README.md#breaking-change-in-v0190-the-key-carries-the-real-serializer).
+[Breaking change in v0.20.0](serializers/README.md#breaking-change-in-v0200-the-key-carries-the-real-serializer).
 
 **Best Practice**: Use namespace versioning for zero-downtime migrations:
 
@@ -594,14 +584,10 @@ def get_user_data_v2(user_id):
 Configuration class for backend-agnostic cache settings. Based on `pydantic-settings` for automatic environment variable loading with the `CACHEKIT_` prefix. Redis connection settings (URL, pool size, timeouts) live on `RedisBackendConfig`, not here.
 
 **Key Fields:**
-- **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
-- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
-- **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection (env: `CACHEKIT_ENABLE_PROMETHEUS_METRICS`)
-- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` (env: `CACHEKIT_MASTER_KEY`)
-
-**Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
+- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB. With a backend, a single value larger than an eighth of it is not kept in L1: it is served from L2, or recomputed if L2 did not store it (env: `CACHEKIT_L1_MAX_SIZE_MB`)
+- **`invalidation_listener_enabled`** (`bool`, default: `False`) - Run the cross-process L1 invalidation listener in this process: one thread and one Redis connection that evict this process's L1 copies of keys other processes invalidate; tenant-scoped Redis backend only (env: `CACHEKIT_INVALIDATION_LISTENER_ENABLED`). See [Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction)
+- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 
 #### Example
 ```python
@@ -611,7 +597,7 @@ from cachekit.config import get_settings
 config = get_settings()
 ```
 
-**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
+**Note:** Configuration is typically loaded automatically via environment variables. The SDK reads only `get_settings()`, which it builds from the environment; a `CachekitConfig(...)` you construct yourself configures nothing. TTL is not a `CachekitConfig` field — see [Default TTL](configuration.md#intent-presets).
 
 
 ---
@@ -623,27 +609,45 @@ The library includes intelligent error classification to distinguish between tra
 > [!NOTE]
 > For detailed error information, solutions, and troubleshooting, see:
 > - **[Troubleshooting Guide](troubleshooting.md)** - Common errors and solutions
-> - **[Error Codes Reference](error-codes.md)** - Complete error code catalog
+> - **[Error Reference](error-codes.md)** - Error types, causes and fixes
 
 ### Error Categories
 
-1. **Transient Errors** (trigger circuit breaker):
-   - `ConnectionError`, `TimeoutError` - Network issues
-   - `BusyLoadingError`, `TryAgainError` - Redis temporarily unavailable
-   - `ConnectionPoolError` - Pool exhausted
+The tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`) wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`; a `RedisBackend` you construct yourself reports every failure as `UNKNOWN`. The checks run in this order, and the first one an exception matches sets its category. A class can therefore land in a different category from its parent: `AuthenticationError` subclasses `ConnectionError`, and `NoPermissionError`, `ReadOnlyError`, `ClusterDownError` and `TryAgainError` subclass `ResponseError`.
 
-2. **Permanent Errors** (don't trigger circuit breaker):
-   - `AuthenticationError` - Wrong credentials
-   - `DataError`, `InvalidResponse` - Protocol issues
-   - `LockError` - Lock acquisition failures
+1. **`AUTHENTICATION`**:
+   - `redis.exceptions.AuthenticationError`, `redis.exceptions.NoPermissionError` - Wrong credentials or missing ACL permission
 
-3. **Application Errors** (ignored by circuit breaker):
-   - User code exceptions
-   - Business logic errors
+2. **`TIMEOUT`**:
+   - `redis.exceptions.TimeoutError` - Operation exceeded its time limit
+
+3. **`TRANSIENT`**:
+   - `redis.exceptions.ConnectionError` - Network issues; includes `redis.exceptions.MaxConnectionsError` (connection pool exhausted)
+   - `redis.exceptions.BusyLoadingError` - Redis is still loading its dataset into memory
+   - `redis.exceptions.ReadOnlyError` - A read-only replica rejected a write, during failover or because writes are routed to a replica
+   - `redis.exceptions.ClusterDownError`, `redis.exceptions.TryAgainError` - Cluster failover or resharding
+
+4. **`PERMANENT`**:
+   - `redis.exceptions.ResponseError`, `redis.exceptions.DataError`, `redis.exceptions.InvalidResponse` - Client input or configuration, command, or protocol errors
+   - `redis.exceptions.LockError` - Lock acquisition failures
+
+5. **`UNKNOWN`**: any other exception
+
+For a redis-py failure, either backend keeps only the exception's class, never the exception: the `BackendError`'s `original_exception`, which is also its `__cause__`, is a `RedisClientError` (`cachekit.backends.redis.error_handler`) whose `exc_type` is that class. The exception is dropped because its traceback holds the Redis password (see [SECURITY.md](../SECURITY.md#cache-key-redaction-in-logs-cwe-532)). Two causes are kept whole instead: an exception your own code raises inside `acquire_lock` or `with_timeout`, and a `BackendError` cachekit raises itself, such as for a reply of the wrong type. So check the cause's type before reading `exc_type`:
+
+```python
+import redis
+
+from cachekit.backends.redis.error_handler import RedisClientError, classify_redis_error
+
+err = classify_redis_error(redis.exceptions.AuthenticationError("WRONGPASS"), operation="get")  # what a failed get raises
+cause = err.original_exception
+assert isinstance(cause, RedisClientError) and issubclass(cause.exc_type, redis.exceptions.AuthenticationError)
+```
 
 ### Connection Failures
 When Redis is unavailable:
-1. Function executes without caching
+1. Function executes. Its result is still stored in L1, unless Redis was already down when the backend was first built: then nothing is cached (see [Connection Errors](error-codes.md#connection-errors))
 2. Warning is logged (if logging configured)
 3. No exception is raised to the caller
 
@@ -664,13 +668,7 @@ For comprehensive backend guide with examples and implementation patterns, see *
 
 ### Backend Resolution Priority
 
-When `@cache` is used without an explicit `backend` parameter, resolution follows this priority:
-
-1. **Explicit backend** — `@cache(backend=...)`, then a backend inside `config=`
-2. **Module-level default** — `set_default_backend(...)`
-3. **Environment auto-detection** — `CACHEKIT_API_KEY`, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR`, with `REDIS_URL` as a fallback
-
-Examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
+Resolution order, examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
 
 ### L1-Only Mode (No Backend)
 
@@ -699,12 +697,11 @@ cachekit is configured through environment variables. For detailed setup and tro
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
 
 # Cache Behavior
-CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
-# Encryption (for @cache.secure)
-CACHEKIT_MASTER_KEY=<hex-encoded-32-bytes-minimum>
+# Encryption key for @cache.secure / encryption=True (a key source, not a switch)
+CACHEKIT_MASTER_KEY=<hex-encoded-key; use exactly 32 bytes>
 
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0
@@ -751,8 +748,8 @@ scrape or external dependency required. `CacheInfo` is exported from the top-lev
 
 | Field | Type | Meaning |
 |:------|:-----|:--------|
-| `hits` | `int` | Total cache hits (L1 + L2) |
-| `misses` | `int` | Total cache misses |
+| `hits` | `int` | Total cache hits (L1 + L2). A call that joined another call's miss on the same key in this process and got its value counts as an L1 hit ([in-process single-flight](features/distributed-locking.md#in-process-single-flight-before-the-lock)) |
+| `misses` | `int` | Calls that ran the function because no cached value was found, sync or async. An async caller that waited on the distributed lock and then found the value counts as an L2 hit. A call that joined another call's miss counts as neither a hit nor a miss when that call raised |
 | `l1_hits` | `int` | L1 (in-memory) hits only |
 | `l2_hits` | `int` | L2 (backend) hits only |
 | `maxsize` | `int \| None` | Always `None` for external caches |
@@ -819,25 +816,35 @@ names carry no `cachekit_` prefix:
 
 - `cache_operations_total` - Operation counter. Labels: `operation`, `namespace`, `success`, `serializer`
 - `redis_cache_operations_total` - Load-control rejection counter. Labels: `operation`, `status`, `serializer`, `namespace`
-- `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`
-- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`
-- `circuit_breaker_state` - Circuit breaker state gauge (0=CLOSED, 1=OPEN, 2=HALF_OPEN). Labels: `namespace`, `state`
+- `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`. Buckets: 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, `+Inf`
+- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`. Buckets: powers of 4 from 16 to 268435456 (256 MiB), `+Inf`
+- `circuit_breaker_state` - Gauge: number of live circuit breakers in each state. Labels: `namespace`, `state` (`CLOSED`, `OPEN`, `HALF_OPEN`)
 
 The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
 preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
 emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
 rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
 
+Each histogram records one observation per operation whose value is above zero, so its `_count` can be
+lower than `cache_operations_total`. Releases before these bucket bounds used
+prometheus_client's default buckets, sized for seconds, so the `le` values changed: re-check dashboards
+and recording rules over the `_bucket` series. A p99 across all label tuples aggregates with
+`sum by (le)`:
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(cache_operation_duration_ms_bucket[5m])))
+```
+
 See the [Prometheus Metrics guide](features/prometheus-metrics.md) for exposition setup,
 query examples, and alerting rules.
 
 ### Structured Logging
 
-All operations include structured logging with:
-- Correlation IDs for request tracking
-- Operation context (namespace, cache key, serializer)
-- Performance metrics (duration, cache hit/miss)
-- Error classification and recovery actions
+cachekit writes structured records through Python's `logging`, so your handlers and levels decide what is kept.
+
+With `enable_structured_logging=True` (the default), these cache operations are logged at INFO on the `cachekit.decorators.orchestrator` logger: L1 and L2 hits of a sync function that has a backend, failed operations and circuit-breaker rejections. Each record's `structured` attribute holds the operation, the namespace and the redacted cache key, plus the duration, hit, serializer and error type where they apply. The message is plain text; your formatter decides whether those fields are rendered. The health checker behind `get_health_checker()`, `health_check_handler()` and `async_health_check_handler()` logs each full check it runs (`HealthLevel.FULL`, the default) the same way, at INFO on the `cachekit.health` logger, with the status, duration and component count, whatever `enable_structured_logging` says.
+
+SDK diagnostics, such as the CachekitIO backend's debug lines, are one JSON object per record on the `cachekit.logging` logger, with `timestamp`, `level`, `message`, `logger`, `hostname`, `pid` and `thread_id`. Each is written when it is logged, on the calling thread. DEBUG, INFO and WARNING records are sampled at `CACHEKIT_LOG_SAMPLING_RATE` (default `0.1`), and ERROR and CRITICAL records never are. A field value JSON cannot encode is written as its type name, such as `"<dict>"`, never as its text. Nothing is sampled or serialised below that logger's level. A child forked by Python (`os.fork()`, `multiprocessing`, Gunicorn, Celery) writes its own records, with its own `pid`. A child forked from C without Python's at-fork hooks (uWSGI without `--py-call-uwsgi-fork-hooks`) writes none, and no health-check record either: `logging`'s after-fork lock reset did not run there, so a lock a parent thread held at the fork would hang the call.
 
 ## Best Practices
 
@@ -884,7 +891,7 @@ def get_reference_data(): ...
 - [Backend Guide](backends/README.md) - Custom storage backend implementation
 - [Configuration Guide](configuration.md) - Environment variable setup and tuning
 - [Troubleshooting Guide](troubleshooting.md) - Debugging and error solutions
-- [Error Codes](error-codes.md) - Complete error code reference
+- [Error Reference](error-codes.md) - Error types, causes and fixes
 
 ### Architecture & Performance
 

@@ -2,22 +2,21 @@
 
 This module provides reusable fixtures for testing the cachekit Python SDK
 against the live SaaS backend (Worker API + Durable Objects).
+
+The target defaults to dev. The key comes only from the environment, under 1Password:
+
+    op run --env-file=<file with CACHEKIT_API_KEY=op://...> -- uv run pytest tests/integration/saas
+
+Without CACHEKIT_API_KEY every test here skips.
 """
 
 import os
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 import requests
-from dotenv import load_dotenv
 
-from .perf_stats import global_tracker
-
-# Load .env.dev for local development (auto-loads test API key)
-env_file = Path(__file__).parent / ".env.dev"
-if env_file.exists():
-    load_dotenv(env_file)
+DEV_API_URL = "https://api.dev.cachekit.io"
 
 # ============================================================================
 # Configuration Fixtures
@@ -30,10 +29,15 @@ def sdk_config():
 
     Returns:
         dict: Configuration with api_url, api_key, namespace
+
+    Skips the session when CACHEKIT_API_KEY is unset: no key means no backend to test, not a failure.
     """
+    api_key = os.getenv("CACHEKIT_API_KEY")
+    if not api_key:
+        pytest.skip("CACHEKIT_API_KEY is not set; run under `op run` with the dev key (see README.md)")
     return {
-        "api_url": os.getenv("CACHEKIT_API_URL", "http://localhost:8787"),
-        "api_key": os.getenv("CACHEKIT_API_KEY", "ck_sdk_test_key_here"),
+        "api_url": os.getenv("CACHEKIT_API_URL", DEV_API_URL).rstrip("/"),
+        "api_key": api_key,
         "namespace": os.getenv("CACHEKIT_NAMESPACE", "sdk_e2e_test"),
     }
 
@@ -47,13 +51,9 @@ def worker_health_check(sdk_config):
     try:
         response = requests.get(f"{sdk_config['api_url']}/health", timeout=5)
         if response.status_code != 200:
-            pytest.fail(
-                f"Worker health check failed: {response.status_code}\n"
-                f"URL: {sdk_config['api_url']}/health\n"
-                "Make sure Worker is running: cd saas && make dev"
-            )
+            pytest.fail(f"Worker health check failed: {response.status_code}\nURL: {sdk_config['api_url']}/health")
     except requests.exceptions.ConnectionError:
-        pytest.fail(f"Worker not running at {sdk_config['api_url']}\nStart Worker: cd saas && make dev")
+        pytest.fail(f"Worker not reachable at {sdk_config['api_url']}")
     except Exception as e:
         pytest.fail(f"Worker health check error: {e}")
 
@@ -78,7 +78,7 @@ def enforce_worker_availability(worker_health_check):
 
 
 @pytest.fixture
-def cache_io_decorator(sdk_config, worker_health_check):
+def cache_io_decorator(sdk_config, worker_health_check, monkeypatch):
     """Configured @cache.io decorator.
 
     Sets environment variables for SDK configuration and returns
@@ -91,9 +91,12 @@ def cache_io_decorator(sdk_config, worker_health_check):
     Returns:
         Callable: cache.io decorator
     """
-    # Set SDK environment variables
-    os.environ["CACHEKIT_API_URL"] = sdk_config["api_url"]
-    os.environ["CACHEKIT_API_KEY"] = sdk_config["api_key"]
+    # Set SDK environment variables. Only api.cachekit.io and api.staging.cachekit.io are on the
+    # SDK's host allowlist, so dev (or any other target) needs the custom-host opt-in.
+    # monkeypatch restores all three after the test, so the allowlist opt-in never outlives it.
+    monkeypatch.setenv("CACHEKIT_API_URL", sdk_config["api_url"])
+    monkeypatch.setenv("CACHEKIT_API_KEY", sdk_config["api_key"])
+    monkeypatch.setenv("CACHEKIT_ALLOW_CUSTOM_HOST", "true")
 
     # Import here to pick up environment variables
     from cachekit import cache
@@ -314,30 +317,6 @@ def performance_timer():
         t.elapsed_ms = (t.end - t.start) * 1000
 
     return timer
-
-
-# ============================================================================
-# Performance Tracking
-# ============================================================================
-
-
-@pytest.fixture
-def perf_tracker():
-    """Performance tracker for measuring latencies.
-
-    Usage in tests:
-        def test_something(perf_tracker):
-            with perf_tracker.timed_operation("GET"):
-                result = client.get("key")
-    """
-    return global_tracker
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Print performance summary at end of test session."""
-    if global_tracker.stats:
-        print("\n")
-        global_tracker.print_summary()
 
 
 # ============================================================================

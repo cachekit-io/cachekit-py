@@ -1,7 +1,12 @@
-"""Structured logging with minimal overhead.
+"""Structured JSON logging with sampling.
 
-This module provides lock-free, sampling-based structured logging
-with asynchronous batch writes.
+Each entry is serialised and written on the caller's thread. There is no background writer: a thread
+started at import is not running in a forked child (Gunicorn ``--preload``, Celery prefork,
+``multiprocessing``'s fork start method), so everything a child buffered for it was lost.
+
+In a child forked from C without at-fork hooks (uWSGI without ``--py-call-uwsgi-fork-hooks``),
+no ``StructuredLogger`` method logs: ``logging``'s own after-fork lock reset did not run there, so a
+level check or a handler lock a parent thread held at fork would hang the caller.
 """
 
 import json
@@ -11,9 +16,9 @@ import platform
 import random
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
+from cachekit import l1_cache
 from cachekit.config import get_settings
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
@@ -21,159 +26,68 @@ from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 logger = logging.getLogger(__name__)
 
 
-# Global configuration - loaded once at module import from the settings singleton
-_settings = get_settings()
-SAMPLING_RATE = _settings.log_sampling_rate
-RING_BUFFER_SIZE = _settings.log_buffer_size
-BATCH_SIZE = _settings.log_batch_size
-FLUSH_INTERVAL = _settings.log_flush_interval
-del _settings  # keep only the four scalars; don't pin a stale config past reset_settings()
+# Loaded once at module import from the settings singleton
+SAMPLING_RATE = get_settings().log_sampling_rate
 
-# Performance and health thresholds
-HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
+_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.CRITICAL,
+}
 
-
-@dataclass
-class LogEntry:
-    """Lightweight log entry for ring buffer."""
-
-    timestamp: float
-    level: str
-    message: str
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "timestamp": self.timestamp,
-            "level": self.level,
-            "message": self.message,
-            **self.extra,
-        }
+# What json.dumps raises on a value its default= never sees: a non-str dict key, a cycle, a too-deep nest
+_UNENCODABLE = (TypeError, ValueError, RecursionError)
 
 
-class LockFreeRingBuffer:
-    """Lock-free ring buffer for log entries.
-
-    Uses atomic operations to minimize contention.
-    """
-
-    def __init__(self, size: int = RING_BUFFER_SIZE):
-        self.size = size
-        self.buffer: list[Optional[LogEntry]] = [None] * size
-        self.write_pos = 0
-        self.read_pos = 0
-
-    def append(self, entry: LogEntry) -> bool:
-        """Append entry to buffer without locks.
-
-        Returns True if successful, False if buffer full.
-        """
-        # Simple atomic increment (in CPython, int ops are atomic)
-        pos = self.write_pos
-        next_pos = (pos + 1) % self.size
-
-        # Check if buffer is full (would overwrite unread data)
-        if next_pos == self.read_pos:
-            return False
-
-        # Write entry
-        self.buffer[pos] = entry
-        self.write_pos = next_pos
-        return True
-
-    def drain(self, max_items: int = BATCH_SIZE) -> list[LogEntry]:
-        """Drain up to max_items from buffer."""
-        items = []
-        count = 0
-
-        while count < max_items and self.read_pos != self.write_pos:
-            entry = self.buffer[self.read_pos]
-            if entry is not None:
-                items.append(entry)
-                self.buffer[self.read_pos] = None  # Clear reference
-            self.read_pos = (self.read_pos + 1) % self.size
-            count += 1
-
-        return items
+def _type_name(value: object) -> str:
+    """Stand in for a value JSON cannot encode: its type only, as its str() may embed a cache key (CWE-532)."""
+    return f"<{type(value).__name__}>"
 
 
-class AsyncLogWriter(threading.Thread):
-    """Background thread for async log writing."""
+def _encodable(value: object) -> object:
+    """The value if json can encode it, else its type name."""
+    try:
+        json.dumps(value, default=_type_name)
+    except _UNENCODABLE:
+        return _type_name(value)
+    return value
 
-    def __init__(self, buffer: LockFreeRingBuffer):
-        super().__init__(daemon=True, name="cachekit-LogWriter")
-        self.buffer = buffer
-        self.running = True
-        self._stop_event = threading.Event()
 
-    def run(self):
-        """Main loop - batch write logs periodically."""
-        while self.running:
-            try:
-                # Wait for interval or stop signal
-                if self._stop_event.wait(timeout=FLUSH_INTERVAL):
-                    break
-
-                # Drain and write batch
-                entries = self.buffer.drain()
-                if entries:
-                    self._write_batch(entries)
-
-            except Exception as e:
-                logger.error(f"Error in async log writer: {redact_error_for_log(e)}")
-
-    def stop(self):
-        """Stop the writer thread."""
-        self.running = False
-        self._stop_event.set()
-
-    def _write_batch(self, entries: list[LogEntry]):
-        """Write a batch of entries to the logger."""
-        for entry in entries:
-            try:
-                # Convert to JSON for structured logging
-                msg = json.dumps(entry.to_dict(), separators=(",", ":"))
-                logger.log(getattr(logging, entry.level, logging.INFO), msg)
-            except Exception:
-                # Silently drop malformed entries
-                pass
+def _enabled(levelno: int) -> bool:
+    """Whether to write an entry at levelno: never in a child forked without at-fork hooks (module docstring)."""
+    return not l1_cache._forked_without_hooks() and logger.isEnabledFor(levelno)
 
 
 class StructuredLogger:
     """Structured logger.
 
+    Each entry is one JSON line on the ``cachekit.logging`` logger, written synchronously.
+
     Features:
-    - Lock-free ring buffer
-    - Sampling (10% default)
-    - Async batch writes
+    - Nothing is sampled or serialised below that logger's level
+    - Sampling (10% default) of DEBUG/INFO/WARNING; ERROR and CRITICAL are never sampled
     - PII key-name masking (password/token/secret/key/auth kwargs)
     """
 
     def __init__(self, name: str):
         self.name = name
-        self.buffer = LockFreeRingBuffer()
-        self.writer = AsyncLogWriter(self.buffer)
-        self.writer.start()
 
-        # Pre-computed values for performance
-        self._sampling_threshold = int(SAMPLING_RATE * 100)
         self._hostname = platform.node()
-        self._pid = os.getpid()
 
         # PII patterns to mask (pre-compiled for speed)
         self._pii_keys = {"password", "token", "secret", "key", "auth"}
 
-        # Thread-local storage for trace context
-        self._context = threading.local()
-
-        # Standard logger for compatibility with tests
+        # Sink for cache_operation: plain-text messages, fields in record.structured
         self.logger = logging.getLogger(name)
 
     def _should_sample(self) -> bool:
         """Fast sampling decision."""
         # Using random for non-cryptographic sampling - performance critical
-        return random.randint(0, 99) < self._sampling_threshold  # noqa: S311
+        return random.random() < SAMPLING_RATE  # noqa: S311
 
     def _mask_pii(self, data: dict[str, Any]) -> dict[str, Any]:
         """Fast PII masking - only on sampled entries."""
@@ -182,30 +96,30 @@ class StructuredLogger:
                 data[key] = "****"
         return data
 
+    def _write(self, level: str, levelno: int, message: str, fields: dict[str, Any]) -> None:
+        """Serialise one entry and log it now."""
+        entry: dict[str, Any] = {
+            **self._mask_pii(fields),  # first, so a caller's pid= cannot replace the real one
+            "timestamp": time.time(),
+            "level": level,
+            "message": message,
+            "logger": self.name,
+            "hostname": self._hostname,
+            "pid": os.getpid(),  # read per entry: a forked child reports its own
+            "thread_id": threading.get_ident(),
+        }
+        try:
+            line = json.dumps(entry, separators=(",", ":"), default=_type_name)
+        except _UNENCODABLE:  # raising would replace the exception a caller may be logging
+            line = json.dumps({k: _encodable(v) for k, v in entry.items()}, separators=(",", ":"), default=_type_name)
+        logger.log(levelno, line)
+
     def log(self, level: str, message: str, **kwargs):
         """Main logging method with sampling."""
-        # Fast path - skip if not sampled
-        if not self._should_sample():
-            return
-
-        # Build entry
-        entry = LogEntry(
-            timestamp=time.time(),
-            level=level.upper(),
-            message=message,
-            extra={
-                "logger": self.name,
-                "hostname": self._hostname,
-                "pid": self._pid,
-                "thread_id": threading.get_ident(),
-                **self._mask_pii(kwargs),
-            },
-        )
-
-        # Append to lock-free buffer
-        if not self.buffer.append(entry):
-            # Buffer full - drop entry (non-blocking behavior)
-            pass
+        level = level.upper()
+        levelno = _LEVELS.get(level, logging.INFO)
+        if _enabled(levelno) and (levelno >= logging.ERROR or self._should_sample()):
+            self._write(level, levelno, message, kwargs)
 
     def debug(self, message: str, **kwargs):
         """Debug level logging."""
@@ -220,21 +134,9 @@ class StructuredLogger:
         self.log("WARNING", message, **kwargs)
 
     def error(self, message: str, **kwargs):
-        """Error level logging - always sampled."""
-        # Errors bypass sampling
-        entry = LogEntry(
-            timestamp=time.time(),
-            level="ERROR",
-            message=message,
-            extra={
-                "logger": self.name,
-                "hostname": self._hostname,
-                "pid": self._pid,
-                "thread_id": threading.get_ident(),
-                **self._mask_pii(kwargs),
-            },
-        )
-        self.buffer.append(entry)
+        """Error level logging - never sampled. Not via log(): a caller field named level or message would collide."""
+        if _enabled(logging.ERROR):
+            self._write("ERROR", logging.ERROR, message, kwargs)
 
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
         """Log cache operation with standard fields."""
@@ -253,8 +155,7 @@ class StructuredLogger:
         if isinstance(kwargs.get("error"), BaseException):
             kwargs["error"] = redact_error_for_log(kwargs["error"])
 
-        # Determine log level based on error presence
-        level = "ERROR" if "error" in kwargs else "INFO"
+        levelno = logging.ERROR if "error" in kwargs else logging.INFO
 
         # Build context
         context = self._get_context()
@@ -296,68 +197,15 @@ class StructuredLogger:
             # Silently ignore if Prometheus metrics not available
             pass
 
-        # For compatibility with tests that expect standard logging
-        import logging as std_logging
-
-        # Map string level to logging constant
-        level_map = {
-            "DEBUG": std_logging.DEBUG,
-            "INFO": std_logging.INFO,
-            "WARNING": std_logging.WARNING,
-            "ERROR": std_logging.ERROR,
-            "CRITICAL": std_logging.CRITICAL,
-        }
-        log_level = level_map.get(level.upper(), std_logging.INFO)
-
-        logger = std_logging.getLogger(self.name)
-        logger.log(log_level, "cache_operation", extra={"structured": context})
-
-    def connection_pool_utilization(self, utilization: float, **kwargs):
-        """Log connection pool metrics."""
-
-        # Determine log level based on utilization
-        if utilization > HIGH_UTILIZATION_THRESHOLD:
-            self.logger.log(
-                logging.WARNING,
-                f"High connection pool utilization: {utilization:.1%}",
-                extra={"structured": {"utilization": utilization, **kwargs}},
-            )
-        else:
-            self.logger.log(
-                logging.INFO,
-                f"Connection pool utilization: {utilization:.1%}",
-                extra={"structured": {"utilization": utilization, **kwargs}},
-            )
-
-        self.log("INFO", "pool_utilization", utilization=round(utilization, 3), **kwargs)
-
-    def set_trace_id(self, trace_id: str):
-        """Set trace ID for correlation."""
-        if not hasattr(self._context, "trace_id"):
-            self._context.trace_id = None
-        self._context.trace_id = trace_id
-
-    def clear_trace_id(self):
-        """Clear trace ID."""
-        if hasattr(self._context, "trace_id"):
-            delattr(self._context, "trace_id")
+        if not l1_cache._forked_without_hooks():  # module docstring; the metrics above still count
+            self.logger.log(levelno, "cache_operation", extra={"structured": context})
 
     def _get_context(self) -> dict[str, Any]:
         """Get current logging context."""
-        context = {
+        return {
             "timestamp": time.time(),
             "thread_id": threading.get_ident(),
         }
-
-        trace_id = getattr(self._context, "trace_id", None)
-        if trace_id:
-            context["trace_id"] = trace_id
-        return context
-
-    def __del__(self):
-        """Cleanup on deletion."""
-        if hasattr(self, "writer"):
-            self.writer.stop()
 
 
 # Global logger instances cache

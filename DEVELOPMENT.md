@@ -314,7 +314,7 @@ Used for security properties in `tests/unit/test_security_properties.py`:
 |:---------|:----------|
 | Encryption roundtrip | `decrypt(encrypt(data)) == data` |
 | Compression integrity | `decompress(compress(data)) == data` |
-| Tenant isolation | Different keys for different tenants |
+| Per-tenant key derivation | Different derived keys for different tenants |
 
 ```python
 from hypothesis import given, strategies as st
@@ -419,23 +419,6 @@ cargo clippy -- -D warnings     # Lint (CI fails on warnings)
 make release-check    # Version check + full validation + build
 make build            # Creates dist/cachekit-*.whl
 ```
-
-### Profile-Guided Optimization (5-8% faster)
-
-```bash
-make build-pgo        # Requires workload profiling
-```
-
-<details>
-<summary><strong>⚡ PGO Steps</strong></summary>
-
-1. Build with instrumentation (`release-pgo-generate` profile)
-2. Run representative workload (benchmarks)
-3. Rebuild with profile data (`release-pgo-use` profile)
-
-See `Makefile` for full details.
-
-</details>
 
 ---
 

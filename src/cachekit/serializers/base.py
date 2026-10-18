@@ -24,26 +24,34 @@ class SerializerProtocol(Protocol):
     The protocol is runtime-checkable to enable isinstance() validation
     without requiring explicit inheritance.
 
-    Cross-SDK contract (``cross_sdk_compatible``):
+    Encryption contract (``cross_sdk_compatible``):
         Serializers carry a class-level ``cross_sdk_compatible: bool`` attribute
-        that declares whether their wire format is language-agnostic (readable by
-        other-language CacheKit SDKs). It governs whether the serializer may be
-        used under encryption — see ``EncryptionWrapper`` and the validation in
-        ``CacheSerializationHandler.__init__``:
+        that declares this rule: after decryption (``metadata.encrypted`` is true),
+        ``deserialize`` decodes the one container its configuration fixes and raises
+        when the bytes do not parse as it, never returning a default or the input;
+        inspecting the bytes may only refuse, never select another decoder. Protocol
+        ENC-2 and ENC-3 require that of the step after decryption on every backend,
+        so the flag governs whether the serializer may be used under encryption —
+        see ``EncryptionWrapper`` and the validation in
+        ``CacheSerializationHandler.__init__``. Plaintext reads are outside the rule:
+        ArrowSerializer sniffs to accept a legacy raw entry there. Despite its name, it
+        does not mean other-language SDKs can read the format: ArrowSerializer's
+        envelope is not a cross-SDK wire format and still qualifies.
 
         - ``True``  (StandardSerializer/MessagePack, OrjsonSerializer/JSON,
-          ArrowSerializer/Arrow IPC): the user's serializer is threaded into the
-          EncryptionWrapper and used as-is under encryption.
-        - ``False`` (AutoSerializer, which emits Python-specific type tags; and any
-          serializer that does not declare the flag): single-SDK only, so combining
-          it with encryption is rejected at decoration time.
+          ArrowSerializer/checksummed Arrow IPC): the user's serializer is threaded
+          into the EncryptionWrapper and used as-is under encryption.
+        - ``False`` (AutoSerializer, which picks its decoder by inspecting the bytes;
+          and any serializer that does not declare the flag): combining it with
+          encryption is rejected at decoration time and when an
+          ``EncryptionWrapper`` is built.
 
         This attribute is intentionally NOT part of the runtime-checkable structural
         set: ``runtime_checkable`` would otherwise force every method-only custom
         serializer to also declare it, breaking ``isinstance(x, SerializerProtocol)``
         on the plaintext path across Python 3.10-3.14. It is enforced for type
         checkers via ``CrossSDKSerializerProtocol`` below, and read at runtime via
-        ``getattr(type(s), "cross_sdk_compatible", False)`` (unmarked == single-SDK).
+        ``getattr(type(s), "cross_sdk_compatible", False)`` (unmarked == refused under encryption).
 
     Examples:
         >>> class MySerializer:
@@ -136,7 +144,7 @@ class CrossSDKSerializerProtocol(SerializerProtocol, Protocol):
 
     At runtime the flag is read defensively via
     ``getattr(type(serializer), "cross_sdk_compatible", False)``; an unmarked
-    serializer is treated as single-SDK (not safe under encryption).
+    serializer is refused under encryption.
     """
 
     cross_sdk_compatible: ClassVar[bool]
@@ -195,6 +203,11 @@ class SerializationFormat(Enum):
 
 class SerializationMetadata:
     """Metadata about serialized data.
+
+    ``encrypted`` on the metadata ``EncryptionWrapper`` passes to its inner serializer's
+    ``deserialize`` means the bytes are decrypted plaintext, whose container the reader's
+    configuration fixes: a serializer must not fall back to a legacy form it would sniff for
+    on a plaintext read.
 
     Examples:
         Create basic metadata:
@@ -326,6 +339,27 @@ class SuspiciousCacheEntryError(SerializationError):
     pass
 
 
+class EnvelopeShapeError(SerializationError):
+    """An entry nothing verified decoded to the SHAPE of a ByteStorage envelope —
+    ``[bytes, [8 ints], int, format]`` with at least three slots intact — and was refused;
+    or, at write, a value that would decode to one.
+
+    Two populations reach this and the read path cannot tell them apart (LAB-2736): a
+    rotted integrity-on envelope whose checksum can no longer be checked, and a legitimate
+    top-level 4-element list a caller cached that merely looks like one. Refusing both is
+    the chosen corner — returning a rotted envelope hands the caller its compressed payload
+    as their object. Callers treat it as a miss (evict → recompute). For the second
+    population recompute re-produces the same bytes, so an integrity-off
+    ``AutoSerializer.serialize`` raises this too and never writes the value: a plain miss,
+    not an eviction and a rewrite on every call. Telemetry counts the read-side refusal under
+    its own ``envelope_shape`` reason rather than ``corruption``: the same redacted key
+    repeating in the WARNING log is a value another writer is still storing, not storage
+    rot, and must not read as a corruption spike.
+    """
+
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
 # ---------------------------------------------------------------------------
@@ -368,9 +402,12 @@ _LOG_UNSAFE_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7F, *range(0x8
 _LOG_UNSAFE_ESCAPES.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
 
 
-def bounded_error(exc: BaseException) -> str:
+def bounded_error(exc: BaseException | str) -> str:
     """``str(exc)`` clipped to :data:`ERROR_ECHO_MAX` and reduced to one terminal-safe line, for
     logging or re-wrapping a failure whose text is influenced by untrusted cache bytes.
+
+    Accepts a bare ``str`` so a boundary whose "cause" is a comparison rather than a raised error
+    (``AutoSerializer._envelope_failure``) bounds through this same helper.
 
     Applied once at each trust-boundary re-raise site (the read-path ``SerializationError``
     wraps in ``cache_handler``) rather than per field: the bound then holds for
@@ -386,6 +423,31 @@ def bounded_error(exc: BaseException) -> str:
     if len(text) > ERROR_ECHO_MAX:
         text = f"{text[:ERROR_ECHO_MAX]}… [truncated, {len(text)} chars total]"
     return text.translate(_LOG_UNSAFE_ESCAPES)
+
+
+def immutable_buffer(data: bytes | bytearray | memoryview) -> bytes | memoryview:
+    """Return ``data`` as one flat, unsigned, immutable byte buffer, copying only when it must.
+
+    For callers that read one untrusted document twice (a structure walk then a decode, or a decode
+    then an envelope probe): a mutable exporter could change between the reads, so both must see
+    one snapshot.
+
+    Examples:
+        >>> immutable_buffer(bytearray(b"ab"))
+        b'ab'
+        >>> immutable_buffer(memoryview(b"\\x94").cast("b"))[0]  # a signed view reads 0x94 as -108
+        148
+    """
+    if isinstance(data, memoryview):
+        # cast("B") flattens a multi-dimensional view and retypes any C-contiguous format
+        # ("b"/"c"/"H"...) to unsigned bytes without copying, so len() is the byte count and indexing
+        # yields byte values; a non-contiguous view has no flat form and is copied.
+        data = data.cast("B") if data.c_contiguous else bytes(data)
+    if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
+        # A mutable exporter (bytearray, mmap, a memoryview over either) is snapshotted. bytes and a
+        # memoryview of bytes stay zero-copy — the same containment proof the Rust side's bytes_view uses.
+        data = bytes(data)
+    return data
 
 
 def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
@@ -425,17 +487,7 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
         ...
         ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
-    if isinstance(data, memoryview):
-        # The walk (PyBuffer<u8>) and the decode must see one flat byte string: cast("B") flattens a
-        # multi-dimensional view and retypes any C-contiguous format ("b"/"c"/"H"...) to unsigned bytes
-        # without copying, so len(data) is the byte count the max_*_len caps need; a non-contiguous
-        # view has no flat form and is copied.
-        data = data.cast("B") if data.c_contiguous else bytes(data)
-    if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
-        # A mutable exporter (bytearray, a memoryview over one) could change between the walk and
-        # the decode, so both must see one immutable document. bytes and a memoryview of bytes stay
-        # zero-copy — the same containment proof the Rust side's bytes_view uses.
-        data = bytes(data)
+    data = immutable_buffer(data)  # the walk and the decode must see one document
     n = len(data)
     check_msgpack_structure(data, MSGPACK_MAX_NESTING)
     return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)

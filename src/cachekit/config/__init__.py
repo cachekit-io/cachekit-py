@@ -8,7 +8,7 @@ This module provides a clean, modular configuration system with:
 """
 
 # Core configuration classes
-from .decorator import DecoratorConfig, get_default_backend, set_default_backend
+from .decorator import UNSET, DecoratorConfig, get_default_backend, set_default_backend
 
 # Nested configuration groups (for customizing DecoratorConfig components)
 from .nested import (
@@ -37,6 +37,7 @@ __all__ = [
     "L1CacheConfig",
     "MonitoringConfig",
     # Backend management
+    "UNSET",
     "set_default_backend",
     "get_default_backend",
     # Singleton

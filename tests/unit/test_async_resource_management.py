@@ -60,6 +60,24 @@ class TestTTLRefreshFireAndForget:
         assert "Background TTL refresh failed" in caplog.text or task.done()
 
     @pytest.mark.asyncio
+    async def test_ttl_extension_failure_stays_at_debug(self, caplog):
+        """A refresh_ttl_on_get TTL extension is optional, so its failure is not a WARNING.
+
+        Unlike a failed value refresh (throttled WARNING), the entry still expires on its own TTL.
+        """
+        from cachekit.decorators.wrapper import _ttl_refresh_done_callback
+
+        async def failing_refresh():
+            raise RuntimeError("TTL extension failed")
+
+        task = asyncio.create_task(failing_refresh())
+        with caplog.at_level(logging.DEBUG, logger="cachekit.decorators.wrapper"):
+            await asyncio.gather(task, return_exceptions=True)
+            _ttl_refresh_done_callback(task, "test:key:123")
+        records = [r for r in caplog.records if "Background TTL refresh failed" in r.getMessage()]
+        assert [r.levelno for r in records] == [logging.DEBUG]
+
+    @pytest.mark.asyncio
     async def test_ttl_refresh_callback_handles_cancelled_task(self):
         """Cancelled TTL refresh tasks should not raise or log errors.
 

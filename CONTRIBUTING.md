@@ -71,6 +71,13 @@ This project follows a standard code of conduct. Please be respectful and profes
    git commit -m "feat: add new feature"
    ```
 
+## Documentation scope
+
+User-facing docs (the README and `docs/`) follow CacheKit's shared rule on what belongs in them:
+[What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
+`prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
+files, `docs/` and commit messages.
+
 ## Code Style Guidelines
 
 ### Python
@@ -189,7 +196,7 @@ make test-cov
 
 **Important**: pytest-redis is required for all Redis-dependent tests. If tests fail with "pytest-redis is required", run `uv sync` to install dependencies.
 
-**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` unset, see [#225](https://github.com/cachekit-io/cachekit-py/issues/225)), `uv run pytest tests/docs/` and `make test-docs-quick`.
+**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
 
 ### Test Coverage
 
@@ -259,7 +266,6 @@ This is a **single-maintainer org** using documentation instead of enforcement. 
 
 ```bash
 make build  # Standard build
-make build-pgo  # Profile-Guided Optimization (5-8% faster)
 ```
 
 ### Running Benchmarks
@@ -267,6 +273,8 @@ make build-pgo  # Profile-Guided Optimization (5-8% faster)
 ```bash
 make perf               # Full battery: env fingerprint + timer calibration, serializer benchmarks, GIL scaling
 make perf-compare       # Regression gate: fail on >10% median serializer regression vs baseline
+make perf-ir            # Instruction-count gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind)
+make perf-ir-update     # Ratchet the committed instruction budgets down to the measured figures
 
 make benchmark          # Serializer benchmarks only + save a local baseline
 make benchmark-compare  # Re-run and fail on >10% median regression vs that baseline
@@ -279,6 +287,12 @@ Baselines are written to `.benchmarks/` (gitignored, per-machine), so regression
 comparison is a local developer tool — wall-clock benchmarks deliberately do not gate
 CI. `make perf` first prints a system fingerprint + environment verdict and
 self-calibrates the timer, so numbers come with the context needed to trust them.
+
+`make perf-ir` is the deterministic one: it counts main-thread instructions per call under
+valgrind against budgets committed in `tests/performance/ir_baselines.json`, so a 1% regression
+is visible however loaded the machine is. Budgets belong to the build that recorded them; on a
+different interpreter, extension or C library, record a baseline on `main` first. Method and
+budgets: [docs/performance.md](docs/performance.md#instruction-budgets).
 
 ### Formatting Code
 

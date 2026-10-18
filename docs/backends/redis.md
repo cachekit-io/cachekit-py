@@ -2,7 +2,7 @@
 
 # Redis Backend
 
-The default L2 backend. Connects to Redis via environment variable or explicit configuration. Production-grade shared caching across multiple processes and pods.
+The recommended production L2 backend. Connects to Redis via environment variable or explicit configuration. Production-grade shared caching across multiple processes and pods.
 
 ## Basic Usage
 
@@ -28,7 +28,7 @@ CACHEKIT_REDIS_URL=redis://prod.example.com:6379  # Primary
 REDIS_URL=redis://localhost:6379                  # Fallback
 ```
 
-`CACHEKIT_REDIS_URL` takes precedence over `REDIS_URL`. If neither is set and no explicit backend is configured, cachekit will attempt to connect to `redis://localhost:6379`.
+`CACHEKIT_REDIS_URL` takes precedence over `REDIS_URL`. If neither is set and nothing else is configured, a plaintext decorator does not use Redis: it caches L1-only, in process ([Nothing Configured](README.md#4-nothing-configured-l1-only)). An explicit `RedisBackend()` with no URL, and an encrypted or interop decorator with nothing configured, still connect to `redis://localhost:6379`.
 
 ## Configuration via Python
 
@@ -41,7 +41,6 @@ config = RedisBackendConfig(
     connection_pool_size=25,
     socket_timeout=5.0,
     socket_connect_timeout=5.0,
-    disable_hiredis=False,
 )
 
 backend = RedisBackend(config)
@@ -52,11 +51,21 @@ An explicit `redis_url` (or config) gets its own per-instance connection pool bo
 | Field | Default | Description |
 |-------|---------|-------------|
 | `redis_url` | `redis://localhost:6379` | Redis connection URL |
-| `connection_pool_size` | `10` | Maximum connections in the pool |
+| `connection_pool_size` | `50` | Maximum connections in the pool (env: `CACHEKIT_CONNECTION_POOL_SIZE`). When all are in use, an operation waits up to `socket_timeout` for one |
 | `socket_timeout` | `5.0` | Socket read/write timeout in seconds (env: `CACHEKIT_SOCKET_TIMEOUT`) |
 | `socket_connect_timeout` | `5.0` | Socket connect timeout in seconds (env: `CACHEKIT_SOCKET_CONNECT_TIMEOUT`) |
-| `socket_keepalive` | `True` | Enable TCP keepalive for connections |
-| `disable_hiredis` | `False` | Use pure Python parser instead of hiredis |
+| `socket_keepalive` | `True` | Set `SO_KEEPALIVE` on TCP connections, using the OS keepalive timers (env: `CACHEKIT_SOCKET_KEEPALIVE`). Not applied to `unix://` URLs |
+| `disable_hiredis` | `False` | Reports `CACHEKIT_DISABLE_HIREDIS`. The parser is chosen from that environment variable at `import cachekit`, before redis loads, so setting this field in code has no effect. See below |
+
+Query options in `redis_url` override the pool fields above, because redis-py's `from_url` lets querystring arguments win. For example, `redis://host:6379/0?socket_timeout=1&socket_keepalive=0` sets a 1 s timeout and turns keepalive off, whatever the config says.
+
+### hiredis and the reply parser
+
+redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. cachekit loads redis-py only for a program that uses its Redis backend, so with the variable unset, the default below never touches a program that uses L1 only, CachekitIO, File or Memcached. `true` is the exception: it blocks hiredis at `import cachekit` for every program, whichever backend it uses.
+
+`CACHEKIT_DISABLE_HIREDIS=true` keeps hiredis out and gives every connection redis-py's pure-Python parser. cachekit applies it at `import cachekit`, so import cachekit before redis; if hiredis is already loaded it logs a warning and the setting cannot take effect. `CACHEKIT_DISABLE_HIREDIS=false` keeps hiredis on every build.
+
+Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is already on (for example `-X gil=1`). A free-threaded build with the GIL still off drops it when cachekit's Redis backend loads, before redis-py does, because importing hiredis there re-enables the GIL. An application that imports redis-py itself before that point keeps hiredis, and the GIL turns on. To avoid that, set `true` and import cachekit before redis-py; `true` cannot undo a hiredis that redis-py has already loaded. Either block is process-wide: once it is in place, any later `import hiredis` in the process raises `ImportError`. See [Free-threaded CPython](../free-threading.md#the-ci-safety-net).
 
 ## When to Use
 
@@ -84,14 +93,14 @@ An explicit `redis_url` (or config) gets its own per-instance connection pool bo
 
 ## Whole-Function Invalidation Across Processes
 
-When the decorator resolves Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `backend=` argument), or is passed a backend from `RedisBackendProvider`, `invalidate_cache()` with no arguments deletes the L2 entries **every** process wrote for the function under the calling tenant ([tenant ids](README.md#3-environment-variable-auto-detection-lowest-priority)), through a server-side key registry. A `RedisBackend` passed explicitly as `backend=` does not keep a registry: its no-args invalidation deletes only the keys the calling process knows. The registry needs Redis **5.0+**, single-instance or primary/replica (not Cluster, and not a sharding proxy in front of several shards), and `@scripting` for restricted ACL users. The registry's sets live in the same keyspace as cache entries and match `*:ck:reg:*`; they are SET-typed, so a scan that `GET`s every key sees `WRONGTYPE` on them — skip that pattern. See [Whole-Function Invalidation](../features/l1-invalidation.md#whole-function-invalidation).
+When the decorator resolves Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `backend=` argument), or is passed a backend from `RedisBackendProvider`, `invalidate_cache()` with no arguments deletes the L2 entries **every** process wrote for the function under the calling tenant ([tenant ids](README.md#3-environment-variable-auto-detection)), through a server-side key registry. A `RedisBackend` passed explicitly as `backend=` does not keep a registry: its no-args invalidation deletes only the keys the calling process knows, with one `UNLINK` per 10 000 keys. The registry needs Redis **5.0+**, single-instance or primary/replica (not Cluster, and not a sharding proxy in front of several shards), and `@scripting` for restricted ACL users. Each successful invalidation on this backend is also announced with one `PUBLISH` on `cachekit:py:invalidate:v1`, so a restricted ACL user needs `publish` on that channel too ([Invalidation announcements](../features/l1-invalidation.md#whole-function-invalidation)). A process that sets `CACHEKIT_INVALIDATION_LISTENER_ENABLED` evicts its own L1 copies on those announcements, through one extra connection that also needs `subscribe` and `ping` (`+@connection` includes `ping`) on that channel ([Cross-Process L1 Eviction](../features/l1-invalidation.md#cross-process-l1-eviction)). The registry's sets live in the same keyspace as cache entries and match `*:ck:reg:*`; they are SET-typed, so a scan that `GET`s every key sees `WRONGTYPE` on them — skip that pattern. See [Whole-Function Invalidation](../features/l1-invalidation.md#whole-function-invalidation).
 
 ## Limitations
 
 1. **Network dependency**: Every L2 operation requires a network round-trip. Use L1 cache to mitigate (enabled by default).
 2. **Redis instance required**: Unlike FileBackend, RedisBackend requires a running Redis server.
 3. **No TTL inspection**: The base RedisBackend does not expose remaining TTL on cached keys.
-4. **Connection pool exhaustion**: Under very high concurrency, the connection pool (`connection_pool_size=10`) can become a bottleneck. Increase via config or env var.
+4. **Connection pool exhaustion**: When all `connection_pool_size` connections (default 50) are in use, an operation waits up to `socket_timeout` for one to be released. If none is released in time, the operation fails with a `BackendError` and the decorator treats it as a cache miss. Async decorated calls run their L2 operations on the default executor's threads (at most 32), which share one pool. Raise the size via config or `CACHEKIT_CONNECTION_POOL_SIZE` if more threads than that share one backend.
 
 ## See Also
 

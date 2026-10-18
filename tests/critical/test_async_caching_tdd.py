@@ -41,9 +41,23 @@ class TestAsyncCachingTDD:
         assert call_count == 1  # Should NOT increment - cached!
 
     @pytest.mark.asyncio
-    async def test_async_l1_cache_hit(self):
+    async def test_async_l1_cache_hit(self, monkeypatch):
         """L1 cache should work with async functions."""
         call_count = 0
+
+        # An L2 hit also keeps call_count at 1, so count backend reads to tell the two apart.
+        # A wall-clock bound cannot: scheduler load stretches an L1 hit past any tight limit.
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
+
+        l2_reads = 0
+        real_get = PerRequestRedisBackend.get
+
+        def counting_get(self, key):
+            nonlocal l2_reads
+            l2_reads += 1
+            return real_get(self, key)
+
+        monkeypatch.setattr(PerRequestRedisBackend, "get", counting_get)
 
         @cache  # L1 enabled by default
         async def expensive_async_operation(value: str) -> str:
@@ -59,14 +73,14 @@ class TestAsyncCachingTDD:
         assert result1 == "processed_test"
         assert call_count == 1
         assert duration1 >= 0.01  # Should take at least 10ms
+        reads_after_miss = l2_reads
+        assert reads_after_miss >= 1  # The miss went to L2, so the spy sees this backend's reads
 
-        # Second call - L1 cache hit (should be near-instant)
-        start = time.perf_counter()
+        # Second call - L1 cache hit: served without touching L2
         result2 = await expensive_async_operation("test")
-        duration2 = time.perf_counter() - start
         assert result2 == "processed_test"
         assert call_count == 1  # No additional calls
-        assert duration2 < 0.001  # L1 hit should be <1ms
+        assert l2_reads == reads_after_miss  # No L2 read: the hit came from L1
 
     @pytest.mark.asyncio
     async def test_async_redis_cache_hit(self):

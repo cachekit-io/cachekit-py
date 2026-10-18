@@ -1,10 +1,11 @@
 """Encrypted-payload E2E smoke for ``@cache.io`` against a live CacheKit SaaS backend.
 
-Encryption on the SaaS path is switched on by setting ``CACHEKIT_MASTER_KEY``:
-``@cache.io`` then encrypts client-side (AES-256-GCM) before any byte leaves the
-process, and the SaaS stores opaque ciphertext. (The env key enables encryption
-fleet-wide via settings — no decorator change needed.) Only a holder of the
-master key can recover the plaintext; the SaaS never sees the key.
+Encryption on the SaaS path is switched on explicitly, with
+``encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)``; ``CACHEKIT_MASTER_KEY``
+supplies the key (a key source, not an activation switch — with no ``encryption=`` the decorator
+refuses the key). ``@cache.io`` then encrypts client-side (AES-256-GCM) before any byte leaves the
+process, and the SaaS stores opaque ciphertext. Only a holder of the master key can recover the
+plaintext; the SaaS never sees the key.
 
 ``@cache.io`` builds its own CachekitIO backend and rejects an injected one
 (``backend=`` is a ConfigurationError), so the ciphertext is captured for the
@@ -31,7 +32,7 @@ Env-parameterized so it targets any environment (validate on dev, gate on prod):
     CACHEKIT_API_KEY            required — ck_sdk_... ; the whole module skips if absent
     CACHEKIT_API_URL            default https://api.cachekit.io
     CACHEKIT_ALLOW_CUSTOM_HOST  set "true" for non-allowlisted hosts (e.g. api.dev.cachekit.io)
-    CACHEKIT_MASTER_KEY         set per-test by the io_env fixture to enable encryption
+    CACHEKIT_MASTER_KEY         set per-test by the io_env fixture as the encryption key
     CACHEKIT_NAMESPACE          default secure_e2e
 """
 
@@ -46,6 +47,7 @@ import pytest
 
 from cachekit import cache
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
+from cachekit.config.nested import EncryptionConfig
 from cachekit.config.singleton import reset_settings
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -65,6 +67,7 @@ pytestmark = [
 # Registry feeding the module-level cached target. Keyed by a per-test tag so
 # tests never collide (the tag is also a cache-key argument).
 _RESULT: dict[str, object] = {}
+_ENCRYPTED = EncryptionConfig(enabled=True, single_tenant_mode=True)
 
 _STD = StandardSerializer()
 
@@ -112,7 +115,7 @@ def io_env(master_key: str) -> Iterator[None]:
     """Configure the env so ``@cache.io`` targets the SaaS *and* encrypts.
 
     Sets the API key/URL, the custom-host override for non-allowlisted hosts
-    (dev), and CACHEKIT_MASTER_KEY (which turns encryption on), then resets the
+    (dev), and CACHEKIT_MASTER_KEY (the key ``_ENCRYPTED`` resolves), then resets the
     cached settings singleton so the values take effect.
     """
     keys = ("CACHEKIT_API_KEY", "CACHEKIT_API_URL", "CACHEKIT_ALLOW_CUSTOM_HOST", "CACHEKIT_MASTER_KEY")
@@ -174,7 +177,7 @@ class TestEncryptedRoundTrip:
     def test_roundtrip_survives_saas(self, payload: object, namespace: str, captured: dict[str, object]) -> None:
         tag = _new_tag()
         _RESULT[tag] = payload
-        fetch = cache.io(namespace=namespace, ttl=300)(_return_registered)
+        fetch = cache.io(namespace=namespace, ttl=300, encryption=_ENCRYPTED)(_return_registered)
 
         assert fetch(tag) == payload  # encrypt + store in SaaS
 
@@ -194,7 +197,7 @@ class TestZeroKnowledge:
         sentinel = f"TOPSECRET-{uuid.uuid4().hex}"
         tag = _new_tag()
         _RESULT[tag] = {"secret": sentinel}
-        fetch = cache.io(namespace=namespace, ttl=300)(_return_registered)
+        fetch = cache.io(namespace=namespace, ttl=300, encryption=_ENCRYPTED)(_return_registered)
 
         assert fetch(tag)["secret"] == sentinel  # client sees plaintext
 
@@ -212,7 +215,7 @@ class TestTamperDetection:
         tag = _new_tag()
         original = {"secret": "genuine"}  # pragma: allowlist secret
         _RESULT[tag] = original
-        fn = cache.io(namespace=namespace, ttl=300)(_return_registered)
+        fn = cache.io(namespace=namespace, ttl=300, encryption=_ENCRYPTED)(_return_registered)
 
         fn(tag)  # store genuine ciphertext
         key = captured["key"]

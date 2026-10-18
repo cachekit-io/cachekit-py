@@ -1,0 +1,197 @@
+{
+  "version": "1.0.0",
+  "generator": "hand-written rows; `stale` and `fresh_for` are what the reference parsers in tools/freshness-headers-verify.py return",
+  "spec": "spec/saas-api.md § GET /v1/cache/{key} (response headers) and § Remaining Freshness",
+  "ci_verification": "tools/freshness-headers-verify.py (stdlib only; with a mutation self-test)",
+  "contract": "Each row is one header's value on a `GET` `200 OK`: `value` is the field value, or null when the response does not carry the header. A field value is bytes, so each character of `value` stands for one byte (U+0000 to U+00FF, as the Fetch Standard models header values). No `value` starts or ends with a space or tab: RFC 9110 §5.5 excludes that white space from the field value, and HTTP stacks differ in whether they strip it before a parser sees it. No `value` holds a control character other than tab: RFC 9110's field-value grammar excludes them, and stacks differ in what they do with one. In `freshness_vectors` the header is `X-CacheKit-Freshness` and `stale` is how the SDK must classify the response: fresh when the header is absent or exactly `fresh`, stale for any other value. In `fresh_for_vectors` the header is `X-CacheKit-Fresh-For` and `fresh_for` is the bound the SDK must read, in seconds: the value's number when it is 1 to 7 ASCII digits and at most 2,592,000, otherwise 0, and null when the header is absent (no server-side bound). An SDK conforms when its parser, handed each `value` as its HTTP stack would deliver those bytes, returns `stale` or `fresh_for`.",
+  "freshness_vectors": [
+    {
+      "name": "freshness_absent",
+      "value": null,
+      "stale": false,
+      "note": "No header: pre-SWR servers do not emit it, so the response is fresh; a parser that treats a missing header as an unrecognized value reads it as stale."
+    },
+    {
+      "name": "freshness_fresh",
+      "value": "fresh",
+      "stale": false,
+      "note": "The `fresh` token."
+    },
+    {
+      "name": "freshness_stale",
+      "value": "stale",
+      "stale": true,
+      "note": "The `stale` token: a stale hit, never an error; a parser that knows only `fresh` raises on it."
+    },
+    {
+      "name": "freshness_capitalised",
+      "value": "Fresh",
+      "stale": true,
+      "note": "Tokens are case-sensitive, so `Fresh` is unrecognized and stale; a parser that compares case-insensitively reads it as fresh."
+    },
+    {
+      "name": "freshness_uppercase_stale",
+      "value": "STALE",
+      "stale": true,
+      "note": "Unrecognized, so stale; a parser that looks only for the exact token `stale` reads it as fresh."
+    },
+    {
+      "name": "freshness_empty",
+      "value": "",
+      "stale": true,
+      "note": "An empty value is present, not absent, so it is unrecognized and stale; a parser that tests the value's truthiness reads it as fresh."
+    },
+    {
+      "name": "freshness_nbsp_suffix",
+      "value": "fresh\u00a0",
+      "stale": true,
+      "note": "`fresh` and a no-break space (byte 0xA0), which HTTP keeps: unrecognized, so stale. Python's `str.strip()` and JavaScript's `trim()` drop it and read fresh."
+    },
+    {
+      "name": "freshness_list_fresh_first",
+      "value": "fresh, stale",
+      "stale": true,
+      "note": "A list, as a recipient that combines repeated field lines delivers it (RFC 9110 §5.3), is not the token `fresh`; a parser that reads the first item, checks a prefix or looks for `fresh` anywhere reads it as fresh."
+    },
+    {
+      "name": "freshness_list_fresh_last",
+      "value": "stale, fresh",
+      "stale": true,
+      "note": "The same list in the other order; a parser that reads the last item reads it as fresh."
+    }
+  ],
+  "fresh_for_vectors": [
+    {
+      "name": "fresh_for_absent",
+      "value": null,
+      "fresh_for": null,
+      "note": "No header: a no-expiry entry, or a pre-signal server. No server-side bound applies, so the SDK's configured local TTL does; a parser that reads it as 0 never backfills from a pre-signal server."
+    },
+    {
+      "name": "fresh_for_zero",
+      "value": "0",
+      "fresh_for": 0,
+      "note": "Zero is valid: freshness is spent, so the response is not backfilled; a parser that turns 0 into no value (`or None`, `|| undefined`) applies no bound."
+    },
+    {
+      "name": "fresh_for_one",
+      "value": "1",
+      "fresh_for": 1,
+      "note": "The smallest positive bound."
+    },
+    {
+      "name": "fresh_for_seven_digits",
+      "value": "0000005",
+      "fresh_for": 5,
+      "note": "Seven digits with leading zeros is valid; a parser that rejects leading zeros reads 0."
+    },
+    {
+      "name": "fresh_for_cap",
+      "value": "2592000",
+      "fresh_for": 2592000,
+      "note": "The 30-day cap itself is valid; a parser whose range check excludes it reads 0."
+    },
+    {
+      "name": "fresh_for_empty",
+      "value": "",
+      "fresh_for": 0,
+      "note": "Empty is present but not 1 to 7 digits, so 0; a parser that treats it as absent applies no bound."
+    },
+    {
+      "name": "fresh_for_negative",
+      "value": "-1",
+      "fresh_for": 0,
+      "note": "Signed, so 0; a parser that accepts a sign reads -1."
+    },
+    {
+      "name": "fresh_for_plus_sign",
+      "value": "+5",
+      "fresh_for": 0,
+      "note": "Signed, so 0; Python's `int()` and JavaScript's `Number()` and `parseInt` read 5."
+    },
+    {
+      "name": "fresh_for_decimal",
+      "value": "5.0",
+      "fresh_for": 0,
+      "note": "A decimal point, so 0; `Number()` and `parseInt` read 5."
+    },
+    {
+      "name": "fresh_for_exponent",
+      "value": "1e3",
+      "fresh_for": 0,
+      "note": "An exponent, so 0; `Number()` reads 1000 and `parseInt` 1."
+    },
+    {
+      "name": "fresh_for_hex",
+      "value": "0x10",
+      "fresh_for": 0,
+      "note": "A hex prefix, so 0; `Number()`, and `parseInt` without a radix, read 16."
+    },
+    {
+      "name": "fresh_for_digit_separator",
+      "value": "1_0",
+      "fresh_for": 0,
+      "note": "An underscore, so 0; Python's `int()` reads 10 and `parseInt` 1."
+    },
+    {
+      "name": "fresh_for_inner_space",
+      "value": "1 0",
+      "fresh_for": 0,
+      "note": "White space inside the value, so 0; `parseInt` reads 1, and a parser that drops white space reads 10."
+    },
+    {
+      "name": "fresh_for_nbsp_prefix",
+      "value": "\u00a05",
+      "fresh_for": 0,
+      "note": "A no-break space (byte 0xA0), then 5: not 1 to 7 ASCII digits, so 0. HTTP keeps the byte, and Python's `str.strip()` and JavaScript's `trim()` drop it and read 5."
+    },
+    {
+      "name": "fresh_for_eight_digits",
+      "value": "00000005",
+      "fresh_for": 0,
+      "note": "Eight digits, so 0 although the number is 5: the grammar bounds the length as well as the value."
+    },
+    {
+      "name": "fresh_for_over_cap",
+      "value": "2592001",
+      "fresh_for": 0,
+      "note": "One over the cap, so 0; a parser without the range check reads 2,592,001."
+    },
+    {
+      "name": "fresh_for_wraps_32_bit",
+      "value": "4297559296",
+      "fresh_for": 0,
+      "note": "2^32 + 2,592,000, ten digits, so 0: a parser that skips the length check and converts to a wrapping 32-bit integer reads 2,592,000, which its range check then passes."
+    },
+    {
+      "name": "fresh_for_over_64_bits",
+      "value": "18446744073712143616",
+      "fresh_for": 0,
+      "note": "2^64 + 2,592,000, twenty digits, so 0: a parser that skips the length check reads 2,592,000 through a wrapping 64-bit integer, and one that converts first and reads the overflow as no value applies no bound."
+    },
+    {
+      "name": "fresh_for_4301_digits",
+      "value": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "fresh_for": 0,
+      "note": "4,301 digits, so 0: Python's `int()` refuses a string of more than 4,300 digits, so a parser that converts before it checks the length raises."
+    },
+    {
+      "name": "fresh_for_superscript_two",
+      "value": "\u00b2",
+      "fresh_for": 0,
+      "note": "The byte 0xB2, `²` in Latin-1: not an ASCII digit, so 0. Python's `str.isdigit()` accepts it, and `int()` then raises."
+    },
+    {
+      "name": "fresh_for_arabic_indic_one",
+      "value": "\u00d9\u00a1",
+      "fresh_for": 0,
+      "note": "The UTF-8 bytes of U+0661 ARABIC-INDIC DIGIT ONE: not ASCII digits, so 0. Decoded as UTF-8, Python's `str.isdigit()` and `int()` accept it as 1."
+    },
+    {
+      "name": "fresh_for_list",
+      "value": "5, 5",
+      "fresh_for": 0,
+      "note": "A list, as a recipient that combines repeated field lines delivers it: not 1 to 7 digits, so 0; `parseInt` reads 5."
+    }
+  ]
+}

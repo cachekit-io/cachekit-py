@@ -51,7 +51,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  STEP 1: DECORATOR ENTRY POINT                                              │
 │  File: src/cachekit/decorators/intent.py                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  @cache                          # Zero-config (90% of use cases, L1+L2)    │
+│  @cache                          # L1-only with nothing configured,         │
+│                                  # L1+L2 once a backend is set              │
 │  @cache.minimal                  # Speed-critical (low latency)             │
 │  @cache.production               # Reliability-critical (circuit breaker)   │
 │  @cache.secure                   # Security-critical (encrypted L1+L2)      │
@@ -107,12 +108,12 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │      # L1-only mode - skip to STEP 11 (execute function)                    │
 │      jump to STEP 11                                                        │
 │                                                                             │
-│  # L2 backend enabled (default: RedisBackend)                               │
+│  # L2 backend enabled (e.g. RedisBackend from REDIS_URL)                    │
 │  l2_backend.get(cache_key) → bytes or None                                  │
 │                                                                             │
 │  Backend types:                                                             │
-│  • RedisBackend: Distributed Redis storage (default)                        │
-│  • CachekitIOBackend: Managed cloud storage via HTTP/2 (api.cachekit.io)    │
+│  • RedisBackend: Distributed Redis storage                                  │
+│  • CachekitIOBackend: Managed cloud storage via HTTPS (api.cachekit.io)     │
 │  • Future: DynamoDBBackend, etc.                                            │
 │                                                                             │
 │  RedisBackend internal flow:                                                │
@@ -179,7 +180,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  • L1Cache.put(cache_key, encrypted_or_plaintext_bytes, ttl)                │
 │                                                                             │
 │  Return deserialized Python object to user:                                 │
-│  • Record metrics (operation="get", hit=True)                               │
+│  • Record metrics (operation="get", serializer="rust")                      │
 │  • Structured logging (if enabled)                                          │
 │  • Return cached value to user ✓                                            │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -191,6 +192,15 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  STEP 11: DISTRIBUTED LOCK (Thundering Herd Protection)                     │
 │  File: src/cachekit/decorators/wrapper.py                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
+│  Concurrent misses on one key in one process share one call                 │
+│  (decorators/single_flight.py), except on the sync backed path. In async    │
+│  backed mode that is the whole trip from the L2 read to the write: only the │
+│  caller that started it reads L2 and takes the lock, and the others decode  │
+│  their own copy of its result. A trip with no serialized value to share (an │
+│  unserializable value, an mmap-path hit, a failed lock release) sends each  │
+│  of them on its own trip afterwards. In L1-only mode it is the function     │
+│  call.                                                                      │
+│                                                                             │
 │  lock_key = f"{cache_key}:lock"                                             │
 │  redis_lock = redis_client.lock(lock_key, timeout=30, blocking_timeout=5)   │
 │                                                                             │
@@ -205,6 +215,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  # After acquiring lock, check cache again                                  │
 │  # Another thread may have populated it while we waited                     │
+│  # CachekitIO skips this when the first lock request won after a clean miss │
 │                                                                             │
 │  cached_result = get_cached_value(cache_key)                                │
 │  if cached_result:                                                          │
@@ -290,9 +301,10 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  1. Calculate expiry: time.time() + ttl - buffer (1s)                       │
 │  2. Estimate size: len(serialized_bytes)  # O(1), not recursive             │
-│  3. Evict LRU entries if needed (max 100MB)                                 │
-│  4. Store bytes in OrderedDict with metadata                                │
-│  5. Mark as most recently used (move_to_end)                                │
+│  3. If size > budget/8: drop any older entry for the key, store nothing     │
+│  4. Evict LRU entries if needed (max 100MB)                                 │
+│  5. Store bytes in OrderedDict with metadata                                │
+│  6. Mark as most recently used (move_to_end)                                │
 │                                                                             │
 │  Note: Stores bytes (encrypted or plaintext msgpack), not Python objects    │
 └──────────────────────────────────┬──────────────────────────────────────────┘
@@ -322,7 +334,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 from cachekit import cache
 from cachekit.config.nested import CircuitBreakerConfig
 
-# Zero-config intelligent caching (90% of use cases, L1+L2 enabled)
+# L1-only, in process (what @cache does with nothing configured)
 @cache(backend=None)
 def expensive_function():
     return compute_result()  # illustrative - not defined
@@ -355,13 +367,16 @@ def custom_function():
 
 | Profile | Circuit Breaker | L1 Cache | L2 Backend | Stats Collection | Use Case |
 |---------|----------------|----------|------------|------------------|----------|
-| **default** | ✓ | ✓ | RedisBackend | ✓ | General purpose caching (L1+L2) |
-| **minimal** | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
-| **production** | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
-| **secure** | ✓ | ✓ | RedisBackend | ✓ | Encrypted sensitive data (L1 stores ciphertext) |
-| **dev** | ✓ | ✓ | None | ✗ | Local development (no Redis) |
-| **test** | ✗ | ✓ | None | ✗ | Test environments (no Redis) |
+| **default** | ✓ | ✓ | Resolved¹ | ✓ | General purpose caching (L1+L2) |
+| **minimal** | ✗ | ✓ | Resolved¹ | ✗ | Low-latency hot paths |
+| **production** | ✓ | ✓ | Resolved¹ | ✓ | Mission-critical reliability |
+| **secure** | ✓ | ✓ | Resolved² | ✓ | Encrypted sensitive data (L1 stores ciphertext) |
+| **dev** | ✓ | ✓ | Resolved¹ | ✗ | Local development |
+| **test** | ✗ | ✓ | Resolved¹ | ✗ | Test environments |
 | **io** | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
+
+¹ Per [Backend Resolution Priority](backends/README.md#backend-resolution-priority); with nothing configured, L1-only.
+² As ¹, but never L1-only: with nothing configured, Redis at `redis://localhost:6379`.
 
 ---
 
@@ -447,8 +462,8 @@ def _blake2b_pickle_hash(args, kwargs):
             ↓ (on miss)
 ┌─────────────────────────────────────────┐
 │ L2 Backend (Pluggable Storage Layer)    │
-│ • RedisBackend (default)                │
-│ • CachekitIOBackend (HTTP/2, managed)   │
+│ • RedisBackend                          │
+│ • CachekitIOBackend (HTTPS, managed)    │
 │ • Network call (~1-2ms latency)         │
 │ • Bytes-based protocol (BaseBackend)    │
 │ • Persistent across process restarts    │
@@ -506,7 +521,7 @@ class BaseBackend(Protocol):
 - **Simple and focused**: Four operations only (get/set/delete/exists)
 - **Works for any backend**: Redis, CachekitIO, File, Memcached, custom implementations
 
-### RedisBackend (Default Implementation)
+### RedisBackend
 
 **File:** `src/cachekit/backends/redis_backend.py`
 
@@ -535,18 +550,18 @@ def my_function():
 
 ### Configuration Modes
 
-**L1+L2 (default):** Fast L1 cache + distributed L2 backend
+**L1+L2:** Fast L1 cache + distributed L2 backend, once a backend is set (`REDIS_URL` or another selector)
 ```python
-@cache  # L1 enabled, L2 = RedisBackend
+@cache  # L1 enabled, L2 = the configured backend (e.g. Redis from REDIS_URL)
 def production_function():
     return result
 ```
 
-**L2-only:** Distributed caching without process memory
+**L2-only:** Distributed caching without process memory. Needs a backend set (`REDIS_URL` or another selector): with nothing configured this caches nothing
 ```python notest
 from cachekit.config.nested import L1CacheConfig
 
-@cache(l1=L1CacheConfig(enabled=False))  # L2 = RedisBackend, no L1
+@cache(l1=L1CacheConfig(enabled=False))  # L2 = the configured backend, no L1
 def memory_constrained_function():
     return result  # illustrative - not defined
 ```
@@ -663,12 +678,13 @@ class RedisBackend:
 
 ### Connection Pool Config
 
+`RedisBackendConfig` defaults (full table: [Redis backend](backends/redis.md)):
+
 ```yaml
-max_connections: 50
-min_idle_connections: 2
-connection_timeout: 5.0s
-socket_timeout: 5.0s
-socket_keepalive: True  # TCP keepalive
+connection_pool_size: 50     # CACHEKIT_CONNECTION_POOL_SIZE; a full pool waits socket_timeout
+socket_timeout: 5.0          # seconds, CACHEKIT_SOCKET_TIMEOUT
+socket_connect_timeout: 5.0  # seconds, CACHEKIT_SOCKET_CONNECT_TIMEOUT
+socket_keepalive: true       # SO_KEEPALIVE on TCP connections, not unix://
 ```
 
 ### Graceful Backend Error Handling
@@ -725,11 +741,13 @@ def deserialize(data: bytes, metadata) -> Any:
 **Decompression Bomb Protection:**
 - Max uncompressed: 512MB
 - Max compressed: 512MB
-- Max compression ratio: 100x
+- Max compression ratio: 1000x
 
 **Checksum Validation:**
 - xxHash3-64 hash verification
-- Detects data corruption
+- Detects data corruption in the **payload bytes** only. The envelope's own `format` and
+  `original_size` fields sit outside it, as does the plaintext CK header — see *Deserialization failed* in
+  [error-codes.md](error-codes.md) for how the decode path handles that.
 
 **Test Coverage:**
 - ByteStorage module: 82% LLVM coverage (all production paths tested)
@@ -780,7 +798,7 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 ### Error Scenarios
 
-1. **Redis Connection Failed** → Execute function without caching
+1. **Redis Connection Failed** → Execute function; the result is still stored in L1, unless Redis was down when the backend was first built (then nothing is cached)
 2. **Lock Acquisition Timeout** → Execute without lock (thundering herd risk accepted)
 3. **Serialization Failed** → Return result, skip caching
 4. **Deserialization Failed** → Execute function as if cache miss
@@ -789,13 +807,8 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 **States:**
 - **CLOSED**: Normal operation (requests allowed)
-- **OPEN**: Too many failures (requests blocked, fallback used)
+- **OPEN**: Too many failures (L2 skipped: L1 hits still served, an L1 miss runs the function)
 - **HALF_OPEN**: Testing recovery (limited requests)
-
-**Fallback Strategies:**
-- `fail_open` (default): Execute function without caching
-- `fail_closed`: Raise exception
-- `custom`: Call custom_fallback function
 
 ---
 

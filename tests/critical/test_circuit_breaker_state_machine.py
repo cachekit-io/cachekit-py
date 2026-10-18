@@ -320,6 +320,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         config = CircuitBreakerConfig(
             failure_threshold=10,
             timeout_seconds=0.1,
+            half_open_requests=1,
         )
         breaker = CircuitBreaker(config, namespace="test")
 
@@ -357,7 +358,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
                     with lock:
                         allowed_count["value"] += 1
 
-            # Only half_open_requests (1 by default) should be allowed
+            # Only half_open_requests (1, set above) should be allowed
             threads = [threading.Thread(target=attempt_half_open) for _ in range(10)]
             for t in threads:
                 t.start()

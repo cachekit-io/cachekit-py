@@ -17,7 +17,7 @@
 Are you caching in Python?
 │
 ├─ Single process, no Redis needed? → @cache(backend=None) [L1-only]
-├─ Multiple pods, need distributed cache? → @cache [L1+L2, out-of-the-box]
+├─ Multiple pods, need distributed cache? → @cache with REDIS_URL set [L1+L2]
 ├─ Need to encrypt cached data? → @cache.secure [AES-256-GCM]
 ├─ Building libraries/packages? → cachekit batteries included
 │
@@ -103,9 +103,9 @@ def expensive_computation(x: int) -> dict:
 > [!IMPORTANT]
 > **Why cachekit wins:**
 > - **L1+L2 caching**: L1 hits ~50ns (local memory), L1 miss → L2 Redis (~2-7ms)
-> - **Circuit breaker**: Redis down? Cache gracefully, don't cascade failures
+> - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
 > - **Distributed locking**: Prevents cache stampedes across pods
-> - **Encryption**: Client-side AES-256-GCM, Redis never sees plaintext
+> - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
 > - **Metrics**: Prometheus counters for hits/misses/errors
 
 ```python
@@ -115,7 +115,8 @@ from cachekit import cache
 def get_user_data(user_id: int) -> dict:
     # First pod (same instance): L1 hit (~50ns)
     # Different pod: L2 hit from Redis (~2-7ms)
-    # Redis down: Circuit breaker returns stale/None, doesn't crash
+    # Redis down: errors are logged and the function runs, doesn't crash
+    # Circuit breaker open: L1 hits still served; a miss runs the function and returns its result
     # Multiple pods calling simultaneously: Distributed lock prevents stampede
     return fetch_user_from_db(user_id)
 ```
@@ -178,11 +179,12 @@ def compute(x):
 
 # Staging: Add Redis (one env var, zero code change)
 # REDIS_URL=redis://localhost:6379
-# @cache automatically uses Redis when available
+# @cache uses Redis once REDIS_URL is set; with nothing set it is L1-only
 
 # Production: Add encryption (one parameter)
 @cache.secure(ttl=300)  # Enables AES-256-GCM
-# CACHEKIT_MASTER_KEY=hex_encoded_key
+# CACHEKIT_MASTER_KEY=hex_encoded_key — with it set, plaintext caches state it:
+# @cache(backend=None, ttl=300, encryption=False)
 ```
 
 **Limitations of alternatives**:
@@ -202,9 +204,10 @@ def compute(x):
 ```python
 @cache(ttl=300)  # Circuit breaker enabled by default
 def fetch_data(key):
-    # Redis is down → Circuit breaker catches errors
-    # After N failures → Open circuit → return None instead of errors
-    # Caller can handle gracefully, app stays up
+    # Redis is down → errors are logged and the function runs
+    # Down from the start → after N failed connects the circuit opens: calls stop trying Redis
+    # Circuit open → L2 is skipped: L1 hits still served, a miss runs the function
+    # Caller gets the function's result either way, app stays up
     return db.query(key)
 ```
 
@@ -265,7 +268,7 @@ def get_user(id):
 
 **Why cachekit wins**:
 - **CachekitIOBackend**: Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
-- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext, never your data
+- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext values, never plaintext values; the cache key stays cleartext ([details](features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure))
 - **Same decorator API**: Swap backend by setting `CACHEKIT_API_KEY` — zero code changes
 
 ```python notest
@@ -504,7 +507,7 @@ A: cachekit is in beta ahead of 1.0. It's used in production by early adopters, 
 A: Yes. Works with any framework (FastAPI, Django, Flask, etc). Metrics integrate with Prometheus/Grafana.
 
 **Q: What if Redis goes down?**
-A: Circuit breaker catches errors, returns stale cache or None, app continues working.
+A: The app keeps working. Redis errors are logged, and your function runs and returns its result. If Redis was down when the backend was first built, nothing is cached and repeated failures open the circuit breaker, so calls stop waiting on Redis. If Redis goes away later, L1 still caches results in-process. While the breaker is open, L1 hits are still served and a miss runs the function.
 
 **Q: Can I use my own backend?**
 A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.

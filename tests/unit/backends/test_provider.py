@@ -23,6 +23,7 @@ from cachekit.backends.provider import (
     DefaultCacheClientProvider,
     DefaultLoggerProvider,
     LoggerProvider,
+    PooledClientProvider,
     SimpleLogger,
 )
 from cachekit.hash_utils import redact_cache_key  # noqa: I001
@@ -156,24 +157,6 @@ class TestSimpleLogger:
 
         mock_logger.debug.assert_called_once_with(f"Cached result for key: {redact_cache_key('key:222')} with TTL 3600")
 
-    def test_cache_invalidated_default_source(self) -> None:
-        """Test cache invalidation logging with default source."""
-        mock_logger = mock.MagicMock()
-        logger = SimpleLogger(mock_logger)
-
-        logger.cache_invalidated("key:333")
-
-        mock_logger.debug.assert_called_once_with(f"Invalidated Redis cache for key: {redact_cache_key('key:333')}")
-
-    def test_cache_invalidated_custom_source(self) -> None:
-        """Test cache invalidation logging with custom source."""
-        mock_logger = mock.MagicMock()
-        logger = SimpleLogger(mock_logger)
-
-        logger.cache_invalidated("key:444", source="L1")
-
-        mock_logger.debug.assert_called_once_with(f"Invalidated L1 cache for key: {redact_cache_key('key:444')}")
-
 
 @pytest.mark.unit
 class TestDefaultLoggerProvider:
@@ -250,6 +233,28 @@ class TestDefaultCacheClientProvider:
 
             assert client is mock_client
             mock_get.assert_called_once()
+
+
+@pytest.mark.unit
+class TestPooledClientProvider:
+    """PooledClientProvider builds its clients once, not per operation (LAB-7075)."""
+
+    def test_get_sync_client_is_cached_over_own_pool(self) -> None:
+        provider = PooledClientProvider("redis://127.0.0.1:1/0")
+
+        client = provider.get_sync_client()
+
+        assert provider.get_sync_client() is client
+        assert client.connection_pool is provider._pool
+
+    @pytest.mark.asyncio
+    async def test_get_async_client_is_cached(self) -> None:
+        provider = PooledClientProvider("redis://127.0.0.1:1/0")
+
+        client = await provider.get_async_client()
+
+        assert await provider.get_async_client() is client
+        assert client.connection_pool.connection_kwargs["port"] == 1
 
 
 _FAKE_API_KEY = "ck_sdk_test"  # pragma: allowlist secret

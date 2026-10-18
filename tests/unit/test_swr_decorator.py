@@ -10,18 +10,25 @@ Spec: protocol spec/saas-api.md#stale-while-revalidate.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import faulthandler
+import logging
+import math
 import os
+import signal
+import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import pytest
 
-from cachekit import cache
+from cachekit import cache, hash_utils
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.validation import ConfigurationError
+from tests.utils.fork_helpers import child_outcome, report, run_fresh
 
 _CAP = 2_592_000  # 30-day storage cap shared by ttl + stale_ttl
 
@@ -245,6 +252,20 @@ class TestSWRConfig:
         assert compute() == "v"
         assert backend.set_calls == [(ttl, 100)]
 
+    def test_preset_default_window_fits_the_cap_after_rounding(self) -> None:
+        """A fractional ttl is ceiled on the wire, so the derived window is bounded by the ceiled TTL."""
+        backend = FakeSWRBackend()
+        ttl = _CAP / 2 + 0.5  # goes out as 1_296_001
+        config = DecoratorConfig(backend=backend, ttl=ttl, swr_by_default=True)  # type: ignore[arg-type]
+
+        @cache(config=config)
+        def compute() -> str:
+            return "v"
+
+        assert compute() == "v"
+        assert backend.set_calls == [(ttl, _CAP // 2 - 1)]
+        assert math.ceil(ttl) + backend.set_calls[0][1] == _CAP
+
     def test_stale_ttl_without_ttl_raises(self) -> None:
         with pytest.raises(ConfigurationError, match="requires a positive ttl"):
 
@@ -310,13 +331,86 @@ class TestSWRConfig:
         assert f() == 7
 
 
+def _forked_stale_hit_outcome(fork: str) -> object:
+    """What a forked child reports after one stale hit on an L1-only and an L2 SWR function.
+
+    fork is "c" for libc's fork(), which runs no at-fork hook (uWSGI without --py-call-uwsgi-fork-hooks),
+    or "os" for os.fork(). Run only in a fresh interpreter (run_fresh), with no other thread alive at
+    fork: one waiting for the GIL at a fork from C hangs the child in no cachekit code.
+    """
+    import ctypes
+    import types
+
+    from cachekit import l1_cache, object_cache
+    from cachekit.config import L1CacheConfig
+
+    backend = FakeSWRBackend()
+    calls = {"l1": 0, "l2": 0}
+
+    @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5))
+    def l1_only() -> int:
+        calls["l1"] += 1
+        return calls["l1"]
+
+    @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+    def l2_swr() -> int:
+        calls["l2"] += 1
+        return calls["l2"]
+
+    l1_only(), l2_swr()  # misses: each stores 1
+    manager = l1_cache.get_l1_cache_manager()
+    if manager._cleanup_thread is not None:  # ends it, still referenced: the parent ran cleanup
+        manager._stop_cleanup.set()
+        manager._cleanup_thread.join()
+    if threading.active_count() != 1:  # not an assert: python -O strips those
+        raise RuntimeError(f"a thread would be alive at fork: {threading.enumerate()}")
+    faulthandler.register(signal.SIGALRM, chain=True)  # the child inherits it: a hang dumps its stack
+    r, w = os.pipe()
+    child = ctypes.PyDLL(None).fork() if fork == "c" else os.fork()  # PyDLL keeps the GIL through the call
+    if child == 0:
+        try:
+            signal.alarm(5)
+            os.close(r)
+            requested: list[str] = []
+            logged: list[str] = []
+
+            class _RecordingThread(threading.Thread):  # keeps the child single-threaded
+                def start(self) -> None:
+                    requested.append(self.name)
+
+            class _Recorder(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    logged.append(record.getMessage())
+
+            threading.Thread = _RecordingThread  # the child's copy only; it never returns
+            logging.getLogger("cachekit").addHandler(_Recorder(logging.WARNING))  # where the refresh paths report
+            now = time.monotonic()
+            object_cache.time = types.SimpleNamespace(monotonic=lambda: now + 60)  # past ttl * ratio, short of ttl
+            backend.stale = True
+            outcome: object = {
+                "hookless": l1_cache._forked_without_hooks(),
+                "served": (l1_only(), l2_swr()),
+                "requested": requested,
+                "calls": calls,
+                "logged": logged,
+            }
+        except BaseException as e:
+            outcome = {"error": repr(e)}
+        try:
+            report(w, outcome)
+        finally:
+            os._exit(1)
+    os.close(w)
+    return child_outcome(child, r)
+
+
 class TestSWRForkIsolation:
     """LAB-506 follow-through: SWR scheduler state must not survive fork().
 
-    The per-wrapper in-flight set and slot semaphore are parent state: the
-    parent threads that would clear them don't survive fork, so without a
+    The per-wrapper refresh pool (in-flight keys and slots) is parent state:
+    the parent threads that would clear it don't survive fork, so without a
     PID guard an inherited in-flight key starves revalidation in the child
-    forever, and the inherited semaphore can carry consumed slots.
+    forever, and the inherited pool can carry consumed slots.
     """
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
@@ -326,11 +420,15 @@ class TestSWRForkIsolation:
         backend = FakeSWRBackend()
         gate = threading.Event()
         calls: list[int] = []
+        parent_pid = os.getpid()
 
         @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
         def compute(x: int) -> int:
             calls.append(os.getpid())
-            if len(calls) > 1 and not gate.is_set():
+            # Only the parent parks. The child must never touch the gate: the parent's revalidation thread
+            # can be forked while it holds the gate's lock on its way into wait(), and the child inherits
+            # that lock held, with no thread left to release it.
+            if len(calls) > 1 and os.getpid() == parent_pid:
                 gate.wait(timeout=30)  # hold the parent's revalidation in flight
             return x + 1
 
@@ -346,24 +444,53 @@ class TestSWRForkIsolation:
             queue = ctx.Queue()
 
             def child(q) -> None:
-                gate.set()  # child's own revalidation must not block
+                # A child stuck past 20 s dumps every thread's stack to stderr while the parent still
+                # waits, so a hang fails with its own diagnosis instead of a bare queue.Empty.
+                faulthandler.dump_traceback_later(20, exit=False, file=sys.__stderr__)
                 before = len(calls)
                 result = compute(1)  # stale hit; key is stuck in the INHERITED in-flight set
                 revalidated = _wait_for(lambda: len(calls) > before, timeout=5.0)
                 q.put({"result": result, "revalidated": revalidated})
 
-            process = ctx.Process(target=child, args=(queue,))
+            # daemon, and killed if still alive: a stuck child fails this test instead of outliving it
+            # (a live non-daemon child is joined with no timeout at interpreter exit).
+            process = ctx.Process(target=child, args=(queue,), daemon=True)
             process.start()
             try:
                 outcome = queue.get(timeout=30)
             finally:
                 process.join(timeout=30)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
 
             assert process.exitcode == 0
             assert outcome["result"] == 2
             assert outcome["revalidated"], "forked child must reset inherited SWR in-flight state and revalidate"
         finally:
             gate.set()  # release the parent's parked revalidation thread
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+    @pytest.mark.parametrize(
+        ("fork", "hookless", "requested"),
+        [
+            pytest.param("c", True, [], id="c-fork"),
+            pytest.param("os", False, ["cachekit-swr-refresh", "cachekit-swr-revalidate"], id="os-fork"),
+        ],
+    )
+    def test_child_forked_without_hooks_serves_stale_and_starts_no_refresh(self, fork, hookless, requested) -> None:
+        """A thread started in a child forked from C can hang in Thread.start(), so neither sync SWR path
+        asks for one there. Stale is still served; an os.fork() child still refreshes both."""
+        run = run_fresh(_forked_stale_hit_outcome, fork)
+
+        assert run.returncode == 0, run.stderr
+        assert ast.literal_eval(run.stdout) == {
+            "hookless": hookless,
+            "served": (1, 1),  # the parent's values, stale in the child
+            "requested": requested,
+            "calls": {"l1": 1, "l2": 1},  # and not recomputed in the call
+            "logged": [],  # logging's own locks may be orphaned in this child
+        }, run.stderr  # a hung child's stack, dumped on its alarm
 
     """Branches the main flows don't reach: L1 refresh, no-lock backends,
     sync failure, slot exhaustion, operation-handler degradation."""
@@ -686,6 +813,406 @@ class TestSWRSchedulingHardening:
         assert compute() == 1  # slot NOT leaked: retry schedules successfully
         assert _wait_for(lambda: calls["n"] == 2)
         assert _wait_for(lambda: len(backend.set_calls) == 2)
+
+
+async def _resume() -> list[asyncio.Task[Any]]:
+    """Let a resumed loop run its other tasks a few steps; return those still pending.
+
+    Every task that finished must have been cancelled: a pruned refresh that raised on the way
+    out (say, by giving back a slot it no longer held) fails the test here.
+    """
+    others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    for t in others:
+        if t.done():
+            assert t.cancelled(), t.exception()
+    return [t for t in others if not t.done()]
+
+
+def _collect_pruned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collect the refreshes pruned from a closed loop, which nothing holds any more. asyncio logs
+    each as destroyed while pending; closing its coroutine must raise nothing."""
+    import gc
+
+    unraisable: list[Any] = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    gc.collect()
+    assert unraisable == []
+
+
+def _close_loop(loop: asyncio.AbstractEventLoop) -> None:
+    if loop.is_closed():
+        return
+    pending = asyncio.all_tasks(loop)
+    for t in pending:
+        t.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.close()
+
+
+class TestAsyncSWRStoppedLoop:
+    """LAB-7295: a revalidation left pending on an event loop that stopped (sync code calling
+    run_until_complete) or closed without cancelling its tasks keeps its slot and key for the
+    hold, then the next revalidation attempt releases both and cancels it."""
+
+    @staticmethod
+    def _parking_compute(backend: FakeSWRBackend, starts: list[int]) -> Any:
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute(x: int) -> int:
+            if backend.stale:  # a revalidation
+                starts.append(x)
+                await asyncio.sleep(3600)  # never answers: the revalidation stays pending
+            return x
+
+        return compute
+
+    @pytest.mark.parametrize("close", [False, True], ids=["stopped", "closed"])
+    def test_revalidation_on_stopped_loop_frees_slot_and_key(self, monkeypatch: pytest.MonkeyPatch, close: bool) -> None:
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+        backend = FakeSWRBackend()
+        starts: list[int] = []
+        compute = self._parking_compute(backend, starts)
+
+        async def hit(x: int) -> None:
+            assert await compute(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(compute(0))  # misses: store
+        asyncio.run(compute(1))
+        backend.stale = True
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(hit(0))  # key 0's revalidation parks on a loop then left stopped
+            if close:
+                stopped.close()  # without cancelling it
+            asyncio.run(hit(1))  # within the hold the parked revalidation keeps the only slot
+            asyncio.run(hit(0))  # and its key
+            assert starts == [0]
+            monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+            asyncio.run(hit(1))  # past the hold it holds no slot
+            asyncio.run(hit(0))  # nor its key
+            assert starts == [0, 1, 0]
+            if close:
+                _collect_pruned(monkeypatch)
+        finally:
+            _close_loop(stopped)
+
+    def test_revalidations_pruned_from_stopped_loops_do_not_resume(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Loops that resume after pausing between run_until_complete calls run no more
+        revalidations than the pool holds: the pruned ones were cancelled."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 2)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        compute = self._parking_compute(backend, [])
+
+        async def hits() -> None:
+            for x in (0, 1):
+                assert await compute(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(compute(0))  # misses: store
+        asyncio.run(compute(1))
+        backend.stale = True
+        loops = [asyncio.new_event_loop() for _ in range(3)]
+        try:
+            for loop in loops:
+                loop.run_until_complete(hits())  # each pauses with its revalidations pending
+            assert sum(len(loop.run_until_complete(_resume())) for loop in loops) == 2  # the pool's 2, not 6
+        finally:
+            for loop in loops:
+                _close_loop(loop)
+
+    def test_pruned_revalidation_that_resumes_frees_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pruned revalidation whose loop runs again neither raises nor gives back the slot or
+        the key that a newer revalidation of the same key now holds."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        starts: list[int] = []
+        compute = self._parking_compute(backend, starts)
+
+        async def hit(x: int) -> None:
+            assert await compute(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(compute(0))  # misses: store
+        asyncio.run(compute(1))
+        backend.stale = True
+        first, second = asyncio.new_event_loop(), asyncio.new_event_loop()
+        try:
+            first.run_until_complete(hit(0))  # parks
+            second.run_until_complete(hit(0))  # prunes the first, then holds key 0 and the only slot
+            assert starts == [0, 0]
+            monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+            assert first.run_until_complete(_resume()) == []  # the pruned one ends cancelled
+            asyncio.run(hit(0))  # the second still holds key 0
+            asyncio.run(hit(1))  # and the only slot
+            assert starts == [0, 0]
+        finally:
+            _close_loop(first)
+            _close_loop(second)
+
+    def test_pruned_revalidation_does_not_store_its_late_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancelling a pruned revalidation does not stop a function that swallows the
+        cancellation, so it must not store what it returns: a newer revalidation has already
+        stored a later value for the key."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        calls: list[str] = []
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute() -> str:
+            if len(calls) == 1:  # the first revalidation parks, then swallows its cancellation
+                calls.append("parked")
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(3600)
+                calls.append("late")
+                return "late"
+            calls.append("seed" if not calls else "fresh")
+            return calls[-1]
+
+        async def finish() -> None:
+            """Run this loop's revalidations to the end: a store goes through a thread, and the
+            task is done only once it has landed."""
+            others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if others:  # the revalidation may already have finished
+                await asyncio.wait(others, timeout=5)
+
+        async def park() -> None:
+            await compute()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        async def hit() -> None:
+            await compute()
+            await finish()
+
+        asyncio.run(compute())  # miss: stores "seed"
+        backend.stale = True
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(park())  # the first revalidation parks on a loop then left stopped
+            asyncio.run(hit())  # prunes it, then stores "fresh"
+            assert calls == ["seed", "parked", "fresh"]
+            assert len(backend.set_calls) == 2
+            stopped.run_until_complete(finish())  # the pruned one resumes and returns "late"
+            assert calls[-1] == "late"
+            assert len(backend.set_calls) == 2  # but stores nothing
+            backend.stale = False
+            assert asyncio.run(compute()) == "fresh"
+        finally:
+            _close_loop(stopped)
+
+
+_WRAPPER_LOGGER = "cachekit.decorators.wrapper"
+
+
+def _warnings(caplog: pytest.LogCaptureFixture, text: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and text in r.getMessage()]
+
+
+def _assert_key_free(message: str, exc_type: str = "RuntimeError") -> None:
+    """The WARNING names the redacted key and the exception type, never the raw key or exception text."""
+    assert "<redacted:" in message and f": {exc_type}" in message
+    assert "tenant-secret-ns" not in message and "secret-detail" not in message
+
+
+def _failing_thread_shim() -> Any:
+    """A stand-in for the wrapper's threading module whose Thread.start() raises."""
+    import types
+
+    class _FailingThread:
+        def __init__(self, *a: Any, **k: Any) -> None: ...
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    shim = types.SimpleNamespace(**{name: getattr(threading, name) for name in dir(threading) if not name.startswith("_")})
+    shim.Thread = _FailingThread
+    return shim
+
+
+class TestRevalidationFailureWarnings:
+    """A revalidation that fails or never runs reaches a default-level log, throttled per function.
+
+    The caller was served the stale value and must never see the failure, so without a WARNING
+    an operator cannot tell that the entry will only be recomputed in the foreground at evict_at.
+    """
+
+    async def test_async_failure_warns_with_redacted_key_and_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        async def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("secret-detail")
+            return 1
+
+        assert await compute() == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert await compute() == 1  # caller unaffected
+            assert await _await_for(lambda: _warnings(caplog, "SWR revalidation failed"))
+        (warning,) = _warnings(caplog, "SWR revalidation failed")
+        _assert_key_free(warning)
+        assert "in function <redacted:" in warning and "(1 since the last warning)" in warning
+        assert "compute" not in warning  # the function by its digest only
+
+    def test_sync_failure_warns_with_redacted_key_and_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("secret-detail")
+            return 1
+
+        assert compute() == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert compute() == 1
+            assert _wait_for(lambda: _warnings(caplog, "SWR revalidation failed"))
+        (warning,) = _warnings(caplog, "SWR revalidation failed")
+        _assert_key_free(warning)
+
+    def test_uncopyable_args_warn_that_refresh_ahead_cannot_run(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns", key=lambda lock: "k")
+        def compute(lock: Any) -> int:
+            return 1
+
+        lock = threading.Lock()  # deepcopy(threading.Lock()) raises TypeError
+        assert compute(lock) == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert compute(lock) == 1  # stale served; the skip is logged before this returns
+        (warning,) = _warnings(caplog, "SWR revalidation skipped")
+        assert "arguments not deep-copyable, so refresh-ahead cannot run for this call" in warning
+        _assert_key_free(warning, exc_type="TypeError")
+
+    def test_unschedulable_revalidation_warns(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        def compute() -> int:
+            return 1
+
+        assert compute() == 1
+        backend.stale = True
+        monkeypatch.setattr(wrapper_mod, "threading", _failing_thread_shim())
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert compute() == 1
+        (warning,) = _warnings(caplog, "SWR revalidation could not be scheduled")
+        _assert_key_free(warning)
+
+    async def test_failures_in_one_window_warn_once_and_the_next_warning_carries_the_count(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("upstream down")
+            return 1
+
+        assert await compute() == 1
+        backend.stale = True
+        n = 5
+        with caplog.at_level(logging.DEBUG, logger=_WRAPPER_LOGGER):
+            for attempt in range(1, n + 1):
+                assert await compute() == 1
+                # The recompute raises without awaiting, so its log line and slot release land
+                # in the same task step as the count: the next stale hit revalidates again.
+                assert await _await_for(lambda attempt=attempt: calls["n"] == attempt + 1)
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            assert await compute() == 1
+            assert await _await_for(lambda: calls["n"] == n + 2)
+        warnings = _warnings(caplog, "SWR revalidation failed")
+        debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "SWR revalidation failed" in r.getMessage()]
+        assert len(warnings) == 2  # one per window, not one per failure
+        assert "(1 since the last warning)" in warnings[0]
+        assert len(debugs) == n - 1  # the rest of the first window, still at DEBUG
+        assert f"({n} since the last warning)" in warnings[1]  # none lost from the count
+
+    async def test_each_kind_has_its_own_window(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A frequent failure must not hide a rarer, permanent skip on the same function."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, key=lambda arg: "k")
+        async def compute(arg: Any) -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("upstream down")
+            return 1
+
+        assert await compute(1) == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert await compute(1) == 1  # revalidation fails: the failure window opens
+            # Logged and its slot released in one task step, so the next hit can revalidate.
+            assert await _await_for(lambda: _warnings(caplog, "SWR revalidation failed"))
+            assert await compute(threading.Lock()) == 1  # same key, uncopyable argument: skipped
+        assert len(_warnings(caplog, "SWR revalidation skipped")) == 1
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_starts_with_its_own_throttle(self) -> None:
+        """A child does not inherit a held throttle lock, nor the parent's window and count."""
+        import multiprocessing
+
+        from cachekit.hash_utils import _WarnThrottle
+
+        throttle = _WarnThrottle()
+        assert throttle.claim() == 1  # the parent's window opens
+        assert throttle.claim() == 0  # counted into the parent's next WARNING
+
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+
+        def child(q: Any) -> None:
+            result: list[int] = []
+            claimer = threading.Thread(target=lambda: result.append(throttle.claim()), daemon=True)
+            claimer.start()
+            claimer.join(5)
+            q.put(result[0] if result else None)
+
+        with throttle._lock:  # a parent thread is mid-claim at fork
+            process = ctx.Process(target=child, args=(queue,), daemon=True)
+            process.start()
+        try:
+            claimed = queue.get(timeout=30)
+        finally:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        assert claimed is not None, "a forked child must not block on a throttle lock it inherited held"
+        assert claimed == 1, "a forked child must open its own window with its own count"
 
 
 class TestPanelFollowUps:

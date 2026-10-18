@@ -73,7 +73,8 @@ below are the **actual** series names — none carry a `cachekit_` prefix.
 > The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
 > preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` is the value
 > recorded when the emitting call site passes no serializer (an instrumentation gap, not a
-> tier).
+> tier). Only failure records (`success="False"`) can carry `unknown`: every success record
+> names its tier.
 
 ### Counters (always increasing)
 
@@ -93,8 +94,12 @@ redis_cache_operations_total{operation="backpressure",status="rejected",serializ
 #         key-fingerprint mismatch under fail-closed: possible tampering or wrong key),
 #         "suspicious_envelope" (unauthenticated envelope inconsistent with config:
 #         plaintext claim under encryption / missing tenant_id — benign during lazy
-#         migration, suspect otherwise), "corruption" (checksum/format failure —
-#         storage rot or bugs); tier ("l1" or "l2").
+#         migration, suspect otherwise), "envelope_shape" (an unverified entry decoded
+#         to the shape of a ByteStorage envelope — a rotted envelope or a legitimate
+#         4-element list, indistinguishable; current writers refuse to store the latter, so the same
+#         redacted key repeating in the WARNING log is another writer still storing it — see
+#         docs/error-codes.md), "corruption" (checksum/format
+#         failure — storage rot or bugs); tier ("l1" or "l2").
 # ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
 cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
 
@@ -123,12 +128,46 @@ cache_operation_duration_ms{operation="get",namespace="users",serializer="rust"}
 cache_operation_size_bytes{operation="get",namespace="users",serializer="l1_memory"}
 ```
 
+Both histograms use fixed bucket bounds, sized for their units. Each label tuple has 14 or fewer
+finite buckets plus `+Inf`.
+
+| Histogram | Finite bucket bounds (`le`) |
+|---|---|
+| `cache_operation_duration_ms` | 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000 |
+| `cache_operation_size_bytes` | powers of 4 from 16 B to 256 MiB: 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456 |
+
+An operation slower than 1000 ms, or a payload larger than 256 MiB, counts only in `+Inf`, so a quantile
+that falls there reads as the top finite bound. Both histograms record one observation per operation
+whose value is above zero, whichever recording mode the collector is in.
+
+What each `cache_operation_duration_ms` series times, measured with a monotonic clock
+(`time.perf_counter`):
+
+| Series | Span |
+|---|---|
+| `operation="get"`, `serializer="l1_memory"` | The L1 lookup plus deserialization (decryption included for an encrypted cache) |
+| `operation="get"`, `serializer="rust"` | The L2 read of a hit |
+| `operation="set"` | Serialization plus the L2 write: not the miss read, the function, a lock wait, the L1 put or key tracking |
+
+> **Changed durations.** Earlier releases recorded every L1 hit as a constant 0.001 ms, and timed
+> `set` from before the L2 read, so each `set` sample also held the miss round trip and the
+> decorated function's own run time, plus the lock wait and a second read on the async locked path.
+> After upgrading, the `set` series drops by about one read round trip plus the function's time
+> (more on the locked path), and the L1 `get` series shows real values instead of the constant.
+> That step is the fix, not a regression.
+
+> **Changed `le` values.** Releases before these bounds used prometheus_client's default buckets
+> (0.005 to 10), sized for seconds, so nearly every operation and every payload landed in `+Inf`. The
+> `le` label values are now different. Re-check any dashboard panel or recording rule that selects
+> `_bucket` series by `le`. prometheus_client writes bounds of one million and over in exponent form
+> (`le="1.048576e+06"`).
+
 ### Gauges (current state)
 
 ```prometheus
-# Circuit breaker state. Numeric value: 0=CLOSED, 1=OPEN, 2=HALF_OPEN.
-# Labels: namespace, state
-circuit_breaker_state{namespace="users",state="open"}
+# Number of live circuit breakers in each state, per namespace.
+# Labels: namespace, state (CLOSED, OPEN or HALF_OPEN)
+circuit_breaker_state{namespace="users",state="OPEN"}
 ```
 
 ---
@@ -147,8 +186,8 @@ other operations, so this is an operation-success rate, not a hit rate.
 ```
 
 For a miss-rate proxy, watch cache writes: `operation="set"` is recorded when a miss
-writes back, but it is a write proxy — it can double-count when stats collection is on
-and records nothing for a failed write — so treat it as a proxy, not an exact miss count.
+writes back, but it is a write proxy — it records nothing for a failed write — so treat it
+as a proxy, not an exact miss count.
 
 ```promql
 # Cache-write rate as a miss-rate proxy (see caveats above)
@@ -157,27 +196,41 @@ sum(rate(cache_operations_total{operation="set"}[5m]))
 
 ### Cache Latency (P99)
 
+The duration buckets run from 0.01 ms to 1000 ms (see [Histograms](#histograms-latency-and-size)).
+Aggregate with `sum by (le)` to get one quantile across all label tuples; add a label to the `by`
+list (for example `namespace`) for one quantile per value.
+
 ```promql
 # 99th percentile cache operation duration (milliseconds)
 histogram_quantile(0.99,
-  rate(cache_operation_duration_ms_bucket[5m])
+  sum by (le) (rate(cache_operation_duration_ms_bucket[5m]))
 )
 ```
 
 ### Payload Size (P99)
 
+The size buckets run from 16 B to 256 MiB, in powers of 4. The top bound sits above the default
+`max_value_size` (100 MiB).
+
 ```promql
 # 99th percentile cache payload size (bytes)
 histogram_quantile(0.99,
-  rate(cache_operation_size_bytes_bucket[5m])
+  sum by (le) (rate(cache_operation_size_bytes_bucket[5m]))
 )
 ```
 
 ### Circuit Breaker State
 
+Each decorated function with the circuit breaker enabled has its own breaker (`@cache.minimal`
+and `@cache.test` have none). The gauge counts them: the value of
+`circuit_breaker_state{namespace="users",state="OPEN"}` is the number of breakers in
+namespace `users` that are open now. Functions without an explicit namespace share
+`namespace="default"`. A breaker that is garbage-collected leaves the count. The gauge is not exported in
+prometheus_client multiprocess mode (`PROMETHEUS_MULTIPROC_DIR` set).
+
 ```promql
-# Current circuit breaker state per namespace (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
-circuit_breaker_state
+# Open breakers per namespace
+sum by (namespace) (circuit_breaker_state{state="OPEN"})
 ```
 
 ---
@@ -200,7 +253,7 @@ circuit_breaker_state
 
 ```yaml
 - alert: CircuitBreakerOpen
-  expr: circuit_breaker_state > 0  # Not CLOSED
+  expr: circuit_breaker_state{state="OPEN"} > 0  # At least one open breaker in the namespace
   for: 1m
   annotations:
     summary: "Cache circuit breaker is open"
@@ -252,7 +305,6 @@ from cachekit.config.nested import MonitoringConfig
     ttl=300,
     monitoring=MonitoringConfig(
         collect_stats=False,
-        enable_tracing=False,
         enable_structured_logging=False,
         enable_prometheus_metrics=False,
     ),
@@ -260,6 +312,10 @@ from cachekit.config.nested import MonitoringConfig
 def operation(x):
     return compute(x)
 ```
+
+`circuit_breaker_state` is the exception: it is recorded for every function whose circuit
+breaker is enabled, whatever `MonitoringConfig` says. To leave a function out of it, pass
+`circuit_breaker=CircuitBreakerConfig(enabled=False)` (from `cachekit.config.nested`).
 
 ---
 
@@ -289,6 +345,11 @@ A: cachekit does not expose metrics for you. Confirm your app starts
 `prometheus_client` exposition (`start_http_server` or `make_wsgi_app`/`make_asgi_app`) on
 the **default** registry, and that at least one decorated function has run — series are
 created lazily on first use.
+
+**Q: A log says "Metric '…' is already registered outside cachekit; not recording it"**
+A: Your application (or another library) registered a metric with the same name on the
+default registry first. cachekit never renames its series, so it skips that one metric
+rather than fail your cache calls. Rename your own metric to get cachekit's back.
 
 **Q: Where is the hit rate?**
 A: There is no hit/miss series or label. `cache_operations_total` exposes operation

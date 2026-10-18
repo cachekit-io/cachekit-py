@@ -2,9 +2,107 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args, overload
+
+from pydantic import GetCoreSchemaHandler, SecretBytes, SecretStr, ValidationError
+from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
+from pydantic_core.core_schema import ErrorType
+from pydantic_settings import BaseSettings, SettingsError
+
+from cachekit.hash_utils import redact_error_for_log
+
+if TYPE_CHECKING:
+    from typing_extensions import Self  # typing.Self is 3.11+
 
 logger = logging.getLogger(__name__)
+
+_BUILTIN_ERROR_TYPES = frozenset(get_args(ErrorType))
+
+_T = TypeVar("_T")
+
+
+def hide_secret(value: str | _T) -> SecretStr | _T:
+    """Wrap a raw secret string in SecretStr; anything else, None or an already-wrapped secret included,
+    passes through.
+
+    A function that takes a secret rebinds its parameter through this before anything can raise, and
+    unwraps it only inside the expression that needs the raw value, so no frame on an error's traceback
+    holds it in a local (CWE-532). Error trackers capture frame locals by default (Sentry's
+    include_local_variables) and render SecretStr as its masked repr.
+    """
+    return SecretStr(value) if isinstance(value, str) else value
+
+
+def reveal_secret(value: SecretStr | _T) -> str | _T:
+    """The raw value of a SecretStr; anything else passes through. Call it inline, never into a local."""
+    return value.get_secret_value() if isinstance(value, SecretStr) else value
+
+
+@overload
+def hide_any_secret(value: bytes | bytearray | memoryview) -> SecretBytes: ...
+@overload
+def hide_any_secret(value: str | _T) -> SecretStr | _T: ...
+def hide_any_secret(value: object) -> object:
+    """``hide_secret`` that wraps bytes too, as SecretBytes, for a value that may be bytes: an ``api_key=``, which takes
+    bytes as it does a str, or a value refused if it is bytes: one under a keyword no form of ``@cache`` takes, or a
+    ``master_key=`` that takes a hex string (see ``refuse_bytes_key``).
+
+    Never raises, so a caller rebinds its parameter through it before any check can raise.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return SecretBytes(bytes(value))
+    return hide_secret(value)
+
+
+_BYTES_KEY_REFUSAL = "master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes."
+
+
+def refuse_bytes_key(master_key: SecretBytes | _T) -> _T:
+    """Return ``master_key``, which ``hide_any_secret`` has wrapped, unless it is a bytes key: then raise TypeError.
+
+    Every ``master_key=`` but EncryptionWrapper's takes a hex string. Decoding bytes there instead would put a second
+    meaning on one parameter: protocol intent-presets.md, Master Key Input, takes raw key bytes only through a
+    distinctly named one.
+    """
+    if isinstance(master_key, SecretBytes):
+        raise TypeError(_BYTES_KEY_REFUSAL)
+    return master_key
+
+
+def _hex_key_bytes(key: SecretStr) -> bytes | None:
+    try:
+        return bytes.fromhex(key.get_secret_value())
+    except ValueError:
+        return None
+
+
+def refuse_current_key_in_previous_keys(master_key: SecretStr | None, previous_master_keys: Iterable[SecretStr]) -> None:
+    """Raise ValueError when the current master key also appears in the decrypt-only list.
+
+    The detectable subset of the spec's forward-only invariant (protocol spec/encryption.md → 'Key Rotation
+    (Keyring)'): a key that ever occupied the encrypting slot is never re-promoted, because re-promotion resumes a
+    used, unknowable AES-GCM nonce budget. Keys compare as decoded bytes, so hex case cannot smuggle the current key
+    past the check. A master key that is not hex is not this check's concern: it fails loudly at its own validation.
+    Decoded keys stay temporaries, never locals (CWE-532).
+
+    >>> refuse_current_key_in_previous_keys(SecretStr("aa" * 32), [SecretStr("bb" * 32)])
+    >>> refuse_current_key_in_previous_keys(SecretStr("aa" * 32), [SecretStr("AA" * 32)])
+    Traceback (most recent call last):
+    ...
+    ValueError: master_key must not appear in previous_master_keys: ...
+    """
+    if master_key is None or _hex_key_bytes(master_key) is None:
+        return
+    if any(_hex_key_bytes(key) == _hex_key_bytes(master_key) for key in previous_master_keys):
+        raise ValueError(
+            "master_key must not appear in previous_master_keys: this configuration is the "
+            "detectable signature of re-promoting a retired key to the current (encrypting) "
+            "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
+            "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
+        )
 
 
 class ConfigurationError(Exception):
@@ -30,7 +128,182 @@ class ConfigurationError(Exception):
     pass
 
 
-def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:
+_REDACTING_SCHEMA = "cachekit_redacting"
+
+
+# Defined before RedactingSettings: pydantic builds the class's core schema, which binds this, as the
+# class statement runs.
+def _redacting_wrap(value: Any, handler: core_schema.ValidatorFunctionWrapHandler, title: str) -> Any:
+    try:
+        return _redacting(functools.partial(handler, value), title)
+    finally:
+        del value, handler
+
+
+class RedactingSettings(BaseSettings):
+    """``BaseSettings`` whose validation errors never carry a raw input (CWE-532).
+
+    ``hide_input_in_errors`` only affects ``str()``/``repr()``: ``errors()`` and ``json()`` still
+    snapshot the raw input, which for a settings model is cleartext credentials (a master key, an
+    API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
+    (``loc == ()``) snapshots the whole input dict. A failure in the constructor (``from_env()``
+    included), a ``model_validate*`` classmethod, or the config's own validator when a
+    ``TypeAdapter`` or a field of another model validates it, is re-raised as a copy with every
+    input redacted and each error's type and loc kept, and its msg and ctx too, except where a ctx exception's msg
+    came from its dropped traceback or chain, or a custom error's msg would change when formatted
+    again with its own ctx (that ctx is dropped). An error that cannot be rebuilt at all comes back
+    as one ctx-less error that withholds the details, and a warning names only the type of what the
+    rebuild raised. The copy is still a ValidationError (a
+    ValueError), so fail-loud propagation paths are unchanged.
+    """
+
+    # Every entry point drops its raw-input locals in a finally: the raised error's traceback holds
+    # these frames, and error trackers capture frame locals (Sentry does by default). The partial is
+    # never bound here, so _redacting holds the only reference and drops it before raising. `obj` is
+    # the caller's object, so it is unbound, never mutated.
+    def __init__(self, **kwargs: Any) -> None:
+        try:
+            _redacting(functools.partial(super().__init__, **kwargs))
+        finally:
+            del kwargs
+
+    # A TypeAdapter, or a model with a config field, validates input that is not a mapping once parsed
+    # through this class's core schema without reaching __init__ or a classmethod below, so the schema
+    # redacts too. It adds to __init__, not replaces it: redacting only here leaves pydantic's own
+    # __init__ frames, which hold the raw kwargs, on the traceback.
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: type[Any], handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        schema = handler(source)
+        # Once built, the class's schema comes back as the wrapper itself, which already redacts.
+        if schema.get("metadata", {}).get(_REDACTING_SCHEMA):
+            return schema
+        # The ref moves to the wrapper, so a model with a config field keeps one $defs entry rather than
+        # an inlined copy per use. It moves off a copy: the handler's schema may be one pydantic holds
+        # elsewhere. The wrapper is named after the class, so a union member's loc names it, not a
+        # partial's repr.
+        schema = schema.copy()
+        ref = cast("str | None", schema.pop("ref", None))
+        wrap = functools.partial(_redacting_wrap, title=source.__name__)
+        wrap.__name__ = source.__name__  # pyright: ignore[reportAttributeAccessIssue]
+        return core_schema.no_info_wrap_validator_function(wrap, schema, ref=ref, metadata={_REDACTING_SCHEMA: True})
+
+    # Still needed beside the schema: malformed JSON fails before any validator runs, and pydantic's
+    # own classmethod frames hold the raw input (`obj`, `json_data`) on the traceback.
+    @classmethod
+    def model_validate(cls, obj: Any, **kwargs: Any) -> Self:
+        try:
+            return _redacting(functools.partial(super().model_validate, obj, **kwargs))
+        finally:
+            del obj, kwargs
+
+    @classmethod
+    def model_validate_json(cls, json_data: str | bytes | bytearray, **kwargs: Any) -> Self:
+        try:
+            return _redacting(functools.partial(super().model_validate_json, json_data, **kwargs))
+        finally:
+            del json_data, kwargs
+
+    @classmethod
+    def model_validate_strings(cls, obj: Any, **kwargs: Any) -> Self:
+        try:
+            return _redacting(functools.partial(super().model_validate_strings, obj, **kwargs))
+        finally:
+            del obj, kwargs
+
+
+def _redacting(validate: Callable[[], _T], title: str | None = None) -> _T:
+    """Run ``validate``, re-raising a failure with no raw input and no chain.
+
+    A ValidationError becomes its redacted copy. A SettingsError (an env value that fails to decode
+    chains the decoder's error, which holds the raw value) or a UnicodeError (an env file that is
+    not valid UTF-8 carries the file's bytes) becomes a SettingsError with only its message, which
+    names what failed without quoting it. ``title`` overrides the ValidationError's title in the
+    warning, and in the withheld error outside a schema (inside one, pydantic-core keeps the outer
+    title). Not a context manager: raising from ``__exit__`` would chain the original, raw inputs
+    and all.
+    """
+    try:
+        return validate()
+    except ValidationError as e:
+        failure: ValidationError | SettingsError = e
+    except (SettingsError, UnicodeError) as e:
+        failure = SettingsError(str(e))
+    finally:
+        del validate  # it binds the raw input, and this frame is on the traceback of what is raised
+    # Redacted and raised OUTSIDE the except block, so nothing raised or reported meanwhile has the
+    # original as its __context__: `raise ... from None` only suppresses display, and the exception a
+    # ctx exception's str() raises once its chain is dropped is reported to sys.unraisablehook as the
+    # msgs are read.
+    if isinstance(failure, ValidationError):
+        title = title or failure.title
+        withheld_because: str | None = None
+        try:
+            failure = _redacted_copy(failure)  # also drops this frame's last reference to the original
+        except Exception as e:
+            # A validator's ctx can defeat the rebuild (an object posing as an exception, a non-str ctx
+            # key); withhold the details rather than raise a traceback whose frames hold the original.
+            withheld_because = redact_error_for_log(e)
+            withheld = PydanticCustomError("redaction_failed", "Validation failed; details withheld")
+            failure = ValidationError.from_exception_data(
+                title, [{"type": withheld, "loc": (), "input": "[REDACTED]"}], hide_input=True
+            )
+        if withheld_because is not None:
+            # Logged outside the except, so a handler that reads sys.exc_info() gets nothing.
+            logger.warning("%s: config validation error details withheld; redacting it raised %s", title, withheld_because)
+    raise failure
+
+
+def _redacted_copy(error: ValidationError) -> ValidationError:
+    """Rebuild ``error`` with every input replaced by ``"[REDACTED]"``.
+
+    Should not raise: a failure here would carry this frame and ``_redacting``'s, both holding the
+    original, raw inputs and all, so ``_redacting`` withholds every detail instead. Kept out of
+    ``_redacting`` so the raw ``err`` dicts are gone from the frame that raises. Side effect: exceptions
+    in a ctx are shared with ``error`` and lose their traceback and chain in place, first, so that no
+    msg read afterwards quotes them.
+    """
+    for err in error.errors():
+        for value in (err.get("ctx") or {}).values():
+            if isinstance(value, BaseException):
+                # A validator's exception (ctx["error"]) keeps its traceback, whose frames hold the
+                # validator's locals (the raw value), and its chain can quote the raw value. Drop both,
+                # through BaseException's own descriptors: a frozen or property-overriding subclass would
+                # raise on plain assignment. Its type and args are unchanged.
+                for attr in ("__traceback__", "__context__", "__cause__"):
+                    getattr(BaseException, attr).__set__(value, None)
+    # Read the msgs only now: one rendered from a ctx exception's str() that read its chain no longer
+    # quotes it. Every msg below (a custom error's template, the mode check) is the post-drop one.
+    errors = error.errors()
+    sanitized: list[InitErrorDetails] = []
+    for err in errors:
+        ctx = err.get("ctx")
+        error_type: str | PydanticCustomError = err["type"]
+        if "url" not in err or error_type not in _BUILTIN_ERROR_TYPES:
+            # Only built-in types rebuild from their name. The url marks a real built-in: a PydanticCustomError
+            # has none and may reuse a built-in name ("value_error") without the ctx that name requires. The
+            # name check guards against a url on a type this pydantic-core's ErrorType does not list, since a
+            # wrong rebuild-by-name raises here. Any other (pydantic's own Path fields raise "path_type")
+            # rebuilds from its rendered msg, which pydantic produced, hence not a LiteralString.
+            error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
+            # A custom error formats its template with its own ctx on every render. When that changes the
+            # rendered msg (a ctx value that quotes a placeholder), formatting it again would put a ctx value
+            # into the msg, so keep the msg verbatim and drop the ctx.
+            if error_type.message() != err["msg"]:
+                error_type = PydanticCustomError(err["type"], err["msg"])  # pyright: ignore[reportArgumentType]
+        detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
+        if ctx and isinstance(error_type, str):  # a custom error carries its own ctx, or none
+            detail["ctx"] = ctx
+        sanitized.append(detail)
+    # A ValidationError renders every msg in one input mode and does not say which ("Input should be
+    # an object" is JSON; "... a valid dictionary ..." is Python). Keep the Python rebuild when it
+    # reproduces the msgs, else the JSON one, so every built-in keeps its type and url.
+    python_copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
+    if [err["msg"] for err in python_copy.errors(include_url=False)] == [err["msg"] for err in errors]:
+        return python_copy
+    return ValidationError.from_exception_data(error.title, sanitized, input_type="json", hide_input=True)
+
+
+def validate_encryption_config(encryption: bool | None = False, master_key: str | SecretStr | None = None) -> None:
     """Validate encryption configuration when encryption is enabled.
 
     Checks for a master key: first from the explicit parameter, then from
@@ -43,6 +316,7 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
 
     Raises:
         ConfigurationError: If encryption config is invalid
+        TypeError: If master_key is bytes, whatever ``encryption`` is: pass ``key.hex()``.
 
     Security Warning:
         Environment variables are NOT secure key storage for production.
@@ -58,17 +332,18 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
 
         >>> validate_encryption_config(encryption=True)  # doctest: +SKIP
     """
+    master_key = hide_any_secret(master_key)  # rebound before the refusal below can raise (CWE-532)
+    master_key = refuse_bytes_key(master_key)
     # Only validate if encryption is explicitly enabled
     if not encryption:
         return
 
-    # Resolve master key: explicit param > env var via settings
+    # Resolve master key: explicit param > env var via settings. Kept wrapped: unwrapped only inline below.
     resolved_key = master_key
     if not resolved_key:
         from cachekit.config.singleton import get_settings
 
-        settings = get_settings()
-        resolved_key = settings.master_key.get_secret_value() if settings.master_key else None
+        resolved_key = get_settings().master_key
 
     if not resolved_key:
         raise ConfigurationError(
@@ -89,14 +364,14 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
                 "(HashiCorp Vault, AWS Secrets Manager, etc.)."
             )
 
-    # Validate key format and length
+    # Validate key format and length (only the length is bound: the decoded key never is)
     try:
-        key_bytes = bytes.fromhex(resolved_key)
-        if len(key_bytes) < 32:
-            raise ConfigurationError(
-                f"CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). "
-                f"Got {len(key_bytes)} bytes. "
-                "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
-            )
+        key_length = len(bytes.fromhex(resolved_key.get_secret_value()))
     except ValueError as e:
         raise ConfigurationError(f"CACHEKIT_MASTER_KEY must be hex-encoded: {e}") from e
+    if key_length < 32:
+        raise ConfigurationError(
+            f"CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). "
+            f"Got {key_length} bytes. "
+            "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
+        )

@@ -10,6 +10,7 @@ from cachekit.hash_utils import redact_error_for_log
 from .auto_serializer import AutoSerializer
 from .base import (
     CrossSDKSerializerProtocol,
+    EnvelopeShapeError,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -21,6 +22,7 @@ from .encryption_wrapper import (
     EncryptionError,
     EncryptionWrapper,
     KeyringConfigurationError,
+    TenantMismatchError,
 )
 from .standard_serializer import StandardSerializer
 
@@ -167,8 +169,8 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
 def get_available_serializers() -> dict[str, Any]:
     """Get all available serializer classes.
 
-    Note: EncryptionWrapper is not included as it's a wrapper requiring
-    a base serializer, not a standalone serializer type.
+    Note: includes "encrypted" (EncryptionWrapper), which no cache decorator accepts as
+    serializer=: encrypt with @cache.secure(master_key=..., serializer=<inner>) instead.
     """
     return SERIALIZER_REGISTRY.copy()
 
@@ -239,10 +241,12 @@ __all__ = [
     "KeyringConfigurationError",
     "EncryptionError",
     "EncryptionWrapper",
+    "TenantMismatchError",
     "OrjsonSerializer",
     "StandardSerializer",
     # Base types
     "CrossSDKSerializerProtocol",
+    "EnvelopeShapeError",
     "SerializationError",
     "SerializationFormat",
     "SerializationMetadata",

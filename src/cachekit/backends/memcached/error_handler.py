@@ -1,6 +1,6 @@
 """Memcached exception classification for backend abstraction.
 
-Maps pymemcache exceptions to BackendErrorType for circuit breaker and retry logic.
+Maps pymemcache exceptions to BackendErrorType for the circuit breaker.
 """
 
 from __future__ import annotations
@@ -8,6 +8,20 @@ from __future__ import annotations
 import socket
 
 from cachekit.backends.errors import BackendError, BackendErrorType
+
+
+def is_pool_exhausted(exc: BaseException) -> bool:
+    """Whether exc is pymemcache's pool-exhaustion error.
+
+    pymemcache's pool raises a bare ``RuntimeError("Too many objects, N >= max")``, instead of
+    waiting, once ``max_pool_size`` connections to one server are checked out.
+
+    >>> is_pool_exhausted(RuntimeError("Too many objects, 10 >= 10"))
+    True
+    >>> is_pool_exhausted(RuntimeError("something else"))
+    False
+    """
+    return isinstance(exc, RuntimeError) and str(exc).startswith("Too many objects")
 
 
 def classify_memcached_error(
@@ -73,7 +87,17 @@ def classify_memcached_error(
             key=key,
         )
 
-    # Permanent — illegal input, client errors (don't retry).
+    # Transient — connection pool exhausted: load, not a fault, but it counts toward the circuit breaker like one.
+    if is_pool_exhausted(exc):
+        return BackendError(
+            message=f"Memcached connection pool exhausted during {operation}: raise max_pool_size",
+            error_type=BackendErrorType.TRANSIENT,
+            original_exception=exc,
+            operation=operation,
+            key=key,
+        )
+
+    # Permanent — illegal input, client errors.
     # Only the exception TYPE goes in the message: pymemcache embeds the raw
     # cache key in illegal-input error text ("Key is too long: %r"), and the
     # message reaches log sinks via str(e) (CWE-532). Full details stay on

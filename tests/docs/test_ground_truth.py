@@ -100,15 +100,14 @@ class TestREADMEClaims:
         assert EncryptionWrapper is not None, "README.md:148 - EncryptionWrapper import failed"
 
     def test_serializer_parameter_syntax(self):
-        """README.md:157 - @cache(serializer='encrypted', master_key=...) must work."""
+        """README.md:156 - @cache.secure(master_key=...) must decorate."""
 
-        # README.md:157 shows encryption with master_key
-        # This requires using @cache.secure preset with master_key parameter
+        # README.md:156 shows encryption with master_key on the @cache.secure preset
         @cache.secure(master_key="0" * 64)
         def test_func():
             return "test"
 
-        assert callable(test_func), "README.md:157 - serializer parameter failed"
+        assert callable(test_func), "README.md:156 - @cache.secure(master_key=...) failed to decorate"
 
     def test_env_var_priority(self):
         """README.md:203-213 - CACHEKIT_REDIS_URL must take precedence over REDIS_URL."""
@@ -321,9 +320,10 @@ class TestEnvironmentVariables:
     def test_all_cachekit_vars_recognized(self):
         """README.md - documented CACHEKIT_* variables must actually load into settings.
 
-        Asserts live fields so the test can't pass vacuously:
-        with extra="forbid", pydantic-settings silently ignores unknown env vars, so
-        naming a removed knob here would assert nothing (issue #163 review).
+        Asserts live fields so the test can't pass vacuously: with extra="forbid",
+        pydantic-settings silently ignores unknown env vars, so naming a removed knob
+        here would assert nothing (issue #163 review). CACHEKIT_DEFAULT_TTL was removed
+        in LAB-4641 (protocol/spec/intent-presets.md rule 3) and must not reappear here.
         """
         reset_settings()  # Clear singleton cache
         _env_vars = ("CACHEKIT_ARROW_COMPRESSION", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB")

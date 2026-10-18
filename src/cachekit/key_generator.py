@@ -168,10 +168,10 @@ class CacheKeyGenerator:
             TypeError: If ``serializer_type`` is not a str.
             ValueError: If ``serializer_type`` is empty. A missing identity must fail here,
                 not fall back to a default code: a fallback is a shared bucket, and a key
-                computed from it is one nothing wrote — an invalidator holding it would
+                computed from it is one nothing wrote — an invalidation holding it would
                 report a successful delete of an entry that is still there.
         """
-        # Guard here, not per caller: every key (write path, CacheInvalidator, direct
+        # Guard here, not per caller: every key (write path, invalidate path, direct
         # generate_key users) passes through this one function.
         if not isinstance(serializer_type, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"serializer_type must be str, got {type(serializer_type).__name__}")
@@ -236,6 +236,15 @@ class CacheKeyGenerator:
         # Initialize aggregate tracker if not provided
         if _array_bytes_seen is None:
             _array_bytes_seen = [0]
+
+        # Fast path: exact primitives skip the isinstance ladder below (LAB-7068). Matched by
+        # exact type, not isinstance(): subclasses (IntEnum, StrEnum, str-mixin Enums) must still
+        # reach the Enum branch so their keys stay what they are today. float is excluded because
+        # -0.0 must reach the float branch to be normalised to 0.0. Identity checks, not set
+        # membership, so the type is never hashed or compared through a metaclass __eq__.
+        t = type(obj)  # pyright: ignore[reportUnknownVariableType]
+        if t is int or t is str or t is bytes or t is bool or obj is None:
+            return obj
 
         # === COLLECTIONS (recursive) ===
         if isinstance(obj, dict):
@@ -443,8 +452,20 @@ class CacheKeyGenerator:
         This replaces every disallowed char with ``_``, collapses runs of
         ``..`` into a single ``.``, and truncates to 200 chars.  The mapping
         is deterministic: same function → same key.
+
+        Deliberately not memoised (LAB-7068): a shared memo was slower under
+        free-threading than recomputing. Instead each regex pass is skipped when
+        it could not change the name (LAB-7405); the checks keep no state.
         """
         raw = f"{module}.{qualname}"
+        # Dots mapped to "_", an ASCII identifier holds only [A-Za-z0-9_.]: with no "..", both passes
+        # are no-ops (encodes the _FUNC_ALLOWED_RE charset; a miss just takes the regex path). "<" is
+        # tested first so <locals>/<lambda> names fail before replace() allocates; the gate needs it.
+        if "<" not in raw and raw.isascii() and raw.replace(".", "_").isidentifier() and ".." not in raw:
+            return raw[: cls._FUNC_NAME_MAX]
         sanitized = cls._FUNC_ALLOWED_RE.sub("_", raw)
-        sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)
+        # The first pass writes only "_", so it never creates a "..": with none in raw, the
+        # collapse pass would find nothing.
+        if ".." in raw:
+            sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)
         return sanitized[: cls._FUNC_NAME_MAX]

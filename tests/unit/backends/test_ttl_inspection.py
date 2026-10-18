@@ -163,6 +163,32 @@ class TestFileBackendTTLInspection:
         with pytest.raises(BackendError):
             await file_backend.refresh_ttl("k", 100)
 
+    async def test_ttl_ops_leave_the_event_loop_free_while_the_lock_is_held(self, file_backend: FileBackend) -> None:
+        """get_ttl/refresh_ttl wait for the process lock in a worker thread, not on the loop."""
+        import threading
+
+        file_backend.set("k", b"v", ttl=100)
+        held, release = threading.Event(), threading.Event()
+
+        def hold_lock() -> None:  # stands in for a set() committing on another thread
+            with file_backend._lock:
+                held.set()
+                release.wait(2)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert held.wait(2)
+        try:
+            tasks = [asyncio.ensure_future(file_backend.get_ttl("k")), asyncio.ensure_future(file_backend.refresh_ttl("k", 200))]
+            await asyncio.sleep(0.05)  # the loop runs on while both wait for the lock
+            assert not any(t.done() for t in tasks), "a TTL op blocked the event loop on the process lock"
+        finally:
+            release.set()
+            holder.join(2)
+        remaining, refreshed = await asyncio.gather(*tasks)
+        assert remaining is not None and 0 < remaining <= 200  # either order: before or after the refresh
+        assert refreshed is True
+
 
 # ----------------------------------------------------------------------- Memcached
 
@@ -174,8 +200,9 @@ def mc_backend(monkeypatch):
 
     from cachekit.backends.memcached.backend import MemcachedBackend
     from cachekit.backends.memcached.config import MemcachedBackendConfig
+    from tests.utils.memcached_helpers import mock_hash_client
 
-    fake = MagicMock()
+    fake = mock_hash_client()
     monkeypatch.setattr("pymemcache.client.hash.HashClient", MagicMock(return_value=fake))
     backend = MemcachedBackend(MemcachedBackendConfig(key_prefix="app:"))
     return backend, fake
@@ -294,6 +321,176 @@ class TestFileRefreshEndToEnd:
             await handler.get_async("k", refresh_ttl=100)
             assert await file_backend.get_ttl("k") == 90
 
+    async def test_refresh_concurrency_is_capped(self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """While every refresh is still in flight, a second hit on a key starts no second refresh, and
+        hits on more distinct keys than the pool holds start one refresh per slot (LAB-7074)."""
+        from cachekit import cache
+
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
+        release = asyncio.Event()
+        get_ttl_calls: list[str] = []
+
+        async def held_get_ttl(key: str) -> int | None:
+            get_ttl_calls.append(key)
+            await release.wait()
+            return None
+
+        file_backend.get_ttl = held_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch(x: int) -> int:
+            return x
+
+        for x in range(3):
+            await fetch(x)  # misses: store
+        for x in (0, 0, 1, 2):
+            assert await fetch(x) == x  # hits; the second hit on key 0 joins its running refresh
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(get_ttl_calls) == 2
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    def test_refresh_single_flight_spans_event_loops(self, file_backend: FileBackend) -> None:
+        """A refresh still running on one thread's event loop is not pruned by a hit on another
+        loop: the second loop sends no duplicate refresh for the same key (LAB-7074)."""
+        import threading
+
+        from cachekit import cache
+
+        release = threading.Event()
+        get_ttl_calls: list[str] = []
+        real_get_ttl = file_backend.get_ttl
+
+        async def slow_get_ttl(key: str) -> int | None:
+            get_ttl_calls.append(key)
+            await asyncio.to_thread(release.wait, 10)
+            return await real_get_ttl(key)
+
+        file_backend.get_ttl = slow_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch() -> int:
+            return 1
+
+        asyncio.run(fetch())  # miss: store
+        loop_a = asyncio.new_event_loop()
+        thread_a = threading.Thread(target=loop_a.run_forever, daemon=True)
+        thread_a.start()
+        try:
+            assert asyncio.run_coroutine_threadsafe(fetch(), loop_a).result(10) == 1  # hit: refresh parked on loop A
+
+            async def hit_on_loop_b() -> None:
+                assert await fetch() == 1
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+            asyncio.run(hit_on_loop_b())
+            assert len(get_ttl_calls) == 1
+        finally:
+            release.set()
+            loop_a.call_soon_threadsafe(loop_a.stop)
+            thread_a.join(10)
+            loop_a.close()
+
+    def test_refresh_on_stopped_loop_frees_key_and_slot(
+        self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refresh left pending on a loop that stopped without closing (sync code calling
+        run_until_complete) keeps its key and pool slot for the hold, as a request it sent may
+        still be in flight; after the hold a hit on another loop refreshes another key, then the
+        same key (LAB-7074)."""
+        from cachekit import cache
+
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 1)
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+        get_ttl_calls: list[str] = []
+
+        async def parked_get_ttl(key: str) -> int | None:
+            get_ttl_calls.append(key)
+            await asyncio.sleep(3600)  # never answers: the refresh stays pending
+            return None
+
+        file_backend.get_ttl = parked_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch(x: int) -> int:
+            return x
+
+        async def hit(x: int) -> None:
+            assert await fetch(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(fetch(0))  # misses: store
+        asyncio.run(fetch(1))
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(hit(0))  # key 0's refresh parks on a loop that is then left stopped
+            asyncio.run(hit(1))  # within the hold the parked refresh keeps its slot
+            asyncio.run(hit(0))  # and its key
+            assert len(get_ttl_calls) == 1
+            monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+            asyncio.run(hit(1))  # past the hold it holds no slot
+            asyncio.run(hit(0))  # nor its key
+            assert len(get_ttl_calls) == 3
+        finally:
+            pending = asyncio.all_tasks(stopped)
+            for t in pending:
+                t.cancel()
+            if pending:
+                stopped.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            stopped.close()
+
+    def test_refresh_pruned_from_stopped_loop_does_not_resume(
+        self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refresh that gave up its slot because its loop stopped is cancelled, so loops that
+        resume after pausing between run_until_complete calls do not run more refreshes than the
+        pool holds (LAB-7074)."""
+        from cachekit import cache
+
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+
+        async def parked_get_ttl(key: str) -> int | None:
+            await asyncio.sleep(3600)  # never answers: the refresh stays pending
+            return None
+
+        file_backend.get_ttl = parked_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch(x: int) -> int:
+            return x
+
+        async def hits() -> None:
+            for x in (0, 1):
+                assert await fetch(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        async def settle() -> int:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return sum(not t.done() for t in asyncio.all_tasks() if t is not asyncio.current_task())
+
+        asyncio.run(fetch(0))  # misses: store
+        asyncio.run(fetch(1))
+        loops = [asyncio.new_event_loop() for _ in range(3)]
+        try:
+            for loop in loops:
+                loop.run_until_complete(hits())  # each pauses with its refreshes pending
+            assert sum(loop.run_until_complete(settle()) for loop in loops) == 2  # resumed: the pool's 2, not 6
+        finally:
+            for loop in loops:
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
     async def test_decorator_refresh_ttl_on_get_slides_file_expiry(self, file_backend: FileBackend) -> None:
         """Behavioural e2e through the real @cache decorator: a hit past the ORIGINAL expiry
         is still served (not recomputed) because refresh_ttl_on_get slid the File TTL forward.
@@ -323,10 +520,9 @@ class TestFileRefreshEndToEnd:
 
         with time_machine.travel(4050.0, tick=False):
             assert await fetch() == 1  # hit; remaining 50 < 90 -> triggers refresh, expiry->4150
-            # Drain any background refresh task the wrapper may have scheduled (File async
-            # methods do sync work, so a couple of loop yields fully complete it).
-            for _ in range(5):
-                await asyncio.sleep(0)
+            # Drain the background refresh task the wrapper scheduled (File's TTL methods run
+            # in a worker thread, so loop yields alone do not complete it).
+            await asyncio.gather(*(t for t in asyncio.all_tasks() if t is not asyncio.current_task()))
 
         with time_machine.travel(4120.0, tick=False):
             # Original expiry (4100) has passed. If the refresh worked, expiry is 4150 > 4120,

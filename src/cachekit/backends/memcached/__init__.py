@@ -1,7 +1,8 @@
 """Memcached backend for cachekit.
 
 Provides Memcached storage backend using pymemcache with consistent hashing
-for multi-server support. Thread-safe via HashClient connection pooling.
+for multi-server support. Thread-safe via a per-server connection pool
+(``max_pool_size`` connections per server).
 
 Public API:
     - MemcachedBackend: Main backend implementation

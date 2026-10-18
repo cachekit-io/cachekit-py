@@ -11,12 +11,11 @@
 <details>
 <summary><strong>Circuit Breaker Errors</strong></summary>
 
-**Issue**: Circuit breaker is open and requests are failing
+**Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Too many transient errors (ConnectionError, TimeoutError) detected
-- Circuit breaker protection is preventing cascading failures
-- Cache is temporarily disabled to avoid overwhelming backend
+- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). Exceptions raised by the decorated function itself never count. A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
+- Calls to this function that miss L1 run uncached until the breaker recovers (L1 hits are still served): after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
 
@@ -33,44 +32,30 @@ env | grep REDIS
 export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
-3. **Wait for circuit breaker to reset**:
-- Circuit breaker automatically resets after timeout
-- Default: 60 seconds (configurable)
-- During recovery: requests execute function without caching
+3. **Let the breaker recover** — no restart is needed:
+- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN with three probe slots (a probe whose function raises hands its slot to the next call, so while it keeps raising, more than three calls can probe in one cycle); three successes close it, and a counted failure reopens it for another cooldown
+- While open, sync and async functions with an L2 backend still serve L1 hits and run without caching on an L1 miss (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
-4. **Increase timeout if network is slow**:
+4. **Increase timeout if network is slow** (both default to 5.0 seconds):
 ```bash
-export CACHEKIT_SOCKET_TIMEOUT=5.0
-export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
+export CACHEKIT_SOCKET_TIMEOUT=10.0
+export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-**Example handling**:
-```python
-import logging
-from cachekit import cache
-
-logger = logging.getLogger(__name__)
-
-@cache()
-def safe_computation(data):
-    try:
-        return expensive_operation(data)
-    except Exception as e:
-        logger.error(f"Computation error: {e}")
-        raise  # Let circuit breaker catch it
-```
+Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions never count toward the circuit breaker, so a function that raises does not stop its own caching.
 
 </details>
 
 <details>
 <summary><strong>Serialization Failures</strong></summary>
 
-**Issue**: "Could not serialize data" or TypeError during caching
+**Issue**: results are never cached, and the log shows `Serialization failed with ...: TypeError` followed by `Failed to store in backend cache for ...: SerializationError`
 
 **What it means**:
 - Cache attempted to serialize function result
 - Data type is not compatible with chosen serializer
-- MessagePack (default) only supports basic types
+- The default serializer (MessagePack) supports `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`
+- The call still returns the result, except with `@cache(interop=...)`, where an unsupported type raises `InteropError` — see [Serialization unsupported type](error-codes.md#serialization-unsupported-type)
 
 **Solutions**:
 
@@ -122,12 +107,6 @@ def get_user(user_id: int) -> dict:
 
    **Why not auto-detect Pydantic models?** See [Serializer Guide - Caching Pydantic Models](serializers/pydantic.md) for the detailed rationale.
 
-5. **Check what serializer is installed**:
-```python notest
-from cachekit.serializers import DEFAULT_SERIALIZER
-print(f"Active serializer: {DEFAULT_SERIALIZER}")
-```
-
 </details>
 
 <details>
@@ -135,11 +114,11 @@ print(f"Active serializer: {DEFAULT_SERIALIZER}")
 
 **Issue**: Redis connection timeout or refused
 
-**Error messages**:
+`@cache` does not raise these: it logs the failure and runs the function. They only occur with a backend configured (or for `@cache.secure`, `encryption=True` and `interop=`, which fall back to localhost Redis); with nothing configured, a plaintext `@cache` is L1-only and connects to nothing. If Redis was unreachable when the backend was first built (the `Connection refused` line below comes from that first ping), nothing is cached, the failure counts toward the circuit breaker, and the next call tries again. If Redis went away later, the result is still stored in L1. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
 ```
-ConnectionError: Error -2 connecting to localhost:6379
-TimeoutError: Connection timeout
-ConnectionRefusedError: [Errno 111] Connection refused
+Error 111 connecting to localhost:6379. Connection refused.
+Timeout connecting to server
+Timeout reading from ...
 ```
 
 **Solutions**:
@@ -175,10 +154,10 @@ redis-cli -h localhost -p 6379 ping
 redis-cli -h redis-server.example.com -p 6379 ping
 ```
 
-4. **For timeout issues**, increase timeout values:
+4. **For timeout issues**, increase timeout values (both default to 5.0 seconds):
 ```bash
-export CACHEKIT_SOCKET_TIMEOUT=5.0
-export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
+export CACHEKIT_SOCKET_TIMEOUT=10.0
+export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
 5. **Verify Redis is running**:
@@ -196,11 +175,14 @@ lsof -i :6379
 
 **Issue**: Decryption failures or key-related errors
 
-**Error messages**:
+**Error messages** (types and when each raises: [Encryption Errors](error-codes.md#encryption-errors)):
 ```
-"CACHEKIT_MASTER_KEY not set"
-"CACHEKIT_MASTER_KEY must be hex-encoded, minimum 32 bytes"
-"Decryption failed: authentication tag verification failed"
+cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable
+A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...
+EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: ...
+CACHEKIT_MASTER_KEY must be hex-encoded: ...
+CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). Got ... bytes. ...
+Decryption failed: ...
 ```
 
 **Solutions**:
@@ -209,9 +191,11 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 
 **Common causes**:
 1. Master key not set when using `@cache.secure()`
-2. Master key format invalid (not hex-encoded)
-3. Master key rotated (can't decrypt old cached data)
-4. Data corruption during storage/retrieval
+2. Master key set, but a cache states no encryption intent — add `encryption=False` for plaintext ([details](error-codes.md#master-key-present-no-encryption-intent))
+3. An `EncryptionWrapper` passed as a decorator's `serializer=` — pass its inner serializer to `@cache.secure(master_key=..., serializer=...)` instead ([details](error-codes.md#encrypting-serializer-on-a-decorator))
+4. Master key format invalid (not hex-encoded)
+5. Master key rotated (can't decrypt old cached data)
+6. Data corruption during storage/retrieval
 
 **Quick fix**:
 ```bash
@@ -288,11 +272,7 @@ echo $CACHEKIT_API_KEY
 export CACHEKIT_API_KEY=new_key_here
 ```
 
-3. **Check for trailing whitespace or newlines** if the key was copy-pasted:
-```bash
-python -c "import os; k=os.getenv('CACHEKIT_API_KEY',''); print(repr(k))"
-# Key must not start/end with spaces or \n
-```
+3. **Check the key for a bad copy.** A key with a character outside the RFC 6750 bearer-token set cannot cause a 401: cachekit raises `ConfigurationError: ... is not a valid bearer token` when the backend is built, before any request is sent (see [the rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)). A key with extra, missing or altered characters from inside the set (`A-Z a-z 0-9 - . _ ~ + /`, then any number of trailing `=`) still passes that check and returns 401 — for example a trailing `.` copied from a sentence, an extra `=`, or a truncated or doubled paste. Copy the key again from the dashboard.
 
 </details>
 
@@ -315,7 +295,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **The circuit breaker handles backoff automatically** — no manual retry logic needed. If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **Sync calls do not retry a rate-limited request** — the function runs, its result is still stored in L1, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs without the lock (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 
@@ -329,7 +309,8 @@ def expensive_query(id):
 **What it means**:
 - A custom `CACHEKIT_API_URL` points to an internal/private host
 - SSRF protection blocks requests to non-allowlisted destinations
-- Only `api.cachekit.io` is permitted by default
+- Only `api.cachekit.io` and `api.staging.cachekit.io` are permitted by default, matched exactly
+- A subdomain (`not in allowlist`) or an ambiguous URL (`Invalid API URL: could not be parsed`) is rejected: use the exact hostname, or set `CACHEKIT_ALLOW_CUSTOM_HOST=true` for your own host. A custom host with non-ASCII characters must be given in its ASCII `xn--` form
 
 **Solutions**:
 
@@ -360,16 +341,14 @@ curl -sf $CACHEKIT_API_URL/healthz
 
 **Solutions**:
 
-1. **Check configured timeout**:
+1. **Check configured timeout** (the `CACHEKIT_SOCKET_*` variables apply to Redis only):
 ```bash
-echo $CACHEKIT_SOCKET_TIMEOUT
-echo $CACHEKIT_SOCKET_CONNECT_TIMEOUT
+echo $CACHEKIT_TIMEOUT
 ```
 
 2. **Increase timeout for high-latency environments**:
 ```bash
-export CACHEKIT_SOCKET_TIMEOUT=10.0
-export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
+export CACHEKIT_TIMEOUT=10.0
 ```
 
 3. **Measure actual latency**:
@@ -378,160 +357,15 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **Circuit breaker will engage automatically** after repeated timeouts, allowing your application to continue running without blocking on the cache backend.
+4. **A timeout does not fail the call**: the request is logged, the function runs, and its result is still stored in L1. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
 
 </details>
 
 ---
 
-## Error Code Reference
+## Error Reference
 
-<details>
-<summary><strong>E001: CACHEKIT_MASTER_KEY not set</strong></summary>
-
-**Message**: "CACHEKIT_MASTER_KEY environment variable must be set"
-
-**Cause**: Using `@cache.secure()` without encryption key configured
-
-**When it occurs**:
-```python notest
-# Raises when CACHEKIT_MASTER_KEY is unset and no master_key= is passed
-@cache.secure(ttl=300)
-def get_sensitive_data():
-    return secrets
-```
-
-**Solution**:
-```bash
-# Generate and export master key
-export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-```
-
-</details>
-
-<details>
-<summary><strong>E002: Invalid Key Format</strong></summary>
-
-**Message**: "CACHEKIT_MASTER_KEY must be hex-encoded, minimum 32 bytes"
-
-**Cause**: Master key is not valid hex or too short
-
-**Invalid examples**:
-```bash
-export CACHEKIT_MASTER_KEY="my-secret-key"  # Not hex
-export CACHEKIT_MASTER_KEY="abcd1234"  # Too short
-```
-
-**Solution**:
-```bash
-# Generate valid 64-character hex string (32 bytes)
-export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-
-# Verify length
-python -c "import os; print(len(os.getenv('CACHEKIT_MASTER_KEY', '')))"
-# Output: 64
-```
-
-</details>
-
-<details>
-<summary><strong>E003: Decryption Failed - Authentication Tag Mismatch</strong></summary>
-
-**Message**: "Decryption failed: authentication tag verification failed"
-
-**Cause**:
-- Master key was changed (can't decrypt old data)
-- Data corruption during storage or retrieval
-- Encrypted data was modified
-
-**Solutions**:
-
-1. **Key was rotated** (most common): keep the old key decrypt-only in
-   `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex, max 3) so entries it
-   wrote stay readable, and follow the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/). Do not
-   flush or mint another key: a flush drops unrelated data on a shared
-   database, and a fresh key only repeats the failure.
-
-2. **Wrong key on some instances** (configuration drift): compare a hash of the
-   key across instances — never print the key itself:
-```bash
-python -c "import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ['CACHEKIT_MASTER_KEY'])).hexdigest()[:16])"
-```
-   An instance whose hash differs from the rest is misconfigured. Do not fix it
-   by setting `CACHEKIT_MASTER_KEY` back to a key that has already encrypted
-   and been retired: re-promoting a key resumes its used AES-GCM nonce budget
-   (see [Key Rotation Pattern](features/zero-knowledge-encryption.md#key-rotation-pattern)).
-   Move the drifted instance forward to the fleet's current key, and keep the
-   key it wrote with decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS`.
-
-3. **Data corruption**: evict the entry, and the function recomputes and
-   re-caches it with the current key on the next call.
-
-Evict the suspect entry through the decorated function, with the same
-arguments and in the same tenant context as the failing read. It derives the key
-the read used and clears both L1 and L2:
-
-```python notest
-get_data.invalidate_cache(user_id)         # sync function
-await get_data.ainvalidate_cache(user_id)  # async function
-```
-
-Called with no arguments on the tenant-scoped Redis backend it deletes every
-process's L2 entries for the calling tenant; on other backends it evicts only the
-keys this process has cached, not the fleet's. It does not cover a function with a custom `key=`: delete that
-entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`,
-with `<tenant>` percent-encoded as shown below.
-
-For bulk eviction, delete by prefix:
-
-```bash
-# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
-# (an int or UUID tenant as its str() first):
-# tenant org:123 is stored as t:org%3A123:...
-# Namespaced function (@cache.secure(namespace="users", ...)):
-redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
-# No namespace (the default): keys start with func:<module>.<qualname>
-redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
-
-# Only if this Redis database is dedicated to cachekit:
-# redis-cli FLUSHDB
-```
-
-</details>
-
-<details>
-<summary><strong>E004: Serialization Compatibility Error</strong></summary>
-
-**Message**: "Could not serialize object of type X"
-
-**Cause**: Data type not supported by serializer
-
-**When it occurs**:
-```python notest
-from cachekit import cache
-import datetime
-
-# WRONG - datetime not serializable by default serializer
-@cache()
-def get_timestamp():
-    return datetime.datetime.now()
-```
-
-**Solution**:
-```python notest
-from cachekit import cache
-from cachekit.serializers import OrjsonSerializer
-import datetime
-
-# OrjsonSerializer handles datetime natively (converts to ISO-8601 string)
-@cache(serializer=OrjsonSerializer(), backend=None)
-def get_timestamp():
-    return {"ts": datetime.datetime.now()}
-```
-```
-
-</details>
+The errors cachekit raises or logs, with whether each reaches your code, are in the [Error Reference](error-codes.md).
 
 ---
 
@@ -540,12 +374,10 @@ def get_timestamp():
 <details>
 <summary><strong>Cache Invalidation</strong></summary>
 
-**Clear entire cache**:
-```bash
-redis-cli FLUSHDB
-```
+**One entry or one function**: call the decorated function's invalidation method. With
+arguments it derives the key the call used, including a custom `key=`, and deletes it from
+L1 and L2:
 
-**Clear by namespace** (if implemented):
 ```python notest
 from cachekit import cache
 
@@ -553,34 +385,18 @@ from cachekit import cache
 def get_user(user_id):
     return fetch_user(user_id)
 
-# Manual invalidation
-# Note: Current cachekit doesn't provide built-in invalidation
-# Clear Redis and re-cache on next call
-```
-
-```bash
-redis-cli FLUSHDB
-```
-
-**Per-function cache clearing** (workaround):
-```python notest
-from cachekit import cache
-import redis
-
-r = redis.from_url("redis://localhost:6379/0")
-
-def invalidate_user_cache(user_id):
-    key = f"users:get_user:{user_id}"
-    r.delete(key)
-
-@cache(namespace="users")
-def get_user(user_id):
-    return fetch_user(user_id)
-
-# Invalidate when user data changes
 user = update_user(user_id, data)
-invalidate_user_cache(user_id)
+get_user.invalidate_cache(user_id)  # an async function: await get_user.ainvalidate_cache(user_id)
+
+get_user.invalidate_cache()  # every get_user entry
 ```
+
+How far the no-argument form reaches depends on the backend: see
+[Whole-Function Invalidation](features/l1-invalidation.md#whole-function-invalidation).
+
+**By prefix**: run the `scan_iter` + `unlink` script under *Option 3: Data corruption* in
+[Decryption failed](error-codes.md#decryption-failed---authentication-tag-mismatch).
+Flush the database (`redis-cli FLUSHDB`) only if it is dedicated to cachekit.
 
 </details>
 
@@ -681,6 +497,8 @@ logging.getLogger("redis").setLevel(logging.DEBUG)
 # View logs
 logging.basicConfig(level=logging.DEBUG)
 ```
+
+With the CachekitIO backend, a `DEBUG` root also shows urllib3's request lines, raw cache keys in their paths, never the API key or lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) if your keys carry identifiers.
 
 </details>
 

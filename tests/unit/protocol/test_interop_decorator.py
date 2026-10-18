@@ -9,8 +9,10 @@ round-trip, and auto-mode remaining byte-identical for non-opted-in callers.
 from __future__ import annotations
 
 import json
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Optional
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -18,6 +20,7 @@ from cachekit import cache
 from cachekit.config.validation import ConfigurationError
 from cachekit.interop import InteropError
 from cachekit.serializers.wrapper import SerializationWrapper
+from tests.unit.protocol.test_interop_model import NS, OP, FormatsAsNsapi, UnhashableAsReserved
 
 VECTORS = json.loads((Path(__file__).parent / "fixtures" / "interop-mode.json").read_text(encoding="utf-8"))
 KEY_VECTORS = {v["name"]: v for v in VECTORS["key_vectors"]}
@@ -66,6 +69,16 @@ def _decorate(backend: DictBackend, **kwargs: Any):
         return cache(backend=backend, l1_enabled=False, **kwargs)(fn)
 
     return apply
+
+
+def _patch_backend_provider(get_backend: DictBackend | BaseException) -> AbstractContextManager[Mock]:
+    """Patch the wrapper's lazy DI provider: ``get_backend`` returns the given backend, or raises it if it is an exception."""
+    provider = Mock()
+    if isinstance(get_backend, BaseException):
+        provider.get_backend.side_effect = get_backend
+    else:
+        provider.get_backend.return_value = get_backend
+    return patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider)
 
 
 class TestInteropKeysAndValues:
@@ -252,10 +265,90 @@ class TestInteropRejections:
             def f(x: int):
                 return x
 
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_reserved_namespace_rejected_at_decoration(self, backend: DictBackend, reserved: str):
+        # The server parses a key starting ns:/nsapi: as namespace-prefixed,
+        # so the key would be rejected or misrouted — fail before any call.
+        with pytest.raises(ConfigurationError, match="reserved"):
+
+            @_decorate(backend, interop="get_user", namespace=reserved)
+            def f(x: int):
+                return x
+
+    @pytest.mark.parametrize(("operation", "namespace"), [("get_user", "a..b"), ("x..y", "users")])
+    def test_double_dot_segment_rejected_at_decoration(self, backend: DictBackend, operation: str, namespace: str):
+        # The server rejects '..' anywhere in a key, so the key would fail on
+        # every CachekitIO request; fail before any call, on every backend.
+        with pytest.raises(ConfigurationError, match=r"must not contain '\.\.'"):
+
+            @_decorate(backend, interop=operation, namespace=namespace)
+            def f(x: int):
+                return x
+
+    def test_lone_dots_accepted(self, backend: DictBackend):
+        """Only '..' is forbidden: dotted segments decorate and write the
+        byte-pinned vector key."""
+        vector = KEY_VECTORS["lone_dots_stay_valid"]
+
+        @_decorate(backend, interop=vector["operation"], namespace=vector["namespace"])
+        def f(x: int):
+            return x
+
+        f(*vector["args"])
+        assert list(backend.store) == [vector["expected_key"]]
+
+    def test_reservation_scope_accepted(self, backend: DictBackend):
+        """The reservation is exact-match and namespace-only: operation nsapi in
+        namespace nsapix decorates and writes the byte-pinned vector key."""
+        vector = KEY_VECTORS["reservation_scope"]
+
+        @_decorate(backend, interop=vector["operation"], namespace=vector["namespace"])
+        def f(x: int):
+            return x
+
+        f(*vector["args"])
+        assert list(backend.store) == [vector["expected_key"]]
+
+    def test_str_enum_segments_write_the_plain_key(self, backend: DictBackend):
+        """A (str, Enum) member is keyed by its value, not its NS.USERS format."""
+
+        @_decorate(backend, interop=OP.GET_USER, namespace=NS.USERS)
+        def get_user(user_id: int):
+            return user_id
+
+        get_user(42)
+        assert list(backend.store) == [KEY_VECTORS["single_int"]["expected_key"]]
+
+    def test_overridden_format_never_writes_a_reserved_prefix(self, backend: DictBackend):
+        @_decorate(backend, interop="get_user", namespace=FormatsAsNsapi("users"))
+        def get_user(user_id: int):
+            return user_id
+
+        get_user(42)
+        assert list(backend.store) == [KEY_VECTORS["single_int"]["expected_key"]]
+
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_overridden_hash_rejected_at_decoration(self, backend: DictBackend, reserved: str):
+        with pytest.raises(ConfigurationError, match="reserved"):
+
+            @_decorate(backend, interop="get_user", namespace=UnhashableAsReserved(reserved))
+            def f(x: int):
+                return x
+
+    def test_wrapper_uses_the_validated_namespace_after_validation(self, backend: DictBackend):
+        """create_cache_wrapper rebinds namespace to the exact str it validated,
+        so later checks such as the key-registry 'ck' reservation cannot be
+        dodged by a subclass whose __eq__ lies."""
+        with pytest.raises(ConfigurationError, match="key registry"):
+
+            @_decorate(backend, interop="get_user", namespace=UnhashableAsReserved("ck"))
+            def f(x: int):
+                return x
+
     def test_custom_key_function_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="key"):
 
-            @_decorate(backend, interop="op", namespace="ns", key=lambda x: str(x))
+            @_decorate(backend, interop="op", namespace="users", key=lambda x: str(x))
             def f(x: int):
                 return x
 
@@ -289,12 +382,12 @@ class TestInteropRejections:
             return x
 
         with pytest.raises(ConfigurationError, match="fast_mode"):
-            create_cache_wrapper(f, interop="op", namespace="ns", backend=backend, fast_mode=True)
+            create_cache_wrapper(f, interop="op", namespace="users", backend=backend, fast_mode=True)
 
     def test_non_default_serializer_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="serializer"):
 
-            @_decorate(backend, interop="op", namespace="ns", serializer="orjson")
+            @_decorate(backend, interop="op", namespace="users", serializer="orjson")
             def f(x: int):
                 return x
 
@@ -306,7 +399,7 @@ class TestInteropRejections:
 
         calls = []
 
-        @_decorate(backend, interop="op", namespace="ns")
+        @_decorate(backend, interop="op", namespace="users")
         def f(x):
             calls.append(x)
             return 1
@@ -318,7 +411,7 @@ class TestInteropRejections:
     def test_out_of_model_value_raises_at_store(self, backend: DictBackend):
         """A value outside the interop model fails loud at store time."""
 
-        @_decorate(backend, interop="op", namespace="ns")
+        @_decorate(backend, interop="op", namespace="users")
         def f(x: int):
             return {1, 2, 3}  # sets do not round-trip cross-SDK
 
@@ -333,7 +426,7 @@ class TestInteropRejections:
 
         with pytest.raises(ConfigurationError, match="prefix"):
 
-            @_decorate(prefixed, interop="op", namespace="ns")
+            @_decorate(prefixed, interop="op", namespace="users")
             def f(x: int):
                 return x
 
@@ -344,7 +437,7 @@ class TestInteropRejections:
         (contract-violating dynamic backend) still fails closed."""
         mutable = DictBackend(key_prefix="")
 
-        @_decorate(mutable, interop="op", namespace="ns")
+        @_decorate(mutable, interop="op", namespace="users")
         def f(x: int):
             return x
 
@@ -361,7 +454,7 @@ class TestInteropRejections:
         cached values from a backend that had started prefixing keys."""
         mutable = DictBackend(key_prefix="")
 
-        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="ns")
+        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="users")
         async def f(x: int):
             return x
 
@@ -371,11 +464,23 @@ class TestInteropRejections:
             await f(1)  # same args → L1 hit path; must still fail closed
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
 
+    def test_key_prefix_appearing_later_fails_closed_per_call_sync_l1_hit(self):
+        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission (LAB-5351),
+        and the per-call re-check must still run before it."""
+        mutable = DictBackend(key_prefix="")
+
+        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="users")
+        def f(x: int):
+            return x
+
+        assert f(1) == 1  # clean backend works; warms L1 for x=1
+        mutable._key_prefix = "tenant-a:"  # contract violation after the fact
+        with pytest.raises(ConfigurationError, match="prefix"):
+            f(1)  # same args → L1 hit path; must still fail closed
+
     async def test_async_lazy_provider_prefixing_backend_fails_closed(self):
         """Lazy DI resolution (backend unknown at decoration) still runs the
         guard before the first async call touches L1 or executes the function."""
-        from unittest.mock import Mock, patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         calls: list[int] = []
@@ -384,31 +489,96 @@ class TestInteropRejections:
             calls.append(x)
             return x
 
-        wrapped = create_cache_wrapper(f, interop="op", namespace="ns")
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
-        provider = Mock()
-        provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(DictBackend(key_prefix="t:default:")):
             with pytest.raises(ConfigurationError, match="prefix"):
                 await wrapped(1)
         assert calls == [], "function must NOT run against an incompatible backend"
+
+    def test_sync_lazy_provider_prefixing_backend_fails_closed(self):
+        """Sync twin (LAB-5351): the guard still runs on the first sync call, when the backend is
+        resolved lazily behind admission. Checking before resolution alone would be a no-op
+        (``ensure_interop_backend_compatible(None)`` returns) and run the function."""
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        calls: list[int] = []
+
+        def f(x: int):
+            calls.append(x)
+            return x
+
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
+
+        with _patch_backend_provider(DictBackend(key_prefix="t:default:")):
+            with pytest.raises(ConfigurationError, match="prefix"):
+                wrapped(1)
+        assert calls == [], "function must NOT run against an incompatible backend"
+
+    @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
+    def test_invalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
+        """Invalidation runs the same guard as reads and writes. Without it, an invalidate-only
+        caller on a key-prefixing backend deletes {prefix}{key} and returns normally, while the
+        bare interop entry other SDKs read stays cached."""
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        key = KEY_VECTORS["single_int"]["expected_key"]
+        prefixed = DictBackend(key_prefix="t:default:")
+        prefixed.store[key] = b"written by another SDK"
+
+        def get_user(user_id: int):
+            return user_id
+
+        wrapped = create_cache_wrapper(get_user, interop="get_user", namespace="users")
+        with _patch_backend_provider(prefixed):
+            if not call_args:
+                # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
+                prefixed._key_prefix = ""
+                del prefixed.store[key]
+                assert wrapped(42) == 42
+                prefixed._key_prefix = "t:default:"
+            with patch.object(prefixed, "delete", wraps=prefixed.delete) as delete:
+                with pytest.raises(ConfigurationError, match="prefix"):
+                    wrapped.invalidate_cache(*call_args)
+        delete.assert_not_called()
+
+    @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
+    async def test_ainvalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
+        """Async mirror of test_invalidate_on_lazy_prefixing_backend_fails_closed."""
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        key = KEY_VECTORS["single_int"]["expected_key"]
+        prefixed = DictBackend(key_prefix="t:default:")
+        prefixed.store[key] = b"written by another SDK"
+
+        async def get_user(user_id: int):
+            return user_id
+
+        wrapped = create_cache_wrapper(get_user, interop="get_user", namespace="users")
+        with _patch_backend_provider(prefixed):
+            if not call_args:
+                # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
+                prefixed._key_prefix = ""
+                del prefixed.store[key]
+                assert await wrapped(42) == 42
+                prefixed._key_prefix = "t:default:"
+            with patch.object(prefixed, "delete", wraps=prefixed.delete) as delete:
+                with pytest.raises(ConfigurationError, match="prefix"):
+                    await wrapped.ainvalidate_cache(*call_args)
+        delete.assert_not_called()
 
     async def test_async_lazy_provider_failure_falls_back_uncached(self):
         """Backend-creation failure degrades to uncached execution (same
         contract as the sync interop path) — loud failure is reserved for
         out-of-model arguments/values, not backend unavailability."""
-        from unittest.mock import Mock, patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         async def f(x: int):
             return x * 2
 
-        wrapped = create_cache_wrapper(f, interop="op", namespace="ns")
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
-        provider = Mock()
-        provider.get_backend.side_effect = RuntimeError("backend down")
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(RuntimeError("backend down")):
             assert await wrapped(3) == 6
 
     def test_tenant_scoped_redis_wrapper_fails_closed(self):
@@ -416,8 +586,6 @@ class TestInteropRejections:
         tenant-scoping wrapper (t:{tenant}:{key} on the wire) — it must expose
         key_prefix so the interop guard rejects it instead of silently diverging
         from the bare keys other SDKs use."""
-        from unittest.mock import Mock
-
         from cachekit.backends.redis.provider import PerRequestRedisBackend
         from cachekit.interop import ensure_interop_backend_compatible
 
@@ -431,7 +599,7 @@ class TestInteropRejections:
         and raw-object storage would skip the cross-SDK value contract."""
         with pytest.raises(ConfigurationError, match="shared backend"):
 
-            @cache(backend=None, interop="op", namespace="ns")
+            @cache(backend=None, interop="op", namespace="users")
             def f(x: int):
                 return x
 
@@ -573,7 +741,7 @@ class TestInteropEncryption:
             @_decorate(
                 backend,
                 interop="op",
-                namespace="ns",
+                namespace="users",
                 encryption=True,
                 master_key=self.MASTER_KEY_HEX,
                 single_tenant_mode=True,
@@ -590,7 +758,7 @@ class TestInteropEncryption:
             @_decorate(
                 backend,
                 interop="op",
-                namespace="ns",
+                namespace="users",
                 encryption=True,
                 master_key=self.MASTER_KEY_HEX,
                 tenant_extractor=ArgumentNameExtractor("tenant_id"),

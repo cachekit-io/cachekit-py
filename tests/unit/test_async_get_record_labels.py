@@ -1,7 +1,7 @@
 """Async hit-record stats parity (LAB-3765).
 
-The sync wrapper records an L1 hit as ``serializer="l1_memory", hit=True`` and an L2
-hit as ``serializer="rust", hit=True``, both with the served size; the async L1 and
+The sync wrapper records an L1 hit as ``serializer="l1_memory"`` and an L2
+hit as ``serializer="rust"``, both with the served size; the async L1 and
 uncontended L2 hit sites recorded none of those, so async hits filed under
 ``serializer="unknown"``. A miss primes L2 (and L1 via the miss-store); clearing L1
 before the second call forces it past L1 to the L2 site.
@@ -15,8 +15,8 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.l1_cache import get_l1_cache_manager
+from cachekit.reliability.async_metrics import AsyncMetricsCollector
 
 
 class _ByteStore:
@@ -52,13 +52,12 @@ def setup_di_for_redis_isolation() -> Iterator[None]:
 
 @pytest.fixture
 def recorded(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Capture the wrapper's explicit features.record_cache_operation(...) calls, keyword args as passed.
+    """Capture every cache-operation metric record, keyword args as passed.
 
-    Patched at the orchestrator, not the collector: record_success() also forwards an
-    operation-context record to the collector, which would shadow the labels under test.
+    Patched at the collector, the metrics sink: every record that reaches Prometheus passes here.
     """
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(FeatureOrchestrator, "record_cache_operation", lambda self, **kw: calls.append(kw))
+    monkeypatch.setattr(AsyncMetricsCollector, "record_cache_operation", lambda self, **kw: calls.append(kw))
     return calls
 
 
@@ -79,12 +78,11 @@ async def test_async_get_hit_records_sync_labels(recorded: list[dict[str, Any]],
 
     assert await compute() == {"answer": 42}
 
-    gets = [c for c in recorded if c["operation"] == "get"]
-    assert len(gets) == 1
-    assert (gets[0].get("serializer"), gets[0].get("hit")) == (tier, True)  # what the sync hit sites pass
+    assert len(recorded) == 1  # one hit, one record
+    assert (recorded[0]["operation"], recorded[0].get("serializer")) == ("get", tier)  # what the sync hit sites pass
     # Exact served size, not just positive: both hit sites record the raw serialized
     # envelope's length — the L1 backfill stores the same bytes L2 returned, so the
     # single L2 store value is the ground truth for either tier. A `> 0` assertion
     # would pass on a wrong constant (e.g. size_bytes=1); this pins the real value.
     expected_size = len(next(iter(backend.store.values())))
-    assert gets[0].get("size_bytes") == expected_size
+    assert recorded[0].get("size_bytes") == expected_size

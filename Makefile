@@ -193,7 +193,7 @@ test-doctest-quiet: setup-logs ## Run doctest validation (minimal output)
 test-docs-examples: setup-logs ## Run markdown documentation examples (verbose)
 	@echo "$(BLUE)Running markdown documentation examples...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_DOCS_EXAMPLES_DIR)/verbose_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest --markdown-docs docs/ -v 2>&1 | tee $(LOG_DOCS_EXAMPLES_DIR)/verbose_$(TIMESTAMP).log; then \
+	@if ! uv run pytest --markdown-docs README.md docs/ -v 2>&1 | tee $(LOG_DOCS_EXAMPLES_DIR)/verbose_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Markdown docs validation failed$(RESET)"; \
 		exit 1; \
 	fi
@@ -201,7 +201,7 @@ test-docs-examples: setup-logs ## Run markdown documentation examples (verbose)
 
 test-docs-quick: setup-logs ## Run markdown documentation examples (quiet)
 	@printf "$(BLUE)markdown docs...$(RESET) "
-	@if ! uv run pytest --markdown-docs docs/ -q --tb=line -p no:warnings > $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log 2>&1; then \
+	@if ! uv run pytest --markdown-docs README.md docs/ -q --tb=line -p no:warnings > $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log 2>&1; then \
 		echo "$(YELLOW)❌ FAILED$(RESET)"; \
 		echo "$(YELLOW)See $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log$(RESET)"; \
 		tail -20 $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log; \
@@ -349,7 +349,7 @@ test-rust-integration: ## Run integration tests only
 test-rust-property: ## Run property-based tests (proptest)
 	@$(MAKE) -C rust test-property
 
-rust-bench: ## Run Rust benchmarks
+rust-bench: ## Point at the Rust benchmarks (in cachekit-core)
 	@$(MAKE) -C rust bench
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -395,6 +395,15 @@ perf: setup-logs ## Unified benchmark battery: env + calibration, serializer ben
 perf-compare: benchmark-compare ## Perf regression gate: fail on >10% median serializer regression
 	@echo "$(GREEN)✓ perf-compare passed$(RESET)"
 
+# Deterministic hot-path gate: main-thread callgrind instructions per op, fail at >=+1% vs the
+# budgets in tests/performance/ir_baselines.json (keyed per interpreter). Needs valgrind and the
+# release extension `uv sync` builds. See docs/performance.md, "Instruction budgets".
+perf-ir: ## Instruction-count gate: fail on >=1% per-op regression (orjson 2%; needs valgrind)
+	@uv run python tests/performance/ir_budget.py
+
+perf-ir-update: ## Ratchet instruction budgets down to the measured figures (never up)
+	@uv run python tests/performance/ir_budget.py --update
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 BUILD & RELEASE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -407,24 +416,6 @@ build: setup-logs ## Build package
 		exit 1; \
 	fi
 	@echo "$(GREEN)✓ Package built in dist/$(RESET)"
-
-build-pgo: setup-logs ## Build with Profile-Guided Optimization (5-8% faster)
-	@echo "$(BLUE)Building with Profile-Guided Optimization...$(RESET)"
-	@echo "$(YELLOW)This will take several minutes but results in 5-8% performance improvement$(RESET)"
-	@echo "$(YELLOW)Logging to $(LOG_BUILD_DIR)/build-pgo_$(TIMESTAMP).log$(RESET)"
-	@if [ -f "scripts/build_with_pgo.sh" ]; then \
-		if ! bash scripts/build_with_pgo.sh 2>&1 | tee $(LOG_BUILD_DIR)/build-pgo_$(TIMESTAMP).log; then \
-			echo "$(YELLOW)❌ PGO build failed$(RESET)"; \
-			exit 1; \
-		fi; \
-	else \
-		echo "$(YELLOW)⚠️  scripts/build_with_pgo.sh not found, running standard build$(RESET)"; \
-		if ! uv build 2>&1 | tee $(LOG_BUILD_DIR)/build-pgo_$(TIMESTAMP).log; then \
-			echo "$(YELLOW)❌ Build failed$(RESET)"; \
-			exit 1; \
-		fi; \
-	fi
-	@echo "$(GREEN)✓ Build complete$(RESET)"
 
 build-multiarch-linux: ## Build Linux wheels for amd64 + arm64 using Docker (local Mac)
 	@bash scripts/build-multiarch-linux.sh

@@ -1,11 +1,8 @@
 import contextvars
 import logging
-import uuid
 from typing import Any, Optional, Union
 
 from ..hash_utils import redact_error_for_log, redact_key_for_log
-from ..monitoring.correlation_tracking import CorrelationTracker
-from ..monitoring.pool_monitor import PoolMonitor
 
 # Import EXISTING modules - no duplication
 from ..reliability import (
@@ -47,13 +44,6 @@ class FeatureOrchestrator:
         'test'
         >>> status["overall_healthy"]
         True
-
-        Generate correlation ID:
-
-        >>> import uuid
-        >>> corr_id = orch.generate_correlation_id()
-        >>> uuid.UUID(corr_id)  # doctest: +ELLIPSIS
-        UUID('...')
     """
 
     def __init__(
@@ -76,8 +66,6 @@ class FeatureOrchestrator:
         self._circuit_breaker = None
         self._load_control = None
         self._metrics_collector = None
-        self._correlation_tracker = None
-        self._pool_monitor = None
 
         if circuit_breaker_enabled:
             # Handle both dict and CircuitBreakerConfig objects
@@ -99,12 +87,6 @@ class FeatureOrchestrator:
         if collect_stats:
             self._metrics_collector = AsyncMetricsCollector()
 
-        if enable_structured_logging:
-            self._correlation_tracker = CorrelationTracker()
-
-        # Pool monitoring - initialized when pool manager is available
-        self._pool_monitor = None
-
     @property
     def circuit_breaker(self) -> Optional[CircuitBreaker]:
         """Get circuit breaker if enabled."""
@@ -120,31 +102,31 @@ class FeatureOrchestrator:
         """Get metrics collector if enabled."""
         return self._metrics_collector
 
-    @property
-    def correlation_tracker(self) -> Optional[CorrelationTracker]:
-        """Get correlation tracker if enabled."""
-        return self._correlation_tracker
-
-    @property
-    def pool_monitor(self) -> Optional[PoolMonitor]:
-        """Get pool monitor."""
-        return self._pool_monitor
-
-    def set_pool_manager(self, pool_manager) -> None:
-        """Initialize pool monitor with pool manager."""
-        if pool_manager and not self._pool_monitor:
-            self._pool_monitor = PoolMonitor(pool_manager)
-
     def should_allow_request(self) -> bool:
-        """Check if request should be allowed based on circuit breaker state."""
+        """Ask the circuit breaker to admit this request: ``admit`` as a bool."""
+        return self.admit() is not None
+
+    def admit(self) -> Optional[int]:
+        """Ask the circuit breaker to admit this request, and say which cycle admitted it.
+
+        This is the breaker's admission decision, not a state read: it runs the
+        OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
+        HALF_OPEN probe slot when it admits. Call it once per request, and record
+        the outcome of every admitted request with this value (``record_success`` /
+        ``record_failure`` / ``handle_cache_error`` as ``cycle``, or
+        ``release_probe`` when it ends with none). A rejected request is not a
+        failure — do not record it.
+
+        Returns:
+            None if the request must fail fast. Otherwise the cycle number that
+            admitted it (see ``CircuitBreaker.admit``; 0 with no breaker). 0 is
+            falsy: test the result with ``is None``.
+        """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
-            return True
+            return 0
 
-        # Use the circuit breaker's call method or check state
-        from ..reliability.circuit_breaker import CircuitState
-
-        return self._circuit_breaker.get_state() != CircuitState.OPEN
+        return self._circuit_breaker.admit()
 
     def can_accept_request(self) -> bool:
         """Check if system can accept new request based on load control."""
@@ -155,26 +137,6 @@ class FeatureOrchestrator:
         # BackpressureController uses context manager (acquire), not can_accept_request
         # For now, always return True and let acquire handle backpressure
         return True
-
-    def start_request(self) -> Optional[str]:
-        """Start request tracking."""
-        # Note: BackpressureController uses acquire() context manager, not start_request()
-        # Load control is handled via acquire() in the wrapper
-
-        if self._correlation_tracker:
-            correlation_id = self._correlation_tracker.generate_correlation_id()
-            self._correlation_tracker.set_correlation_id(correlation_id)
-            return correlation_id
-
-        return None
-
-    def end_request(self, correlation_id: Optional[str] = None) -> None:
-        """End request tracking."""
-        # Note: BackpressureController uses acquire() context manager, not end_request()
-        # Load control cleanup is automatic via context manager
-
-        if self._correlation_tracker:
-            self._correlation_tracker.clear_correlation_id()
 
     def log_structured(self, level: str, message: str, **kwargs) -> None:
         """Log with structured format if enabled."""
@@ -223,11 +185,6 @@ class FeatureOrchestrator:
             lc_status = self._load_control.get_stats()
             components["load_control"] = lc_status
 
-        # Pool monitor health
-        if self._pool_monitor:
-            pool_status = self._pool_monitor.get_pool_stats()
-            components["pool_monitor"] = pool_status
-
         # Metrics collector health
         if self._metrics_collector:
             metrics_status = self._metrics_collector.get_stats()
@@ -235,44 +192,13 @@ class FeatureOrchestrator:
 
         return status
 
-    def generate_correlation_id(self) -> str:
-        """Generate a unique correlation ID for request tracking."""
-        return str(uuid.uuid4())
-
-    def create_correlation_id(self) -> str:
-        """Alias for generate_correlation_id."""
-        return self.generate_correlation_id()
-
-    def set_correlation_id(self, correlation_id: str) -> None:
-        """Set correlation ID for structured logging."""
-        # Implementation depends on correlation tracker
-        pass
-
-    def clear_correlation_id(self) -> None:
-        """Clear correlation ID."""
-        # Implementation depends on correlation tracker
-        pass
-
-    def create_span(self, name: str, attributes: Optional[dict[str, Any]] = None):
-        """Create a tracing span (no-op if tracing not available)."""
-
-        # Simple no-op context manager for now
-        class NoOpSpan:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        return NoOpSpan()
-
-    def set_span_attributes(self, span: Any, attributes: dict[str, Any]):
-        """Set attributes on a span (no-op)."""
-        pass
-
     def log_cache_operation(self, **kwargs: Any) -> None:
-        """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532)."""
-        if self._enable_structured_logging and kwargs:
+        """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532).
+
+        Returns before redacting or formatting anything unless INFO is enabled: every L1 and L2 hit calls this,
+        and at the default WARNING level ``logger.info`` would drop the record it built.
+        """
+        if self._enable_structured_logging and kwargs and logger.isEnabledFor(logging.INFO):
             operation = kwargs.get("operation", "unknown")
             # Redact in kwargs itself — it is splatted into the structured payload below.
             if "key" in kwargs:
@@ -283,30 +209,20 @@ class FeatureOrchestrator:
             key = kwargs.get("key", "unknown")
             self.log_structured("info", f"Cache operation: {operation}", cache_key=key, **kwargs)
 
-    def record_exception(self, span, exception: Exception):
-        """Record exception in span and metrics."""
-        if self._metrics_collector:
-            self._metrics_collector.record_cache_operation(
-                operation="exception",
-                namespace=self.namespace,
-                success=False,
-                duration_ms=0.0,
-            )
-
     def set_operation_context(self, operation: str, duration_ms: float = 0.0):
-        """Set operation context for automatic tracking in record_success/failure.
+        """Set operation context for automatic tracking in record_failure.
 
         Args:
             operation: Operation type (e.g., "get", "set", "delete")
             duration_ms: Operation duration in milliseconds (optional)
 
         This method sets thread-local context that will be automatically used by
-        subsequent record_success() or record_failure() calls. Works across async
-        boundaries thanks to contextvars.
+        a subsequent record_failure() call. Works across async boundaries thanks
+        to contextvars.
 
         Example:
             features.set_operation_context("get", duration_ms=1.5)
-            features.record_success()  # Automatically uses "get" and 1.5ms
+            features.record_failure(error)  # Automatically uses "get" and 1.5ms
         """
         _operation_context.set(
             {
@@ -315,7 +231,7 @@ class FeatureOrchestrator:
             }
         )
 
-    def record_failure(self, error: Exception):
+    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True, cycle: Optional[int] = None) -> None:
         """Record operation failure with automatic context detection.
 
         Automatically uses operation type and duration from set_operation_context()
@@ -323,14 +239,20 @@ class FeatureOrchestrator:
 
         Args:
             error: The exception that caused the failure
+            count_toward_breaker: False records the metric only. For failures that
+                say nothing about backend health, such as an L2 entry that fails
+                decryption or integrity checks.
+            cycle: What ``admit`` returned for the request. A HALF_OPEN breaker
+                ignores a failure from a request another cycle admitted (see
+                ``CircuitBreaker.record_failure``).
         """
         # Get operation context (async-safe)
         ctx = _operation_context.get() or {}
         operation = ctx.get("operation", "cache_operation")
         duration_ms = ctx.get("duration_ms", 0.0)
 
-        if self._circuit_breaker:
-            self._circuit_breaker._on_failure(error)
+        if self._circuit_breaker and count_toward_breaker:
+            self._circuit_breaker._on_failure(error, cycle)
         if self._metrics_collector:
             self._metrics_collector.record_cache_operation(
                 operation=operation,
@@ -339,26 +261,31 @@ class FeatureOrchestrator:
                 duration_ms=duration_ms,
             )
 
-    def record_success(self):
-        """Record operation success with automatic context detection.
+    def record_success(self, cycle: Optional[int] = None):
+        """Record operation success with the circuit breaker.
 
-        Automatically uses operation type and duration from set_operation_context()
-        if available, otherwise falls back to defaults.
+        Emits no metrics: every success site also calls record_cache_operation() with the
+        full label set (serializer, size), and a second, unlabelled record here would count
+        each operation twice in cache_operations_total, once under serializer="unknown".
+
+        ``cycle`` is what ``admit`` returned for the request: a HALF_OPEN breaker counts
+        only its own cycle's probes toward closing (see ``CircuitBreaker.record_success``).
+        Positional, unlike there: this runs on every L2 hit and write, where passing it by
+        keyword through two calls costs about 0.3% of the op in instructions.
         """
-        # Get operation context (async-safe)
-        ctx = _operation_context.get() or {}
-        operation = ctx.get("operation", "cache_operation")
-        duration_ms = ctx.get("duration_ms", 0.0)
-
         if self._circuit_breaker:
-            self._circuit_breaker._on_success()
-        if self._metrics_collector:
-            self._metrics_collector.record_cache_operation(
-                operation=operation,
-                namespace=self.namespace,
-                success=True,
-                duration_ms=duration_ms,
-            )
+            self._circuit_breaker._on_success(cycle)
+
+    def release_probe(self, cycle: int) -> None:
+        """Give back the HALF_OPEN probe slot of an admitted request that ends with no outcome.
+
+        For the decorated function's own exception: it says nothing about backend
+        health, so it is not a failure, and the next request probes in its place.
+        ``cycle`` is what ``admit`` returned for the request; a slot from any other
+        cycle stays spent (see ``CircuitBreaker.release_probe``).
+        """
+        if self._circuit_breaker:
+            self._circuit_breaker.release_probe(cycle)
 
     def record_cache_operation(
         self,
@@ -368,7 +295,6 @@ class FeatureOrchestrator:
         duration_ms: float,
         serializer: str = "unknown",
         size_bytes: int = 0,
-        hit: Optional[bool] = None,
     ):
         """Record cache operation metrics."""
         if self._metrics_collector:
@@ -379,7 +305,6 @@ class FeatureOrchestrator:
                 duration_ms=duration_ms,
                 serializer=serializer,
                 size_bytes=size_bytes,
-                hit=hit,
             )
 
     def check_health(self) -> dict[str, Any]:
@@ -407,9 +332,10 @@ class FeatureOrchestrator:
         operation: str,
         cache_key: str = "unknown",
         namespace: Optional[str] = None,
-        span: Optional[Any] = None,
         duration_ms: float = 0.0,
-        correlation_id: Optional[str] = None,
+        *,
+        count_toward_breaker: bool = True,
+        cycle: Optional[int] = None,
         **extra_context: Any,
     ) -> None:
         """Centralized error handler for all cache operations.
@@ -423,9 +349,10 @@ class FeatureOrchestrator:
             cache_key: Cache key involved (use "unknown" if unavailable). Pass the
                 raw key — it is redacted here before any logging (CWE-532).
             namespace: Cache namespace (defaults to orchestrator namespace)
-            span: Optional tracing span for recording
             duration_ms: Operation duration in milliseconds
-            correlation_id: Optional correlation ID for distributed tracing
+            count_toward_breaker: Passed to record_failure(). False keeps the metric
+                and logs but leaves the circuit breaker untouched.
+            cycle: Passed to record_failure(): what ``admit`` returned for the request.
             **extra_context: Additional context to include in logs
 
         Example:
@@ -433,7 +360,6 @@ class FeatureOrchestrator:
                 error=e,
                 operation="key_generation",
                 cache_key=cache_key,
-                span=span,
                 duration_ms=0.0
             )
         """
@@ -444,17 +370,13 @@ class FeatureOrchestrator:
         # (CWE-532) — callers pass the raw key; sentinels pass through readable.
         cache_key = redact_key_for_log(cache_key)
 
-        # 1. Record exception in span and metrics
-        if span:
-            self.record_exception(span, error)
-
-        # 2. Set operation context for metrics
+        # 1. Set operation context for metrics
         self.set_operation_context(operation, duration_ms)
 
-        # 3. Record failure in circuit breaker and metrics collector
-        self.record_failure(error)
+        # 2. Record failure in circuit breaker and metrics collector
+        self.record_failure(error, count_toward_breaker=count_toward_breaker, cycle=cycle)
 
-        # 4. Structured logging with full context
+        # 3. Structured logging with full context
         self.log_cache_operation(
             operation=f"{operation}_failed",
             key=cache_key,
@@ -464,11 +386,10 @@ class FeatureOrchestrator:
             error=redact_error_for_log(error),
             error_type=type(error).__name__,
             duration_ms=duration_ms,
-            correlation_id=correlation_id,
             **extra_context,
         )
 
-        # 5. Also log via standard logger for backwards compatibility. Redact the key
+        # 4. Also log via standard logger for backwards compatibility. Redact the key
         # inline (idempotent: it is already redacted above, but the flow-insensitive
         # architecture guard requires the wrapper on the logged expression) and keep
         # the exception text key-free with redact_error_for_log (CWE-532).

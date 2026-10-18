@@ -22,6 +22,7 @@ import json
 import logging
 from typing import Any
 
+import msgpack
 import pytest
 
 from cachekit.cache_handler import (
@@ -31,12 +32,13 @@ from cachekit.cache_handler import (
     handle_decrypt_failure,
 )
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.base import EnvelopeShapeError, SerializationError, SerializationMetadata, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionError,
     EncryptionWrapper,
 )
+from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 _HEX_KEY = "a" * 64
@@ -68,12 +70,22 @@ class TestExceptionTaxonomy:
             wrapper.deserialize(bytes(tampered), meta, cache_key="key:a")
 
     def test_non_string_original_type_is_corruption_not_tamper(self):
-        """LAB-4350: the header is an AAD *input*, not authenticated content —
-        a rotted ``original_type`` is corruption, not tamper."""
+        """LAB-4350: a non-string ``original_type`` cannot be built into the AAD,
+        so no tag check runs — it is corruption, not tamper."""
         wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
         enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
         meta.original_type = ["rotted"]
         with pytest.raises(SerializationError, match="original_type") as exc_info:
+            wrapper.deserialize(enc, meta, cache_key="key:a")
+        assert not isinstance(exc_info.value, DecryptionAuthenticationError)
+
+    def test_non_encodable_compressed_is_corruption_not_tamper(self):
+        """A lone-surrogate ``compressed`` cannot be built into the AAD either,
+        so no tag check runs — it is corruption, not tamper."""
+        wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
+        enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
+        meta.compressed = "\ud800"
+        with pytest.raises(SerializationError, match="compressed") as exc_info:
             wrapper.deserialize(enc, meta, cache_key="key:a")
         assert not isinstance(exc_info.value, DecryptionAuthenticationError)
 
@@ -187,6 +199,12 @@ class TestHandleDecryptFailure:
         err = SuspiciousCacheEntryError("x")
         assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "suspicious_envelope"
 
+    def test_classifies_envelope_shape(self):
+        # Kept out of "corruption": the read path cannot prove it is corrupt, and for a legitimate
+        # envelope-shaped value it fires on every read forever (LAB-2736).
+        err = EnvelopeShapeError("x")
+        assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "envelope_shape"
+
     def test_classifies_corruption(self):
         assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=False) == "corruption"
         assert handle_decrypt_failure(EncryptionError("x"), tier="l1", cache_key="k", fail_closed=False) == "corruption"
@@ -200,6 +218,7 @@ class TestHandleDecryptFailure:
             == "suspicious_envelope"
         )
         assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=True) == "corruption"
+        assert handle_decrypt_failure(EnvelopeShapeError("x"), tier="l2", cache_key="k", fail_closed=True) == "envelope_shape"
 
     def test_records_counter_with_reason_and_tier_labels(self, monkeypatch):
         recorded: list[tuple[str, dict[str, Any]]] = []
@@ -358,11 +377,163 @@ class TestGetCachedValueFailPolicy:
         assert handler.get_cached_value("key:d") is None  # miss, not raise
         assert strategy.deleted == ["key:d"]  # self-heals
 
+    def test_fail_closed_non_encodable_compressed_header_is_corruption(self, monkeypatch):
+        """A lone-surrogate ``compressed`` in the stored plaintext header cannot be
+        built into the AAD: corruption-class, evicted and counted even under
+        fail_closed=True — not swallowed as a silent miss that never evicts."""
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        class _Collector:
+            def record_counter(self, name, labels=None, value=1.0):
+                recorded.append((name, labels or {}))
+
+        import cachekit.reliability.async_metrics as am
+
+        monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _Collector())
+        handler, strategy, serialization = _make_operation_handler(fail_closed=True)
+        entry = serialization.serialize_data({"v": 1}, cache_key="key:e")
+        payload, metadata_dict, serializer_name = SerializationWrapper.unwrap(entry)
+        metadata_dict["compressed"] = "\ud800"
+        # Plant the frame bytes directly: `wrap` refuses a lone surrogate, `json.loads` accepts it.
+        header = json.dumps({"s": serializer_name, "m": metadata_dict, "v": "2.0"}).encode()
+        strategy.store["key:e"] = b"CK\x03" + len(header).to_bytes(4, "big") + header + bytes(payload)
+        assert handler.get_cached_value("key:e") is None  # miss, not raise
+        assert strategy.deleted == ["key:e"]  # self-heals
+        assert recorded == [("cachekit_decrypt_failures_total", {"reason": "corruption", "tier": "l2"})]
+
     def test_fail_open_valid_entry_roundtrips(self):
         """Regression: the happy path is untouched by the policy plumbing."""
         handler, strategy, serialization = _make_operation_handler(fail_closed=True)
         strategy.store["key:a"] = serialization.serialize_data({"v": 7}, cache_key="key:a")
         assert handler.get_cached_value("key:a") == CacheHit({"v": 7}, strategy.store["key:a"], len(strategy.store["key:a"]))
+
+
+class TestArrowPostDecryptContainer:
+    """After a decrypt, Arrow decodes only its configured container: [xxHash3-64][ARROW1...].
+
+    The bare ARROW1 form survives for plaintext legacy entries only; spec/encryption.md forbids
+    sniffing or falling back between containers on decrypted bytes."""
+
+    @pytest.fixture
+    def df(self):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        return pd.DataFrame({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})
+
+    @staticmethod
+    def _arrow_wrapper(tenant_id: str = "t1") -> EncryptionWrapper:
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        return EncryptionWrapper(serializer=ArrowSerializer(), master_key=_KEY_BYTES, tenant_id=tenant_id)
+
+    @staticmethod
+    def _seal_bare(wrapper: EncryptionWrapper, df, metadata, cache_key: str) -> bytes:
+        """Seal bare ARROW1 bytes as the plaintext, under the reader's own AAD."""
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        checksummed, _ = ArrowSerializer().serialize(df)
+        bare = checksummed[8:]
+        assert bare[:6] == b"ARROW1"
+        return wrapper.encryptor.encrypt_with_keys(bare, wrapper._create_aad(metadata, cache_key), wrapper.tenant_keys)
+
+    def test_both_encrypted_read_paths_refuse_bare_arrow(self, df):
+        wrapper = self._arrow_wrapper()
+        _, meta = wrapper.serialize(df, cache_key="key:a")
+        sealed = self._seal_bare(wrapper, df, meta, "key:a")
+        with pytest.raises(EncryptionError, match="lacks the checksum prefix"):
+            wrapper.deserialize(sealed, meta, cache_key="key:a")
+        with pytest.raises(EncryptionError, match="lacks the checksum prefix"):
+            wrapper.deserialize_without_key_identity(sealed, meta, cache_key="key:a")
+
+    def test_handler_read_of_sealed_bare_arrow_is_miss_and_evicted(self, df):
+        pd = pytest.importorskip("pandas")
+        serialization = CacheSerializationHandler(
+            serializer_name="arrow",
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            enable_integrity_checking=False,
+        )
+        strategy = _DictCacheStrategy({})
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=strategy)  # type: ignore[arg-type]
+
+        # integrity_checking=False does not choose the container: the cache reads its own writes.
+        strategy.store["key:a"] = serialization.serialize_data(df, cache_key="key:a")
+        hit = handler.get_cached_value("key:a")
+        assert hit is not None
+        pd.testing.assert_frame_equal(hit.value, df)
+
+        _, metadata_dict, serializer_name = SerializationWrapper.unwrap(strategy.store["key:a"])
+        wrapper = self._arrow_wrapper(tenant_id=metadata_dict["tenant_id"])
+        sealed = self._seal_bare(wrapper, df, SerializationMetadata.from_dict(metadata_dict), "key:a")
+        strategy.store["key:a"] = SerializationWrapper.wrap(sealed, metadata_dict, serializer_name)
+
+        assert handler.get_cached_value("key:a") is None
+        assert strategy.deleted == ["key:a"]
+
+
+class TestStandardPostDecryptContainer:
+    """After a decrypt, an integrity-off StandardSerializer probes only for a legacy-layout envelope.
+
+    The AAD binds ``compressed``, and the one writer that sealed an envelope under ``compressed=False``
+    (AutoSerializer before 0.12.0) used the legacy int-array layout. So a value equal to a current (bin)
+    envelope's four fields, which the plaintext probe refuses, comes back; a legacy envelope does not."""
+
+    @pytest.fixture
+    def envelope_fields(self) -> list[Any]:
+        return msgpack.unpackb(StandardSerializer(enable_integrity_checking=True).serialize({"actual": "inner"})[0])
+
+    @staticmethod
+    def _handler() -> tuple[CacheOperationHandler, _DictCacheStrategy, CacheSerializationHandler]:
+        serialization = CacheSerializationHandler(
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            enable_integrity_checking=False,
+        )
+        strategy = _DictCacheStrategy({})
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=strategy)  # type: ignore[arg-type]
+        return handler, strategy, serialization
+
+    def test_both_encrypted_read_paths_return_an_envelope_shaped_value(self, envelope_fields):
+        wrapper = EncryptionWrapper(
+            serializer=StandardSerializer(enable_integrity_checking=False), master_key=_KEY_BYTES, tenant_id="t1"
+        )
+        sealed, meta = wrapper.serialize(envelope_fields, cache_key="key:a")
+        assert meta.compressed is False
+        assert wrapper.deserialize(sealed, meta, cache_key="key:a") == envelope_fields
+        assert wrapper.deserialize_without_key_identity(sealed, meta, cache_key="key:a") == envelope_fields
+
+    def test_handler_read_of_an_envelope_shaped_value_is_a_hit(self, envelope_fields):
+        handler, strategy, serialization = self._handler()
+        strategy.store["key:a"] = serialization.serialize_data(envelope_fields, cache_key="key:a")
+        hit = handler.get_cached_value("key:a")
+        assert hit is not None
+        assert hit.value == envelope_fields
+        assert strategy.deleted == []
+
+    def test_handler_read_of_a_sealed_legacy_envelope_is_miss_and_evicted(self):
+        """A pre-0.12.0 AutoSerializer entry: an integrity-on envelope in the legacy layout, sealed under
+        ``compressed=False``. It is refused (miss + evict), never returned as its four fields."""
+        value = {"user_id": 123, "name": "Alice"}
+        handler, strategy, serialization = self._handler()
+        strategy.store["key:a"] = serialization.serialize_data(value, cache_key="key:a")
+        _, metadata_dict, serializer_name = SerializationWrapper.unwrap(strategy.store["key:a"])
+        assert metadata_dict["compressed"] is False
+
+        compressed, checksum, original_size, fmt = msgpack.unpackb(StandardSerializer().serialize(value)[0])
+        legacy = msgpack.packb([list(compressed), checksum, original_size, fmt], use_bin_type=True)
+        wrapper = EncryptionWrapper(
+            serializer=StandardSerializer(enable_integrity_checking=False),
+            master_key=_KEY_BYTES,
+            tenant_id=metadata_dict["tenant_id"],
+        )
+        aad = wrapper._create_aad(SerializationMetadata.from_dict(metadata_dict), "key:a")
+        sealed = wrapper.encryptor.encrypt_with_keys(legacy, aad, wrapper.tenant_keys)
+        strategy.store["key:a"] = SerializationWrapper.wrap(sealed, metadata_dict, serializer_name)
+
+        assert handler.get_cached_value("key:a") is None
+        assert strategy.deleted == ["key:a"]
 
 
 class TestConfigDriftRead:

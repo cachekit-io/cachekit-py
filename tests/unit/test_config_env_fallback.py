@@ -1,7 +1,9 @@
 """Test that pydantic-settings properly handles environment variables for backend configs."""
 
 import pytest
+from pydantic import ValidationError
 
+from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.config import CachekitConfig
 
@@ -23,7 +25,7 @@ class TestRedisBackendConfigEnv:
 
         config = RedisBackendConfig()
         assert config.redis_url == "redis://localhost:6379"
-        assert config.connection_pool_size == 10
+        assert config.connection_pool_size == 50
         assert config.socket_keepalive is True
         assert config.disable_hiredis is False
 
@@ -91,6 +93,16 @@ class TestRedisBackendConfigEnv:
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
 
+    def test_no_process_wide_default_ttl(self, monkeypatch):
+        """protocol/spec/intent-presets.md rule 3: no process-wide TTL override.
+
+        CACHEKIT_DEFAULT_TTL is reserved by the spec; setting it must neither
+        surface a field nor break construction (LAB-4641).
+        """
+        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
+        config = CachekitConfig.from_env()
+        assert not hasattr(config, "default_ttl")
+
     def test_removed_knob_env_vars_are_ignored(self, monkeypatch):
         """Stale exports of removed CachekitConfig knobs must not break startup."""
         removed = {
@@ -100,12 +112,29 @@ class TestRedisBackendConfigEnv:
             "EARLY_REFRESH_RATIO": "0.5",
             "ENABLE_CORRUPTION_DETECTION": "false",
             "MAX_KEY_SIZE": "2048",
+            "L1_ENABLED": "false",
+            "ENABLE_PROMETHEUS_METRICS": "false",
+            "BACKEND_PROVIDER_CLASS": "cachekit.backends.redis.provider.RedisBackendProvider",
+            "LOG_BUFFER_SIZE": "10000",
+            "LOG_BATCH_SIZE": "100",
+            "LOG_FLUSH_INTERVAL": "86400",
         }
         for name, value in removed.items():
             monkeypatch.setenv(f"CACHEKIT_{name}", value)
 
         config = CachekitConfig.from_env()
         assert [knob for knob in removed if hasattr(config, knob.lower())] == []
+
+    def test_removed_cachekitio_max_retries_env_var_is_ignored(self, monkeypatch):
+        """A stale CACHEKIT_MAX_RETRIES export must not break CachekitIO startup; the kwarg is rejected."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_key")
+        monkeypatch.setenv("CACHEKIT_MAX_RETRIES", "5")
+
+        config = CachekitIOBackendConfig.from_env()
+        assert not hasattr(config, "max_retries")
+
+        with pytest.raises(ValidationError):
+            CachekitIOBackendConfig(api_key="ck_test_key", max_retries=5)  # pragma: allowlist secret
 
 
 class TestRedisUrlAliasChoicesPriority:
@@ -155,3 +184,27 @@ class TestRedisUrlAliasChoicesPriority:
 
         config = RedisBackendConfig()
         assert config.redis_url == "redis://localhost:6379"
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"REDIS_URL": "redis://generic:6379"},
+            {"CACHEKIT_REDIS_URL": "redis://cachekit:6379"},
+            {"CACHEKIT_REDIS_URL": "redis://cachekit:6379", "REDIS_URL": "redis://generic:6379"},
+            {},
+        ],
+        ids=["redis_url", "cachekit_redis_url", "both", "neither"],
+    )
+    def test_explicit_kwarg_beats_env(self, monkeypatch, env):
+        """An explicit redis_url= kwarg wins over either env var (cachekit-py#225).
+
+        pydantic-settings < 2.12 rejected the kwarg as extra_forbidden whenever an
+        alias env var was set: the env value took the field and the kwarg was left over.
+        """
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        config = RedisBackendConfig(redis_url="redis://other:6380")
+        assert config.redis_url == "redis://other:6380"

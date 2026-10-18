@@ -20,13 +20,16 @@ class RedisBackendConfig(BaseBackendConfig):
     and Redis-specific performance tuning.
 
     Attributes:
-        redis_url: Redis server connection URL
-        connection_pool_size: Maximum connections in the Redis pool
+        redis_url: Redis server connection URL; left out of the config's repr, as it can carry a password
+        connection_pool_size: Maximum connections in the Redis pool. When all are
+            in use, an operation waits up to socket_timeout for one to be released
         socket_timeout: Socket read/write timeout in seconds (finite so a dead
             Redis fails fast instead of blocking on the OS TCP timeout)
         socket_connect_timeout: Socket connect timeout in seconds
-        socket_keepalive: Enable TCP keepalive for connections
-        disable_hiredis: Disable hiredis parser (use pure Python)
+        socket_keepalive: Enable TCP keepalive (SO_KEEPALIVE) on TCP connections;
+            not applied to unix:// URLs
+        disable_hiredis: Reports CACHEKIT_DISABLE_HIREDIS. cachekit.hiredis_compat reads that
+            variable at import, before redis loads; setting this field changes nothing
 
     Examples:
         Create with defaults:
@@ -35,7 +38,7 @@ class RedisBackendConfig(BaseBackendConfig):
         >>> config.redis_url
         'redis://localhost:6379'
         >>> config.connection_pool_size
-        10
+        50
         >>> config.socket_keepalive
         True
 
@@ -49,6 +52,11 @@ class RedisBackendConfig(BaseBackendConfig):
         'redis://myhost:6380'
         >>> custom.connection_pool_size
         25
+
+        The URL is left out of the repr:
+
+        >>> "myhost" in repr(custom)
+        False
     """
 
     model_config = SettingsConfigDict(
@@ -60,11 +68,14 @@ class RedisBackendConfig(BaseBackendConfig):
         default="redis://localhost:6379",
         validation_alias=AliasChoices("CACHEKIT_REDIS_URL", "REDIS_URL"),
         description="Redis connection URL (env: CACHEKIT_REDIS_URL or REDIS_URL)",
+        repr=False,
     )
     connection_pool_size: int = Field(
-        default=10,
+        # Above the default executor's min(32, cpu_count + 4) threads, which async
+        # decorated calls share for their L2 operations. Connections open lazily.
+        default=50,
         gt=0,
-        description="Maximum connections in the Redis pool",
+        description="Maximum connections in the Redis pool (env: CACHEKIT_CONNECTION_POOL_SIZE)",
     )
     socket_timeout: float = Field(
         default=5.0,
@@ -78,11 +89,14 @@ class RedisBackendConfig(BaseBackendConfig):
     )
     socket_keepalive: bool = Field(
         default=True,
-        description="Enable TCP keepalive for connections",
+        description="Enable TCP keepalive on TCP connections; not applied to unix:// URLs (env: CACHEKIT_SOCKET_KEEPALIVE)",
     )
     disable_hiredis: bool = Field(
         default=False,
-        description="Disable hiredis parser (use pure Python)",
+        description=(
+            "Reports CACHEKIT_DISABLE_HIREDIS; the parser is chosen from that variable at import cachekit "
+            "(see cachekit.hiredis_compat), so setting this field changes nothing"
+        ),
     )
 
     @classmethod

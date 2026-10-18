@@ -29,6 +29,7 @@ import inspect
 import math
 import re
 import struct
+from collections.abc import Iterable
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import Enum
@@ -41,6 +42,11 @@ from .serializers.base import SerializationError, unpackb_bounded
 # Full-string match REQUIRED: re.match with a $ anchor still accepts a
 # trailing newline. Pinned by the reject_trailing_newline error vector.
 SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+# Exact-match, namespace-only: the CachekitIO server parses a key starting
+# ns: or nsapi: as namespace-prefixed (protocol spec/cache-key-format.md
+# "Server-Side Requirements"). Operations may still be ns / nsapi.
+RESERVED_NAMESPACES = frozenset({"ns", "nsapi"})
 
 UINT64_MAX = 2**64 - 1
 INT64_MIN = -(2**63)
@@ -223,9 +229,34 @@ def _normalize_arg(v: object) -> object:
     Decimal's textual form is caller-visible contract: "1.0" and "1.00" hash
     differently — agree on the form across SDKs or avoid Decimal arguments.
     """
-    if v is None or isinstance(v, (bool, int, float, str, bytes, bytearray)):
-        # Range/NaN/Infinity/surrogate enforcement lives in ONE place: the
-        # encoder, which every path hits.
+    # Range/NaN/Infinity/surrogate enforcement lives in ONE place: the encoder,
+    # which every path hits. A real scalar subclass is first reduced to its exact
+    # base-type value through the base type's own slot, so the hashed bytes are
+    # the argument's value and never the output of a method the subclass can
+    # override (encode, to_bytes, is_integer, __int__, __bytes__, __lt__).
+    # Dispatch is on type(v), never isinstance: isinstance honours a __class__
+    # property, so an int subclass reporting str would take the str branch.
+    t = type(v)
+    if v is None or t is bool:  # bool cannot be subclassed
+        return v
+    u: Any = v  # the slots take their own type; issubclass(t, ...) does not narrow v
+    if issubclass(t, str):
+        return str.__str__(u)
+    if issubclass(t, int):
+        return int.__int__(u)
+    if issubclass(t, float):
+        return float.__float__(u)
+    # bytes.__bytes__ does not exist on Python 3.10; the base type's full slice
+    # copies the buffer without calling anything a subclass defines.
+    if issubclass(t, bytes):
+        return bytes.__getitem__(u, slice(None))
+    if issubclass(t, bytearray):
+        return bytes(bytearray.__getitem__(u, slice(None)))
+    if isinstance(v, (bool, int, float, str, bytes, bytearray)):
+        # Not a subclass: it only reports a scalar type through __class__, as a
+        # lazy proxy does (SimpleLazyObject, wrapt). The slots would raise
+        # TypeError on it, so it keeps its pre-existing pass-through and is
+        # hashed through its own forwarded methods.
         return v
     if isinstance(v, datetime):
         if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
@@ -252,7 +283,18 @@ def _normalize_arg(v: object) -> object:
         for k, val in v.items():
             if not isinstance(k, str):
                 raise InteropError(f"interop map keys must be strings, got {type(k).__name__}")
-            norm[k] = _normalize_arg(val)
+            # Check first, then normalize: normalizing first would accept Enum,
+            # Path, UUID and Decimal keys and widen the str-keys contract. The
+            # second check catches a non-str subclass that reports str.
+            key = _normalize_arg(k)
+            if not isinstance(key, str):
+                raise InteropError(f"interop map keys must be strings, got {type(k).__name__}")
+            if key in norm:
+                # Only a subclass overriding __eq__/__hash__ gets two equal keys
+                # into one dict. Such a map has no canonical encoding, and
+                # keeping either value would hash it like a different argument.
+                raise InteropError(f"interop map has duplicate key {key!r} after normalization")
+            norm[key] = _normalize_arg(val)
         return norm
     if isinstance(v, Enum):
         return _normalize_arg(v.value)
@@ -278,17 +320,43 @@ def args_hash(args: list | tuple) -> str:
 
 
 def validate_segment(name: str, segment: object) -> str:
-    """Validate an interop namespace/operation segment. Returns the segment.
+    """Validate an interop namespace/operation segment. Returns it as an exact ``str``.
 
     Full-string match against ``^[a-z0-9][a-z0-9._-]{0,63}$`` — never silently
     normalized. re.fullmatch, not re.match: $ accepts a trailing newline.
+    Neither segment may contain ``..``, and a namespace must additionally not
+    be one of :data:`RESERVED_NAMESPACES`.
+
+    A ``str`` subclass is checked and returned as its exact ``str`` value, so
+    callers must render the returned value, not the argument. The subclass's own
+    ``__format__`` could otherwise render a key that was never checked (a
+    ``(str, Enum)`` member formats as ``NS.USERS`` since Python 3.11), and its
+    ``__hash__``/``__eq__`` could make the reserved-namespace lookup miss.
     """
-    if not isinstance(segment, str) or not SEGMENT_RE.fullmatch(segment):
+    # str.__str__, not str(): it copies the underlying characters and ignores
+    # an overridden __str__. The characters are unchanged, so this is not a
+    # normalization in the spec's sense.
+    value = str.__str__(segment) if isinstance(segment, str) else segment
+    if not isinstance(value, str) or not SEGMENT_RE.fullmatch(value):
         raise InteropError(
-            f"invalid interop {name} {segment!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
+            f"invalid interop {name} {value!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
             f"(lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
         )
-    return segment
+    # SEGMENT_RE admits `..`, but the server rejects `..` anywhere in a key
+    # (protocol spec/cache-key-format.md "Server-Side Requirements", Traversal
+    # row). The `:` delimiters separate the segments and the hash is hex, so any
+    # `..` in a key lies inside one segment.
+    if ".." in value:
+        raise InteropError(
+            f"invalid interop {name} {value!r}: must not contain '..', because the CachekitIO server "
+            f"rejects '..' anywhere in a key"
+        )
+    if name == "namespace" and value in RESERVED_NAMESPACES:
+        raise InteropError(
+            f"invalid interop namespace {value!r}: reserved, because the CachekitIO server parses a key "
+            f"starting '{value}:' as namespace-prefixed"
+        )
+    return value
 
 
 def validate_interop_config(operation: object, namespace: object, *, has_custom_key: bool = False) -> tuple[str, str]:
@@ -299,6 +367,8 @@ def validate_interop_config(operation: object, namespace: object, *, has_custom_
     Covers: operation/namespace segment charset, mandatory namespace,
     ``key=`` mutual exclusion. Raises InteropError; callers keep their own
     error wrapping and site-specific checks (fast_mode, L1-only, backend).
+    Returns ``(operation, namespace)`` as exact ``str`` values; a caller that
+    builds keys must use these, not its arguments (see :func:`validate_segment`).
     """
     op = validate_segment("operation", operation)
     if namespace is None:
@@ -322,9 +392,9 @@ def generate_interop_key(namespace: str, operation: str, args: list | tuple) -> 
     Max possible key length is 64+1+64+1+64 = 194 chars — under every
     backend limit, so key truncation never applies to interop keys.
     """
-    validate_segment("namespace", namespace)
-    validate_segment("operation", operation)
-    return f"{namespace}:{operation}:{args_hash(args)}"
+    ns = validate_segment("namespace", namespace)
+    op = validate_segment("operation", operation)
+    return f"{ns}:{op}:{args_hash(args)}"
 
 
 def bind_flat_args(sig: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
@@ -410,25 +480,53 @@ def _iso_utc(value: str) -> str:
     return value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
 
 
-def _revive_sentinels(obj: Any) -> Any:
-    """msgpack object_hook: revive wire-format.md temporal sentinel maps."""
-    if isinstance(obj, dict):
-        if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
-            return datetime.fromisoformat(_iso_utc(obj["value"]))
-        if obj.get("__date__") is True and isinstance(obj.get("value"), str):
-            return date.fromisoformat(obj["value"])
-        if obj.get("__time__") is True and isinstance(obj.get("value"), str):
-            return time.fromisoformat(_iso_utc(obj["value"]))
+def _revive_sentinels(obj: dict[Any, Any]) -> Any:
+    """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is."""
+    if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
+        return datetime.fromisoformat(_iso_utc(obj["value"]))
+    if obj.get("__date__") is True and isinstance(obj.get("value"), str):
+        return date.fromisoformat(obj["value"])
+    if obj.get("__time__") is True and isinstance(obj.get("value"), str):
+        return time.fromisoformat(_iso_utc(obj["value"]))
     return obj
+
+
+# Most entries one map may hold under a key that is neither str nor bytes. str and bytes hash under a
+# per-process secret; int, float and msgpack.Timestamp hash without one, so a forged entry can choose its
+# keys' hashes. Sharing one hash makes each insert compare against every earlier key. Distinct hashes chosen
+# so their dict probe sequences merge (CPython's perturbation is spent after 13 probes, and every sequence
+# then walks the same cycle) make each insert walk one shared chain. Either way the build is quadratic in the
+# key count, so the count is what is capped. The interop data model writes only string keys. At 32, a forged
+# map's decode costs at most ~3.5x an honest one of the same size (32 Timestamps on one hash).
+_MAX_NON_STRING_KEYS = 32
+
+
+def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
+    """msgpack object_pairs_hook: build one map, refusing one whose keys could make the build quadratic."""
+    # msgpack's C unpacker passes a list, its pure-Python fallback a one-shot generator: materialise it
+    # once, or the count below consumes it and the map silently decodes empty.
+    pairs = list(pairs)
+    # Entries, not distinct keys: telling keys apart needs a hash table of them, the very build being bounded.
+    if len(pairs) > _MAX_NON_STRING_KEYS and sum(type(k) not in (str, bytes) for k, _ in pairs) > _MAX_NON_STRING_KEYS:
+        raise InteropDecodeError(
+            f"stored value has a map with more than {_MAX_NON_STRING_KEYS} entries keyed by neither str nor bytes: "
+            "a hash-flood bound, not a framing error. The entry is likely forged."
+        )
+    return _revive_sentinels(dict(pairs))
 
 
 def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     """Decode one plain-MessagePack interop value document.
 
-    Readers accept any well-formed MessagePack document (canonical or not),
-    but MUST consume exactly one document — trailing bytes are rejected
-    (msgpack-python raises ExtraData). A CK v3 frame prefix gets the
-    protocol#11 diagnostic instead of decoding its magic byte as int 67.
+    Readers accept any well-formed MessagePack document (canonical or not) in
+    which no map holds more than _MAX_NON_STRING_KEYS entries keyed by neither
+    str nor bytes. The bound counts every such key, whatever its type: int,
+    float, bool, None, Timestamp, ExtType or a revived temporal. A map over it
+    raises InteropDecodeError (a hash-flood bound), which a cached read treats
+    as a miss. A hashable non-str key decodes as-is; an unhashable one raises
+    InteropDecodeError. Readers MUST consume exactly one document — trailing
+    bytes are rejected (msgpack-python raises ExtraData). A CK v3 frame prefix
+    gets the protocol#11 diagnostic instead of decoding its magic byte as int 67.
     """
     raw = bytes(data)
     if raw[: len(_CK_FRAME_MAGIC)] == _CK_FRAME_MAGIC:
@@ -437,8 +535,13 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
             "interop value. An auto-mode writer and an interop reader are sharing a key — "
             "check that every writer for this key uses @cache(interop=...)."
         )
+    # strict_map_key=False: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must
+    # accept. msgpack's default exists against hash flooding; _build_map bounds that instead, and an
+    # array/map key still fails as unhashable.
     try:
-        return unpackb_bounded(raw, raw=False, strict_map_key=True, object_hook=_revive_sentinels)
+        return unpackb_bounded(raw, raw=False, strict_map_key=False, object_pairs_hook=_build_map)
+    except InteropDecodeError:
+        raise
     except Exception as e:
         raise InteropDecodeError(f"stored value is not a single well-formed MessagePack document: {e}") from e
 
@@ -453,8 +556,8 @@ def ensure_interop_backend_compatible(backend: Any) -> None:
 
     A backend key prefix (e.g. MemcachedBackend's ``key_prefix``) makes this
     SDK read/write ``{prefix}{ns}:{op}:{hash}`` while other SDKs use the bare
-    key — silent cross-SDK misses, and the encryption AAD binds the
-    UN-prefixed key. Backends that transform keys MUST expose the prefix as a
+    key — silent cross-SDK misses, and the encryption AAD would bind the
+    prefixed key, which no other SDK builds. Backends that transform keys MUST expose the prefix as a
     ``key_prefix`` attribute (contract); non-prefix key transforms are
     incompatible with interop mode entirely. Same decision as cachekit-ts
     (wrap-time + per-call guard) and cachekit-rs (read-time guard).
@@ -481,6 +584,7 @@ def ensure_interop_backend_compatible(backend: Any) -> None:
 __all__ = [
     "InteropDecodeError",
     "InteropError",
+    "RESERVED_NAMESPACES",
     "SEGMENT_RE",
     "args_hash",
     "bind_flat_args",

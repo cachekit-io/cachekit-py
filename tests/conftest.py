@@ -135,12 +135,17 @@ if PYTEST_REDIS_AVAILABLE:
 
         _parsed = urlparse(redis_url)
         redis_noproc = factories.redis_noproc(host=_parsed.hostname or "localhost", port=_parsed.port or 6379)
-        redis_isolated = factories.redisdb("redis_noproc")
+        _REDIS_PROCESS_FIXTURE = "redis_noproc"
     else:
-        # Local development - spawn Redis process
-        redis_proc_kwargs = {"timeout": 60}
+        # Local development - spawn Redis process.
+        # Draw the port below 30000. The default pool runs up to the ephemeral range, so it overlaps
+        # Kubernetes' NodePort range (30000-32767). On a k8s node, kube-proxy intercepts connections to
+        # an allocated NodePort on every local address, loopback included: redis listens, but the
+        # readiness probe gets ECONNREFUSED (or another service) until the 60 s startup timeout.
+        redis_proc_kwargs = {"timeout": 60, "port": (1024, 29999)}
         redis_proc = factories.redis_proc(**redis_proc_kwargs)
-        redis_isolated = factories.redisdb("redis_proc")
+        _REDIS_PROCESS_FIXTURE = "redis_proc"
+    redis_isolated = factories.redisdb(_REDIS_PROCESS_FIXTURE)
 
     # Also make it available under the name the tests expect
     redisdb = redis_isolated
@@ -150,6 +155,33 @@ if PYTEST_REDIS_AVAILABLE:
     def redis_session(redis_isolated):
         """Function-scoped Redis client for performance tests."""
         return redis_isolated
+
+    @pytest.fixture
+    def redis_backend(request):
+        """A Redis backend (the production PerRequestRedisBackend) whose keys belong to this test alone.
+
+        It never flushes. xdist workers share CI's one Redis, so redis_isolated's teardown
+        ``flushall`` would empty another worker's entries mid-test. Instead the backend's tenant
+        is unique to the test, and teardown deletes only that tenant's keys.
+        """
+        import uuid
+
+        import redis
+
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
+
+        proc = request.getfixturevalue(_REDIS_PROCESS_FIXTURE)
+        client = redis.Redis(
+            proc.host, proc.port, username=proc.username, password=proc.password, unix_socket_path=proc.unixsocket
+        )
+        tenant = uuid.uuid4().hex
+        try:
+            yield PerRequestRedisBackend(client, tenant)
+        finally:
+            keys = list(client.scan_iter(match=f"t:{tenant}:*"))
+            if keys:
+                client.delete(*keys)
+            client.close()
 
 
 # =============================================================================
@@ -299,19 +331,6 @@ def mock_backend_without_timeout():
 
 
 @pytest.fixture
-def redis_backend(redis_isolated):
-    """Provide Redis-backed backend for integration tests.
-
-    Uses the isolated Redis instance from pytest-redis.
-    For unit tests that don't need real Redis, use backend fixture.
-    """
-    from cachekit.backends.redis_backend import RedisBackend
-
-    backend = RedisBackend(redis_isolated)
-    return backend
-
-
-@pytest.fixture
 def redis_backend_provider(redis_isolated):
     """Provide Redis backend provider for integration tests.
 
@@ -431,12 +450,10 @@ def reset_call_counters(*mock_objects):
 def setup_redis_env():
     """Legacy fixture for backward compatibility.
 
-    Previously also set CACHEKIT_MASTER_KEY for every test. That broke after the
-    PR #127 auto-detect: any cached settings singleton that captured the env-set
-    master key turned encryption on globally, which the v0.6.0 cross-SDK rule
-    then rejected for non-default serializers (serializer='auto', custom
-    instances). Tests that need encryption now set CACHEKIT_MASTER_KEY locally
-    via monkeypatch.setenv.
+    Deliberately does NOT set CACHEKIT_MASTER_KEY: a present key with no stated
+    encryption= intent raises ConfigurationError at construction, so a global key
+    would break every test that builds a cache without one. Tests that need a key
+    set CACHEKIT_MASTER_KEY locally via monkeypatch.setenv and state their intent.
 
     reset_settings() brackets each test so the singleton never carries env
     state across test boundaries.

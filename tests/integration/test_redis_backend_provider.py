@@ -14,6 +14,7 @@ from cachekit.backends.redis.provider import (
     RedisBackendProvider,
     tenant_context,
 )
+from tests.fixtures.tenant import as_tenant
 
 
 @pytest.mark.integration
@@ -186,13 +187,11 @@ class TestRedisBackendProviderFactory:
 
         # Multiple get_backend calls should return different backend instances
         # but sharing the same client
-        token = tenant_context.set("tenant1")
-        backend1 = provider.get_backend()
-        tenant_context.reset(token)
+        with as_tenant("tenant1"):
+            backend1 = provider.get_backend()
 
-        token = tenant_context.set("tenant2")
-        backend2 = provider.get_backend()
-        tenant_context.reset(token)
+        with as_tenant("tenant2"):
+            backend2 = provider.get_backend()
 
         # Different backend instances
         assert backend1 is not backend2
@@ -206,8 +205,7 @@ class TestRedisBackendProviderFactory:
         """Test provider fails fast if tenant context not set."""
         provider = RedisBackendProvider("redis://localhost:6379")
 
-        # Reset tenant context
-        tenant_context.set(None)
+        tenant_context.set(None)  # no reset: this test needs the missing-tenant path
 
         with pytest.raises(RuntimeError, match="tenant_id cannot be None"):
             provider.get_backend()
@@ -320,14 +318,6 @@ def _tenant_prefixes(client) -> set[str]:
     return {key.decode().split(":", 2)[1] for key in _cache_entries(client)}
 
 
-def as_tenant(tenant, fn, *args):
-    token = tenant_context.set(tenant)
-    try:
-        return fn(*args)
-    finally:
-        tenant_context.reset(token)
-
-
 @pytest.mark.integration
 class TestTenantScopedPerOperation:
     """LAB-4773: the decorator resolves its backend once and keeps it, so the backend it
@@ -345,11 +335,8 @@ class TestTenantScopedPerOperation:
             return {"x": x}
 
         for tenant in ("tenant-a", "org:b"):
-            token = tenant_context.set(tenant)
-            try:
+            with as_tenant(tenant):
                 assert lookup(1) == {"x": 1}
-            finally:
-                tenant_context.reset(token)
 
         assert _tenant_prefixes(env_resolved_redis) == {"tenant-a", "org%3Ab"}
         assert calls == [1, 1], "the second tenant must miss, not read the first tenant's entry"
@@ -363,11 +350,8 @@ class TestTenantScopedPerOperation:
         def lookup(x):
             return x
 
-        token = tenant_context.set("tenant-a")
-        try:
+        with as_tenant("tenant-a"):
             lookup(1)
-        finally:
-            tenant_context.reset(token)
 
         # A fresh thread starts with an empty context: tenant_context is unset there.
         worker = threading.Thread(target=lookup, args=(2,))
@@ -407,17 +391,11 @@ class TestTenantScopedPerOperation:
             return x
 
         for tenant in ("tenant-a", "tenant-b"):
-            token = tenant_context.set(tenant)
-            try:
+            with as_tenant(tenant):
                 lookup(1)
-            finally:
-                tenant_context.reset(token)
 
-        token = tenant_context.set("tenant-b")
-        try:
+        with as_tenant("tenant-b"):
             lookup.invalidate_cache(1)
-        finally:
-            tenant_context.reset(token)
 
         assert _tenant_prefixes(env_resolved_redis) == {"tenant-a"}
 
@@ -425,8 +403,7 @@ class TestTenantScopedPerOperation:
         """One shared instance: reads, writes, deletes, TTL ops and locks all re-scope per context."""
         backend = PerRequestRedisBackend(redis_isolated, "default", follow_context=True)
         for tenant, wire in (("tenant-a", "tenant-a"), ("org:b", "org%3Ab")):
-            token = tenant_context.set(tenant)
-            try:
+            with as_tenant(tenant):
                 assert backend.key_prefix == f"t:{wire}:"
                 backend.set("k", b"v-" + tenant.encode(), ttl=60)
                 assert backend.get("k") == b"v-" + tenant.encode()
@@ -438,8 +415,6 @@ class TestTenantScopedPerOperation:
                     assert redis_isolated.exists(f"t:{wire}:k:lock")
                 backend.set("gone", b"x")
                 assert backend.delete("gone")
-            finally:
-                tenant_context.reset(token)
 
         assert sorted(redis_isolated.keys("t:*")) == [b"t:org%3Ab:k", b"t:tenant-a:k"]
 
@@ -454,15 +429,19 @@ class TestTenantScopedPerOperation:
         def lookup(x):
             return x
 
-        as_tenant("tenant-a", lookup, 1)
-        as_tenant("tenant-b", lookup, 1)
-        as_tenant("tenant-b", lookup, 2)
+        with as_tenant("tenant-a"):
+            lookup(1)
+        with as_tenant("tenant-b"):
+            lookup(1)
+            lookup(2)
         env_resolved_redis.delete(*env_resolved_redis.keys("t:tenant-b:ck:reg:*"))
 
-        as_tenant("tenant-a", lookup.invalidate_cache)
+        with as_tenant("tenant-a"):
+            lookup.invalidate_cache()
         assert _tenant_prefixes(env_resolved_redis) == {"tenant-b"}
 
-        as_tenant("tenant-b", lookup.invalidate_cache)
+        with as_tenant("tenant-b"):
+            lookup.invalidate_cache()
         assert env_resolved_redis.keys("t:*") == []
 
     def test_whole_function_invalidate_evicts_l1_for_every_tenant(self, env_resolved_redis):
@@ -478,9 +457,11 @@ class TestTenantScopedPerOperation:
             calls.append(tenant_context.get())
             return x
 
-        as_tenant("tenant-b", lookup, 1)
-        as_tenant("tenant-a", lookup.invalidate_cache)
-        as_tenant("tenant-a", lookup, 1)
+        with as_tenant("tenant-b"):
+            lookup(1)
+        with as_tenant("tenant-a"):
+            lookup.invalidate_cache()
+            lookup(1)
 
         assert calls == ["tenant-b", "tenant-a"]
 
@@ -521,11 +502,8 @@ class TestTenantScopedPerOperation:
 
         try:
             for tenant in ("tenant-a", "tenant-b"):
-                token = tenant_context.set(tenant)
-                try:
+                with as_tenant(tenant):
                     lookup(1)
-                finally:
-                    tenant_context.reset(token)
         finally:
             redis_provider.close()
 
@@ -537,11 +515,8 @@ class TestTenantScopedPerOperation:
         import threading
 
         redis_provider = RedisBackendProvider(os.environ["CACHEKIT_REDIS_URL"])
-        token = tenant_context.set("tenant-x")
-        try:
+        with as_tenant("tenant-x"):
             backend = redis_provider.get_backend()
-        finally:
-            tenant_context.reset(token)
 
         try:
             worker = threading.Thread(target=backend.set, args=("k", b"v"))
@@ -555,10 +530,7 @@ class TestTenantScopedPerOperation:
     def test_direct_binding_is_not_overridden_by_the_context(self, redis_isolated):
         """Explicit construction (admin / fan-out to another tenant) keeps its tenant."""
         backend = PerRequestRedisBackend(redis_isolated, "tenant-x")
-        token = tenant_context.set("tenant-y")
-        try:
+        with as_tenant("tenant-y"):
             backend.set("k", b"v")
-        finally:
-            tenant_context.reset(token)
 
         assert redis_isolated.keys("t:*") == [b"t:tenant-x:k"]

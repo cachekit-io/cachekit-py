@@ -7,10 +7,34 @@ Tests error paths, corruption detection, and security boundary validation.
 
 import pytest
 
+from tests.utils.tracemalloc_isolation import measure_in_subprocess
+
 from ..utils.redis_test_helpers import RedisIsolationMixin
 
 # Mark all tests in this module as critical
 pytestmark = pytest.mark.critical
+
+
+def _measure_memoryview_retrieve() -> dict:
+    """Heap peak of ByteStorage.retrieve(memoryview), as a multiple of the payload."""
+    import gc
+    import os
+    import tracemalloc
+
+    from cachekit._rust_serializer import ByteStorage
+
+    storage = ByteStorage("msgpack")
+    payload = os.urandom(8 * 1024 * 1024)  # incompressible: envelope ~= payload
+    envelope = storage.store(payload, None)
+    view = memoryview(envelope)
+
+    gc.collect()
+    tracemalloc.start()
+    data, _ = storage.retrieve(view)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    return {"roundtrip": data == payload, "ratio": peak / len(payload)}
 
 
 class TestByteStorageErrorInjection(RedisIsolationMixin):
@@ -506,26 +530,11 @@ class TestByteStorageBufferProtocol:
         copy paths both read 1.00x), so the borrow itself is pinned by review of
         retrieve() in rust/src/python_bindings.rs, not by this suite.
         """
-        import gc
-        import os
-        import tracemalloc
+        measured = measure_in_subprocess(_measure_memoryview_retrieve)
 
-        from cachekit._rust_serializer import ByteStorage
-
-        storage = ByteStorage("msgpack")
-        payload = os.urandom(8 * 1024 * 1024)  # incompressible: envelope ~= payload
-        envelope = storage.store(payload, None)
-        view = memoryview(envelope)
-
-        gc.collect()
-        tracemalloc.start()
-        data, _ = storage.retrieve(view)
-        peak = tracemalloc.get_traced_memory()[1]
-        tracemalloc.stop()
-
-        assert data == payload
-        assert peak / len(payload) < 1.5, (
-            f"retrieve(memoryview) peak {peak / len(payload):.2f}x payload — the zero-copy borrow "
+        assert measured["roundtrip"]
+        assert measured["ratio"] < 1.5, (
+            f"retrieve(memoryview) peak {measured['ratio']:.2f}x payload — the zero-copy borrow "
             f"regressed to a full envelope copy (expected ~1x: just the output bytes)"
         )
 

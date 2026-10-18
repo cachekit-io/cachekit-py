@@ -53,7 +53,7 @@ help: ## Show Rust-specific commands
 	@echo "  $(YELLOW)make test-property$(RESET)        Property-based tests (proptest)"
 	@echo ""
 	@echo "$(GREEN)Benchmarks:$(RESET)"
-	@echo "  $(YELLOW)make bench$(RESET)            Run Rust benchmarks"
+	@echo "  $(YELLOW)make bench$(RESET)            Point at the Rust benchmarks (cachekit-core)"
 	@echo ""
 	@echo "$(GREEN)Security:$(RESET)"
 	@echo "  $(YELLOW)make security-fast$(RESET)    Fast security checks (< 3 min)"
@@ -163,12 +163,9 @@ test-property: ## Run property-based tests (in cachekit-core)
 # 📊 BENCHMARKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-bench: ## Run Rust benchmarks
-	@echo "$(BLUE)Running Rust benchmarks...$(RESET)"
-	@echo "$(YELLOW)Logging to $(LOG_DIR)/benchmark/rust-bench_$(TIMESTAMP).log$(RESET)"
-	$(call require_binary,cargo,Install Rust: https://rustup.rs)
-	@cargo bench --bench unified_benchmarks 2>&1 | tee $(LOG_DIR)/benchmark/rust-bench_$(TIMESTAMP).log
-	@echo "$(GREEN)✓ Rust benchmarks completed$(RESET)"
+bench: ## Run Rust benchmarks (in cachekit-core)
+	@echo "$(BLUE)Rust benchmarks are now in cachekit-core/$(RESET)"
+	@echo "$(YELLOW)Run: cd ../../cachekit-core && cargo bench --features encryption --bench hot_path$(RESET)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔒 SECURITY & VERIFICATION

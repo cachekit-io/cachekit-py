@@ -16,10 +16,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cachekit.backends.base import BaseBackend
-from cachekit.backends.errors import BackendErrorType
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.backend import MemcachedBackend
 from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL, MemcachedBackendConfig
 from cachekit.backends.memcached.error_handler import classify_memcached_error
+from tests.utils.memcached_helpers import mock_hash_client as _mock_hash_client
 
 
 @pytest.fixture
@@ -32,7 +33,7 @@ def config() -> MemcachedBackendConfig:
 def mock_hash_client():
     """Patch HashClient and return the mock instance."""
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
-        mock_instance = MagicMock()
+        mock_instance = _mock_hash_client()
         mock_cls.return_value = mock_instance
         yield mock_instance
 
@@ -353,3 +354,329 @@ class TestLazyImport:
 
         with pytest.raises(AttributeError, match="has no attribute"):
             _ = cachekit.backends.NoSuchBackend  # type: ignore[attr-defined]
+
+
+class _FakeServer:
+    """Stands in for one server's pymemcache client inside a real HashClient."""
+
+    def __init__(self, server: object) -> None:
+        self.server = server
+        self.sends: list[tuple[list[str], object]] = []  # delete_many sends
+        self.commands: list[tuple[str, str]] = []  # single-key commands that reached the server
+        self.store: dict[str, bytes] = {}
+        self.error: Exception | None = None
+
+    def _send(self, cmd: str, key: str) -> None:
+        self.commands.append((cmd, key))
+        if self.error is not None:
+            raise self.error
+
+    def delete_many(self, keys: list[str], noreply: object = None) -> bool:
+        self.sends.append((list(keys), noreply))
+        if self.error is not None:
+            raise self.error
+        for key in keys:
+            self.store.pop(key, None)
+        return True
+
+    def get(self, key: str, default: object = None) -> object:
+        self._send("get", key)
+        return self.store.get(key, default)
+
+    def set(self, key: str, value: bytes, expire: int = 0, noreply: object = None) -> bool:
+        self._send("set", key)
+        self.store[key] = value
+        return True
+
+    def delete(self, key: str, noreply: object = None) -> bool:
+        self._send("delete", key)
+        return self.store.pop(key, None) is not None
+
+    def touch(self, key: str, expire: int = 0, noreply: object = None) -> bool:
+        self._send("touch", key)
+        return key in self.store
+
+
+def _fake_backend(servers: int = 2, key_prefix: str = "") -> tuple[MemcachedBackend, dict[object, _FakeServer]]:
+    """A MemcachedBackend on a real HashClient (real routing and retry handling), fake servers."""
+    cfg = MemcachedBackendConfig(servers=[f"127.0.0.1:{21000 + i}" for i in range(servers)], key_prefix=key_prefix)
+    backend = MemcachedBackend(cfg)
+    fakes = {name: _FakeServer(client.server) for name, client in backend._client.clients.items()}
+    backend._client.clients.update(fakes)
+    return backend, fakes
+
+
+def _open_retry_window(backend: MemcachedBackend, fake: _FakeServer) -> None:
+    """Fail one command on fake's server, so HashClient skips that server until retry_timeout passes."""
+    fake.error = OSError("connection refused")
+    with pytest.raises(BackendError):
+        backend.delete("__open_window__")
+    fake.error = None
+    fake.commands.clear()
+    assert fake.server in backend._client._failed_clients
+
+
+def _close_retry_window(backend: MemcachedBackend) -> None:
+    """Age every failure past retry_timeout, as if the window had expired."""
+    for meta in backend._client._failed_clients.values():
+        meta["failed_time"] -= backend._client.retry_timeout + 1
+
+
+@pytest.mark.unit
+class TestDeleteMany:
+    """_delete_many against a real HashClient (real routing and retry handling), fake servers."""
+
+    _backend = staticmethod(_fake_backend)
+
+    def test_one_acknowledged_send_per_server(self) -> None:
+        backend, fakes = self._backend()
+        keys = [f"k{i}" for i in range(200)]
+
+        assert backend._delete_many(keys) == set()
+
+        sends = [s for f in fakes.values() for s in f.sends]
+        assert len(sends) == 2  # both servers own some keys; one send each
+        assert all(noreply is False for _, noreply in sends)
+        assert sorted(k for ks, _ in sends for k in ks) == sorted(keys)
+        for name, fake in fakes.items():
+            for sent, _ in fake.sends:
+                assert all(backend._client.hasher.get_node(k) == name for k in sent)
+
+    def test_sends_are_capped(self) -> None:
+        backend, fakes = self._backend(servers=1)
+        backend._delete_many([f"k{i}" for i in range(2500)])
+        (fake,) = fakes.values()
+        assert [len(ks) for ks, _ in fake.sends] == [1000, 1000, 500]
+
+    def test_prefix_applied_and_failures_reported_raw(self) -> None:
+        backend, fakes = self._backend(servers=1, key_prefix="app:")
+        (fake,) = fakes.values()
+        fake.error = OSError("connection reset")
+
+        assert backend._delete_many(["a", "b"]) == {"a", "b"}
+        assert fake.sends[0][0] == ["app:a", "app:b"]
+
+    def test_failing_server_fails_only_its_keys(self) -> None:
+        backend, fakes = self._backend()
+        keys = [f"k{i}" for i in range(200)]
+        bad_name, bad = next(iter(fakes.items()))
+        bad.error = OSError("connection reset")
+
+        failed = backend._delete_many(keys)
+
+        assert failed and failed == {k for k in keys if backend._client.hasher.get_node(k) == bad_name}
+
+    def test_server_in_retry_window_is_not_counted_deleted(self) -> None:
+        backend, fakes = self._backend(servers=1)
+        ((name, fake),) = fakes.items()
+        fake.error = OSError("down")
+        assert backend._delete_many(["a"]) == {"a"}  # marks the server failed
+        fake.error = None
+        fake.sends.clear()
+
+        # Within retry_timeout HashClient skips the server and returns its default: not an ack.
+        assert backend._delete_many(["a", "b"]) == {"a", "b"}
+        assert fake.sends == []
+
+    def test_invalid_key_fails_alone(self) -> None:
+        backend, fakes = self._backend(servers=1)
+        assert backend._delete_many(["good", "has space"]) == {"has space"}
+        (fake,) = fakes.values()
+        assert fake.sends[0][0] == ["good"]
+
+    def test_empty(self) -> None:
+        backend, fakes = self._backend()
+        assert backend._delete_many([]) == set()
+        assert all(f.sends == [] for f in fakes.values())
+
+    @pytest.mark.parametrize("private", ["_get_client", "_safely_run_func"])
+    def test_api_drift_raises_instead_of_failing_keys(self, private: str) -> None:
+        """A renamed HashClient internal must raise, so the sweep falls back to per-key deletes."""
+        backend, _ = self._backend(servers=1)
+        with patch.object(backend._client, private, side_effect=AttributeError(private)):
+            with pytest.raises(AttributeError):
+                backend._delete_many(["a"])
+
+    def test_api_drift_sweep_still_erases_every_key(self) -> None:
+        """End to end: with a broken internal, a no-args sweep deletes through public delete()."""
+        from cachekit import cache
+
+        backend, _ = self._backend(servers=1)
+        store: dict[str, bytes] = {}
+        with (
+            patch.object(backend, "get", side_effect=lambda k: store.get(k)),
+            patch.object(backend, "set", side_effect=lambda k, v, ttl=None: store.__setitem__(k, v)),
+            patch.object(MemcachedBackend, "delete", autospec=True, side_effect=lambda self, k: store.pop(k, None) is not None),
+            patch.object(backend._client, "_safely_run_func", side_effect=AttributeError("renamed")),
+        ):
+
+            @cache(backend=backend, ttl=60, namespace="mc_api_drift")
+            def f(x: int) -> int:
+                return x
+
+            for i in range(5):
+                f(i)
+            assert len(store) == 5
+            f.invalidate_cache()
+            assert store == {}
+
+
+@pytest.mark.unit
+class TestRetryWindowSkip:
+    """A command HashClient skips for a server in its retry window never reports an outcome."""
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda b: b.delete("k"), id="delete"),
+            pytest.param(lambda b: b.set("k", b"v"), id="set"),
+            pytest.param(lambda b: b.exists("k"), id="exists"),
+        ],
+    )
+    def test_skipped_command_raises_transient(self, call) -> None:
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        fake.store["k"] = b"old"
+        _open_retry_window(backend, fake)
+
+        with pytest.raises(BackendError) as exc_info:
+            call(backend)
+
+        assert exc_info.value.error_type == BackendErrorType.TRANSIENT
+        assert "retry window" in str(exc_info.value)
+        assert fake.commands == []  # nothing sent: the old value is still there
+        assert fake.store == {"k": b"old"}
+
+    async def test_skipped_refresh_ttl_raises_transient(self) -> None:
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        fake.store["k"] = b"v"
+        _open_retry_window(backend, fake)
+
+        with pytest.raises(BackendError) as exc_info:
+            await backend.refresh_ttl("k", 60)
+
+        assert exc_info.value.error_type == BackendErrorType.TRANSIENT
+        assert fake.commands == []
+
+    def test_skipped_health_probe_is_unhealthy(self) -> None:
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        _open_retry_window(backend, fake)
+
+        is_healthy, details = backend.health_check()
+
+        assert is_healthy is False
+        assert "retry window" in details["error"]
+        assert fake.commands == []
+
+    def test_skipped_get_reads_as_miss(self) -> None:
+        """Deliberate: a miss on a read only makes the caller recompute."""
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        fake.store["k"] = b"v"
+        _open_retry_window(backend, fake)
+
+        assert backend.get("k") is None
+        assert fake.commands == []
+
+    def test_real_miss_still_returns_false(self) -> None:
+        backend, fakes = _fake_backend(servers=1, key_prefix="app:")
+        (fake,) = fakes.values()
+
+        assert backend.delete("absent") is False
+        assert backend.exists("absent") is False
+        assert fake.commands == [("delete", "app:absent"), ("get", "app:absent")]
+
+    def test_commands_reach_the_server_once_the_window_expires(self) -> None:
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        fake.store["k"] = b"v"
+        _open_retry_window(backend, fake)
+        _close_retry_window(backend)
+
+        assert backend.delete("k") is True
+        assert backend.delete("absent") is False
+        assert fake.commands == [("delete", "k"), ("delete", "absent")]
+
+    def test_server_errors_are_still_classified(self) -> None:
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        fake.error = TimeoutError("timed out")
+
+        with pytest.raises(BackendError) as exc_info:
+            backend.set("k", b"v")
+
+        assert exc_info.value.error_type == BackendErrorType.TIMEOUT
+
+    def test_api_drift_falls_back_to_the_public_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A renamed _safely_run_func must not stop the real per-key delete reaching the server."""
+        from pymemcache.client.hash import HashClient
+
+        # Simulate a pymemcache release that renamed the internal: HashClient's own commands
+        # still work, but nothing answers to the old name.
+        renamed = HashClient._safely_run_func
+        monkeypatch.delattr(HashClient, "_safely_run_func")
+
+        def run_cmd(self, cmd, key, default_val, *args, **kwargs):
+            client = self._get_client(key)
+            return renamed(self, client, getattr(client, cmd), default_val, key, *args, **kwargs)
+
+        monkeypatch.setattr(HashClient, "_run_cmd", run_cmd)
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+        fake.store["k"] = b"v"
+
+        assert backend.delete("k") is True
+        assert fake.commands == [("delete", "k")]
+
+
+@pytest.mark.unit
+class TestRetryWindowInvalidation:
+    """Invalidation of a key whose server is in the retry window keeps the key tracked."""
+
+    @staticmethod
+    def _cached(namespace: str):
+        from cachekit import cache
+
+        backend, fakes = _fake_backend(servers=1)
+        (fake,) = fakes.values()
+
+        @cache(backend=backend, ttl=60, namespace=namespace)
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        assert len(fake.store) == 3
+        return backend, fake, f
+
+    def test_sweep_per_key_fallback_keeps_skipped_keys_tracked(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        backend, fake, f = self._cached("mc_skip_sweep")
+        _open_retry_window(backend, fake)
+
+        # Force the sweep onto its per-key fallback, the path that trusted a skipped delete.
+        with patch.object(backend, "_delete_many", side_effect=AttributeError("renamed")):
+            with caplog.at_level(logging.DEBUG, logger="cachekit"):
+                f.invalidate_cache()
+
+        assert len(fake.store) == 3
+        assert any("Failed to delete 3 L2 key(s)" in r.getMessage() for r in caplog.records)
+
+        _close_retry_window(backend)
+        f.invalidate_cache()  # the next sweep retries every key it kept
+        assert fake.store == {}
+
+    def test_single_key_invalidation_keeps_skipped_key_tracked(self) -> None:
+        backend, fake, f = self._cached("mc_skip_single")
+        _open_retry_window(backend, fake)
+
+        f.invalidate_cache(0)
+        assert len(fake.store) == 3  # skipped: nothing deleted
+
+        _close_retry_window(backend)
+        with patch.object(backend, "_delete_many", side_effect=AttributeError("renamed")):
+            f.invalidate_cache()  # per-key sweep: reaches key 0 only if it was re-tracked
+        assert fake.store == {}
