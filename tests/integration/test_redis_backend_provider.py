@@ -281,7 +281,11 @@ def isolated_redis_url(redis_isolated):
     kwargs = redis_isolated.connection_pool.connection_kwargs
     db = kwargs.get("db", 0)
     # pytest-redis spawns a unix-socket server locally; CI points at a TCP service.
-    return f"unix://{kwargs['path']}?db={db}" if "path" in kwargs else f"redis://{kwargs['host']}:{kwargs['port']}/{db}"
+    if "path" in kwargs:
+        return f"unix://{kwargs['path']}?db={db}"
+    host = kwargs["host"]
+    host = f"[{host}]" if ":" in host else host  # an IPv6 literal needs brackets in a URL authority
+    return f"redis://{host}:{kwargs['port']}/{db}"
 
 
 @pytest.fixture

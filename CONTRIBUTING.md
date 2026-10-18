@@ -196,7 +196,12 @@ make test-cov
 
 **Important**: pytest-redis is required for all Redis-dependent tests. If tests fail with "pytest-redis is required", run `uv sync` to install dependencies.
 
-**Which Redis the tests use.** Locally, the suite starts its own `redis-server` (it must be on `PATH`) and never touches a Redis you already run on port 6379. With `REDIS_URL` set, as CI sets it, the suite uses that server instead. The spawned server listens on a unix socket under pytest's base temp directory, and a socket path over about 107 characters fails every Redis test with `UnixSocketTooLong`. The `make test*` targets pass a short `--basetemp` for that reason. If your `TMPDIR` is long and you run pytest directly, pass a short base temp that no other run uses, for example `uv run pytest -n auto --basetemp=/tmp/pt-$$`. Do not reuse one fixed path across runs: pytest empties the base temp directory when a run starts, so two runs sharing it delete each other's files.
+**Which Redis the tests use.** Locally, the suite starts its own `redis-server` (it must be on `PATH`) and never touches a Redis you already run on port 6379. With `REDIS_URL` set, as CI sets it, the suite uses that server instead.
+
+> [!CAUTION]
+> With `REDIS_URL` set, the tests erase **every database** on that server: pytest-redis runs `FLUSHALL` after each test. The suite uses only the URL's host and port and ignores its database number, so `/15` protects nothing. Point `REDIS_URL` only at a dedicated, disposable server that holds no data you need.
+
+The spawned server listens on a unix socket under pytest's base temp directory, and a socket path over about 107 characters fails every Redis test with `UnixSocketTooLong`. The `make test*` targets pass a short `--basetemp` for that reason. If your `TMPDIR` is long and you run pytest directly, pass a short base temp that no other run uses, for example `uv run pytest -n auto --basetemp=/tmp/pt-$$`. Do not reuse one fixed path across runs: pytest empties the base temp directory when a run starts, so two runs sharing it delete each other's files.
 
 **Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
 
