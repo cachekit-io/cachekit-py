@@ -306,13 +306,13 @@ def mock_backend_without_timeout():
 def redis_backend(redis_isolated):
     """Provide Redis-backed backend for integration tests.
 
-    Uses the isolated Redis instance from pytest-redis.
+    Uses the isolated Redis instance from pytest-redis, wrapped the way
+    ``RedisBackendProvider.get_shared_backend()`` wraps the production client.
     For unit tests that don't need real Redis, use backend fixture.
     """
-    from cachekit.backends.redis_backend import RedisBackend
+    from cachekit.backends.redis.provider import PerRequestRedisBackend
 
-    backend = RedisBackend(redis_isolated)
-    return backend
+    return PerRequestRedisBackend(redis_isolated, "default", follow_context=True)
 
 
 @pytest.fixture
