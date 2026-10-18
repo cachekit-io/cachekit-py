@@ -51,7 +51,7 @@ def journey(promise: str) -> Callable[[Callable[[], str | None]], Callable[[], s
     """Register a journey. ``promise`` states the documented behaviour it checks, in the docs' terms.
 
     The function raises AssertionError, with what it saw, when the promise does not hold. It may return a
-    short note for the report. A journey never skips: a missing dependency fails it, because a skip is how
+    short note for the report. A journey never skips: a missing dependency fails the run, because a skip is how
     the dead polars tests hid a defect.
     """
 
@@ -224,7 +224,7 @@ for _label, _make in FRAME_SERIALIZERS:
     _frame_journey(_label, _make)
 
 
-@journey('a NumPy array cached through serializer="auto" on FileBackend comes back equal and writable')
+@journey('a NumPy array cached through serializer="auto" on FileBackend comes back equal, same dtype, and writable')
 def _() -> None:
     calls: list[int] = []
 
@@ -234,8 +234,12 @@ def _() -> None:
         return np.arange(10, dtype="int64")
 
     hit = call_twice(f, calls)
+    assert hit.dtype == np.int64, f"the hit's dtype is {hit.dtype}, not int64"
     assert np.array_equal(hit, np.arange(10)), "the hit differs from the array the function returned"
-    assert hit.flags.writeable, "the hit is a read-only array"
+    try:
+        hit[0] = -1
+    except Exception as e:
+        raise AssertionError(f"editing the hit in place raised {type(e).__name__}: {e}") from e
 
 
 @journey("a dict cached with the default serializer on FileBackend comes back equal and editable")
@@ -350,21 +354,50 @@ for _label, _make, _promised in MMAP_CONFIGS:
     _mmap_journey(_label, _make, _promised)
 
 
+class _WriteRecorder:
+    """Wraps the cache file handed to a streaming write and records the size of every write to it."""
+
+    def __init__(self, file: Any, sizes: list[int]) -> None:
+        self._file = file
+        self._sizes = sizes
+
+    def write(self, data: Any) -> int:
+        self._sizes.append(memoryview(data).nbytes)
+        return self._file.write(data)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._file, name)
+
+
 def _streaming_journey(label: str, make_serializer: Callable[[], Any]) -> None:
-    @journey(f"a plaintext FileBackend write through {label} streams into the cache file")
-    def _() -> None:
+    @journey(f"a plaintext FileBackend write through {label} streams into the cache file batch by batch")
+    def _() -> str:
         backend = file_backend()
-        streamed = spy(backend, "set_streaming")
+        original = backend.set_streaming
+        sizes: list[int] = []
+
+        def recording(key: str, write_payload: Callable[[Any], None], ttl: int | None = None) -> None:
+            original(key, lambda file: write_payload(_WriteRecorder(file, sizes)), ttl)
+
+        backend.set_streaming = recording  # type: ignore[method-assign]
+        # About 24 MB of incompressible float64: three ~8 MiB record batches (docs/serializers/arrow.md).
+        frame = pd.DataFrame({"x": np.random.default_rng(0).random(3_000_000)})
         calls: list[int] = []
 
         @cache(backend=backend, serializer=make_serializer(), l1_enabled=False, ttl=60)
         def f() -> pd.DataFrame:
             calls.append(1)
-            return small_frame()
+            return frame
 
         hit = call_twice(f, calls)
-        assert streamed, "the write took the buffered path: set_streaming was never called"
-        assert hit.equals(small_frame()), "the streamed entry reads back different"
+        assert sizes, "the write took the buffered path: set_streaming was never called"
+        # A payload staged in memory and then written reaches the file as one write of nearly everything.
+        largest, total = max(sizes), sum(sizes)
+        assert largest <= total // 2, (
+            f"the largest of {len(sizes)} writes is {largest} of {total} bytes: the payload was buffered"
+        )
+        assert hit.equals(frame), "the streamed entry reads back different"
+        return f"{len(sizes)} writes, largest {largest} of {total} bytes"
 
 
 for _label, _make in ARROW_SPELLINGS:
@@ -421,11 +454,11 @@ def run_one(index: int) -> int:
     return REPORTED_FAIL
 
 
-def run_isolated(index: int) -> tuple[bool, str]:
+def run_isolated(index: int, env: dict[str, str]) -> tuple[bool, str]:
     """Run journey ``index`` in a fresh interpreter: (passed, note)."""
     try:
         proc = subprocess.run(  # noqa: S603 - this interpreter running this file
-            [sys.executable, "-I", __file__, str(index)], capture_output=True, text=True, timeout=TIMEOUT_S, check=False
+            [sys.executable, "-I", __file__, str(index)], env=env, capture_output=True, text=True, timeout=TIMEOUT_S, check=False
         )
     except subprocess.TimeoutExpired:
         return False, f"no result after {TIMEOUT_S} s"
@@ -440,10 +473,13 @@ def redis_listening() -> list[str]:
     copy of this before its build, so a busy port fails in seconds; change the two together."""
     found = []
     for family, _, _, _, addr in socket.getaddrinfo("localhost", 6379, type=socket.SOCK_STREAM):
-        with socket.socket(family, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            if s.connect_ex(addr) == 0:
-                found.append(str(addr[0]))
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(addr) == 0:
+                    found.append(str(addr[0]))
+        except OSError:  # a family the kernel lacks (IPv6 disabled) cannot hold a listener either
+            continue
     return found
 
 
@@ -456,19 +492,18 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    if not __debug__:
-        print("journeys: python -O strips the asserts every journey checks with", file=sys.stderr)
-        return 2
     if "site-packages" not in (cachekit.__file__ or ""):
         print(f"journeys: cachekit was imported from {cachekit.__file__}, not an installed wheel", file=sys.stderr)
         return 2
     print(f"cachekit {cachekit.__version__} from {os.path.dirname(cachekit.__file__)}")
     print(f"python {sys.version.split()[0]}, pandas {pd.__version__}, pyarrow {pa.__version__}, polars {pl.__version__}\n")
     failed = 0
-    for index, (promise, _) in enumerate(JOURNEYS):
-        passed, note = run_isolated(index)
-        failed += not passed
-        print(f"{'PASS' if passed else 'FAIL'}  {promise}" + (f"\n        {note}" if note else ""))
+    with tempfile.TemporaryDirectory(prefix="cachekit-journeys-") as scratch:  # every journey's cache directories
+        env = {**os.environ, "TMPDIR": scratch}
+        for index, (promise, _) in enumerate(JOURNEYS):
+            passed, note = run_isolated(index, env)
+            failed += not passed
+            print(f"{'PASS' if passed else 'FAIL'}  {promise}" + (f"\n        {note}" if note else ""))
     print(f"\njourneys: {len(JOURNEYS) - failed} passed, {failed} failed")
     return 1 if failed else 0
 

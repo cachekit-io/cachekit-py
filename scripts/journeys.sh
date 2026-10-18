@@ -22,10 +22,14 @@ venv_python="$work/venv/bin/python"
 "$venv_python" - <<'EOF' || exit 2
 import socket, sys
 for family, _, _, _, addr in socket.getaddrinfo("localhost", 6379, type=socket.SOCK_STREAM):
-    with socket.socket(family, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        if s.connect_ex(addr) == 0:
-            sys.exit(f"journeys: something listens on localhost:6379 ({addr[0]}); stop it, a user's machine has no Redis")
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            found = s.connect_ex(addr) == 0
+    except OSError:  # a family the kernel lacks (IPv6 disabled) cannot hold a listener either
+        continue
+    if found:
+        sys.exit(f"journeys: something listens on localhost:6379 ({addr[0]}); stop it, a user's machine has no Redis")
 EOF
 
 requirement="${JOURNEY_CACHEKIT:-}"
@@ -39,7 +43,7 @@ fi
 echo "journeys: installing $requirement"
 uv pip install --quiet --python "$venv_python" "$requirement" polars
 
-# journeys.py scrubs REDIS_URL and CACHEKIT_* (any case) itself, before it imports cachekit. TMPDIR puts the
-# journeys' cache directories under $work, which the trap removes.
+# journeys.py scrubs REDIS_URL and CACHEKIT_* (any case) itself, before it imports cachekit, and removes the
+# journeys' cache directories when it finishes.
 cd "$work"
-TMPDIR="$work" "$venv_python" -I "$repo/journeys/journeys.py"
+"$venv_python" -I "$repo/journeys/journeys.py"
