@@ -167,8 +167,9 @@ class PooledClientProvider(CacheClientProvider):
         return self._async_client
 
 
-class _BackendSelectors(BaseSettings):
-    """The backend-selecting env vars, for DefaultBackendProvider._is_configured(): its _SELECTORS plus REDIS_URL."""
+class _BackendEnv(BaseSettings):
+    """The backend env vars as pydantic-settings reads them, for DefaultBackendProvider._is_configured():
+    its four _SELECTORS plus REDIS_URL."""
 
     model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
 
@@ -224,14 +225,18 @@ class DefaultBackendProvider(BackendProviderInterface):
         self._memcached_backend = None
         self._file_backend = None
 
+    def _matched(self) -> list[tuple[str, str]]:
+        """The prefixed selectors set to a non-empty value, matched by exact name."""
+        import os
+
+        return [(env_var, key) for env_var, key in self._SELECTORS if os.environ.get(env_var)]
+
     def _detect(self):
         """Return the chosen backend key, or None for Redis from REDIS_URL or ``RedisBackendConfig``'s default.
 
         Raises ConfigurationError if more than one prefixed selector is set.
         """
-        import os
-
-        matched = [(env_var, key) for env_var, key in self._SELECTORS if os.environ.get(env_var)]
+        matched = self._matched()
         if len(matched) > 1:
             from cachekit.config.validation import ConfigurationError
 
@@ -250,10 +255,14 @@ class DefaultBackendProvider(BackendProviderInterface):
         reads them: a lowercase ``redis_url`` always reached that Redis through ``get_backend()``'s
         fallback. ``_detect()`` stays case-sensitive on purpose: a lowercase prefixed selector counts as
         configured here and still resolves Redis there, as before; aligning either method changes routing.
+        A selector ``_detect()`` matches always counts too: with two spellings set, pydantic keeps one
+        (an empty one can win), while ``_detect()`` still routes on the exact-case one.
         Never raises: two selectors count as configured, so ``get_backend()`` raises the ambiguity
         error where the decorator already handles a backend that fails to build.
         """
-        return any(value is not None and value.get_secret_value() for value in vars(_BackendSelectors()).values())
+        if self._matched():
+            return True
+        return any(value is not None and value.get_secret_value() for value in vars(_BackendEnv()).values())
 
     def get_backend(self):
         """Get backend instance, auto-detected from environment on first call."""

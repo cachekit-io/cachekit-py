@@ -372,7 +372,7 @@ That cache is per process: nothing is shared with other processes, and an
 `invalidate_cache()` in one process does not reach another. Values are held by reference,
 so mutating a returned object mutates the cached one. With `l1_enabled=False` nothing is
 cached at all. The choice is made at the function's first call, or at its first
-`invalidate_cache()` or `cache_clear()` if one comes earlier, and kept: set a backend (any
+`invalidate_cache()`, `ainvalidate_cache()` or `cache_clear()` if one comes earlier, and kept: set a backend (any
 tier above) before either.
 
 This tier does not apply to `@cache.secure`, `encryption=True` or `interop=`. L1-only

@@ -483,9 +483,20 @@ def test_is_configured_reads_every_selector_in_any_case(monkeypatch: pytest.Monk
     assert provider._is_configured() is False  # empty is unset, as for get_backend()'s selectors
 
 
+@pytest.mark.parametrize("var", _SELECTORS)
+def test_empty_other_casing_does_not_hide_a_selector(var: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """pydantic keeps one of two spellings, possibly the empty one; _detect() still routes on the exact-case one."""
+    _clear_selectors(monkeypatch)
+    monkeypatch.setenv(var, "configured")
+    monkeypatch.setenv(var.lower(), "")
+    provider = DefaultBackendProvider()
+    assert provider._detect() is not None
+    assert provider._is_configured() is True
+
+
 def test_selector_model_tracks_the_provider_selectors() -> None:
-    """_is_configured() reads _BackendSelectors; _detect() reads _SELECTORS. They must name the same variables."""
-    from cachekit.backends.provider import _BackendSelectors
+    """_is_configured() reads _BackendEnv; _detect() reads _SELECTORS. They must name the same variables."""
+    from cachekit.backends.provider import _BackendEnv
 
     expected = {var.lower() for var, _ in DefaultBackendProvider._SELECTORS} | {"redis_url"}
-    assert set(_BackendSelectors.model_fields) == expected
+    assert set(_BackendEnv.model_fields) == expected
