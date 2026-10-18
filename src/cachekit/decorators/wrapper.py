@@ -1505,7 +1505,8 @@ def create_cache_wrapper(
                 raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
             # The function's 16-hex identity goes last, so two functions whose key functions return the
             # same string never share an entry, and no colon in the namespace or the key can absorb it.
-            # Last also keeps the pre-fix key as the prefix, so CachekitIO routes it as before. No other
+            # Last also keeps the pre-fix key as the prefix, so CachekitIO routes it as before, except a
+            # colon-free key under namespace ns or nsapi, which it now accepts under a key-named one. No other
             # mode's key ends in a 16-hex segment, so this key can never equal one of theirs.
             return f"{namespace or 'default'}:{custom_key}:{_registry_hash}"
         # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.

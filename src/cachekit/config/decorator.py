@@ -145,7 +145,8 @@ class DecoratorConfig:
              The stored key is "{namespace or 'default'}:{returned str}:{identity}", where identity
              is 16 hex of the blake3 hash of the function's module.qualname, so functions with
              different module.qualnames never share an entry. Functions sharing one (closures from
-             one factory, lambdas, __main__ in two scripts) still do: give them distinct namespaces.
+             one factory, lambdas, __main__ in two scripts) still do whenever "{namespace}:{returned str}"
+             is the same: give them distinct namespaces, none of them another plus ":".
              Not for cross-SDK sharing: interop mode rejects key=.
              Return a str that differs whenever the arguments differ and uses only [A-Za-z0-9_.:-]
              (CachekitIO rejects other characters, Memcached whitespace), e.g. for a numeric numpy array:
