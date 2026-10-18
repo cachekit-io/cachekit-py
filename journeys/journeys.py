@@ -358,7 +358,7 @@ def _memory_held() -> int:
 
 class _WriteRecorder:
     """Wraps the cache file handed to a streaming write. At every write it records the write's size and the
-    memory the serializer holds beyond what it held when the write began."""
+    memory held beyond the baseline taken before the cached call began."""
 
     def __init__(self, file: Any, sizes: list[int], held: list[int], baseline: int) -> None:
         self._file, self._sizes, self._held, self._baseline = file, sizes, held, baseline
@@ -373,22 +373,18 @@ class _WriteRecorder:
 
 
 def _streaming_journey(label: str, make_serializer: Callable[[], Any]) -> None:
-    @journey(f"a plaintext FileBackend write through {label} streams into the cache file batch by batch")
+    @journey(f"a plaintext FileBackend write through {label} streams into the cache file without materializing the payload")
     def _() -> str:
         backend = file_backend()
         original = backend.set_streaming
         streamed: list[bool] = []
         sizes: list[int] = []
         held: list[int] = []
+        baseline = 0
 
         def recording(key: str, write_payload: Callable[[Any], None], ttl: int | None = None) -> None:
             streamed.append(True)
-            tracemalloc.start()
-            try:
-                baseline = _memory_held()
-                original(key, lambda file: write_payload(_WriteRecorder(file, sizes, held, baseline)), ttl)
-            finally:
-                tracemalloc.stop()
+            original(key, lambda file: write_payload(_WriteRecorder(file, sizes, held, baseline)), ttl)
 
         backend.set_streaming = recording  # type: ignore[method-assign]
         # About 24 MB of incompressible float64: three ~8 MiB record batches (docs/serializers/arrow.md).
@@ -400,15 +396,21 @@ def _streaming_journey(label: str, make_serializer: Callable[[], Any]) -> None:
             calls.append(1)
             return frame
 
-        hit = call_twice(f, calls)
+        # The baseline comes before the cached call, so staging anywhere on the store path counts, not only
+        # staging inside set_streaming.
+        tracemalloc.start()
+        try:
+            baseline = _memory_held()
+            hit = call_twice(f, calls)
+        finally:
+            tracemalloc.stop()
         assert streamed, "the write took the buffered path: set_streaming was never called"
         assert sizes, "set_streaming ran, but nothing was written to the cache file it was given"
-        # Staging the payload shows either as one write of nearly everything or, when the staged copy is written
-        # out in slices, as memory held at the time of those writes.
-        largest, total, peak = max(sizes), sum(sizes), max(held)
-        note = f"{len(sizes)} writes, largest {largest} of {total} bytes; at most {peak} bytes held while writing"
-        assert largest <= total // 2, f"the payload was buffered: {note}"
-        assert peak <= total // 2, f"the payload was buffered: {note}"
+        largest, total, held_max = max(sizes), sum(sizes), max(held)
+        limit = total // 2
+        note = f"{len(sizes)} writes, largest {largest} of {total} bytes; at most {held_max} bytes held at a write"
+        assert largest <= limit, f"one write carried {largest} bytes, over half the {total}-byte payload: {note}"
+        assert held_max <= limit, f"{held_max} bytes were held at a write, over half the {total}-byte payload: {note}"
         assert hit.equals(frame), "the streamed entry reads back different"
         return note
 
