@@ -29,6 +29,7 @@ from cachekit.backends.base import (
     TTLInspectableBackend,
 )
 from cachekit.backends.file.backend import HEADER_SIZE as FILE_HEADER_SIZE
+from cachekit.backends.file.backend import MMAP_RELEASES_FD
 from cachekit.backends.provider import (
     BackendProviderInterface,
     DefaultBackendProvider,
@@ -1198,21 +1199,23 @@ class CacheSerializationHandler:
         return SerializationWrapper.wrap_prefix(metadata, self._serializer_string_name)
 
     def supports_mmap_read(self) -> bool:
-        """True iff reads can use the zero-copy mmap fast path (#171).
+        """True iff reads can use the mmap fast path (#171).
 
         Eligible only for PLAINTEXT cachekit Arrow (``serializer="arrow"`` or an
-        ``ArrowSerializer(...)`` instance), for every return_format:
-        - encrypted values can never mmap (AES-GCM decrypt owns its buffer);
-        - non-Arrow serializers gain nothing (they copy at the Rust/C boundary, rebuild objects).
-
-        An "arrow" or "polars" result keeps the mapping alive: its buffers hold exports of the
-        mapped pages, so the handle's close() leaves the mapping in place and it is unmapped when
-        the result's last buffer is released (see ``_MmapHandle``).
+        ``ArrowSerializer(...)`` instance): encrypted values can never mmap (AES-GCM decrypt owns
+        its buffer), and other serializers copy at their Rust/C boundary anyway. Every return_format
+        is eligible on Python 3.13+, pandas only before it (see below). A result may keep the mapping
+        alive past the read; ``_MmapHandle`` states that lifetime contract.
 
         The backend must also support buffer reads (File/POSIX); that is checked separately, so a
         True here on a non-File backend simply means get_buffer returns None and we fall back.
         """
-        return not self.encryption and self._is_cachekit_arrow()
+        if self.encryption or not self._is_cachekit_arrow():
+            return False
+        # A pandas result copies out, so its mapping closes when the read returns. An Arrow or polars
+        # result keeps the mapping, and before Python 3.13 each mapping also keeps a file descriptor:
+        # those return formats map only where the mapping holds no descriptor.
+        return MMAP_RELEASES_FD or getattr(self._base_serializer, "return_format", None) == "pandas"
 
     def supports_streaming_write(self) -> bool:
         """True iff writes can stream the envelope to a capable backend (LAB-766).
@@ -1525,9 +1528,10 @@ class CacheHit(NamedTuple):
     """A successful L2 read from :class:`CacheOperationHandler`.
 
     envelope is the serialized bytes so the decorator can backfill L1 without
-    re-serializing (re-encrypting) — None on the mmap fast path, where the
-    mapped view is confined to its frame and must never reach L1 (#171
-    blocker C). size_bytes is the envelope's byte length on every hit, mmap
+    re-serializing (re-encrypting) — None on the mmap fast path (sync reads
+    only), whose handle is confined to its frame and whose bytes never reach
+    L1 (#171 blocker C); the value itself may be an Arrow or polars result
+    over the mapping (see ``_MmapHandle``). size_bytes is the envelope's byte length on every hit, mmap
     included, so payload-size stats never depend on holding the bytes.
     A hit is distinguished from "no cache entry" by getting a CacheHit at
     all vs. None — there is no boolean slot (LAB-3757).

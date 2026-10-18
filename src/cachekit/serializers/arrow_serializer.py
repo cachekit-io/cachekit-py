@@ -171,11 +171,13 @@ class ArrowSerializer:
     - Deserialize: the envelope is sliced with a memoryview (no full-body copy), wrapped via
       pa.py_buffer (zero-copy), and Arrow->pandas conversion uses self_destruct + split_blocks
       to free Arrow buffers during conversion. zstd is decompressed transparently by the reader.
-    - Uncompressed File-backend hits (plaintext, POSIX) read over a memory map of the cache file.
-      Per return_format: "arrow" returns a table whose buffers all alias the mapping (no heap
-      copy); "polars" keeps numeric, bool and temporal columns zero-copy and copies strings into
-      polars' layout; "pandas" copies once into a writable DataFrame. A zero-copy result keeps
-      the mapping alive until it is garbage-collected.
+    - Plaintext File-backend hits (POSIX) read over a memory map of the cache file ("arrow" and
+      "polars" on Python 3.13+ only, where a held mapping costs no file descriptor). A compressed
+      payload is decompressed out of the map; an uncompressed one stays zero-copy per return_format:
+      "arrow" returns a table whose buffers all alias the mapping (no heap copy); "polars" keeps
+      numeric, bool and temporal columns zero-copy and copies strings into polars' layout; "pandas"
+      copies once into a writable DataFrame. A zero-copy result keeps the mapping alive until it
+      is garbage-collected.
 
     Use cases:
     - Data science pipelines (pandas/polars DataFrames)
@@ -233,9 +235,9 @@ class ArrowSerializer:
                 - "auto" (default): use the CACHEKIT_ARROW_COMPRESSION setting (itself "zstd" by default)
                 - "zstd" / "lz4": compress the payload (smaller wire/L1; must be decompressed on read)
                 - None or "none": store uncompressed Arrow IPC, at the cost of a larger stored payload.
-                  Lets the File backend serve plaintext reads over a memory map of the cache file,
-                  for every return_format (see the memory profile above); the checksum check still
-                  reads every page once. On wire backends it only skips the codec.
+                  Lets plaintext File-backend hits stay zero-copy (see the memory profile above);
+                  the checksum check still reads every page once. On wire backends it only skips
+                  the codec.
 
         Raises:
             ValueError: If return_format or compression is not a valid option

@@ -152,10 +152,8 @@ class CachekitConfig(RedactingSettings):
         description=(
             "Arrow IPC compression codec for DataFrame caching (ArrowSerializer, compression='auto'). "
             "'zstd'/'lz4' shrink the stored payload but must be decompressed into the heap on read. "
-            "'none' stores uncompressed Arrow IPC, at the cost of a larger payload; the File backend "
-            "then serves plaintext reads over a memory map of the cache file: zero-copy for "
-            "return_format 'arrow', zero-copy fixed-width columns for 'polars', one copy for 'pandas'. "
-            "Writes are codec-independent: plaintext "
+            "'none' stores uncompressed Arrow IPC, at the cost of a larger payload, and lets plaintext "
+            "File-backend hits stay zero-copy (see ArrowSerializer). Writes are codec-independent: plaintext "
             "Arrow streams to the File backend without materializing the payload (encrypted "
             "values stay buffered). Env: CACHEKIT_ARROW_COMPRESSION."
         ),

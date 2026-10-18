@@ -15,7 +15,7 @@
 
 **Performance characteristics:**
 - Payload: Arrow IPC, compressed with zstd by default (`CACHEKIT_ARROW_COMPRESSION`), so a read decompresses it
-- Zero-copy reads: only for uncompressed, plaintext payloads on the File backend, which memory-maps the stored file; what stays zero-copy depends on `return_format` (see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend)). The stored payload is then larger
+- Zero-copy reads: only for uncompressed, plaintext payloads on the File backend; what stays zero-copy depends on `return_format` (see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend)). The stored payload is then larger
 - Network overhead: Efficient columnar format
 
 StandardSerializer (MessagePack) does not accept DataFrames, so there is no MessagePack figure to compare against. Sizes and instruction counts measured on a real dataset are in [Performance on Real Data](#performance-on-real-data).
@@ -142,7 +142,7 @@ For comprehensive performance analysis including decorator overhead, concurrent 
 
 ### Memory Usage
 
-A read of a compressed payload (the default) decompresses it into new buffers. An uncompressed, plaintext payload on the File backend is memory-mapped instead of copied in, at the cost of a larger stored payload: see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend). Wire backends always copy the payload in.
+A read of a compressed payload (the default) decompresses it into new buffers. An uncompressed, plaintext payload on the File backend can be read without copying it, at the cost of a larger stored payload: see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend). Wire backends always copy the payload in.
 
 **Writes stream on the File backend.** When the cache backend supports streaming writes
 (File backend only today) and the value is plaintext (no encryption), serialization streams
@@ -153,14 +153,14 @@ buffered path unchanged. See [File Backend](../backends/file.md#bounded-memory-l
 
 ### Zero-Copy Reads on the File Backend
 
-A cache hit memory-maps the cache file when all of these hold:
+A cache hit memory-maps the cache file instead of reading it into memory when all of these hold:
 
 - the backend is a `FileBackend` on a POSIX system, and the stored file is at most 512 MB;
 - the serializer is cachekit's `ArrowSerializer`, as `serializer="arrow"` or an `ArrowSerializer(...)` instance (a subclass reads the buffered way);
-- the payload is uncompressed: `ArrowSerializer(compression=None)`, or `CACHEKIT_ARROW_COMPRESSION=none` for `serializer="arrow"`;
-- the value is not encrypted, and the cached function is synchronous (hits of an `async def` function copy the file in).
+- the value is not encrypted, and the cached function is synchronous (hits of an `async def` function read the file in);
+- `return_format="pandas"`, or Python 3.13 or later for `"arrow"` and `"polars"`. Those results keep the mapping open, and before 3.13 every open mapping also holds a file descriptor, so a few hundred held results would exhaust the process's descriptor limit. On earlier Pythons they read the file in instead.
 
-What the hit then costs depends on `return_format`:
+A compressed payload (the default) is then decompressed out of the mapping into new memory. Only an uncompressed payload, `ArrowSerializer(compression=None)` or `CACHEKIT_ARROW_COMPRESSION=none` for `serializer="arrow"`, can stay zero-copy, and what an uncompressed hit costs depends on `return_format`:
 
 | `return_format` | Uncompressed File-backend hit |
 |---|---|
@@ -170,7 +170,7 @@ What the hit then costs depends on `return_format`:
 
 A zero-copy result keeps the mapping alive for as long as you hold it, and it is unmapped when the result is garbage-collected. Deleting, overwriting or evicting the entry meanwhile does not change the result: cachekit replaces a cache file by renaming a new one over it and deletes by unlinking, so the held result keeps reading the old data. The disk space of a replaced or deleted entry is reclaimed only after the last result that maps it is dropped. Do not truncate or rewrite cache files in place from outside cachekit while results are held: touching a truncated mapping raises `SIGBUS`.
 
-Uncompressed entries are written with their Arrow data starting on a 64-byte boundary of the cache file, which polars needs to import columns without copying. Entries written by cachekit-py releases before this alignment still read correctly; polars copies their numeric columns.
+Uncompressed entries are written with their Arrow data starting on a 64-byte boundary of the cache file (64 bytes is Arrow's recommended alignment), so polars imports fixed-width columns without copying. Entries written by cachekit-py releases before this alignment still read correctly; polars copies their numeric columns.
 
 ```python
 import tempfile

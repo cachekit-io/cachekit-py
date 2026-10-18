@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import statistics
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -617,13 +618,15 @@ def _rss_anon() -> int:
 @pytest.mark.performance
 @pytest.mark.slow
 @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="reads RssAnon from /proc (Linux)")
+@pytest.mark.skipif(sys.version_info < (3, 13), reason="Arrow results map only on Python 3.13+")
 def test_arrow_format_hit_allocates_no_heap(tmp_path: Path) -> None:
     """An uncompressed ArrowSerializer(return_format="arrow") hit returns a table over the mapped
     cache file: its pages are file-backed, so anonymous RSS barely moves however large the value.
 
     Measured on a 62 MB table: +0.0 MB per hit (and 0 bytes from the Arrow pool). The bound
-    leaves room for allocator noise while failing on any whole-column copy (the smallest
-    column here is 2 MB of bools; the next is 16 MB).
+    leaves room for allocator noise while failing on a copy of any numeric, timestamp or string
+    column (16 MB or more). Arrow bit-packs the bool column into 250 KB, so a copy of that one
+    alone would pass; the Arrow-pool assertion catches it.
     """
     import gc
 

@@ -647,7 +647,7 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!TIP]
-> Compression saves network bandwidth for large values. `none` enables memory-mapped reads of plaintext (unencrypted) Arrow payloads on the File backend: a `return_format="arrow"` hit is zero-copy, `"polars"` keeps its fixed-width columns zero-copy, and `"pandas"` copies once ([details](serializers/arrow.md#zero-copy-reads-on-the-file-backend)). This setting applies to `serializer="arrow"` and to `ArrowSerializer()` instances left at `compression="auto"`. Writes are independent of this setting: plaintext Arrow values stream to the File backend record batch by record batch (compressed or not), never materializing the full payload in memory; encrypted values and other backends use the buffered write path.
+> Compression saves network bandwidth for large values. `none` lets plaintext (unencrypted) File-backend hits stay zero-copy, depending on `return_format` ([details](serializers/arrow.md#zero-copy-reads-on-the-file-backend)). This setting applies to `serializer="arrow"` and to `ArrowSerializer()` instances left at `compression="auto"`. Writes are independent of this setting: plaintext Arrow values stream to the File backend record batch by record batch (compressed or not), never materializing the full payload in memory; encrypted values and other backends use the buffered write path.
 
 ### Connection Pooling
 

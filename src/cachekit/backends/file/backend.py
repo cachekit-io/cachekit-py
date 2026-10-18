@@ -22,6 +22,7 @@ import os
 import platform
 import stat
 import struct
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -71,6 +72,12 @@ MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
 # misconfigured huge max_value_mb (or an out-of-band file dropped in cache_dir) can't map an
 # unbounded region. Above this, get_buffer() returns None and the caller falls back to os.read.
 MMAP_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MB
+
+# Python 3.13+ maps without keeping a duplicate of the file descriptor (trackfd=False). Before 3.13
+# every mmap object holds one descriptor until it is freed, so a result that keeps its mapping alive
+# also keeps a descriptor open, and a few hundred held results exhaust RLIMIT_NOFILE.
+MMAP_RELEASES_FD: bool = sys.version_info >= (3, 13)
+_MMAP_KWARGS: dict[str, Any] = {"trackfd": False} if MMAP_RELEASES_FD else {}
 
 
 def _warn_throttled(throttle: _WarnThrottle, msg: str, *args: object) -> None:
@@ -137,12 +144,16 @@ class _MmapHandle:
     The CALLER must ``close()`` once deserialize returns. Lifetime contract (CPython):
 
     - ``close()`` releases the handle's own view, so touching ``handle.view`` afterwards raises
-      ``ValueError``; the handle must still never escape the read call frame nor reach L1
-      (#171 blocker C).
+      ``ValueError`` (unless a consumer exported ``handle.view`` itself: then the release refuses
+      and the view stays readable until that export dies). Either way the handle must never
+      escape the read call frame nor reach L1 (#171 blocker C).
     - Anything deserialize built over the mapping (an Arrow table, a polars frame, or pandas
       columns that are views) holds buffer exports of it. ``mmap.close()`` refuses with
       ``BufferError`` while any export lives; ``close()`` swallows that, and the mapping is
       unmapped when the last export is released. A result therefore never dangles.
+    - A mapping that outlives the read costs no file descriptor on Python 3.13+ (``trackfd=False``).
+      Before 3.13 the mmap object holds a duplicate descriptor until it is freed, which is why the
+      cache handler maps only pandas results there (they release the mapping at once).
     - The file's pages stay valid while mapped because cachekit never rewrites a cache file in
       place: writes go to a temp file and ``rename``, eviction and delete ``unlink``, and both
       leave an existing mapping intact. A process that truncates a cache file in place while a
@@ -405,7 +416,7 @@ class FileBackend:
                     if st_size <= HEADER_SIZE or st_size > MMAP_MAX_BYTES:
                         return None
 
-                    mm = mmap.mmap(fd, st_size, access=mmap.ACCESS_READ)
+                    mm = mmap.mmap(fd, st_size, access=mmap.ACCESS_READ, **_MMAP_KWARGS)
                     handle = _MmapHandle(mm)
                     mm = None  # ownership transferred to the handle; don't close it in finally
                     return handle

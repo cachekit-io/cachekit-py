@@ -2,9 +2,10 @@
 
 Three properties compose:
 - eligibility by serializer object: ``ArrowSerializer(...)`` instances take the mmap read and
-  streaming write paths, for every return_format;
+  streaming write paths (every return_format on Python 3.13+, pandas only before it);
 - an Arrow or polars result aliases the mapping and keeps it alive (the handle's close() leaves
-  an exported mapping in place; refcounting unmaps it with the result's last buffer);
+  an exported mapping in place; refcounting unmaps it with the result's last buffer), and holds
+  no file descriptor while it does;
 - uncompressed Arrow IPC starts on a 64-byte boundary of the cache file (the CK frame header is
   padded with spaces), so polars imports aligned columns without copying.
 """
@@ -38,6 +39,9 @@ pytestmark = [
 
 _N = 100_000
 _LINUX = sys.platform.startswith("linux")
+# Before 3.13 a mapping holds a file descriptor, so Arrow and polars results use the copying read.
+_FD_FREE_MMAP = sys.version_info >= (3, 13)
+needs_fd_free_mmap = pytest.mark.skipif(not _FD_FREE_MMAP, reason="Arrow/polars results map only on Python 3.13+")
 
 
 def _frame() -> pd.DataFrame:
@@ -96,11 +100,6 @@ def _table_buffers(table):
     return [b for column in table.columns for chunk in column.chunks for b in chunk.buffers()]
 
 
-def _ipc_offset(frame: bytes) -> int:
-    """Offset of the Arrow IPC body in a CK frame: after the prefix and the 8-byte checksum."""
-    return frame.index(b"ARROW1")
-
-
 def _operation_handler(backend, serializer) -> CacheOperationHandler:
     op = CacheOperationHandler(CacheSerializationHandler(serializer_name=serializer), CacheKeyGenerator())
     op.set_cache_handler(StandardCacheHandler(backend))
@@ -122,8 +121,39 @@ class TestInstanceTakesZeroCopyPaths:
         assert spies["streamed"] == 1
         assert spies["maps"] == []
         out = load()
-        assert len(spies["maps"]) == 1
+        assert len(spies["maps"]) == (1 if _FD_FREE_MMAP or return_format == "pandas" else 0)
         assert len(out) == _N
+
+    @pytest.mark.parametrize(
+        "return_format",
+        [
+            pytest.param(
+                "pandas",
+                marks=pytest.mark.xfail(
+                    not _FD_FREE_MMAP,
+                    strict=True,
+                    reason="before 3.13 a single-batch pandas result is still a view of the mapping, so it holds its fd",
+                ),
+            ),
+            "arrow",
+        ],
+    )
+    def test_held_results_hold_no_file_descriptors(self, backend, return_format) -> None:
+        """A result that keeps its mapping must not keep a descriptor too: holding a few hundred
+        would exhaust RLIMIT_NOFILE, after which every open() and socket fails with EMFILE."""
+        psutil = pytest.importorskip("psutil")
+
+        @cache(backend=backend, serializer=ArrowSerializer(return_format=return_format, compression=None), l1_enabled=False)
+        def load(i):
+            return pd.DataFrame({"i": np.arange(1000) + i})
+
+        for i in range(50):
+            load(i)
+        gc.collect()
+        before = psutil.Process().num_fds()
+        held = [load(i) for i in range(50)]
+        assert psutil.Process().num_fds() - before < 5
+        assert len(held) == 50
 
     def test_subclass_stays_on_buffered_paths(self, backend, spies) -> None:
         class Custom(ArrowSerializer):
@@ -139,6 +169,7 @@ class TestInstanceTakesZeroCopyPaths:
         assert spies["maps"] == []
 
 
+@needs_fd_free_mmap
 class TestArrowResultAliasesTheMapping:
     def test_hit_is_zero_copy(self, backend, spies) -> None:
         df = _frame()
@@ -185,6 +216,7 @@ class TestArrowResultAliasesTheMapping:
         assert table.equals(pa.Table.from_pandas(df, preserve_index=None))
 
 
+@needs_fd_free_mmap
 class TestPolarsResultAliasesTheMapping:
     def test_aligned_fixed_width_columns_are_zero_copy(self, backend, spies) -> None:
         pl = pytest.importorskip("polars")
@@ -210,7 +242,7 @@ class TestUncompressedIpcAlignment:
         with open(backend._key_to_path("k"), "rb") as f:
             stored = f.read()
         assert stored.index(b"ARROW1") % 64 == 0
-        assert HEADER_SIZE + _ipc_offset(backend.get("k")) == stored.index(b"ARROW1")
+        assert HEADER_SIZE + backend.get("k").index(b"ARROW1") == stored.index(b"ARROW1")
 
     @pytest.mark.parametrize("by_name", [True, False], ids=["name", "instance"])
     def test_streamed_and_buffered_are_byte_identical(self, by_name) -> None:
@@ -223,7 +255,7 @@ class TestUncompressedIpcAlignment:
         sh.write_serialized_to(sink, _frame())
         buffered = sh.serialize_data(_frame(), cache_key="k")
         assert sink.getvalue() == buffered
-        assert (HEADER_SIZE + _ipc_offset(buffered)) % 64 == 0
+        assert (HEADER_SIZE + buffered.index(b"ARROW1")) % 64 == 0
 
     def test_compressed_entries_are_not_padded(self) -> None:
         serializer = ArrowSerializer(compression="zstd")
@@ -246,7 +278,7 @@ class TestUncompressedIpcAlignment:
         serializer = ArrowSerializer(compression=None)
         payload, metadata = serializer.serialize(_frame())
         legacy = SerializationWrapper.wrap(payload, metadata.to_dict(), "ArrowSerializer")
-        assert (HEADER_SIZE + _ipc_offset(legacy)) % 64 != 0
+        assert (HEADER_SIZE + legacy.index(b"ARROW1")) % 64 != 0
         backend.set("k", legacy, ttl=60)
 
         hit = _operation_handler(backend, serializer).get_cached_value("k")

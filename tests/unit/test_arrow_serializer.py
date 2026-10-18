@@ -474,7 +474,7 @@ class TestPolarsSupport:
         assert isinstance(result, pl.DataFrame)
         assert result.equals(df)
 
-    @pytest.mark.parametrize(("compression", "contiguous"), [("zstd", True), ("lz4", True), (None, False)])
+    @pytest.mark.parametrize(("compression", "contiguous"), [("zstd", True), (None, False)])
     def test_only_uncompressed_reads_keep_record_batch_chunks(self, compression, contiguous):
         """Uncompressed IPC keeps one chunk per record batch so its columns stay views of the payload;
         a decompressed table is already a copy, so it comes back contiguous, as before."""

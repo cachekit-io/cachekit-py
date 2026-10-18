@@ -90,13 +90,10 @@ making it the right choice for caching DataFrames bigger than your RAM headroom:
   serialized record batch by record batch straight into the cache file (temp file + atomic
   rename), so the full serialized payload never exists in memory. Write peak RSS is ~2.3x the
   DataFrame's logical size, versus ~5.6x on the buffered path every other backend uses.
-- **Zero-copy reads** (`BufferReadableBackend.get_buffer`): uncompressed entries
-  (`compression=None`, or `CACHEKIT_ARROW_COMPRESSION=none`) are served back through a POSIX
-  mmap without materializing the payload on the heap. A `return_format="arrow"` result points
-  into the mapped file, `"polars"` keeps its fixed-width columns there, and `"pandas"` copies
-  once; a result that points into the mapping keeps it alive until it is dropped. Details,
-  limits and the lifetime rules: [ArrowSerializer → Zero-Copy Reads on the File
-  Backend](../serializers/arrow.md#zero-copy-reads-on-the-file-backend).
+- **Memory-mapped reads** (`BufferReadableBackend.get_buffer`): hits are served through a POSIX
+  mmap instead of being read onto the heap, and an uncompressed entry can then stay zero-copy.
+  What stays zero-copy per `return_format`, the Python-version and lifetime rules: [ArrowSerializer →
+  Zero-Copy Reads on the File Backend](../serializers/arrow.md#zero-copy-reads-on-the-file-backend).
 
 Both engage automatically — no API change — whenever the serializer is cachekit's plaintext
 Arrow serializer: `serializer="arrow"` or an `ArrowSerializer(...)` instance (not a subclass),

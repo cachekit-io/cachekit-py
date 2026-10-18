@@ -3,14 +3,16 @@
 Three units compose the zero-copy Arrow read fast path:
 - ``CacheSerializationHandler.supports_mmap_read()`` — eligibility (plaintext cachekit Arrow).
 - ``StandardCacheHandler.get_buffer()`` — delegates to a backend that exposes ``get_buffer``.
-- ``CacheOperationHandler.get_cached_value(_async)`` — when eligible, reads via the mmap handle,
-  deserializes over the view, and closes the handle in a ``finally``. Crucially the mmap NEVER
-  becomes the value the decorator holds (it returns the deserialized object), so it can't reach
-  ``_l1_cache.put`` (blocker C).
+- ``CacheOperationHandler.get_cached_value`` (sync only; the async read never maps) — when
+  eligible, reads via the mmap handle, deserializes over the view, and closes the handle in a
+  ``finally``. The handle never leaves the frame and its bytes never reach ``_l1_cache.put``
+  (blocker C); an Arrow or polars result may keep the mapping alive (see ``_MmapHandle``).
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,14 +27,23 @@ from cachekit.cache_handler import (
 
 @pytest.mark.unit
 class TestSupportsMmapRead:
-    def test_arrow_pandas_plaintext_is_eligible(self) -> None:
-        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
-        sh = CacheSerializationHandler(serializer_name="arrow")
-        assert sh.supports_mmap_read() is True
-
     def test_default_serializer_not_eligible(self) -> None:
         sh = CacheSerializationHandler(serializer_name="default")
         assert sh.supports_mmap_read() is False
+
+    def test_eligibility_checks_never_import_pyarrow(self) -> None:
+        """Every store asks _frame_prefix whether the serializer is cachekit's Arrow one: that must
+        not import pyarrow (hundreds of ms and MBs) for a handler that never uses it."""
+        code = (
+            "import sys\n"
+            "from cachekit.cache_handler import CacheSerializationHandler\n"
+            "sh = CacheSerializationHandler(serializer_name='default')\n"
+            "sh.serialize_data({'a': 1}, cache_key='k')\n"
+            "sh.supports_mmap_read(); sh.supports_streaming_write()\n"
+            "print('pyarrow' in sys.modules)\n"
+        )
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)  # noqa: S603 (trusted: literal code)
+        assert out.stdout.strip() == "False"
 
     def test_encrypted_arrow_not_eligible(self) -> None:
         """Encrypted values can never mmap — AES-GCM decrypt owns its buffer."""
@@ -41,25 +52,27 @@ class TestSupportsMmapRead:
         sh.encryption = True
         assert sh.supports_mmap_read() is False
 
+    @pytest.mark.parametrize("releases_fd", [True, False], ids=["py313+", "pre-313"])
     @pytest.mark.parametrize("return_format", ["pandas", "arrow", "polars"])
-    def test_every_return_format_is_eligible(self, return_format) -> None:
-        """An Arrow or polars result keeps the mapping alive through its buffer exports, so the
-        handle's close() cannot free pages it still uses: every return_format may mmap."""
+    def test_return_formats_that_keep_the_mapping_need_an_fd_free_mmap(self, return_format, releases_fd, monkeypatch) -> None:
+        """An Arrow or polars result keeps its mapping alive, and before Python 3.13 a mapping also
+        keeps a file descriptor: those formats map only where the mmap holds none. pandas always maps."""
         pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
+        monkeypatch.setattr("cachekit.cache_handler.MMAP_RELEASES_FD", releases_fd)
         sh = CacheSerializationHandler(serializer_name="arrow")
         # Swap in a throwaway serializer rather than mutating the process-wide cached instance, so
         # this test can never leak a return_format into another test (no shared state).
         sh._base_serializer = ArrowSerializer(return_format=return_format)
-        assert sh.supports_mmap_read() is True
+        assert sh.supports_mmap_read() is (releases_fd or return_format == "pandas")
 
     def test_arrow_serializer_instance_is_eligible(self) -> None:
         """Eligibility is by serializer object: an instance's frame tag is its class name, not "arrow"."""
         pytest.importorskip("pyarrow")
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
-        assert CacheSerializationHandler(serializer_name=ArrowSerializer(return_format="arrow")).supports_mmap_read() is True
+        assert CacheSerializationHandler(serializer_name=ArrowSerializer(return_format="pandas")).supports_mmap_read() is True
 
     def test_arrow_serializer_subclass_not_eligible(self) -> None:
         """Exact type: a subclass may override serialize/deserialize, so it stays on the buffered path."""
@@ -70,14 +83,6 @@ class TestSupportsMmapRead:
             pass
 
         assert CacheSerializationHandler(serializer_name=Custom()).supports_mmap_read() is False
-
-    def test_encrypted_arrow_instance_not_eligible(self) -> None:
-        pytest.importorskip("pyarrow")
-        from cachekit.serializers.arrow_serializer import ArrowSerializer
-
-        sh = CacheSerializationHandler(serializer_name=ArrowSerializer())
-        sh.encryption = True
-        assert sh.supports_mmap_read() is False
 
 
 @pytest.mark.unit
