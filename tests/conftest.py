@@ -135,7 +135,7 @@ if PYTEST_REDIS_AVAILABLE:
 
         _parsed = urlparse(redis_url)
         redis_noproc = factories.redis_noproc(host=_parsed.hostname or "localhost", port=_parsed.port or 6379)
-        redis_isolated = factories.redisdb("redis_noproc")
+        _REDIS_PROCESS_FIXTURE = "redis_noproc"
     else:
         # Local development - spawn Redis process.
         # Draw the port below 30000. The default pool runs up to the ephemeral range, so it overlaps
@@ -144,7 +144,8 @@ if PYTEST_REDIS_AVAILABLE:
         # readiness probe gets ECONNREFUSED (or another service) until the 60 s startup timeout.
         redis_proc_kwargs = {"timeout": 60, "port": (1024, 29999)}
         redis_proc = factories.redis_proc(**redis_proc_kwargs)
-        redis_isolated = factories.redisdb("redis_proc")
+        _REDIS_PROCESS_FIXTURE = "redis_proc"
+    redis_isolated = factories.redisdb(_REDIS_PROCESS_FIXTURE)
 
     # Also make it available under the name the tests expect
     redisdb = redis_isolated
@@ -154,6 +155,32 @@ if PYTEST_REDIS_AVAILABLE:
     def redis_session(redis_isolated):
         """Function-scoped Redis client for performance tests."""
         return redis_isolated
+
+    @pytest.fixture
+    def redis_backend(request):
+        """A Redis backend (the production PerRequestRedisBackend) whose keys belong to this test alone.
+
+        It never flushes. xdist workers share CI's one Redis, so redis_isolated's teardown
+        ``flushall`` would empty another worker's entries mid-test. Instead the backend's tenant
+        is unique to the test, and teardown deletes only that tenant's keys.
+        """
+        import uuid
+
+        import redis
+
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
+
+        proc = request.getfixturevalue(_REDIS_PROCESS_FIXTURE)
+        client = redis.Redis(
+            proc.host, proc.port, username=proc.username, password=proc.password, unix_socket_path=proc.unixsocket
+        )
+        tenant = uuid.uuid4().hex
+        try:
+            yield PerRequestRedisBackend(client, tenant)
+        finally:
+            for key in client.scan_iter(match=f"t:{tenant}:*"):
+                client.delete(key)
+            client.close()
 
 
 # =============================================================================
@@ -300,19 +327,6 @@ def mock_backend_without_timeout():
 
     backend = create_backend_with_capabilities(timeout_support=False, tenant_id="test-tenant")
     return backend
-
-
-@pytest.fixture
-def redis_backend(redis_isolated):
-    """Provide Redis-backed backend for integration tests.
-
-    Uses the isolated Redis instance from pytest-redis, wrapped the way
-    ``RedisBackendProvider.get_shared_backend()`` wraps the production client.
-    For unit tests that don't need real Redis, use backend fixture.
-    """
-    from cachekit.backends.redis.provider import PerRequestRedisBackend
-
-    return PerRequestRedisBackend(redis_isolated, "default", follow_context=True)
 
 
 @pytest.fixture

@@ -219,18 +219,21 @@ class TestDeserializedArraysAreWritable:
             pytest.param(
                 AutoSerializer,
                 id="arrow",
-                marks=pytest.mark.xfail(strict=True, reason="#582: a single-batch Arrow read returns read-only pandas columns"),
+                marks=pytest.mark.xfail(
+                    strict=True, raises=ValueError, reason="#582: a single-batch Arrow read returns read-only pandas columns"
+                ),
             ),
         ],
     )
     def test_dataframe_numeric_column_writable(self, serializer: Callable[[], AutoSerializer]) -> None:
         s = serializer()
-        data, meta = s.serialize(pd.DataFrame({"x": np.arange(5, dtype=np.float64)}))
+        df = pd.DataFrame({"x": np.arange(5, dtype=np.float64)})
+        data, meta = s.serialize(df)
 
         out = s.deserialize(data, meta)
         out.loc[0, "x"] = -1.0  # must not raise
         assert out.loc[0, "x"] == -1.0
-        pd.testing.assert_frame_equal(s.deserialize(data, meta), pd.DataFrame({"x": np.arange(5, dtype=np.float64)}))
+        pd.testing.assert_frame_equal(s.deserialize(data, meta), df)
 
 
 @pytest.mark.unit
