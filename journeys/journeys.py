@@ -26,28 +26,11 @@ import tracemalloc
 from collections.abc import Callable
 from typing import Any
 
-# Scrub before cachekit is imported: its settings read the environment when they are first built.
-for _var in [v for v in os.environ if v.startswith("CACHEKIT_") or v == "REDIS_URL"]:
+# Scrub before cachekit is imported: its settings read the environment when they are first built, and match
+# names case-insensitively, so redis_url configures a backend as REDIS_URL does. Each journey's interpreter
+# inherits this environment.
+for _var in [v for v in os.environ if v.upper().startswith("CACHEKIT_") or v.upper() == "REDIS_URL"]:
     del os.environ[_var]
-
-
-def _redis_listening() -> list[str]:
-    """Every localhost address on which something accepts connections on Redis's default port."""
-    found = []
-    for family, _, _, _, addr in socket.getaddrinfo("localhost", 6379, type=socket.SOCK_STREAM):
-        with socket.socket(family, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            if s.connect_ex(addr) == 0:
-                found.append(str(addr[0]))
-    return found
-
-
-if __name__ == "__main__" and (_listening := _redis_listening()):
-    print(
-        f"journeys: something listens on localhost:6379 ({', '.join(_listening)}); a user's machine has no Redis",
-        file=sys.stderr,
-    )
-    sys.exit(2)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -61,6 +44,7 @@ from cachekit.serializers import ArrowSerializer  # noqa: E402
 
 JOURNEYS: list[tuple[str, Callable[[], str | None]]] = []
 PY313 = sys.version_info >= (3, 13)
+TIMEOUT_S = 300
 
 
 def journey(promise: str) -> Callable[[Callable[[], str | None]], Callable[[], str | None]]:
@@ -139,8 +123,7 @@ def _() -> None:
         calls.append(x)
         return {"x": x}
 
-    assert f(1) == {"x": 1} and f(1) == {"x": 1}, "wrong value"
-    assert len(calls) == 1, f"the function body ran {len(calls)} times for two identical calls"
+    assert call_twice(lambda: f(1), calls) == {"x": 1}, "wrong value"
 
 
 @journey("bare @cache on an async function, nothing configured: the second call is a hit")
@@ -160,7 +143,7 @@ def _() -> None:
 
 
 @journey("each plaintext preset (minimal, production, dev, test), nothing configured: the second call is a hit")
-def _() -> str:
+def _() -> None:
     for preset in ("minimal", "production", "dev", "test"):
         calls: list[int] = []
 
@@ -169,10 +152,10 @@ def _() -> str:
             calls.append(x)  # noqa: B023 - called within this iteration
             return x
 
-        f(1)
-        f(1)
-        assert len(calls) == 1, f"@cache.{preset}: the function body ran {len(calls)} times for two identical calls"
-    return "minimal production dev test"
+        try:
+            call_twice(lambda: f(1), calls)  # noqa: B023 - called within this iteration
+        except AssertionError as e:
+            raise AssertionError(f"@cache.{preset}: {e}") from e
 
 
 @journey("bare @cache holds values by reference (README): a hit is the object the function returned")
@@ -185,44 +168,35 @@ def _() -> None:
     assert values() is first, "a hit is not the object the first call returned"
 
 
-@journey("invalidate_cache on a bare @cache: the next call recomputes")
-def _() -> None:
-    calls: list[int] = []
+def _invalidate_journey(label: str, make_decorator: Callable[[], Any]) -> None:
+    @journey(f"invalidate_cache on {label}: after a hit, the next call recomputes")
+    def _() -> None:
+        calls: list[int] = []
 
-    @cache
-    def f(x: int) -> int:
-        calls.append(x)
-        return x
+        @make_decorator()
+        def f(x: int) -> int:
+            calls.append(x)
+            return x
 
-    call_twice(lambda: f(1), calls)
-    f.invalidate_cache(1)
-    f(1)
-    assert len(calls) == 2, f"the function body ran {len(calls)} times across a hit, invalidate_cache, call"
+        call_twice(lambda: f(1), calls)
+        f.invalidate_cache(1)
+        f(1)
+        assert len(calls) == 2, f"the function body ran {len(calls)} times across a hit, invalidate_cache, call"
 
 
-@journey("invalidate_cache with FileBackend: the next call recomputes")
-def _() -> None:
-    calls: list[int] = []
-
-    @cache(backend=file_backend(), ttl=60)
-    def f(x: int) -> int:
-        calls.append(x)
-        return x
-
-    call_twice(lambda: f(1), calls)
-    f.invalidate_cache(1)
-    f(1)
-    assert len(calls) == 2, f"the function body ran {len(calls)} times across a hit, invalidate_cache, call"
+_invalidate_journey("a bare @cache", lambda: cache)
+_invalidate_journey("FileBackend", lambda: cache(backend=file_backend(), ttl=60))
 
 
 # ── a backend hit is equal and editable ───────────────────────────────────────────────────────────────
 
-FRAME_SERIALIZERS: list[tuple[str, Callable[[], Any]]] = [
-    ('serializer="auto"', lambda: "auto"),
+# The two documented spellings of the Arrow serializer, each with and without compression where it matters.
+ARROW_SPELLINGS: list[tuple[str, Callable[[], Any]]] = [
     ('serializer="arrow"', lambda: "arrow"),
     ("ArrowSerializer()", ArrowSerializer),
     ("ArrowSerializer(compression=None)", lambda: ArrowSerializer(compression=None)),
 ]
+FRAME_SERIALIZERS: list[tuple[str, Callable[[], Any]]] = [('serializer="auto"', lambda: "auto"), *ARROW_SPELLINGS]
 
 
 def _frame_journey(label: str, make_serializer: Callable[[], Any]) -> None:
@@ -339,9 +313,7 @@ def _() -> None:
 
 # (spelling, serializer factory, whether the docs promise the mmap read on this Python)
 MMAP_CONFIGS: list[tuple[str, Callable[[], Any], bool]] = [
-    ('serializer="arrow"', lambda: "arrow", True),
-    ("ArrowSerializer()", ArrowSerializer, True),
-    ("ArrowSerializer(compression=None)", lambda: ArrowSerializer(compression=None), True),
+    *((label, make, True) for label, make in ARROW_SPELLINGS),
     (
         'ArrowSerializer(return_format="arrow", compression=None)',
         lambda: ArrowSerializer(return_format="arrow", compression=None),
@@ -395,7 +367,7 @@ def _streaming_journey(label: str, make_serializer: Callable[[], Any]) -> None:
         assert hit.equals(small_frame()), "the streamed entry reads back different"
 
 
-for _label, _make, _ in MMAP_CONFIGS[:3]:
+for _label, _make in ARROW_SPELLINGS:
     _streaming_journey(_label, _make)
 
 
@@ -430,23 +402,60 @@ if PY313:  # the docs promise zero-copy "arrow" results from Python 3.13 on; ear
 # ── runner ────────────────────────────────────────────────────────────────────────────────────────────
 
 
+REPORTED_FAIL = 3  # a journey's own failure; any other non-zero status means its interpreter died first
+
+
 def run_one(index: int) -> int:
-    """Run one journey in this interpreter: print its note or failure, exit 0 on pass and 1 on fail."""
+    """Run one journey in this interpreter and print its note or failure."""
     _, fn = JOURNEYS[index]
     try:
         print(fn() or "")
         return 0
     except AssertionError as e:
         print(e)
-    except Exception as e:  # an unexpected error breaks the promise too
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:  # an unexpected error breaks the promise too; a pyo3 panic is a BaseException
         frame = traceback.extract_tb(e.__traceback__)[-1]
         print(f"{type(e).__name__}: {e} ({os.path.basename(frame.filename)}:{frame.lineno})")
-    return 1
+    return REPORTED_FAIL
+
+
+def run_isolated(index: int) -> tuple[bool, str]:
+    """Run journey ``index`` in a fresh interpreter: (passed, note)."""
+    try:
+        proc = subprocess.run(  # noqa: S603 - this interpreter running this file
+            [sys.executable, "-I", __file__, str(index)], capture_output=True, text=True, timeout=TIMEOUT_S, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"no result after {TIMEOUT_S} s"
+    if proc.returncode in (0, REPORTED_FAIL):
+        return proc.returncode == 0, proc.stdout.strip()
+    last = proc.stderr.strip().splitlines()[-1:] or [""]
+    return False, f"the interpreter died with status {proc.returncode}: {last[0]}"
+
+
+def redis_listening() -> list[str]:
+    """Every localhost address that accepts connections on Redis's default port. scripts/journeys.sh runs a
+    copy of this before its build, so a busy port fails in seconds; change the two together."""
+    found = []
+    for family, _, _, _, addr in socket.getaddrinfo("localhost", 6379, type=socket.SOCK_STREAM):
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(addr) == 0:
+                found.append(str(addr[0]))
+    return found
 
 
 def main() -> int:
     """Run every journey, each in a fresh interpreter, so a user's first call meets an unused cachekit and
     no journey's cache entries, spies or crash can reach another."""
+    if listening := redis_listening():
+        print(
+            f"journeys: something listens on localhost:6379 ({', '.join(listening)}); a user's machine has no Redis",
+            file=sys.stderr,
+        )
+        return 2
     if not __debug__:
         print("journeys: python -O strips the asserts every journey checks with", file=sys.stderr)
         return 2
@@ -457,16 +466,7 @@ def main() -> int:
     print(f"python {sys.version.split()[0]}, pandas {pd.__version__}, pyarrow {pa.__version__}, polars {pl.__version__}\n")
     failed = 0
     for index, (promise, _) in enumerate(JOURNEYS):
-        try:
-            proc = subprocess.run(  # noqa: S603 - this interpreter running this file
-                [sys.executable, "-I", __file__, str(index)], capture_output=True, text=True, timeout=300, check=False
-            )
-            passed, note = proc.returncode == 0, proc.stdout.strip()
-            if proc.returncode not in (0, 1):  # died before reporting: a crash, a signal, an import error
-                last = proc.stderr.strip().splitlines()[-1:] or [""]
-                passed, note = False, f"the interpreter exited with status {proc.returncode}: {last[0]}"
-        except subprocess.TimeoutExpired:
-            passed, note = False, "no result after 300 s"
+        passed, note = run_isolated(index)
         failed += not passed
         print(f"{'PASS' if passed else 'FAIL'}  {promise}" + (f"\n        {note}" if note else ""))
     print(f"\njourneys: {len(JOURNEYS) - failed} passed, {failed} failed")

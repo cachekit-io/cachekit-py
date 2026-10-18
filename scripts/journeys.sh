@@ -17,8 +17,9 @@ trap 'rm -rf "${work:?}"' EXIT
 uv venv --quiet --python "$python" "$work/venv"
 venv_python="$work/venv/bin/python"
 
-# Fail before the build, which takes minutes. journeys.py checks again with its own resolver.
-if ! "$venv_python" - <<'EOF'
+# Fail before the build, which takes minutes. A copy of redis_listening() in journeys.py, which checks again
+# for direct runs; change the two together.
+"$venv_python" - <<'EOF' || exit 2
 import socket, sys
 for family, _, _, _, addr in socket.getaddrinfo("localhost", 6379, type=socket.SOCK_STREAM):
     with socket.socket(family, socket.SOCK_STREAM) as s:
@@ -26,9 +27,6 @@ for family, _, _, _, addr in socket.getaddrinfo("localhost", 6379, type=socket.S
         if s.connect_ex(addr) == 0:
             sys.exit(f"journeys: something listens on localhost:6379 ({addr[0]}); stop it, a user's machine has no Redis")
 EOF
-then
-    exit 2
-fi
 
 requirement="${JOURNEY_CACHEKIT:-}"
 if [[ -z "$requirement" ]]; then
@@ -41,7 +39,7 @@ fi
 echo "journeys: installing $requirement"
 uv pip install --quiet --python "$venv_python" "$requirement" polars
 
-# The scrub matches journeys.py's, so a direct run of the script and this one see the same environment.
-mapfile -t unset_args < <(compgen -e | grep -E '^(CACHEKIT_|REDIS_URL$)' | sed 's/^/-u/')
+# journeys.py scrubs REDIS_URL and CACHEKIT_* (any case) itself, before it imports cachekit. TMPDIR puts the
+# journeys' cache directories under $work, which the trap removes.
 cd "$work"
-env "${unset_args[@]}" "$venv_python" -I "$repo/journeys/journeys.py"
+TMPDIR="$work" "$venv_python" -I "$repo/journeys/journeys.py"
