@@ -11,7 +11,8 @@ as raw msgpack — losing the corruption diagnostic. A checksum mismatch must su
 
 DataFrames route through ArrowSerializer when pyarrow is installed, so the columnar msgpack path
 (``_serialize_dataframe`` / the ``"dataframe"`` branch) is exercised by disabling the arrow
-serializer. Series never use arrow, so they hit the columnar path unconditionally.
+serializer; the #157 DataFrame test runs both paths. Series never use arrow, so they hit the
+columnar path unconditionally.
 
 LAB-2503: ``TestDataFrameSeriesReadRoutes`` pins every DataFrame/Series read route (metadata x
 integrity, and metadata-less via the envelope's format_id); it lives here because this file
@@ -178,7 +179,11 @@ class TestDataFrameSeriesReadRoutes:
 
 @pytest.mark.unit
 class TestDeserializedArraysAreWritable:
-    """#157: deserialized numeric arrays must be writable and must not alias the cached buffer."""
+    """#157: deserialized numeric arrays must be writable and must not alias the cached buffer.
+
+    Writability is tested with an in-place edit, never ``flags.writeable``: pandas 3's copy-on-write
+    sets that False on arrays pandas owns, while edits of the Series or DataFrame still work.
+    """
 
     def test_top_level_numpy_writable_and_unaliased(self) -> None:
         s = AutoSerializer()
@@ -186,7 +191,6 @@ class TestDeserializedArraysAreWritable:
         data, meta = s.serialize(arr)
 
         out = s.deserialize(data, meta)
-        assert out.flags.writeable, "deserialized numpy array must be writable"
         out[:] = -1.0  # must not raise on a read-only buffer
 
         # Mutating the returned array must not write back through the (possibly L1-cached) buffer.
@@ -197,22 +201,33 @@ class TestDeserializedArraysAreWritable:
         data, meta = s.serialize({"a": np.arange(6, dtype=np.int64)})
 
         out = s.deserialize(data, meta)
-        assert out["a"].flags.writeable, "nested numpy array must be writable"
         out["a"][0] = 42  # must not raise
+        assert out["a"][0] == 42
 
     def test_series_numeric_values_writable(self) -> None:
         s = AutoSerializer()
         data, meta = s.serialize(pd.Series(np.arange(8, dtype=np.float64)))
 
         out = s.deserialize(data, meta)
-        assert out.to_numpy(copy=False).flags.writeable, "deserialized Series values must be writable"
+        out.iloc[0] = -1.0  # must not raise
+        assert out.iloc[0] == -1.0
 
-    def test_dataframe_numeric_column_writable(self) -> None:
-        s = _no_arrow()
-        data, meta = s.serialize(pd.DataFrame({"x": np.arange(5, dtype=np.float64)}))
+    @pytest.mark.parametrize(
+        "serializer",
+        [
+            pytest.param(_no_arrow, id="columnar"),
+            pytest.param(AutoSerializer, id="arrow"),
+        ],
+    )
+    def test_dataframe_numeric_column_writable(self, serializer: Callable[[], AutoSerializer]) -> None:
+        s = serializer()
+        df = pd.DataFrame({"x": np.arange(5, dtype=np.float64)})
+        data, meta = s.serialize(df)
 
         out = s.deserialize(data, meta)
-        assert out["x"].to_numpy(copy=False).flags.writeable, "deserialized DataFrame column must be writable"
+        out.loc[0, "x"] = -1.0  # must not raise
+        assert out.loc[0, "x"] == -1.0
+        pd.testing.assert_frame_equal(s.deserialize(data, meta), df)
 
 
 @pytest.mark.unit
