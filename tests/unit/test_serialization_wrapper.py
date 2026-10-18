@@ -356,3 +356,8 @@ def test_wrap_prefix_rejects_an_impossible_alignment(align: int, offset: int) ->
     """align=0 would divide by zero and a negative offset names no byte position: both are caller bugs."""
     with pytest.raises(ValueError, match="align >= 1 and offset >= 0"):
         SerializationWrapper.wrap_prefix({}, "arrow", align=align, offset=offset)
+
+
+def test_wrap_prefix_ignores_offset_without_alignment() -> None:
+    """align=1 pads nothing, so offset plays no part: the default prefix comes back whatever it is."""
+    assert SerializationWrapper.wrap_prefix({}, "arrow", align=1, offset=-5) == SerializationWrapper.wrap_prefix({}, "arrow")

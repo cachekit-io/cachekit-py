@@ -183,7 +183,8 @@ class SerializationWrapper:
         ``offset + len(prefix)`` is a multiple of ``align``; ``offset`` counts the bytes outside the
         prefix that precede the position to align. JSON allows trailing whitespace, so every reader
         parses a padded header unchanged. The default (``align=1``) never pads. Raises ``ValueError``
-        for an ``align`` below 1 or a negative ``offset``.
+        for an ``align`` below 1, or for a negative ``offset`` when ``align`` is above 1; with
+        ``align=1`` nothing is padded, so ``offset`` is ignored.
 
         >>> padded = SerializationWrapper.wrap_prefix({}, "arrow", align=64, offset=22)
         >>> (22 + len(padded)) % 64
