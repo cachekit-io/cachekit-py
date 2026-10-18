@@ -153,7 +153,8 @@ class _MmapHandle:
       unmapped when the last export is released. A result therefore never dangles.
     - A mapping that outlives the read costs no file descriptor on Python 3.13+ (``trackfd=False``).
       Before 3.13 the mmap object holds a duplicate descriptor until it is freed, which is why the
-      cache handler maps only pandas results there (they release the mapping at once).
+      cache handler maps only pandas results there: they are meant to copy out, and only a pandas
+      column that stays a view of the mapped buffers keeps the mapping and its descriptor.
     - The file's pages stay valid while mapped because cachekit never rewrites a cache file in
       place: writes go to a temp file and ``rename``, eviction and delete ``unlink``, and both
       leave an existing mapping intact. A process that truncates a cache file in place while a

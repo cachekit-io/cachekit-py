@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import os
 import statistics
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -618,8 +617,7 @@ def _rss_anon() -> int:
 @pytest.mark.performance
 @pytest.mark.slow
 @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="reads RssAnon from /proc (Linux)")
-@pytest.mark.skipif(sys.version_info < (3, 13), reason="Arrow results map only on Python 3.13+")
-def test_arrow_format_hit_allocates_no_heap(tmp_path: Path) -> None:
+def test_arrow_format_hit_allocates_no_heap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An uncompressed ArrowSerializer(return_format="arrow") hit returns a table over the mapped
     cache file: its pages are file-backed, so anonymous RSS barely moves however large the value.
 
@@ -635,6 +633,10 @@ def test_arrow_format_hit_allocates_no_heap(tmp_path: Path) -> None:
     pa = pytest.importorskip("pyarrow")
     from cachekit import cache
     from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+    # Before 3.13 the handler keeps Arrow results on the copying read (each held mapping would hold a
+    # file descriptor); the heap cost of the mapped read does not depend on the version.
+    monkeypatch.setattr("cachekit.cache_handler.MMAP_RELEASES_FD", True)
 
     n = 2_000_000
     rng = np.random.default_rng(0)

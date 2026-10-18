@@ -21,7 +21,7 @@ import pytest
 
 from cachekit import cache
 from cachekit.backends.file import FileBackend, FileBackendConfig
-from cachekit.backends.file.backend import HEADER_SIZE
+from cachekit.backends.file.backend import HEADER_SIZE, MMAP_RELEASES_FD
 from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, StandardCacheHandler
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -39,9 +39,14 @@ pytestmark = [
 
 _N = 100_000
 _LINUX = sys.platform.startswith("linux")
-# Before 3.13 a mapping holds a file descriptor, so Arrow and polars results use the copying read.
-_FD_FREE_MMAP = sys.version_info >= (3, 13)
-needs_fd_free_mmap = pytest.mark.skipif(not _FD_FREE_MMAP, reason="Arrow/polars results map only on Python 3.13+")
+
+
+@pytest.fixture
+def map_every_return_format(monkeypatch) -> None:
+    """Map Arrow and polars results on every Python. Before 3.13 the handler keeps them on the copying
+    read, because there each held mapping also holds a file descriptor; aliasing and lifetime do not
+    depend on the version, so these tests run on the whole matrix."""
+    monkeypatch.setattr("cachekit.cache_handler.MMAP_RELEASES_FD", True)
 
 
 def _frame() -> pd.DataFrame:
@@ -121,23 +126,10 @@ class TestInstanceTakesZeroCopyPaths:
         assert spies["streamed"] == 1
         assert spies["maps"] == []
         out = load()
-        assert len(spies["maps"]) == (1 if _FD_FREE_MMAP or return_format == "pandas" else 0)
+        assert len(spies["maps"]) == (1 if MMAP_RELEASES_FD or return_format == "pandas" else 0)
         assert len(out) == _N
 
-    @pytest.mark.parametrize(
-        "return_format",
-        [
-            pytest.param(
-                "pandas",
-                marks=pytest.mark.xfail(
-                    not _FD_FREE_MMAP,
-                    strict=True,
-                    reason="before 3.13 a single-batch pandas result is still a view of the mapping, so it holds its fd",
-                ),
-            ),
-            "arrow",
-        ],
-    )
+    @pytest.mark.parametrize("return_format", ["pandas", "arrow"])
     def test_held_results_hold_no_file_descriptors(self, backend, return_format) -> None:
         """A result that keeps its mapping must not keep a descriptor too: holding a few hundred
         would exhaust RLIMIT_NOFILE, after which every open() and socket fails with EMFILE."""
@@ -169,7 +161,7 @@ class TestInstanceTakesZeroCopyPaths:
         assert spies["maps"] == []
 
 
-@needs_fd_free_mmap
+@pytest.mark.usefixtures("map_every_return_format")
 class TestArrowResultAliasesTheMapping:
     def test_hit_is_zero_copy(self, backend, spies) -> None:
         df = _frame()
@@ -216,7 +208,7 @@ class TestArrowResultAliasesTheMapping:
         assert table.equals(pa.Table.from_pandas(df, preserve_index=None))
 
 
-@needs_fd_free_mmap
+@pytest.mark.usefixtures("map_every_return_format")
 class TestPolarsResultAliasesTheMapping:
     def test_aligned_fixed_width_columns_are_zero_copy(self, backend, spies) -> None:
         pl = pytest.importorskip("polars")

@@ -1212,9 +1212,10 @@ class CacheSerializationHandler:
         """
         if self.encryption or not self._is_cachekit_arrow():
             return False
-        # A pandas result copies out, so its mapping closes when the read returns. An Arrow or polars
-        # result keeps the mapping, and before Python 3.13 each mapping also keeps a file descriptor:
-        # those return formats map only where the mapping holds no descriptor.
+        # An Arrow or polars result keeps the mapping, and before Python 3.13 each mapping also keeps a
+        # file descriptor, so those return formats map only where the mapping holds none. A pandas
+        # result is meant to copy out; any pandas column that stays a view of the mapped Arrow
+        # buffers still keeps the mapping (and, before 3.13, its descriptor) until it is released.
         return MMAP_RELEASES_FD or getattr(self._base_serializer, "return_format", None) == "pandas"
 
     def supports_streaming_write(self) -> bool:

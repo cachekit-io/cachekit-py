@@ -69,7 +69,7 @@ serializer = ArrowSerializer(return_format="pandas")
 # Return as polars DataFrame (requires polars installed)
 serializer = ArrowSerializer(return_format="polars")
 
-# Return as pyarrow.Table (no conversion; zero-copy on an uncompressed File-backend hit)
+# Return as pyarrow.Table (no conversion; zero-copy on an uncompressed File-backend hit on Python 3.13+)
 serializer = ArrowSerializer(return_format="arrow")
 ```
 
@@ -225,7 +225,7 @@ If polars is not installed, deserializing with `return_format="polars"` raises `
 
 ## Performance Optimization Tips
 
-1. **Use return_format="arrow"** to skip the pandas conversion, and add `compression=None` on the File backend for zero-copy hits:
+1. **Use return_format="arrow"** to skip the pandas conversion, and add `compression=None` on the File backend for zero-copy hits on Python 3.13+ ([details](#zero-copy-reads-on-the-file-backend)):
 
    ```python notest
    from cachekit import cache

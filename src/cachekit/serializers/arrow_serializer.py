@@ -226,7 +226,7 @@ class ArrowSerializer:
                 - "pandas": Convert to pandas.DataFrame (default)
                 - "polars": Convert to polars.DataFrame
                 - "arrow": Return pyarrow.Table (no conversion; zero-copy on an uncompressed
-                  File-backend hit)
+                  File-backend hit on Python 3.13+)
             enable_integrity_checking: Retained for API compatibility. The 8-byte xxHash3-64
                 checksum is now ALWAYS written and validated (silently returning corrupted
                 DataFrames is unacceptable, and 8 bytes is negligible), so this flag no longer
@@ -348,8 +348,7 @@ class ArrowSerializer:
             # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
             # payload). Batches are sized by actual bytes (<= 8 MiB), not a uniform row-count
             # estimate, so the bound holds for skewed/wide frames too (#161). compression=None
-            # writes uncompressed IPC, which the File backend reads zero-copy via mmap (#171,
-            # plaintext only).
+            # writes uncompressed IPC.
             sink = pa.BufferOutputStream()
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(sink, table.schema, options=write_options) as writer:
