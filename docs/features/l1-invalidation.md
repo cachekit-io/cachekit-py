@@ -270,6 +270,27 @@ Things to know:
 
 **Writes in flight.** An invalidation does not stop a write that began before it. A call that missed the cache before an invalidation still stores its result after it, and so does a `@cache.io` [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) refresh. The value it stores was computed no earlier than the call started, and it expires by its TTL. With `ttl=None` that is never for an L2 entry, and one year for an entry in L1-only mode. With a backend, the store is two steps, L2 then L1, so an invalidation that arrives between them, from this process or [announced](#cross-process-l1-eviction) by another, can leave the value in this process's L1 alone. Likewise, a read that fetched the old value from L2 just before an invalidation can copy it into this process's L1 just after. Either copy expires by its L1 TTL. In L1-only mode a background SWR refresh never lands after an invalidation: it is dropped when the entry it refreshes has been removed. A call that starts after an invalidation in this process never joins a miss that started before it ([in-process single-flight](distributed-locking.md#in-process-single-flight-before-the-lock)): it runs its own.
 
+### Upgrading: Custom `key=` Keys Carry the Function's Identity
+
+A custom `key=` key is `{namespace or default}:{your key}:{identity}`, where `{identity}` is the first 16 hex characters of the blake3 hash of the decorated function's `module.qualname`. Earlier releases stored `{namespace or default}:{your key}`, so two functions in one namespace whose key functions returned the same string read, overwrote and invalidated one shared entry. That happened under every decorator with a backend, `@cache.secure` included, and through the shared L1 even when the two functions used different backends. `@cache.local` and `backend=None` were never affected: each function keeps its own in-process cache.
+
+Functions that share a `module.qualname` still share entries, as they do with generated keys, and only the namespace separates them. That covers closures made by one factory, decorated lambdas, wrappers built without `functools.wraps`, and functions defined in `__main__` by two scripts or notebooks. Give each of them its own namespace.
+
+Upgrading changes the following.
+
+- **Every `key=` entry is recomputed once.** The old entries are never read again: reading them would bring back the shared entry.
+- **Old entries are not deleted for you.** They retire by TTL, and never if none was set. On a function that takes parameters, one no-args `invalidate_cache()` from an upgraded process deletes every old entry still tracked in the function's key registry set, whose name has not changed; run it once per tenant, since it reaches only the tenant set in `tenant_context`. On a zero-parameter function, a no-args `invalidate_cache()` deletes only the new key and never drains a registry set. Old entries that are not tracked, because their set expired seven days after its last write or because the backend does not track keys, and every zero-parameter function's old entry, can be erased with the `scan_iter` + `unlink` script from [Upgrading to 0.20.0](../backends/README.md#upgrading-to-0200), with `pattern = "t:*:users:*"` for namespace `users` (`"t:*:default:*"` for none) on the tenant-scoped Redis backend, or `pattern = "users:*"` on a plain `RedisBackend`. That pattern also deletes the namespace's new custom-key and `fast_mode` entries, which are then recomputed once. Run it after the rollout completes, or processes still on the earlier release write the old keys back.
+- **Rolling deploys and rollbacks leave stale entries.** Processes on the earlier release keep reading and writing the old shared key. An `invalidate_cache(args)` on an upgraded process deletes only the new key, so those processes keep serving the old entry; one on an earlier process deletes only the old key, so upgraded processes keep serving the new one. Once the rollout completes, run one no-args `invalidate_cache()` per tenant from an upgraded process for each affected function. A rollback brings the shared entries back: the earlier release serves the old keys again, which this release never deleted, so erase them with the script above after rolling back.
+- **Keys are 17 characters longer.** A custom key within 17 characters of a backend's limit, Memcached's 250 bytes or CachekitIO's 400 characters, is rejected on every call after the upgrade, so that function stops being cached in L2. On CachekitIO, a custom key with no colon under namespace `ns` or `nsapi`, which the service rejects today, is accepted after the upgrade under a namespace named by your key. Do not use those two namespaces with `key=`.
+- **Anything that addresses `{namespace}:{your key}` directly stops matching.** That includes an operator's delete script and a delete sent by another SDK's client. Append `:` and the identity, computed from the function's `module.qualname`:
+
+```python
+import blake3
+
+identity = blake3.blake3(b"billing.invoices.fetch_invoice").hexdigest()[:16]
+assert f"billing:inv-42:{identity}" == "billing:inv-42:f597f24f4f87a17e"
+```
+
 ---
 
 ## Multi-Instance Semantics

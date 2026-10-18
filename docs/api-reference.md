@@ -84,7 +84,7 @@ def your_function(args):
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
 - **`integrity_checking`** (`bool`, default: `True`; any non-bool raises `ConfigurationError`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Behaviour when a writer and reader disagree on this flag: [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
-- **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
+- **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`. The stored key is `{namespace or default}:{returned str}:{16 hex}`, the last segment a hash of the function's `module.qualname`, so two functions share an entry only if they share a `module.qualname` and a namespace ([upgrade note](features/l1-invalidation.md#upgrading-custom-key-keys-carry-the-functions-identity))
 
 #### Performance Parameters
 

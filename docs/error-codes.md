@@ -270,9 +270,9 @@ left behind. `scan_iter` returns each key whole. A `SCAN` pattern alone cannot
 scope the delete either, because a namespace may contain `:` or glob characters:
 pattern `ns:users:*` also matches namespace `users:admin`. The script below uses
 `SCAN` only to find candidates and deletes a key only if it has exactly the shape
-cachekit generates for that namespace or function. Shape is all a key carries, so
-the script cannot tell a generated key from a custom one of the same shape (see
-below).
+cachekit generates for that namespace or function. Its last segment is the flags
+segment, `0` or `1` and then one letter or `x` and 4 hex, which no custom `key=` key
+ends in (see below).
 
 ```python notest
 # Needs a live Redis: set the URL, including the database number cachekit uses.
@@ -301,7 +301,7 @@ function = None
 # The key builder replaces spaces, \r and \n with _.
 ns = "" if not namespace else "ns:" + re.sub(r"[ \r\n]", "_", namespace) + ":"
 fn = r"[A-Za-z0-9_.]+" if function is None else re.escape(function)
-generated = re.compile(re.escape(prefix + ns + "func:") + fn + r":args:[0-9a-f]{64}:[^:]+")
+generated = re.compile(re.escape(prefix + ns + "func:") + fn + r":args:[0-9a-f]{64}:[01](?:x[0-9a-f]{4}|[a-z])")
 # A key over 250 characters is stored as its first 50, ":" and a hash (see below).
 head = (ns + "func:" + ("" if function is None else function + ":args:"))[:50]
 shortened = re.compile(re.escape(prefix + head) + f".{{{50 - len(head)}}}:[0-9a-f]{{32}}")
@@ -343,16 +343,14 @@ first 50 characters and prints a warning instead of deleting them, because anoth
 namespace or function can share those characters.
 
 A function with a custom `key=` stores its entries at
-`t:<tenant>:<namespace, or default>:<your key>`, and one with `fast_mode=True` or
-`interop=` uses its own key shape, so the script normally leaves them alone. Evict
-them with `invalidate_cache(<args>)` or a no-argument
+`t:<tenant>:<namespace, or default>:<your key>:<16 hex>`, the last segment a hash of
+the function's `module.qualname`, and one with `fast_mode=True` or `interop=` uses
+its own key shape, so the script leaves them alone. Evict them with
+`invalidate_cache(<args>)` or a no-argument
 [whole-function invalidation](features/l1-invalidation.md#whole-function-invalidation).
-The exception is a custom entry whose stored key, `<namespace>:<your key>`, itself
-has the generated shape. That needs a custom-`key=` namespace of `ns` or `func`, or
-one starting `ns:` or `func:`, such as `ns:users` with a key
-`func:<name>:args:<64 hex>:1s`. It is the very key a generated function could
-write, so the script deletes it with namespace `users`. Do not give a custom-`key=`
-function such a namespace if it shares a database with generated keys.
+A custom key never matches the script's pattern, even when it spells a generated
+key, such as namespace `ns:users` with a key `func:<name>:args:<64 hex>:1s`: its
+16-hex last segment is not a flags segment.
 
 Flush the database (`FLUSHDB`) only if it is dedicated to cachekit.
 
