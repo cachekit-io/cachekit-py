@@ -349,3 +349,10 @@ class TestHeaderMemo:
         SerializationWrapper.wrap_prefix({"format": "msgpack", "n": 0.0}, "default")
         assert SerializationWrapper.wrap_prefix(meta, "default") == expected
         assert SerializationWrapper.wrap_prefix(meta, "default") == expected
+
+
+@pytest.mark.parametrize(("align", "offset"), [(0, 0), (-64, 0), (64, -1)])
+def test_wrap_prefix_rejects_an_impossible_alignment(align: int, offset: int) -> None:
+    """align=0 would divide by zero and a negative offset names no byte position: both are caller bugs."""
+    with pytest.raises(ValueError, match="align >= 1 and offset >= 0"):
+        SerializationWrapper.wrap_prefix({}, "arrow", align=align, offset=offset)

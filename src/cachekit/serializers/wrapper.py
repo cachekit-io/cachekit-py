@@ -182,7 +182,8 @@ class SerializationWrapper:
         ``align`` pads HEADER with trailing ASCII spaces, counted in HDR_LEN, until
         ``offset + len(prefix)`` is a multiple of ``align``; ``offset`` counts the bytes outside the
         prefix that precede the position to align. JSON allows trailing whitespace, so every reader
-        parses a padded header unchanged. The default (``align=1``) never pads.
+        parses a padded header unchanged. The default (``align=1``) never pads. Raises ``ValueError``
+        for an ``align`` below 1 or a negative ``offset``.
 
         >>> padded = SerializationWrapper.wrap_prefix({}, "arrow", align=64, offset=22)
         >>> (22 + len(padded)) % 64
@@ -202,6 +203,8 @@ class SerializationWrapper:
             prefix = _encode_prefix(serializer_name, metadata, version)
         if align == 1:
             return prefix
+        if align < 1 or offset < 0:
+            raise ValueError(f"wrap_prefix needs align >= 1 and offset >= 0, got align={align}, offset={offset}")
         pad = -(offset + len(prefix)) % align
         if not pad:
             return prefix
