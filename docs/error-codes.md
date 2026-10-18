@@ -270,9 +270,9 @@ left behind. `scan_iter` returns each key whole. A `SCAN` pattern alone cannot
 scope the delete either, because a namespace may contain `:` or glob characters:
 pattern `ns:users:*` also matches namespace `users:admin`. The script below uses
 `SCAN` only to find candidates and deletes a key only if it has exactly the shape
-cachekit generates for that namespace or function. Its last segment is the flags
-segment, `0` or `1` and then one letter or `x` and 4 hex, which no custom `key=` key
-ends in (see below).
+cachekit generates for that namespace or function: `ns:` or `func:` after the tenant
+prefix, and a last segment of `0` or `1` and then one letter or `x` and 4 hex. A
+custom `key=` key starts with 16 hex and `-` instead (see below).
 
 ```python notest
 # Needs a live Redis: set the URL, including the database number cachekit uses.
@@ -343,14 +343,14 @@ first 50 characters and prints a warning instead of deleting them, because anoth
 namespace or function can share those characters.
 
 A function with a custom `key=` stores its entries at
-`t:<tenant>:<namespace, or default>:<your key>:<16 hex>`, the last segment a hash of
-the function's `module.qualname`, and one with `fast_mode=True` or `interop=` uses
+`t:<tenant>:<16 hex>-<namespace, or default>:<your key>`, the 16 hex a hash of the
+function's `module.qualname`, and one with `fast_mode=True` or `interop=` uses
 its own key shape, so the script leaves them alone. Evict them with
 `invalidate_cache(<args>)` or a no-argument
 [whole-function invalidation](features/l1-invalidation.md#whole-function-invalidation).
 A custom key never matches the script's pattern, even when it spells a generated
-key, such as namespace `ns:users` with a key `func:<name>:args:<64 hex>:1s`: its
-16-hex last segment is not a flags segment.
+key, such as namespace `ns:users` with a key `func:<name>:args:<64 hex>:1s`: it
+starts with 16 hex and `-`, where a generated key starts `ns:` or `func:`.
 
 Flush the database (`FLUSHDB`) only if it is dedicated to cachekit.
 

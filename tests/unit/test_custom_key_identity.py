@@ -2,8 +2,9 @@
 
 Before, a ``key=`` key was ``{namespace or 'default'}:{custom_key}``: two functions whose key functions
 returned the same string read, overwrote and invalidated one entry, on every decorator with a backend,
-``@cache.secure`` included. The key is now ``{namespace or 'default'}:{custom_key}:{identity}``, where the
-identity is the 16-hex blake3 of the decorated function's ``module.qualname``.
+``@cache.secure`` included. The key is now ``{identity}-{namespace or 'default'}:{custom_key}``, where the
+identity is the 16-hex blake3 of the decorated function's ``module.qualname``. Identity first keeps every new key
+apart from every key an earlier release writes, which starts with a configured namespace.
 """
 
 from __future__ import annotations
@@ -144,7 +145,7 @@ class TestNoSharedEntries:
         f2 = cache(ttl=60, backend=backend, namespace=f"a:{id1}", key=lambda x: "x", l1_enabled=False)(f2)
 
         assert (f1(1), f2(1)) == ("f1", "f2")
-        assert set(backend.store) == {f"a:{id2}:x:{id1}", f"a:{id1}:x:{id2}"}
+        assert set(backend.store) == {f"{id1}-a:{id2}:x", f"{id2}-a:{id1}:x"}
 
 
 @pytest.mark.unit
@@ -233,11 +234,11 @@ class TestKeyShape:
         wrapped = cache(ttl=60, backend=backend, namespace="billing", key=lambda i: f"inv-{i}", l1_enabled=False)(fetch_invoice)
 
         wrapped(42)
-        assert set(backend.store) == {"billing:inv-42:f597f24f4f87a17e"}
+        assert set(backend.store) == {"f597f24f4f87a17e-billing:inv-42"}
 
     @pytest.mark.parametrize("namespace", [None, "default", "users", "ns", "nsapi", "a:b"])
-    def test_pre_fix_key_is_the_prefix(self, namespace: Optional[str]) -> None:
-        """The key grows by exactly ``:`` plus 16 lowercase hex, so CachekitIO routes it as before."""
+    def test_key_is_the_identity_then_the_pre_fix_key(self, namespace: Optional[str]) -> None:
+        """The key grows by exactly 16 lowercase hex plus ``-``, in front of the pre-fix key."""
         backend = RecordingBackend()
 
         @cache(ttl=60, backend=backend, namespace=namespace, key=lambda x: f"user:{x}", l1_enabled=False)
@@ -247,9 +248,9 @@ class TestKeyShape:
         f(7)
         (stored,) = backend.store
         old_key = f"{namespace or 'default'}:user:7"
-        assert stored.startswith(old_key + ":")
+        assert stored == f"{_identity(f)}-{old_key}"
         assert len(stored) == len(old_key) + 17
-        assert _HEX16.fullmatch(stored[len(old_key) + 1 :])
+        assert _HEX16.fullmatch(stored[:16])
 
     def test_never_equals_a_generated_key(self) -> None:
         """A custom key spelling a generated key, under ``ns:users``, is not that generated key."""
@@ -269,7 +270,7 @@ class TestKeyShape:
             return "custom"
 
         assert custom(1) == "custom"
-        assert set(backend.store) == {generated_key, f"{generated_key}:{_identity(custom)}"}
+        assert set(backend.store) == {generated_key, f"{_identity(custom)}-{generated_key}"}
         assert generated(1) == "generated"
 
 
@@ -294,30 +295,24 @@ class TestNoLegacyKey:
         assert set(backend.store) == {"default:1", new_key}
 
     @pytest.mark.parametrize("intent", ["plain", "secure"])
-    def test_mixed_release_overlap_is_closed_by_a_namespace_change(self, intent: str) -> None:
-        """The upgrade note's hazard and its fix: an earlier release's entry for ``"42:<identity>"`` is the
-        entry the new key reads for ``"42"``, and only a new namespace keeps the two releases apart."""
+    @pytest.mark.parametrize("namespace", ["users", "a:b"])
+    def test_no_key_an_earlier_release_writes_is_read(self, intent: str, namespace: str) -> None:
+        """An earlier release writes ``{namespace}:{key}`` for any key a caller can shape, in this namespace or an
+        enclosing one (``a`` for ``a:b``). Every key this release touches starts with the identity, so a crafted
+        argument on an earlier-release process can never plant an entry this release reads."""
         backend = RecordingBackend()
 
         def lookup(record_id: str) -> str:
             return f"record {record_id}"
 
         identity = _identity(lookup)
+        for crafted in ("42", f"42:{identity}", f"{identity}-{namespace}:42"):
+            backend.store[f"{namespace}:{crafted}"] = b"planted by an earlier release"
+        upgraded = _decorator(intent, backend, namespace, False)(lookup)
 
-        def earlier_release(record_id: str) -> str:
-            return f"record 42:{identity}"
-
-        # The earlier release's write for lookup(f"42:{identity}") lands at users:42:<identity>, which is
-        # where this release stores lookup's "42" entry; write that value there, sealed for that key.
-        earlier_release.__module__, earlier_release.__qualname__ = lookup.__module__, lookup.__qualname__
-        _decorator(intent, backend, "users", False)(earlier_release)("42")
-        assert set(backend.store) == {f"users:42:{identity}"}
-
-        upgraded = _decorator(intent, backend, "users", False)(lookup)
-        moved = _decorator(intent, backend, "users-v2", False)(lookup)
-
-        assert upgraded("42") == f"record 42:{identity}"  # served the other argument's value
-        assert moved("42") == "record 42"
+        assert upgraded("42") == "record 42"
+        assert backend.reads and all(key.startswith(f"{identity}-") for key in backend.reads)
+        assert {key for key in backend.store if not key.startswith(f"{namespace}:")} == {f"{identity}-{namespace}:42"}
 
     def test_no_args_invalidation_drains_tracked_pre_fix_keys(self) -> None:
         """The registry set name did not move, so the migration's early-cleanup step reaches old keys."""

@@ -142,7 +142,7 @@ class DecoratorConfig:
                            Set to False for @cache.minimal (speed-first, no integrity guarantee)
         key: Custom key function for complex types. Receives (*args, **kwargs) and returns str.
              Use for numpy arrays, DataFrames and other arguments the default key cannot hash.
-             The stored key is "{namespace or 'default'}:{returned str}:{identity}", where identity
+             The stored key is "{identity}-{namespace or 'default'}:{returned str}", where identity
              is 16 hex of the blake3 hash of the function's module.qualname, so functions with
              different module.qualnames never share an entry. Functions sharing one (closures from
              one factory, lambdas, __main__ in two scripts) still do whenever "{namespace}:{returned str}"

@@ -588,8 +588,8 @@ The cache key is cleartext too. By default it carries the namespace (when set), 
 `module.qualname` and an unkeyed, unsalted blake2b-256 hash of the arguments
 (`[ns:{ns}:]func:{mod.fn}:args:{64-hex}:{flags}`), so over a small or guessable argument space the
 hash can be enumerated offline. A custom `key=` function is not hashed: its return value becomes
-the key verbatim, between the namespace and the function's identity
-(`{namespace}:{value}:{identity}`, with `default` when no namespace is set and `{identity}` the
+the key verbatim, after the function's identity and the namespace
+(`{identity}-{namespace}:{value}`, with `default` when no namespace is set and `{identity}` the
 16-hex blake3 hash of the function's `module.qualname`), so never return raw identifiers or
 personal data from it — derive them with an HMAC whose key never reaches the backend.
 
