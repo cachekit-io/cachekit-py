@@ -69,6 +69,8 @@ serializer = ArrowSerializer(return_format="polars")
 serializer = ArrowSerializer(return_format="arrow")
 ```
 
+A pandas result accepts in-place edits after a backend hit (`df.loc[0, "a"] = 1`), exactly as the uncached result does: no column is a read-only view of the cached bytes. A frame that fits one record batch (about 8 MiB) costs one extra copy of its numeric, datetime and categorical columns for this; larger frames do not.
+
 **Example with polars:**
 ```python notest
 import polars as pl
