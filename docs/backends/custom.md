@@ -245,7 +245,7 @@ def test_custom_backend():
 
 - [Backend Guide](README.md) — Backend comparison and resolution priority
 - [CachekitIO Backend](cachekitio.md) — Managed SaaS backend (no custom implementation needed)
-- [Redis Backend](redis.md) — Default production backend
+- [Redis Backend](redis.md) — Recommended production backend
 - [API Reference](../api-reference.md) — Decorator parameters
 
 ---

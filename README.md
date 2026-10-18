@@ -60,7 +60,23 @@ Or with [uv][uv-url] (recommended):
 uv add cachekit
 ```
 
-### Setup (choose a backend)
+### Setup
+
+With nothing configured, `@cache` caches in L1, in process, like `lru_cache`: no backend,
+no connection attempt, no warning.
+
+```python
+from cachekit import cache
+
+@cache  # nothing configured: L1-only, per process
+def expensive_api_call(user_id: int):
+    return fetch_user_data(user_id)
+```
+
+An L1-only cache is not shared between processes, holds values by reference, and is chosen
+at the function's first call, so configure a backend before then.
+
+### Choose a backend
 
 cachekit exposes one decorator API over a pluggable backend abstraction. Pick the
 backend that fits your infrastructure — they're peers behind the same `@cache` API:
@@ -70,7 +86,7 @@ backend that fits your infrastructure — they're peers behind the same `@cache`
 | Redis | Self-hosted, full control | `REDIS_URL` / `CACHEKIT_REDIS_URL` |
 | CachekitIO | Managed, zero-ops (beta) | `CACHEKIT_API_KEY` |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
-| File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / `backend=None` |
+| File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / nothing (or `backend=None`) |
 
 ```bash
 # Run Redis locally or use your existing infrastructure
@@ -80,13 +96,16 @@ export REDIS_URL="redis://localhost:6379"
 ```python
 from cachekit import cache
 
-@cache  # Auto-detects backend (defaults to Redis at localhost)
+@cache  # REDIS_URL set: L1 + Redis, shared across processes
 def expensive_api_call(user_id: int):
     return fetch_user_data(user_id)
 ```
 
-> [!TIP]
-> No Redis? No worries! Use `@cache(backend=None)` for L1-only in-memory caching, like `lru_cache`, but with all the bells and whistles.
+> [!WARNING]
+> Earlier releases connected to `redis://localhost:6379` when nothing was configured. To keep
+> that Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`). `@cache.secure`,
+> `encryption=True` and `interop=` still need a backend and still fall back to localhost Redis;
+> see [Backend Resolution Priority](docs/backends/README.md#backend-resolution-priority).
 
 ### More Backends
 
@@ -469,7 +488,8 @@ info = expensive_func.cache_info()
 # Backend selection: set exactly ONE of CACHEKIT_REDIS_URL, CACHEKIT_API_KEY,
 # CACHEKIT_MEMCACHED_SERVERS, CACHEKIT_FILE_CACHE_DIR. Two or more is a ConfigurationError at
 # first call, and decorators relying on env auto-detection run uncached (docs/backends/README.md).
-# REDIS_URL is only a fallback and never conflicts.
+# REDIS_URL is only a fallback and never conflicts. With none of them set, decorators cache
+# L1-only, in process (encrypted and interop decorators still use localhost Redis).
 
 # Redis Connection (priority: CACHEKIT_REDIS_URL > REDIS_URL)
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)

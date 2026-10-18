@@ -29,6 +29,8 @@ from cachekit.decorators import wrapper as wrapper_module  # noqa: E402
 from cachekit.reliability import async_metrics  # noqa: E402
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("backend_configured")  # tests stand in for backend resolution
+
 _STATES = ("CLOSED", "OPEN", "HALF_OPEN")
 _TIMEOUT = 1.0
 _PAST_TIMEOUT = timedelta(seconds=_TIMEOUT + 1)

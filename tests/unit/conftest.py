@@ -36,3 +36,13 @@ def live_breakers(monkeypatch: pytest.MonkeyPatch) -> list[CircuitBreaker]:
 
     monkeypatch.setattr(orchestrator_module, "CircuitBreaker", spy)
     return captured
+
+
+@pytest.fixture
+def backend_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mark a backend as configured for tests that stand in for its resolution (_resolve_lazy_backend).
+
+    With nothing configured a plaintext decorator runs L1-only and never resolves a backend, so a test
+    that patches the resolver must say a backend is configured, or its stand-in is never asked.
+    """
+    monkeypatch.setenv("REDIS_URL", "redis://configured.invalid:6379")

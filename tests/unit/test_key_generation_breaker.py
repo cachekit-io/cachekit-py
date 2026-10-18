@@ -27,6 +27,8 @@ from cachekit.decorators import orchestrator as orchestrator_module
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
 
+pytestmark = pytest.mark.usefixtures("backend_configured")  # tests stand in for backend resolution
+
 _DEFAULTS = CircuitBreakerConfig()
 _PAST_TIMEOUT = timedelta(seconds=_DEFAULTS.timeout_seconds + 1)
 _EPOCH = 1_000_000.0  # Frozen wall clock; any fixed instant works

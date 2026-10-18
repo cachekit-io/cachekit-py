@@ -17,7 +17,7 @@
 Are you caching in Python?
 │
 ├─ Single process, no Redis needed? → @cache(backend=None) [L1-only]
-├─ Multiple pods, need distributed cache? → @cache [L1+L2, out-of-the-box]
+├─ Multiple pods, need distributed cache? → @cache with REDIS_URL set [L1+L2]
 ├─ Need to encrypt cached data? → @cache.secure [AES-256-GCM]
 ├─ Building libraries/packages? → cachekit batteries included
 │
@@ -179,7 +179,7 @@ def compute(x):
 
 # Staging: Add Redis (one env var, zero code change)
 # REDIS_URL=redis://localhost:6379
-# @cache automatically uses Redis when available
+# @cache uses Redis once REDIS_URL is set; with nothing set it is L1-only
 
 # Production: Add encryption (one parameter)
 @cache.secure(ttl=300)  # Enables AES-256-GCM
