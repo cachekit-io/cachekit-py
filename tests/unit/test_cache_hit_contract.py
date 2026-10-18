@@ -1,8 +1,8 @@
 """A cache hit must behave like the value that was cached.
 
 Every round trip elsewhere in the suite asserts equality, and equality passes on a read-only
-DataFrame: a single-batch Arrow read comes back read-only from every L2 backend until #582 lands,
-while ``backend=None`` returns a writable frame, so the defect shows up in production and not in
+DataFrame: a single-batch Arrow read once came back read-only from every L2 backend (#582) while
+``backend=None`` returned a writable frame, so the defect showed up in production and not in
 development. This contract is checked on the second and third calls, which are hits:
 
 - the hit has the cached value's type and equals it exactly;
@@ -45,12 +45,6 @@ pytestmark = pytest.mark.unit
 BATCH_BYTES = 16 * 1024
 ROWS_MULTI_BATCH = 2_000
 
-# Remove when cachekit-io/cachekit-py#582 merges: strict, so the cases fail the moment
-# the fix lands and this marker is forgotten.
-READ_ONLY_ARROW_FRAME = pytest.mark.xfail(
-    strict=True, raises=ValueError, reason="#582: a single-batch Arrow read returns read-only pandas columns"
-)
-
 
 def _frame(rows: int) -> pd.DataFrame:
     """int64, float64, datetime64[ns], categorical, string and bool columns; row 0's category is "red"."""
@@ -83,7 +77,8 @@ def _uncompressed_arrow(monkeypatch: pytest.MonkeyPatch) -> str:
     takes the mmap read (``CacheSerializationHandler.supports_mmap_read``).
     """
     monkeypatch.setenv("CACHEKIT_ARROW_COMPRESSION", "none")
-    # "arrow" resolves its codec once, then both caches hold the instance; the decorator reads the second.
+    # "arrow" resolves its codec once and is cached twice: the decorator's instance cache, and
+    # get_serializer's cache, which fills the first on a miss. Both must be emptied.
     monkeypatch.setattr(serializers, "_serializer_cache", {})
     monkeypatch.setattr(cache_handler, "_serializer_instance_cache", {})
     reset_settings()
@@ -100,7 +95,6 @@ SERIALIZERS: dict[str, tuple[Callable[[pytest.MonkeyPatch], Any], tuple[str, ...
     "ArrowSerializer(compression=None)": (lambda _: ArrowSerializer(compression=None), FRAMES),
     "orjson": (lambda _: "orjson", ("nested",)),
 }
-ARROW_ROUTED = {"auto", "arrow", "arrow-uncompressed", "ArrowSerializer()", "ArrowSerializer(compression=None)"}
 MMAP_READ = {"arrow", "arrow-uncompressed"}  # the spellings supports_mmap_read() admits
 
 
@@ -131,9 +125,7 @@ def _cases() -> list[Any]:
             backends = (*backends, "none")
         for value in values:
             for backend in backends:
-                read_only = value == "frame-one-batch" and serializer in ARROW_ROUTED and backend != "none"
-                marks = [READ_ONLY_ARROW_FRAME] if read_only else []
-                cases.append(pytest.param(serializer, value, backend, marks=marks, id=f"{serializer}-{value}-{backend}"))
+                cases.append(pytest.param(serializer, value, backend, id=f"{serializer}-{value}-{backend}"))
     return cases
 
 

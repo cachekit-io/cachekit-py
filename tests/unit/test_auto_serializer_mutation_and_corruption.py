@@ -216,13 +216,7 @@ class TestDeserializedArraysAreWritable:
         "serializer",
         [
             pytest.param(_no_arrow, id="columnar"),
-            pytest.param(
-                AutoSerializer,
-                id="arrow",
-                marks=pytest.mark.xfail(
-                    strict=True, raises=ValueError, reason="#582: a single-batch Arrow read returns read-only pandas columns"
-                ),
-            ),
+            pytest.param(AutoSerializer, id="arrow"),
         ],
     )
     def test_dataframe_numeric_column_writable(self, serializer: Callable[[], AutoSerializer]) -> None:
