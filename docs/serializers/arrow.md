@@ -71,6 +71,8 @@ serializer = ArrowSerializer(return_format="arrow")
 
 A pandas result accepts in-place edits after a backend hit (`df.loc[0, "a"] = 1`), exactly as the uncached result does: no column is a read-only view of the cached bytes. A frame that fits one record batch (about 8 MiB) costs one extra copy of its numeric, datetime and categorical columns for this; larger frames do not.
 
+With `serializer="arrow"`, `CACHEKIT_ARROW_COMPRESSION=none` and the File backend, a hit reads the stored file through a memory map. Parts of the result that pandas never edits in place can still reference that map: the categories of a numeric or datetime categorical, a `CategoricalIndex`, and Arrow-backed columns such as pandas 3's default strings. The map, and the disk space of a cache file deleted in the meantime, is released when the result is.
+
 **Example with polars:**
 ```python notest
 import polars as pl

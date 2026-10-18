@@ -8,6 +8,7 @@ development (``backend=None``). Same contract as AutoSerializer's numpy paths (c
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 from unittest.mock import patch
 
@@ -102,7 +103,8 @@ def test_mmap_hit_leaves_no_mapping_of_the_cache_file(tmp_path: Path, monkeypatc
     used to keep the cache file mapped after the call, which the handler's close() cannot undo.
 
     No string column: on pandas 3 its default ``str`` dtype is Arrow-backed, so it references the
-    payload by design. That is immutable and safe, since the mapping is released when the frame is.
+    payload by design. Immutable buffers like that may keep the mapping until the frame is released;
+    the next test pins that lifetime.
     """
     monkeypatch.setattr(_get_cached_serializer_instance("arrow"), "compression", None)
     backend = FileBackend(FileBackendConfig(cache_dir=tmp_path))
@@ -117,6 +119,33 @@ def test_mmap_hit_leaves_no_mapping_of_the_cache_file(tmp_path: Path, monkeypatc
     get_buffer.assert_called_once()  # the mmap path served the hit
     assert _cache_maps(tmp_path) == []
     pd.testing.assert_frame_equal(out, _frame().drop(columns="s"))
+
+
+@pytest.mark.skipif(not Path("/proc/self/maps").exists(), reason="reads /proc/self/maps (Linux)")
+def test_immutable_buffers_hold_the_mapping_only_while_the_result_lives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The categories of a numeric categorical and a CategoricalIndex stay zero-copy views of the
+    payload (immutable in pandas), as do Arrow-backed columns. The result stays editable, and the
+    mapping, with the disk space of a cache file deleted meanwhile, is released with the result."""
+    monkeypatch.setattr(_get_cached_serializer_instance("arrow"), "compression", None)
+    backend = FileBackend(FileBackendConfig(cache_dir=tmp_path))
+
+    def frame() -> pd.DataFrame:
+        return pd.DataFrame({"nc": pd.Categorical([1, 2, 1]), "s": ["a", "b", "c"]}, index=pd.CategoricalIndex([10, 20, 30]))
+
+    @cache(backend=backend, serializer="arrow", l1_enabled=False)
+    def load() -> pd.DataFrame:
+        return frame()
+
+    load()
+    out = load()
+    out.loc[out.index[0], "nc"] = 2  # editable whatever still references the payload
+    expected = frame()
+    expected.loc[expected.index[0], "nc"] = 2
+    pd.testing.assert_frame_equal(out, expected)
+
+    del out
+    gc.collect()
+    assert _cache_maps(tmp_path) == []
 
 
 def test_multi_batch_frame_skips_the_copy(monkeypatch: pytest.MonkeyPatch) -> None:
