@@ -270,9 +270,9 @@ left behind. `scan_iter` returns each key whole. A `SCAN` pattern alone cannot
 scope the delete either, because a namespace may contain `:` or glob characters:
 pattern `ns:users:*` also matches namespace `users:admin`. The script below uses
 `SCAN` only to find candidates and deletes a key only if it has exactly the shape
-cachekit generates for that namespace or function. Shape is all a key carries, so
-the script cannot tell a generated key from a custom one of the same shape (see
-below).
+cachekit generates for that namespace or function, starting `ns:` or `func:` after
+the tenant prefix. A custom `key=` key starts with 16 hex and `-` instead, so the
+script never matches one (see below).
 
 ```python notest
 # Needs a live Redis: set the URL, including the database number cachekit uses.
@@ -343,16 +343,11 @@ first 50 characters and prints a warning instead of deleting them, because anoth
 namespace or function can share those characters.
 
 A function with a custom `key=` stores its entries at
-`t:<tenant>:<namespace, or default>:<your key>`, and one with `fast_mode=True` or
-`interop=` uses its own key shape, so the script normally leaves them alone. Evict
-them with `invalidate_cache(<args>)` or a no-argument
+`t:<tenant>:<16 hex>-<namespace, or default>:<your key>`, the 16 hex a hash of the
+function's `module.qualname`, and one with `fast_mode=True` or `interop=` uses
+its own key shape, so the script leaves them alone. Evict them with
+`invalidate_cache(<args>)` or a no-argument
 [whole-function invalidation](features/l1-invalidation.md#whole-function-invalidation).
-The exception is a custom entry whose stored key, `<namespace>:<your key>`, itself
-has the generated shape. That needs a custom-`key=` namespace of `ns` or `func`, or
-one starting `ns:` or `func:`, such as `ns:users` with a key
-`func:<name>:args:<64 hex>:1s`. It is the very key a generated function could
-write, so the script deletes it with namespace `users`. Do not give a custom-`key=`
-function such a namespace if it shares a database with generated keys.
 
 Flush the database (`FLUSHDB`) only if it is dedicated to cachekit.
 

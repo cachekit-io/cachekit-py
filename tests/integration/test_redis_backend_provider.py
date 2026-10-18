@@ -7,7 +7,6 @@ with a real Redis instance.
 import time
 
 import pytest
-import redis
 
 from cachekit.backends.redis.provider import (
     PerRequestRedisBackend,
@@ -177,9 +176,9 @@ class TestRedisBackendProviderTimeout:
 class TestRedisBackendProviderFactory:
     """Test RedisBackendProvider factory pattern."""
 
-    def test_provider_creates_singleton_pool(self):
+    def test_provider_creates_singleton_pool(self, isolated_redis_url):
         """Test provider creates a singleton connection pool."""
-        provider = RedisBackendProvider("redis://localhost:6379", pool_size=10)
+        provider = RedisBackendProvider(isolated_redis_url, pool_size=10)
 
         # Pool should be created once
         assert provider._pool is not None
@@ -201,9 +200,9 @@ class TestRedisBackendProviderFactory:
 
         provider.close()
 
-    def test_provider_requires_tenant_context(self):
+    def test_provider_requires_tenant_context(self, isolated_redis_url):
         """Test provider fails fast if tenant context not set."""
-        provider = RedisBackendProvider("redis://localhost:6379")
+        provider = RedisBackendProvider(isolated_redis_url)
 
         tenant_context.set(None)  # no reset: this test needs the missing-tenant path
 
@@ -212,9 +211,9 @@ class TestRedisBackendProviderFactory:
 
         provider.close()
 
-    def test_provider_closeables(self):
+    def test_provider_closeables(self, isolated_redis_url):
         """Test provider cleanup with close()."""
-        provider = RedisBackendProvider("redis://localhost:6379")
+        provider = RedisBackendProvider(isolated_redis_url)
 
         # Should not raise error
         provider.close()
@@ -271,22 +270,26 @@ class TestRedisBackendProviderErrorRecovery:
 
 
 @pytest.fixture
-def redis_client(skip_if_no_redis):
-    """Get a Redis client for integration tests."""
-    client = redis.Redis(host="localhost", port=6379, db=15)
-    # Flush test database before test
-    client.flushdb()
-    yield client
-    # Cleanup after test
-    try:
-        client.flushdb()
-        client.close()
-    except Exception:
-        pass
+def redis_client(redis_isolated):
+    """The suite's isolated Redis (pytest-redis flushes it after each test), never a developer's own server."""
+    return redis_isolated
 
 
 @pytest.fixture
-def env_resolved_redis(redis_isolated, monkeypatch):
+def isolated_redis_url(redis_isolated):
+    """URL of the isolated Redis, for code under test that builds its own connection pool."""
+    kwargs = redis_isolated.connection_pool.connection_kwargs
+    db = kwargs.get("db", 0)
+    # pytest-redis spawns a unix-socket server locally; CI points at a TCP service.
+    if "path" in kwargs:
+        return f"unix://{kwargs['path']}?db={db}"
+    host = kwargs["host"]
+    host = f"[{host}]" if ":" in host else host  # an IPv6 literal needs brackets in a URL authority
+    return f"redis://{host}:{kwargs['port']}/{db}"
+
+
+@pytest.fixture
+def env_resolved_redis(redis_isolated, isolated_redis_url, monkeypatch):
     """Route the decorator's backend resolution through the production DefaultBackendProvider.
 
     The autouse DI fixture installs a test provider; this swaps in the real one, pointed at
@@ -297,13 +300,9 @@ def env_resolved_redis(redis_isolated, monkeypatch):
     from cachekit.config.decorator import set_default_backend
     from cachekit.di import DIContainer
 
-    kwargs = redis_isolated.connection_pool.connection_kwargs
-    db = kwargs.get("db", 0)
-    # pytest-redis spawns a unix-socket server locally; CI points at a TCP service.
-    url = f"unix://{kwargs['path']}?db={db}" if "path" in kwargs else f"redis://{kwargs['host']}:{kwargs['port']}/{db}"
     for var in ("CACHEKIT_API_KEY", "CACHEKIT_MEMCACHED_SERVERS", "CACHEKIT_FILE_CACHE_DIR"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("CACHEKIT_REDIS_URL", url)
+    monkeypatch.setenv("CACHEKIT_REDIS_URL", isolated_redis_url)
     set_default_backend(None)
     DIContainer()._singletons[BackendProviderInterface] = DefaultBackendProvider()
     return redis_isolated

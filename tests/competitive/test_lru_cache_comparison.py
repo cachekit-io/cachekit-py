@@ -18,6 +18,28 @@ import pytest
 from cachekit.decorators import cache
 
 
+class _DictBackend:
+    """In-process byte store: puts a real serialize/deserialize round trip behind the decorator."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, bytes] = {}
+
+    def get(self, key: str) -> bytes | None:
+        return self._store.get(key)
+
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        self._store[key] = value
+
+    def delete(self, key: str) -> bool:
+        return self._store.pop(key, None) is not None
+
+    def exists(self, key: str) -> bool:
+        return key in self._store
+
+    def health_check(self) -> tuple[bool, dict]:
+        return True, {}
+
+
 class TestLruCacheComparison:
     """Validate competitive claims about lru_cache vs cachekit."""
 
@@ -39,35 +61,32 @@ class TestLruCacheComparison:
 
     def test_cachekit_type_preservation_serialized(self):
         """
-        CLAIM: cachekit preserves tuple types even after Redis serialization.
+        CLAIM: once a value goes through a backend, the serializer decides whether a tuple survives.
 
-        STATUS: VALIDATION FAILURE - REQUIRES FIX
+        The default StandardSerializer returns a tuple as a list, as MessagePack does, so that other
+        language SDKs can read the entry. serializer="auto" keeps the tuple through its type markers,
+        at the cost of entries that only Python reads. Both match docs/comparison.md.
 
-        Current behavior: cachekit converts tuples to lists via JSON (incorrect)
-        Expected behavior: MessagePack should preserve tuple types
-
-        This is a validation-first finding. The requirement states cachekit should
-        preserve tuples through MessagePack serialization. However, current
-        implementation converts tuples to lists like JSON-based competitors.
-
-        TODO: Fix MessagePack serialization to preserve tuple types
+        The backend is explicit: this directory's conftest removes the suite's Redis wiring, so a
+        decorator without backend= would run L1-only (raw objects, tuple kept) wherever REDIS_URL
+        is unset, and the result would depend on the machine.
         """
 
-        @cache(ttl=300)
+        @cache(ttl=300, backend=_DictBackend())
         def get_tuple(x: int) -> tuple[int, str]:
             return (x, f"value_{x}")
 
-        # First call - cache miss
-        result1 = get_tuple(1)
-        assert result1 == (1, "value_1"), "Value mismatch"
+        @cache(ttl=300, backend=_DictBackend(), serializer="auto")
+        def get_tuple_auto(x: int) -> tuple[int, str]:
+            return (x, f"value_{x}")
 
-        # Second call - cache hit from L2 (via serialization)
-        # KNOWN ISSUE: Currently converts tuples to lists (like JSON)
-        result2 = get_tuple(1)
-        assert result2 == [1, "value_1"], "Tuple converted to list (bug to fix)"
-        # Once fixed, should assert:
-        # assert isinstance(result2, tuple)
-        # assert result2 == (1, "value_1")
+        assert get_tuple(1) == (1, "value_1")  # miss: the function's own return value
+        assert get_tuple(1) == [1, "value_1"]  # hit: deserialized by StandardSerializer
+
+        assert get_tuple_auto(1) == (1, "value_1")
+        hit = get_tuple_auto(1)
+        assert isinstance(hit, tuple)
+        assert hit == (1, "value_1")
 
     def test_lru_cache_no_ttl_support(self):
         """
