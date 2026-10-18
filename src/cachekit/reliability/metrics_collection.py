@@ -35,7 +35,7 @@ class MetricsCollector:
     Examples:
         Create and use a counter:
 
-        >>> counter = MetricsCollector("test_counter")
+        >>> counter = MetricsCollector("doctest_counter")
         >>> counter.inc()
         >>> counter.get()
         1.0
@@ -45,21 +45,21 @@ class MetricsCollector:
 
         Use with labels:
 
-        >>> counter = MetricsCollector("labeled_counter")
+        >>> counter = MetricsCollector("doctest_labeled_counter")
         >>> counter.inc({"operation": "get", "status": "success"})
         >>> counter.get({"operation": "get", "status": "success"})
         1.0
 
         Set gauge value:
 
-        >>> gauge = MetricsCollector("test_gauge")
+        >>> gauge = MetricsCollector("doctest_gauge")
         >>> gauge.set(42.0)
         >>> gauge.get()
         42.0
 
         Chain with labels() method:
 
-        >>> counter = MetricsCollector("chained")
+        >>> counter = MetricsCollector("doctest_chained")
         >>> counter.labels(operation="set").inc()
         >>> counter.get({"operation": "set"})
         1.0
