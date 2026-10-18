@@ -66,6 +66,11 @@ source, if the key is not an RFC 6750 bearer token, if `CACHEKIT_API_URL` fails 
 you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
 To cache through another backend, use `@cache.production(backend=...)`.
 
+A function with a custom `key=` is filed in the service's `default` namespace, an open write space,
+whatever its `namespace=`. For a `key=` namespace of `ns` or `nsapi` that is a change from earlier
+releases, and any API key that can reach `default` can read, overwrite, delete or lock those entries:
+see [CachekitIO files every custom key in its `default` namespace](../features/l1-invalidation.md#upgrading-custom-key-keys-carry-the-functions-identity).
+
 A bearer token carries only `A-Z a-z 0-9 - . _ ~ + /`, then any number of trailing `=`. So cachekit
 rejects a key with whitespace (usually a trailing newline from a secrets file), a byte-order mark (from
 a file saved on Windows), a control character or a non-ASCII letter. It never strips the key, and the

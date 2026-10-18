@@ -270,9 +270,9 @@ left behind. `scan_iter` returns each key whole. A `SCAN` pattern alone cannot
 scope the delete either, because a namespace may contain `:` or glob characters:
 pattern `ns:users:*` also matches namespace `users:admin`. The script below uses
 `SCAN` only to find candidates and deletes a key only if it has exactly the shape
-cachekit generates for that namespace or function: `ns:` or `func:` after the tenant
-prefix, and a last segment of `0` or `1` and then one letter or `x` and 4 hex. A
-custom `key=` key starts with 16 hex and `-` instead (see below).
+cachekit generates for that namespace or function, starting `ns:` or `func:` after
+the tenant prefix. A custom `key=` key starts with 16 hex and `-` instead, so the
+script never matches one (see below).
 
 ```python notest
 # Needs a live Redis: set the URL, including the database number cachekit uses.
@@ -301,7 +301,7 @@ function = None
 # The key builder replaces spaces, \r and \n with _.
 ns = "" if not namespace else "ns:" + re.sub(r"[ \r\n]", "_", namespace) + ":"
 fn = r"[A-Za-z0-9_.]+" if function is None else re.escape(function)
-generated = re.compile(re.escape(prefix + ns + "func:") + fn + r":args:[0-9a-f]{64}:[01](?:x[0-9a-f]{4}|[a-z])")
+generated = re.compile(re.escape(prefix + ns + "func:") + fn + r":args:[0-9a-f]{64}:[^:]+")
 # A key over 250 characters is stored as its first 50, ":" and a hash (see below).
 head = (ns + "func:" + ("" if function is None else function + ":args:"))[:50]
 shortened = re.compile(re.escape(prefix + head) + f".{{{50 - len(head)}}}:[0-9a-f]{{32}}")
@@ -348,9 +348,6 @@ function's `module.qualname`, and one with `fast_mode=True` or `interop=` uses
 its own key shape, so the script leaves them alone. Evict them with
 `invalidate_cache(<args>)` or a no-argument
 [whole-function invalidation](features/l1-invalidation.md#whole-function-invalidation).
-A custom key never matches the script's pattern, even when it spells a generated
-key, such as namespace `ns:users` with a key `func:<name>:args:<64 hex>:1s`: it
-starts with 16 hex and `-`, where a generated key starts `ns:` or `func:`.
 
 Flush the database (`FLUSHDB`) only if it is dedicated to cachekit.
 

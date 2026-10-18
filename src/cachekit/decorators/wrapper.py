@@ -1506,8 +1506,9 @@ def create_cache_wrapper(
             # The function's 16-hex identity goes first, at a fixed width no namespace or key can shift, so
             # two functions whose key functions return the same string never share an entry. First also keeps
             # every key apart from the pre-fix "{namespace}:{key}" keys an earlier release writes, which start
-            # with a configured namespace: a crafted argument cannot plant one. Generated keys start ns: or
-            # func:, so this key never equals one. CachekitIO routes it to its default namespace.
+            # with a configured namespace: a crafted argument cannot plant one (unless a plain RedisBackend
+            # sharing the database uses namespace t or t:*, which can spell a tenant-scoped key). Generated
+            # keys start ns: or func:, so this key never equals one. CachekitIO files it in its default namespace.
             return f"{_registry_hash}-{namespace or 'default'}:{custom_key}"
         # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.
         # Minimal key generation - no string formatting overhead (10-50μs savings)

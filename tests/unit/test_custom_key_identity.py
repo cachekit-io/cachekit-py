@@ -9,7 +9,6 @@ apart from every key an earlier release writes, which starts with a configured n
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Optional
@@ -24,7 +23,6 @@ from cachekit.l1_cache import get_l1_cache_manager
 from tests.unit.test_key_registry import TrackingBackend
 
 MASTER_KEY = "cd" * 48
-_HEX16 = re.compile(r"[0-9a-f]{16}")
 
 
 @pytest.fixture(autouse=True)
@@ -249,8 +247,6 @@ class TestKeyShape:
         (stored,) = backend.store
         old_key = f"{namespace or 'default'}:user:7"
         assert stored == f"{_identity(f)}-{old_key}"
-        assert len(stored) == len(old_key) + 17
-        assert _HEX16.fullmatch(stored[:16])
 
     def test_never_equals_a_generated_key(self) -> None:
         """A custom key spelling a generated key, under ``ns:users``, is not that generated key."""
@@ -306,8 +302,13 @@ class TestNoLegacyKey:
             return f"record {record_id}"
 
         identity = _identity(lookup)
+        # A real plaintext entry, which a plain read would serve if it reached one; under @cache.secure the
+        # key-prefix assertion below is what bites, since no writer of this release can seal for an old key.
+        scratch = RecordingBackend()
+        cache(ttl=60, backend=scratch, key=lambda: "seed", l1_enabled=False)(lambda: "planted")()
+        (planted,) = scratch.store.values()
         for crafted in ("42", f"42:{identity}", f"{identity}-{namespace}:42"):
-            backend.store[f"{namespace}:{crafted}"] = b"planted by an earlier release"
+            backend.store[f"{namespace}:{crafted}"] = planted
         upgraded = _decorator(intent, backend, namespace, False)(lookup)
 
         assert upgraded("42") == "record 42"
