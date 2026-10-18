@@ -1,6 +1,6 @@
 # pyright: reportOptionalMemberAccess=false
 # pyright: reportInvalidTypeForm=false
-"""Apache Arrow IPC serializer for zero-copy DataFrame caching.
+"""Apache Arrow IPC serializer for DataFrame caching.
 
 This module provides ArrowSerializer for high-performance DataFrame serialization
 using Apache Arrow's Inter-Process Communication (IPC) format.
@@ -133,6 +133,22 @@ class _HashingSink:
         return self._hasher.digest()
 
 
+def _views_of(table: pa.Table, source: pa.Buffer) -> bool:
+    """True iff every data buffer of ``table`` points into ``source``: an uncompressed IPC read.
+
+    A compressed read decompresses into new buffers. Checking every buffer, not the first, matters: a
+    codec may store a buffer that does not shrink raw, and the reader then slices that one from ``source``.
+    """
+    lo, hi = source.address, source.address + source.size
+    return all(
+        lo <= buf.address < hi
+        for column in table.columns
+        for chunk in column.chunks
+        for buf in chunk.buffers()
+        if buf is not None and buf.size
+    )
+
+
 class ArrowSerializer:
     """Apache Arrow IPC serializer for memory-efficient DataFrame caching with xxHash3-64 integrity.
 
@@ -155,6 +171,13 @@ class ArrowSerializer:
     - Deserialize: the envelope is sliced with a memoryview (no full-body copy), wrapped via
       pa.py_buffer (zero-copy), and Arrow->pandas conversion uses self_destruct + split_blocks
       to free Arrow buffers during conversion. zstd is decompressed transparently by the reader.
+    - Plaintext File-backend hits (POSIX) read over a memory map of the cache file ("arrow" and
+      "polars" on Python 3.13+ only, where a held mapping costs no file descriptor). A compressed
+      payload is decompressed out of the map; an uncompressed one stays zero-copy per return_format:
+      "arrow" returns a table whose buffers all alias the mapping (no heap copy); "polars" keeps
+      numeric, bool and temporal columns zero-copy and copies strings into polars' layout; "pandas"
+      copies once into a writable DataFrame. A zero-copy result keeps the mapping alive until it
+      is garbage-collected.
 
     Use cases:
     - Data science pipelines (pandas/polars DataFrames)
@@ -203,7 +226,8 @@ class ArrowSerializer:
                 - "pandas": Convert to pandas.DataFrame (default). Every column accepts in-place
                   edits, as on an uncached result: none is a read-only view of the cached bytes.
                 - "polars": Convert to polars.DataFrame
-                - "arrow": Return pyarrow.Table (zero-copy, no conversion)
+                - "arrow": Return pyarrow.Table (no conversion; zero-copy on an uncompressed
+                  File-backend hit on Python 3.13+)
             enable_integrity_checking: Retained for API compatibility. The 8-byte xxHash3-64
                 checksum is now ALWAYS written and validated (silently returning corrupted
                 DataFrames is unacceptable, and 8 bytes is negligible), so this flag no longer
@@ -211,10 +235,10 @@ class ArrowSerializer:
             compression: Arrow IPC compression codec.
                 - "auto" (default): use the CACHEKIT_ARROW_COMPRESSION setting (itself "zstd" by default)
                 - "zstd" / "lz4": compress the payload (smaller wire/L1; must be decompressed on read)
-                - None or "none": store uncompressed Arrow IPC. Lets the File backend serve plaintext
-                  DataFrame reads (returned as pandas) via a zero-copy mmap — low steady-state read
-                  RSS (~0.32x), though peak is transiently higher from checksum verification + pandas
-                  materialization — at the cost of a larger stored payload. No effect on wire backends.
+                - None or "none": store uncompressed Arrow IPC, at the cost of a larger stored payload.
+                  Lets plaintext File-backend hits stay zero-copy (see the memory profile above);
+                  the checksum check still reads every page once. On wire backends it only skips
+                  the codec.
 
         Raises:
             ValueError: If return_format or compression is not a valid option
@@ -325,8 +349,7 @@ class ArrowSerializer:
             # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
             # payload). Batches are sized by actual bytes (<= 8 MiB), not a uniform row-count
             # estimate, so the bound holds for skewed/wide frames too (#161). compression=None
-            # writes uncompressed IPC, which the File backend reads zero-copy via mmap (#171,
-            # plaintext, pandas return only).
+            # writes uncompressed IPC.
             sink = pa.BufferOutputStream()
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(sink, table.schema, options=write_options) as writer:
@@ -453,7 +476,8 @@ class ArrowSerializer:
         """
         try:
             # pa.py_buffer over the memoryview is zero-copy; open_file decompresses transparently.
-            reader = pa.ipc.open_file(pa.py_buffer(body))
+            source = pa.py_buffer(body)
+            reader = pa.ipc.open_file(source)
             table = reader.read_all()
 
             # Convert to requested format
@@ -475,11 +499,16 @@ class ArrowSerializer:
                 try:
                     import polars as pl  # type: ignore[import-not-found]
 
-                    return pl.from_arrow(table)
+                    # Uncompressed IPC: the table's buffers are views of ``body`` (the mapped cache
+                    # file on a File-backend hit). rechunk=False keeps them, one chunk per record
+                    # batch, so aligned numeric, bool and temporal columns import zero-copy; the
+                    # default concatenates, which copies every column. A decompressed table is
+                    # already a heap copy, so it keeps the contiguous default.
+                    return pl.from_arrow(table, rechunk=not _views_of(table, source))
                 except ImportError as import_err:
                     raise SerializationError("polars not installed. Install with: pip install polars") from import_err
             else:  # return_format == "arrow"
-                return table  # zero-copy, no conversion
+                return table  # no conversion; aliases ``body`` when the IPC is uncompressed
 
         except (pa.ArrowInvalid, pa.ArrowSerializationError, OSError) as e:
             raise SerializationError(f"Failed to deserialize Arrow IPC data: {e}") from e

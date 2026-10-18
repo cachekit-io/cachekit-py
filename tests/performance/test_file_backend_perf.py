@@ -606,3 +606,62 @@ def test_mmap_read_rss_far_below_full_read(tmp_path: Path) -> None:
 
     print(f"\n  full-read RSS: {full_read_rss / 1e6:.1f} MB   mmap RSS: {mmap_rss / 1e6:.1f} MB")
     assert mmap_rss < full_read_rss * 0.5, f"mmap RSS {mmap_rss} not < 0.5x full-read RSS {full_read_rss}"
+
+
+def _rss_anon() -> int:
+    """Anonymous (heap) RSS: excludes the file-backed page cache an mmap read faults in."""
+    with open("/proc/self/status") as status:
+        return next(int(line.split()[1]) * 1024 for line in status if line.startswith("RssAnon:"))
+
+
+@pytest.mark.performance
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="reads RssAnon from /proc (Linux)")
+def test_arrow_format_hit_allocates_no_heap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An uncompressed ArrowSerializer(return_format="arrow") hit returns a table over the mapped
+    cache file: its pages are file-backed, so anonymous RSS barely moves however large the value.
+
+    Measured on a 62 MB table: +0.0 MB per hit (and 0 bytes from the Arrow pool). The bound
+    leaves room for allocator noise while failing on a copy of any numeric, timestamp or string
+    column (16 MB or more). Arrow bit-packs the bool column into 250 KB, so a copy of that one
+    alone would pass; the Arrow-pool assertion catches it.
+    """
+    import gc
+
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    from cachekit import cache
+    from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+    # Before 3.13 the handler keeps Arrow results on the copying read (each held mapping would hold a
+    # file descriptor); the heap cost of the mapped read does not depend on the version.
+    monkeypatch.setattr("cachekit.cache_handler.MMAP_RELEASES_FD", True)
+
+    n = 2_000_000
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(
+        {
+            "i64": np.arange(n, dtype="int64"),
+            "f64": rng.random(n),
+            "s": pd.Series(rng.integers(0, 1000, n)).astype(str),
+            "b": rng.random(n) < 0.5,
+            "ts": pd.date_range("2024-01-01", periods=n, freq="s"),
+        }
+    )
+    backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "c", max_size_mb=1024, max_value_mb=512))
+
+    @cache(backend=backend, serializer=ArrowSerializer(return_format="arrow", compression=None), l1_enabled=False)
+    def load():
+        return df
+
+    load()
+    gc.collect()
+    base, pool = _rss_anon(), pa.total_allocated_bytes()
+    table = load()
+    gc.collect()
+    grew = _rss_anon() - base
+
+    print(f"\n  arrow hit: {table.nbytes / 1e6:.1f} MB table, anon RSS +{grew / 1e6:.2f} MB")
+    assert pa.total_allocated_bytes() == pool
+    assert grew < 1_000_000, f"anon RSS grew {grew} bytes on a {table.nbytes}-byte zero-copy hit"

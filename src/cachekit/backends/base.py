@@ -186,9 +186,12 @@ class BufferHandle(Protocol):
     """A borrowed, zero-copy view of a cached value plus the resource backing it.
 
     Returned by ``BufferReadableBackend.get_buffer``. ``view`` aliases backend-owned memory (e.g.
-    mmap'd file pages), not a heap copy — so the consumer must finish reading and ``close()``
-    before the view is touched again. The view DANGLES after close (touching it can segfault), so
-    it must never be stored (e.g. in L1) nor returned past the read call frame (#171).
+    mmap'd file pages), not a heap copy. The consumer reads it, then calls ``close()``; the view
+    is unusable afterwards (unless the consumer exported the view itself, which keeps it readable
+    until that export dies), so it must never be stored (e.g. in L1) nor returned past the read
+    call frame (#171). An object built over the view (an Arrow table) keeps the backing memory
+    alive past ``close()`` through its buffer exports: the implementation must never free memory
+    that is still exported.
     """
 
     view: memoryview
