@@ -192,6 +192,9 @@ uv run pytest -m integration -v  # Integration tests
 
 # With coverage
 make test-cov
+
+# User journeys: the built wheel in a fresh venv, nothing configured (docs/CONTRIBUTING.md)
+make journeys
 ```
 
 **Important**: pytest-redis is required for all Redis-dependent tests. If tests fail with "pytest-redis is required", run `uv sync` to install dependencies.

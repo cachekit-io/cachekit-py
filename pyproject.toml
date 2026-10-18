@@ -136,6 +136,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/**/*" = ["S101", "S105", "S110", "S112", "S311", "D", "F841", "N802"]
+"journeys/**/*" = ["S101"]  # a journey states its promise as an assert
 "src/cachekit/logging.py" = ["S110"]  # Logging errors would create recursion
 "src/cachekit/reliability/async_metrics.py" = ["S101"]  # Internal invariant checks
 "src/cachekit/serializers/__init__.py" = ["S101"]  # Module-level validation

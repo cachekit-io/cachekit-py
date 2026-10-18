@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: help install test test-cov lint lint-makefile format check clean build build-multiarch-linux publish publish-test release release-check sbom test-critical security-deep
+.PHONY: help install test test-cov journeys lint lint-makefile format check clean build build-multiarch-linux publish publish-test release release-check sbom test-critical security-deep
 .DEFAULT_GOAL := help
 
 # Colors for output (using printf for cross-platform compatibility)
@@ -72,6 +72,7 @@ help: ## Show available commands
 	@echo "  $(YELLOW)make test$(RESET)                  All tests (Python + Rust)"
 	@echo "  $(YELLOW)make test-python$(RESET)           Python tests (642+ tests)"
 	@echo "  $(YELLOW)make test-doctest$(RESET)          Doctest validation (code examples)"
+	@echo "  $(YELLOW)make journeys$(RESET)              User journeys on the built wheel, nothing configured"
 	@echo "  $(YELLOW)make test-docs-examples$(RESET)    Markdown docs validation (verbose)"
 	@echo "  $(YELLOW)make test-docs-quick$(RESET)       Markdown docs validation (quiet)"
 	@echo "  $(YELLOW)make test-rust-unit$(RESET)        Rust tests (72 tests, <1s)"
@@ -164,6 +165,9 @@ test-critical-quiet: setup-logs ## Run critical tests (minimal output)
 		exit 1; \
 	fi
 	@echo "$(GREEN)✓$(RESET)"
+
+journeys: ## User journeys: the built wheel in a fresh venv, nothing configured, no Redis (JOURNEY_CACHEKIT, JOURNEY_PYTHON)
+	@bash scripts/journeys.sh
 
 security-audit: setup-logs ## Scan dependencies for CVEs
 	@echo "$(BLUE)Scanning dependencies for vulnerabilities...$(RESET)"

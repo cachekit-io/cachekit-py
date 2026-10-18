@@ -127,6 +127,43 @@ make test-docs-quick
 make test-docs-examples
 ```
 
+## User Journeys
+
+The examples above and the test suite run inside the repository, with `tests/conftest.py` and `docs/conftest.py` setting things up. A user has none of that. `make journeys` checks the documented promises the way a user meets them:
+
+```bash
+make journeys                                          # the wheel built from this checkout
+make journeys JOURNEY_CACHEKIT='cachekit[data]==0.22.0'  # a PyPI release, for comparison
+make journeys JOURNEY_PYTHON=3.12                      # another interpreter (default 3.13)
+```
+
+It builds the wheel, installs it with the `[data]` extra and polars into a fresh virtualenv, and runs `journeys/journeys.py` from outside the repository, with `REDIS_URL` and every `CACHEKIT_*` variable unset. It stops before building if anything listens on `localhost:6379`, because a user's machine has no Redis. Each journey runs in its own interpreter. The report lists every promise as `PASS` or `FAIL`, with what the failing journey saw, and the run exits non-zero if any fails.
+
+**When to run it:** before you open a pull request that changes what a user sees by default (no configuration, presets, backend resolution), how a value comes back from a backend (serializers, return types, writability), or a documented fast path (mmap reads, streaming writes, zero-copy). Run it again before a release.
+
+**When you document a new promise,** add a journey for it in the same pull request. A journey is a function in `journeys/journeys.py`, registered with `@journey("<the promise, as the docs state it>")`, that does what a user would and asserts what the docs say:
+
+```python notest
+@journey("a DataFrame cached through serializer=\"auto\" on FileBackend comes back equal and editable")
+def _() -> None:
+    calls: list[int] = []
+
+    @cache(backend=file_backend(), serializer="auto", l1_enabled=False, ttl=60)
+    def f() -> pd.DataFrame:
+        calls.append(1)
+        return small_frame()
+
+    hit = call_twice(f, calls)  # fails unless the second call was a hit
+    assert hit.equals(small_frame()), "the hit differs from the frame the function returned"
+    assert_editable(hit)
+```
+
+- Use only the public API and the installed packages. Never import from `tests/`, and never configure anything the docs do not tell a user to configure.
+- Check the outcome a user sees: the function body ran once, the hit is editable, the fast path engaged (spy on the backend instance with `spy(backend, "get_buffer")`). Equality alone passes on a read-only or uncached result.
+- When the docs give two spellings of one feature (`serializer="arrow"` and `ArrowSerializer(...)`), cover both.
+- Never skip. A missing dependency fails the run. A promise the docs limit to some Pythons is checked both ways: the feature engages where they promise it and stays off where they say it does.
+- The new journey must fail on a build without the feature (an older release, such as `JOURNEY_CACHEKIT='cachekit[data]==0.22.0'`, or a branch without the change) and pass with it.
+
 ## Common Issues and Solutions
 
 | Issue | Solution |
