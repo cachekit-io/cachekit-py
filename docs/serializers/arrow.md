@@ -15,7 +15,7 @@
 
 **Performance characteristics:**
 - Payload: Arrow IPC, compressed with zstd by default (`CACHEKIT_ARROW_COMPRESSION`), so a read decompresses it
-- Zero-copy reads: only for uncompressed, plaintext payloads on the File backend; what stays zero-copy depends on `return_format` (see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend)). The stored payload is then larger
+- Zero-copy reads: only for uncompressed, plaintext payloads on the File backend; what stays zero-copy depends on `return_format` and the Python version (see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend)). The stored payload is then larger
 - Network overhead: Efficient columnar format
 
 StandardSerializer (MessagePack) does not accept DataFrames, so there is no MessagePack figure to compare against. Sizes and instruction counts measured on a real dataset are in [Performance on Real Data](#performance-on-real-data).
@@ -142,7 +142,7 @@ For comprehensive performance analysis including decorator overhead, concurrent 
 
 ### Memory Usage
 
-A read of a compressed payload (the default) decompresses it into new buffers. An uncompressed, plaintext payload on the File backend can be read without copying it, at the cost of a larger stored payload: see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend). Wire backends always copy the payload in.
+A read of a compressed payload (the default) decompresses it into new buffers. An uncompressed, plaintext payload on the File backend can be read without copying it, depending on `return_format` and the Python version, at the cost of a larger stored payload: see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend). Wire backends always copy the payload in.
 
 **Writes stream on the File backend.** When the cache backend supports streaming writes
 (File backend only today) and the value is plaintext (no encryption), serialization streams
@@ -158,7 +158,7 @@ A cache hit memory-maps the cache file instead of reading it into memory when al
 - the backend is a `FileBackend` on a POSIX system, and the stored file is at most 512 MB;
 - the serializer is cachekit's `ArrowSerializer`, as `serializer="arrow"` or an `ArrowSerializer(...)` instance (a subclass reads the buffered way);
 - the value is not encrypted, and the cached function is synchronous (hits of an `async def` function read the file in);
-- `return_format="pandas"`, or Python 3.13 or later for `"arrow"` and `"polars"`. Those results keep the mapping open, and before 3.13 every open mapping also holds a file descriptor, so a few hundred held results would exhaust the process's descriptor limit. On earlier Pythons they read the file in instead.
+- `return_format="pandas"`, or Python 3.13 or later for `"arrow"` and `"polars"`. Arrow and polars results keep the mapping open, and before 3.13 every open mapping also holds a file descriptor, so a few hundred held results would exhaust the process's descriptor limit. On earlier Pythons they read the file in instead. A pandas result keeps the mapping, and before 3.13 its descriptor, only through a column that stays a view of the mapped data.
 
 A compressed payload (the default) is then decompressed out of the mapping into new memory. Only an uncompressed payload, `ArrowSerializer(compression=None)` or `CACHEKIT_ARROW_COMPRESSION=none` for `serializer="arrow"`, can stay zero-copy, and what an uncompressed hit costs depends on `return_format`:
 
@@ -189,7 +189,7 @@ def load_prices():
 
 load_prices()  # miss: streams the uncompressed Arrow IPC into the cache file
 pool_before = pa.total_allocated_bytes()
-table = load_prices()  # hit: a pyarrow.Table over the mapped file
+table = load_prices()  # hit: a pyarrow.Table over the mapped file on Python 3.13+ (read in before 3.13)
 assert table.num_rows == 100_000
 assert pa.total_allocated_bytes() == pool_before  # no Arrow buffers were allocated for the hit
 ```
@@ -238,7 +238,7 @@ If polars is not installed, deserializing with `return_format="polars"` raises `
    def get_data():
        return df  # illustrative - df not defined
 
-   # Result is a pyarrow.Table over the mapped cache file (no pandas conversion, no copy)
+   # Result is a pyarrow.Table (no pandas conversion); on Python 3.13+ it is a view of the mapped cache file, no copy
    table = get_data()
    ```
 

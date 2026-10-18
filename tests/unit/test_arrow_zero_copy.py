@@ -4,8 +4,8 @@ Three properties compose:
 - eligibility by serializer object: ``ArrowSerializer(...)`` instances take the mmap read and
   streaming write paths (every return_format on Python 3.13+, pandas only before it);
 - an Arrow or polars result aliases the mapping and keeps it alive (the handle's close() leaves
-  an exported mapping in place; refcounting unmaps it with the result's last buffer), and holds
-  no file descriptor while it does;
+  an exported mapping in place; refcounting unmaps it with the result's last buffer), and on
+  Python 3.13+ holds no file descriptor while it does;
 - uncompressed Arrow IPC starts on a 64-byte boundary of the cache file (the CK frame header is
   padded with spaces), so polars imports aligned columns without copying.
 """

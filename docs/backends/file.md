@@ -97,7 +97,7 @@ making it the right choice for caching DataFrames bigger than your RAM headroom:
 
 Both engage automatically — no API change — whenever the serializer is cachekit's plaintext
 Arrow serializer: `serializer="arrow"` or an `ArrowSerializer(...)` instance (not a subclass),
-with no encryption. Reads also need a synchronous cached function. **Encrypted values are excluded from both paths**:
+with no encryption. Reads also need a synchronous cached function, and map `return_format="arrow"` and `"polars"` results only on Python 3.13+. **Encrypted values are excluded from both paths**:
 AES-256-GCM needs the whole ciphertext to produce/verify its auth tag, so the secure path
 stays on buffered `set()`/`get()`. Streamed values also intentionally skip the L1 in-memory
 cache — holding a multi-GB envelope in-process would defeat the point.
