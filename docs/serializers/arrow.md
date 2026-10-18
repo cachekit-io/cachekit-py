@@ -196,7 +196,7 @@ assert pa.total_allocated_bytes() == pool_before  # no Arrow buffers were alloca
 
 ## Polars Support
 
-Polars DataFrames are written through the `__arrow_c_stream__` interface (Arrow C Data Interface), with no intermediate pandas conversion. Reads with `return_format="polars"` build the frame with `polars.from_arrow(table, rechunk=False)`, which keeps one chunk per stored record batch; see [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend) for which columns stay zero-copy.
+Polars DataFrames are written through the `__arrow_c_stream__` interface (Arrow C Data Interface), with no intermediate pandas conversion. Reads with `return_format="polars"` of an uncompressed payload keep one chunk per stored record batch, so the columns can stay views of the stored bytes; a compressed payload is decompressed into new memory anyway and comes back with contiguous columns. See [Zero-Copy Reads on the File Backend](#zero-copy-reads-on-the-file-backend) for which columns stay zero-copy.
 
 ```python notest
 import polars as pl

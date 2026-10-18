@@ -474,6 +474,20 @@ class TestPolarsSupport:
         assert isinstance(result, pl.DataFrame)
         assert result.equals(df)
 
+    @pytest.mark.parametrize(("compression", "contiguous"), [("zstd", True), ("lz4", True), (None, False)])
+    def test_only_uncompressed_reads_keep_record_batch_chunks(self, compression, contiguous):
+        """Uncompressed IPC keeps one chunk per record batch so its columns stay views of the payload;
+        a decompressed table is already a copy, so it comes back contiguous, as before."""
+        pl = pytest.importorskip("polars")
+        n = 1_500_000  # 24 MB: several ~8 MiB record batches
+        df = pd.DataFrame({"i": np.arange(n, dtype="int64"), "f": np.arange(n, dtype="float64")})
+
+        serializer = ArrowSerializer(return_format="polars", compression=compression)
+        result = serializer.deserialize(serializer.serialize(df)[0])
+
+        assert result.equals(pl.from_pandas(df))
+        assert all(result[name].n_chunks() == 1 for name in result.columns) is contiguous
+
 
 class TestCompression:
     """Arrow IPC zstd compression (default-on)."""

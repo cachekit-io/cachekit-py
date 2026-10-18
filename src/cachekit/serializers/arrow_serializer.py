@@ -133,6 +133,22 @@ class _HashingSink:
         return self._hasher.digest()
 
 
+def _views_of(table: pa.Table, source: pa.Buffer) -> bool:
+    """True iff every data buffer of ``table`` points into ``source``: an uncompressed IPC read.
+
+    A compressed read decompresses into new buffers. Checking every buffer, not the first, matters: a
+    codec may store a buffer that does not shrink raw, and the reader then slices that one from ``source``.
+    """
+    lo, hi = source.address, source.address + source.size
+    return all(
+        lo <= buf.address < hi
+        for column in table.columns
+        for chunk in column.chunks
+        for buf in chunk.buffers()
+        if buf is not None and buf.size
+    )
+
+
 class ArrowSerializer:
     """Apache Arrow IPC serializer for memory-efficient DataFrame caching with xxHash3-64 integrity.
 
@@ -458,7 +474,8 @@ class ArrowSerializer:
         """
         try:
             # pa.py_buffer over the memoryview is zero-copy; open_file decompresses transparently.
-            reader = pa.ipc.open_file(pa.py_buffer(body))
+            source = pa.py_buffer(body)
+            reader = pa.ipc.open_file(source)
             table = reader.read_all()
 
             # Convert to requested format
@@ -472,10 +489,12 @@ class ArrowSerializer:
                 try:
                     import polars as pl  # type: ignore[import-not-found]
 
-                    # rechunk=False keeps one chunk per record batch: the default concatenates, which
-                    # copies every column. Aligned numeric, bool and temporal columns then import
-                    # zero-copy (strings convert to polars' own layout); call .rechunk() for one chunk.
-                    return pl.from_arrow(table, rechunk=False)
+                    # Uncompressed IPC: the table's buffers are views of ``body`` (the mapped cache
+                    # file on a File-backend hit). rechunk=False keeps them, one chunk per record
+                    # batch, so aligned numeric, bool and temporal columns import zero-copy; the
+                    # default concatenates, which copies every column. A decompressed table is
+                    # already a heap copy, so it keeps the contiguous default.
+                    return pl.from_arrow(table, rechunk=not _views_of(table, source))
                 except ImportError as import_err:
                     raise SerializationError("polars not installed. Install with: pip install polars") from import_err
             else:  # return_format == "arrow"
