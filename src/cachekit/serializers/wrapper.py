@@ -200,6 +200,8 @@ class SerializationWrapper:
             prefix = _encode_prefix_memo(serializer_name, items, version)
         else:
             prefix = _encode_prefix(serializer_name, metadata, version)
+        if align == 1:
+            return prefix
         pad = -(offset + len(prefix)) % align
         if not pad:
             return prefix

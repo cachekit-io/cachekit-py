@@ -79,6 +79,9 @@ CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
 # prefix and ArrowSerializer's 8-byte xxHash3-64 checksum; 64 is Arrow's recommended alignment.
 _ARROW_IPC_ALIGN = 64
 _ARROW_CHECKSUM_SIZE = 8
+# Frame tags an ArrowSerializer can record: its string name, or the class name of an instance. A set
+# lookup on the tag screens every other serializer out before the type check, on every read and write.
+_ARROW_FRAME_TAGS = frozenset({"arrow", "ArrowSerializer"})
 
 # Global DI container instance with default registrations
 container = DIContainer()
@@ -1145,9 +1148,12 @@ class CacheSerializationHandler:
             else:
                 # Convert metadata to dict if needed
                 metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
-                # One prefix builder for this path and write_serialized_to, so buffered and streamed
-                # entries stay byte-identical (the payload is copied once, as in wrap()).
-                wrapped = self._frame_prefix(metadata_dict) + serialized_data
+                if self._serializer_string_name in _ARROW_FRAME_TAGS:
+                    # One prefix builder for this path and write_serialized_to, so buffered and streamed
+                    # entries stay byte-identical (the payload is copied once, as in wrap()).
+                    wrapped = self._frame_prefix(metadata_dict) + serialized_data
+                else:
+                    wrapped = SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
         except ValueError:
             # Tenant extraction, cache_key missing, or an interop data-model
             # rejection (InteropError) — FAIL CLOSED / fail loud (re-raise).
@@ -1180,6 +1186,8 @@ class CacheSerializationHandler:
         a subclass may override ``serialize`` and stays on the buffered paths. Read through
         ``sys.modules`` so a handler that never loaded the module never imports pyarrow here.
         """
+        if self._serializer_string_name not in _ARROW_FRAME_TAGS:
+            return False
         module = sys.modules.get("cachekit.serializers.arrow_serializer")
         return module is not None and type(self._base_serializer) is module.ArrowSerializer
 
@@ -1210,7 +1218,8 @@ class CacheSerializationHandler:
         The backend must also support buffer reads (File/POSIX); that is checked separately, so a
         True here on a non-File backend simply means get_buffer returns None and we fall back.
         """
-        if self.encryption or not self._is_cachekit_arrow():
+        # The tag screen first: it keeps every other serializer's read free of the helper call.
+        if self.encryption or self._serializer_string_name not in _ARROW_FRAME_TAGS or not self._is_cachekit_arrow():
             return False
         # An Arrow or polars result keeps the mapping, and before Python 3.13 each mapping also keeps a
         # file descriptor, so those return formats map only where the mapping holds none. A pandas
@@ -1232,7 +1241,12 @@ class CacheSerializationHandler:
         separately at the cache-handler layer, so True here on a non-streaming backend simply
         means the write falls back to the buffered path.
         """
-        return not self.encryption and not self.interop_mode and self._is_cachekit_arrow()
+        return (
+            not self.encryption
+            and not self.interop_mode
+            and self._serializer_string_name in _ARROW_FRAME_TAGS
+            and self._is_cachekit_arrow()
+        )
 
     def write_serialized_to(self, sink: BinaryIO, data: Any) -> None:
         """Streaming twin of :meth:`serialize_data` (LAB-766): write the SAME envelope bytes into
