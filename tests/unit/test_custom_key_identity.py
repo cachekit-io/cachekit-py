@@ -293,6 +293,32 @@ class TestNoLegacyKey:
         assert "default:1" not in backend.reads
         assert set(backend.store) == {"default:1", new_key}
 
+    @pytest.mark.parametrize("intent", ["plain", "secure"])
+    def test_mixed_release_overlap_is_closed_by_a_namespace_change(self, intent: str) -> None:
+        """The upgrade note's hazard and its fix: an earlier release's entry for ``"42:<identity>"`` is the
+        entry the new key reads for ``"42"``, and only a new namespace keeps the two releases apart."""
+        backend = RecordingBackend()
+
+        def lookup(record_id: str) -> str:
+            return f"record {record_id}"
+
+        identity = _identity(lookup)
+
+        def earlier_release(record_id: str) -> str:
+            return f"record 42:{identity}"
+
+        # The earlier release's write for lookup(f"42:{identity}") lands at users:42:<identity>, which is
+        # where this release stores lookup's "42" entry; write that value there, sealed for that key.
+        earlier_release.__module__, earlier_release.__qualname__ = lookup.__module__, lookup.__qualname__
+        _decorator(intent, backend, "users", False)(earlier_release)("42")
+        assert set(backend.store) == {f"users:42:{identity}"}
+
+        upgraded = _decorator(intent, backend, "users", False)(lookup)
+        moved = _decorator(intent, backend, "users-v2", False)(lookup)
+
+        assert upgraded("42") == f"record 42:{identity}"  # served the other argument's value
+        assert moved("42") == "record 42"
+
     def test_no_args_invalidation_drains_tracked_pre_fix_keys(self) -> None:
         """The registry set name did not move, so the migration's early-cleanup step reaches old keys."""
         backend = TrackingBackend()
