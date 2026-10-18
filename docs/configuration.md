@@ -20,7 +20,7 @@ cachekit supports four backends. Pick the one that fits your infrastructure:
 | File | Local dev, testing | None |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 
-By default `@cache` auto-detects your backend from env vars, falling back to Redis at localhost (12-factor convention). CachekitIO is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
+`@cache` picks its backend from env vars at a function's first call; with nothing configured it caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). CachekitIO is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
 
 ### Redis Backend
 
@@ -30,7 +30,7 @@ For self-hosted Redis infrastructure:
 ```python
 from cachekit import cache
 
-@cache  # Auto-detects backend (defaults to Redis at localhost)
+@cache  # Redis when CACHEKIT_REDIS_URL or REDIS_URL is set
 def fetch_data():
     return expensive_computation()
 ```
@@ -407,7 +407,7 @@ def secure_function():
 > [!IMPORTANT]
 > When multiple environment variables could apply, cachekit follows this priority order.
 > The four backend selectors are the exception: they have no order, so set exactly one
-> ([details](backends/README.md#3-environment-variable-auto-detection-lowest-priority)).
+> ([details](backends/README.md#3-environment-variable-auto-detection)).
 
 ### Redis URL Priority
 

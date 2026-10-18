@@ -22,6 +22,11 @@ result = expensive_computation(42)
 
 No environment variables needed. No services to run. Works everywhere.
 
+A decorator with no `backend=` at all runs in exactly this mode when nothing is configured: no
+`set_default_backend()`, no `CACHEKIT_*` selector and no `REDIS_URL` at its first call
+([Nothing Configured](README.md#4-nothing-configured-l1-only)). Write `backend=None` when the
+function must stay in-process even after a backend is configured.
+
 ## When to Use
 
 **Use L1-only when**:
@@ -128,7 +133,7 @@ def get_user(user_id: int) -> dict:
     return db.fetch(user_id)
 
 # Production: just remove backend=None
-# Set REDIS_URL and cachekit auto-detects Redis
+# Set REDIS_URL before the first call and cachekit auto-detects Redis
 @cache(ttl=300)
 def get_user(user_id: int) -> dict:
     return db.fetch(user_id)

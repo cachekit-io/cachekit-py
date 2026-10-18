@@ -9,7 +9,7 @@ Configuration errors raise when the decorator is applied. Backend failures (conn
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
 
-After a read or write failure on a backend that is already built, the result is still stored in L1 (on by default), so later calls in the same process hit it. Two backend failures cache nothing: a backend that cannot be built on the first call, such as an auto-detected Redis that is down then (see [Connection Errors](#connection-errors)), and a failed streamed write from a sync function using the plaintext Arrow serializer on the File backend, which never goes to L1 (see [Circuit breaker open](#circuit-breaker-open)).
+After a read or write failure on a backend that is already built, the result is still stored in L1 (on by default), so later calls in the same process hit it. Two backend failures cache nothing: a backend that cannot be built on the first call, such as a Redis selected by `CACHEKIT_REDIS_URL` or `REDIS_URL` that is down then (see [Connection Errors](#connection-errors)), and a failed streamed write from a sync function using the plaintext Arrow serializer on the File backend, which never goes to L1 (see [Circuit breaker open](#circuit-breaker-open)).
 
 ## Encryption Errors
 
@@ -625,9 +625,9 @@ def my_function():
 
 ### Redis URL not set
 
-**Exception**: none. With neither `CACHEKIT_REDIS_URL` nor `REDIS_URL` set, cachekit connects to `redis://localhost:6379`. If nothing listens there, see *Redis unreachable*.
+**Exception**: none. With no backend configured at all (no `CACHEKIT_*` selector, no `REDIS_URL`, no `set_default_backend()`), a plaintext decorator caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). `@cache.secure`, `encryption=True` and `interop=` decorators cannot run L1-only: they connect to `redis://localhost:6379`, and if nothing listens there, see *Redis unreachable*.
 
-**Cause**: No Redis connection string provided
+**Cause**: No backend selected. Earlier releases connected every decorator to `redis://localhost:6379` here; set `REDIS_URL` to keep that Redis
 
 **Solution**:
 ```bash

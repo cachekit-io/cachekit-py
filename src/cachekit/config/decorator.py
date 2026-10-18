@@ -110,10 +110,10 @@ class DecoratorConfig:
     - Frozen dataclass ensures immutability
     - Nested configs group related settings
     - Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit backend=,
-      then set_default_backend(), then one env selector at first call
+      then set_default_backend(), then one env selector at first call, else L1-only (nothing configured)
 
     Examples:
-        # Zero-config (backend auto-detected from the environment at first call)
+        # Zero-config: backend auto-detected from the environment at first call, L1-only if none is set
         @cache.minimal(ttl=300)
         def fast_function():
             return "value"
@@ -328,7 +328,8 @@ class DecoratorConfig:
         Trade-offs: Circuit breaker disabled, no monitoring, NO integrity checking
 
         Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call.
+              backend=, then set_default_backend(), then one env selector at first call, else
+              L1-only (nothing configured).
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -375,7 +376,8 @@ class DecoratorConfig:
         Trade-offs: Additional latency from circuit breaker, monitoring, integrity validation
 
         Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call.
+              backend=, then set_default_backend(), then one env selector at first call, else
+              L1-only (nothing configured).
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -524,7 +526,8 @@ class DecoratorConfig:
         Trade-offs: Verbose logs, Prometheus metrics disabled for simplicity except circuit_breaker_state
 
         Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call.
+              backend=, then set_default_backend(), then one env selector at first call, else
+              L1-only (nothing configured).
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -569,7 +572,8 @@ class DecoratorConfig:
         Trade-offs: No circuit breaker, no stats, no integrity (reproducible, fast)
 
         Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
-              backend=, then set_default_backend(), then one env selector at first call.
+              backend=, then set_default_backend(), then one env selector at first call, else
+              L1-only (nothing configured).
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,

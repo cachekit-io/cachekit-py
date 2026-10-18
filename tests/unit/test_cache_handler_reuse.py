@@ -10,6 +10,8 @@ from cachekit import cache
 from cachekit.cache_handler import StandardCacheHandler
 from cachekit.decorators import wrapper as wrapper_module
 
+pytestmark = pytest.mark.usefixtures("backend_configured")  # tests stand in for backend resolution
+
 
 class _Backend:
     def __init__(self) -> None:

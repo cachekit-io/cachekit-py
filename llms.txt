@@ -32,14 +32,14 @@ def get_patient(id: int):
 
 | Backend | Install | Use Case | Latency |
 |---------|---------|----------|---------|
-| **Redis** (default) | included | Production, distributed | 1-7ms |
+| **Redis** | included | Production, distributed | 1-7ms |
 | **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra | 1-5ms |
 | **File** | included | Single-machine, zero-dependency | 1-10ms |
 | **CachekitIO** | included | Managed SaaS, zero infrastructure | 10-50ms |
 
-### Redis (default)
+### Redis
 ```python
-# Configure via environment:
+# Configure via environment (with no backend configured at all, @cache is L1-only, in process):
 # REDIS_URL=redis://localhost:6379  (or CACHEKIT_REDIS_URL)
 
 @cache

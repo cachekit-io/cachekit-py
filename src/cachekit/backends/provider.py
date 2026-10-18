@@ -174,8 +174,12 @@ class DefaultBackendProvider(BackendProviderInterface):
         - CACHEKIT_REDIS_URL          → Redis (tenant-scoped PerRequestRedisBackend)
         - CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
         - CACHEKIT_FILE_CACHE_DIR     → FileBackend
-    With none of them set: REDIS_URL, or nothing → Redis, as above (12-factor /
-    localhost default).
+    With none of them set, ``REDIS_URL`` → Redis, as above (12-factor).
+
+    With nothing set at all, ``is_configured()`` is False and a plaintext decorator
+    never calls ``get_backend()``: it caches in L1 only, in process.
+    Only the decorators that cannot run L1-only (encryption, ``interop=``) still call
+    it then, and get Redis at ``RedisBackendConfig``'s localhost default.
 
     Setting more than one of the four prefixed selectors raises
     ``ConfigurationError`` — auto-detection must be unambiguous; pass
@@ -206,7 +210,7 @@ class DefaultBackendProvider(BackendProviderInterface):
         self._file_backend = None
 
     def _detect(self):
-        """Return the chosen backend key, or None to use the Redis fallback.
+        """Return the chosen backend key, or None for Redis from REDIS_URL or ``RedisBackendConfig``'s default.
 
         Raises ConfigurationError if more than one prefixed selector is set.
         """
@@ -223,6 +227,16 @@ class DefaultBackendProvider(BackendProviderInterface):
                 "CACHEKIT_MEMCACHED_SERVERS / CACHEKIT_FILE_CACHE_DIR, or pass backend= explicitly."
             )
         return matched[0][1] if matched else None
+
+    def is_configured(self) -> bool:
+        """Whether the environment names a backend: any prefixed selector, or ``REDIS_URL``.
+
+        Never raises: two selectors count as configured, so ``get_backend()`` raises the
+        ambiguity error where the decorator already handles a backend that fails to build.
+        """
+        import os
+
+        return any(os.environ.get(env_var) for env_var, _ in self._SELECTORS) or bool(os.environ.get("REDIS_URL"))
 
     def get_backend(self):
         """Get backend instance, auto-detected from environment on first call."""
@@ -249,7 +263,8 @@ class DefaultBackendProvider(BackendProviderInterface):
                 self._file_backend = FileBackend(FileBackendConfig.from_env())
             return self._file_backend
 
-        # choice == "redis" (explicit CACHEKIT_REDIS_URL) or None (REDIS_URL / localhost fallback).
+        # choice == "redis" (explicit CACHEKIT_REDIS_URL) or None: REDIS_URL, or, for a decorator that
+        # cannot run L1-only (see the class docstring), nothing set at all and RedisBackendConfig's default.
         # Shared backend: it resolves the tenant per operation, so caching it cannot pin a tenant.
         if self._redis_backend is None:
             from cachekit.backends.redis.config import RedisBackendConfig

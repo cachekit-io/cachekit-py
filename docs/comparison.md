@@ -179,7 +179,7 @@ def compute(x):
 
 # Staging: Add Redis (one env var, zero code change)
 # REDIS_URL=redis://localhost:6379
-# @cache automatically uses Redis when available
+# @cache uses Redis once REDIS_URL is set; with nothing set it is L1-only
 
 # Production: Add encryption (one parameter)
 @cache.secure(ttl=300)  # Enables AES-256-GCM
