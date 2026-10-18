@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import time
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -83,15 +84,20 @@ def _state(wrapper: Callable[..., Any]) -> dict[str, Any]:
     }
 
 
+def _clear_selectors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delete every selector in any casing: _is_configured() reads names case-insensitively."""
+    wanted = {var.lower() for var in _ENV}
+    for name in [name for name in os.environ if name.lower() in wanted]:
+        monkeypatch.delenv(name)
+
+
 @pytest.fixture
 def nothing_configured(monkeypatch: pytest.MonkeyPatch) -> Iterator[mock.MagicMock]:
     """Clean slate: the production DefaultBackendProvider, no selector, no REDIS_URL, no default backend.
 
     Yields a spy on DefaultBackendProvider.get_backend that fails the test if it builds anything.
     """
-    for var in _ENV:
-        monkeypatch.delenv(var, raising=False)
-        monkeypatch.delenv(var.lower(), raising=False)  # _is_configured() matches any case
+    _clear_selectors(monkeypatch)
     monkeypatch.setattr("cachekit.config.decorator._default_backend", None)
     monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, DefaultBackendProvider())
     with mock.patch.object(
@@ -465,14 +471,21 @@ class TestEncryptedAndInteropUnchanged:
 
 
 def test_is_configured_reads_every_selector_in_any_case(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in _ENV:
-        monkeypatch.delenv(var, raising=False)
-        monkeypatch.delenv(var.lower(), raising=False)
+    _clear_selectors(monkeypatch)
     provider = DefaultBackendProvider()
     assert provider._is_configured() is False
     for var in _ENV:  # uppercase names: test_one_selector_resolves_a_backend
-        monkeypatch.setenv(var.lower(), "x")  # RedisBackendConfig reads names case-insensitively
-        assert provider._is_configured() is True
-        monkeypatch.delenv(var.lower())
+        for name in (var.lower(), var.title()):  # RedisBackendConfig reads names case-insensitively
+            monkeypatch.setenv(name, "x")
+            assert provider._is_configured() is True
+            monkeypatch.delenv(name)
     monkeypatch.setenv("REDIS_URL", "")
     assert provider._is_configured() is False  # empty is unset, as for get_backend()'s selectors
+
+
+def test_selector_model_tracks_the_provider_selectors() -> None:
+    """_is_configured() reads _BackendSelectors; _detect() reads _SELECTORS. They must name the same variables."""
+    from cachekit.backends.provider import _BackendSelectors
+
+    expected = {var.lower() for var, _ in DefaultBackendProvider._SELECTORS} | {"redis_url"}
+    assert set(_BackendSelectors.model_fields) == expected

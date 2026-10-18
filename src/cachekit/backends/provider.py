@@ -10,12 +10,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from cachekit.hash_utils import redact_key_for_log
 
 if TYPE_CHECKING:
     import redis
     import redis.asyncio as redis_async
-    from pydantic import SecretStr
 
     from cachekit.backends.redis.config import RedisBackendConfig
 
@@ -165,6 +167,19 @@ class PooledClientProvider(CacheClientProvider):
         return self._async_client
 
 
+class _BackendSelectors(BaseSettings):
+    """The backend-selecting env vars, for DefaultBackendProvider._is_configured(): its _SELECTORS plus REDIS_URL."""
+
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
+
+    # SecretStr: an API key, or a URL that may carry a password (CWE-532)
+    cachekit_api_key: Optional[SecretStr] = None
+    cachekit_redis_url: Optional[SecretStr] = None
+    cachekit_memcached_servers: Optional[SecretStr] = None
+    cachekit_file_cache_dir: Optional[SecretStr] = None
+    redis_url: Optional[SecretStr] = None
+
+
 class DefaultBackendProvider(BackendProviderInterface):
     """Default backend provider with env-based auto-detection.
 
@@ -231,17 +246,14 @@ class DefaultBackendProvider(BackendProviderInterface):
     def _is_configured(self) -> bool:
         """Whether the environment names a backend: any prefixed selector, or ``REDIS_URL``.
 
-        Names match in any case, as ``RedisBackendConfig`` reads them (``case_sensitive=False``):
-        a lowercase ``redis_url`` always reached that Redis through ``get_backend()``'s fallback.
-        ``_detect()`` stays case-sensitive on purpose: a lowercase prefixed selector counts as
+        Read through pydantic-settings with ``case_sensitive=False``, exactly as ``RedisBackendConfig``
+        reads them: a lowercase ``redis_url`` always reached that Redis through ``get_backend()``'s
+        fallback. ``_detect()`` stays case-sensitive on purpose: a lowercase prefixed selector counts as
         configured here and still resolves Redis there, as before; aligning either method changes routing.
-        Compared lowercased, as pydantic-settings does. Never raises: two selectors count as configured, so ``get_backend()`` raises the
-        ambiguity error where the decorator already handles a backend that fails to build.
+        Never raises: two selectors count as configured, so ``get_backend()`` raises the ambiguity
+        error where the decorator already handles a backend that fails to build.
         """
-        import os
-
-        names = {name.lower() for name, value in os.environ.items() if value}
-        return "redis_url" in names or any(env_var.lower() in names for env_var, _ in self._SELECTORS)
+        return any(value is not None and value.get_secret_value() for value in vars(_BackendSelectors()).values())
 
     def get_backend(self):
         """Get backend instance, auto-detected from environment on first call."""
