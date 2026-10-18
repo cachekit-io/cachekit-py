@@ -162,7 +162,7 @@ def _() -> None:
 - Check the outcome a user sees: the function body ran once, the hit is editable, the fast path engaged (spy on the backend instance with `spy(backend, "get_buffer")`). Equality alone passes on a read-only or uncached result.
 - When the docs give two spellings of one feature (`serializer="arrow"` and `ArrowSerializer(...)`), cover both.
 - Never skip. A missing dependency fails the run. A promise the docs limit to some Pythons is checked both ways: the feature engages where they promise it and stays off where they say it does.
-- The new journey must fail on a build without the feature (`JOURNEY_CACHEKIT=` an older release, or a branch without the change) and pass with it.
+- The new journey must fail on a build without the feature (an older release, such as `JOURNEY_CACHEKIT='cachekit[data]==0.22.0'`, or a branch without the change) and pass with it.
 
 ## Common Issues and Solutions
 

@@ -236,10 +236,7 @@ def _() -> None:
     hit = call_twice(f, calls)
     assert hit.dtype == np.int64, f"the hit's dtype is {hit.dtype}, not int64"
     assert np.array_equal(hit, np.arange(10)), "the hit differs from the array the function returned"
-    try:
-        hit[0] = -1
-    except Exception as e:
-        raise AssertionError(f"editing the hit in place raised {type(e).__name__}: {e}") from e
+    hit[0] = -1  # raises on a read-only array; run_one reports it
 
 
 @journey("a dict cached with the default serializer on FileBackend comes back equal and editable")
@@ -354,15 +351,21 @@ for _label, _make, _promised in MMAP_CONFIGS:
     _mmap_journey(_label, _make, _promised)
 
 
-class _WriteRecorder:
-    """Wraps the cache file handed to a streaming write and records the size of every write to it."""
+def _memory_held() -> int:
+    """Bytes held now by Python (tracemalloc, which also sees NumPy) and by Arrow's memory pool."""
+    return tracemalloc.get_traced_memory()[0] + pa.total_allocated_bytes()
 
-    def __init__(self, file: Any, sizes: list[int]) -> None:
-        self._file = file
-        self._sizes = sizes
+
+class _WriteRecorder:
+    """Wraps the cache file handed to a streaming write. At every write it records the write's size and the
+    memory the serializer holds beyond what it held when the write began."""
+
+    def __init__(self, file: Any, sizes: list[int], held: list[int], baseline: int) -> None:
+        self._file, self._sizes, self._held, self._baseline = file, sizes, held, baseline
 
     def write(self, data: Any) -> int:
         self._sizes.append(memoryview(data).nbytes)
+        self._held.append(_memory_held() - self._baseline)
         return self._file.write(data)
 
     def __getattr__(self, name: str) -> Any:
@@ -374,10 +377,18 @@ def _streaming_journey(label: str, make_serializer: Callable[[], Any]) -> None:
     def _() -> str:
         backend = file_backend()
         original = backend.set_streaming
+        streamed: list[bool] = []
         sizes: list[int] = []
+        held: list[int] = []
 
         def recording(key: str, write_payload: Callable[[Any], None], ttl: int | None = None) -> None:
-            original(key, lambda file: write_payload(_WriteRecorder(file, sizes)), ttl)
+            streamed.append(True)
+            tracemalloc.start()
+            try:
+                baseline = _memory_held()
+                original(key, lambda file: write_payload(_WriteRecorder(file, sizes, held, baseline)), ttl)
+            finally:
+                tracemalloc.stop()
 
         backend.set_streaming = recording  # type: ignore[method-assign]
         # About 24 MB of incompressible float64: three ~8 MiB record batches (docs/serializers/arrow.md).
@@ -390,14 +401,16 @@ def _streaming_journey(label: str, make_serializer: Callable[[], Any]) -> None:
             return frame
 
         hit = call_twice(f, calls)
-        assert sizes, "the write took the buffered path: set_streaming was never called"
-        # A payload staged in memory and then written reaches the file as one write of nearly everything.
-        largest, total = max(sizes), sum(sizes)
-        assert largest <= total // 2, (
-            f"the largest of {len(sizes)} writes is {largest} of {total} bytes: the payload was buffered"
-        )
+        assert streamed, "the write took the buffered path: set_streaming was never called"
+        assert sizes, "set_streaming ran, but nothing was written to the cache file it was given"
+        # Staging the payload shows either as one write of nearly everything or, when the staged copy is written
+        # out in slices, as memory held at the time of those writes.
+        largest, total, peak = max(sizes), sum(sizes), max(held)
+        note = f"{len(sizes)} writes, largest {largest} of {total} bytes; at most {peak} bytes held while writing"
+        assert largest <= total // 2, f"the payload was buffered: {note}"
+        assert peak <= total // 2, f"the payload was buffered: {note}"
         assert hit.equals(frame), "the streamed entry reads back different"
-        return f"{len(sizes)} writes, largest {largest} of {total} bytes"
+        return note
 
 
 for _label, _make in ARROW_SPELLINGS:

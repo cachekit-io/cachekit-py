@@ -44,6 +44,7 @@ echo "journeys: installing $requirement"
 uv pip install --quiet --python "$venv_python" "$requirement" polars
 
 # journeys.py scrubs REDIS_URL and CACHEKIT_* (any case) itself, before it imports cachekit, and removes the
-# journeys' cache directories when it finishes.
+# journeys' cache directories when it finishes. TMPDIR puts them under $work too, so the trap removes them if
+# journeys.py is killed first.
 cd "$work"
-"$venv_python" -I "$repo/journeys/journeys.py"
+TMPDIR="$work" "$venv_python" -I "$repo/journeys/journeys.py"
