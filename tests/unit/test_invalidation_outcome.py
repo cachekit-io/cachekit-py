@@ -21,7 +21,7 @@ from cachekit import InvalidationOutcome, cache
 from cachekit.backends.redis.provider import PerRequestRedisBackend
 from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("backend_configured")]  # tests stand in for backend resolution
 
 _FAILED_LOG = "Failed to delete L2 key"
 

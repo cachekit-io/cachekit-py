@@ -673,6 +673,8 @@ def create_cache_wrapper(
                    for both performance and security.
         backend: Optional backend (BaseBackend implementation). If None, resolved on first
                  call from set_default_backend() or the DI backend provider (env auto-detection).
+                 With nothing configured there, a plaintext non-interop function runs L1-only,
+                 as config.backend=None does; encrypted and interop functions still resolve one.
                  Held for the wrapper's lifetime, so it must be safe to share across requests.
         circuit_breaker: Enable circuit breaker for fault tolerance. Its settings come from
                         config.circuit_breaker; without config= the breaker runs its defaults.
@@ -1027,23 +1029,20 @@ def create_cache_wrapper(
     # max_size_mb=None inherits the global CACHEKIT_L1_MAX_SIZE_MB setting (issue #163),
     # mirroring L1CacheManager's resolution for the L2-backed path.
     _l1_budget_mb: int = _l1_config.max_size_mb if _l1_config.max_size_mb is not None else get_settings().l1_max_size_mb
-    # l1_enabled already merges the decorator param with config.l1.enabled (see
-    # config handling above) — with it False in L1-only mode there is no cache
-    # at all and the wrappers call the function directly.
-    _object_cache: ObjectCache | None = (
-        ObjectCache(
-            max_entries=None,
-            max_size_bytes=_l1_budget_mb * 1024 * 1024,
-            swr_threshold_ratio=_l1_config.swr_threshold_ratio,
-            swr_retry_interval=_l1_config.swr_retry_interval,
-        )
-        if _l1_only_mode and l1_enabled
-        else None
-    )
 
+    # Set by _enter_l1_only(), below: backed wrappers keep these.
+    _object_cache: ObjectCache | None = None
+    _l1_swr_active = False
     # SWR needs a TTL: freshness is measured against ttl * swr_threshold_ratio.
     # With ttl=None entries never go stale, so there is nothing to revalidate.
-    _l1_swr_active = _object_cache is not None and _l1_config.swr_enabled and ttl is not None and ttl > 0
+    _l1_swr_wanted = _l1_config.swr_enabled and ttl is not None and ttl > 0
+
+    # ZERO-CONFIG: with no backend stated, a plaintext non-interop decorator that finds nothing configured
+    # at its first call (no set_default_backend(), no non-default backend provider, no CACHEKIT_* selector,
+    # no REDIS_URL) runs exactly as backend=None does: _settle_zero_config() switches it to L1-only before
+    # that call's first lookup. Encryption and interop cannot run L1-only (refused above), so they keep
+    # resolving a backend, localhost Redis included. Redis is never dialled for "no config".
+    _zero_config_pending = backend is None and not _l1_only_mode and interop is None and not serialization_handler.encryption
 
     # Background revalidation machinery — mirrors the L1-only SWR shapes below:
     # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
@@ -1558,11 +1557,32 @@ def create_cache_wrapper(
 
     # Whether a generated key differs from its pre-0.20.0 twin: only when the serializer code is
     # not the default's. Fixed at decoration, so the default serializer pays nothing per call.
-    _records_twin = (
-        _generated_key_mode
-        and not _l1_only_mode
-        and key_generator.serializer_code(serialization_handler.serializer_key_name) != key_generator.serializer_code("default")
-    )
+    _records_twin = _generated_key_mode and key_generator.serializer_code(
+        serialization_handler.serializer_key_name
+    ) != key_generator.serializer_code("default")
+
+    def _enter_l1_only() -> None:
+        """Set every piece of state L1-only mode derives, in one place: for backend=None at decoration,
+        and for a zero-config candidate at its first call (_settle_zero_config)."""
+        nonlocal _l1_only_mode, _object_cache, _l1_swr_active, _records_twin
+        # l1_enabled already merges the decorator param with config.l1.enabled (see config handling
+        # above): with it False there is no cache at all and the wrappers call the function directly.
+        _object_cache = (
+            ObjectCache(
+                max_entries=None,
+                max_size_bytes=_l1_budget_mb * 1024 * 1024,
+                swr_threshold_ratio=_l1_config.swr_threshold_ratio,
+                swr_retry_interval=_l1_config.swr_retry_interval,
+            )
+            if l1_enabled
+            else None
+        )
+        _l1_swr_active = _object_cache is not None and _l1_swr_wanted
+        _records_twin = False  # L1-only writes no L2 entry, so it has no twin to record
+        _l1_only_mode = True
+
+    if _l1_only_mode:
+        _enter_l1_only()
 
     def _twin_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str | None:
         """The call's pre-0.20.0 twin key for the write or L2 hit to record, or None when it has none.
@@ -1728,6 +1748,51 @@ def create_cache_wrapper(
                 safe_url,
             )
 
+    _zero_config_locks: dict[int, threading.Lock] = {}  # one per process: see invalidation._pid_lock
+
+    def _nothing_configured() -> bool:
+        """No backend configured anywhere, so a zero-config candidate runs L1-only.
+
+        Only DefaultBackendProvider can report that: any other registered provider is configuration (an
+        application's dependency injection, the test suite), and get_backend() takes no arguments to ask
+        it. An error here counts as configured, so it is raised again where the backend is built, inside
+        the call's client_creation guard, and handled there as it is for any configured backend.
+        """
+        from ..backends.provider import DefaultBackendProvider
+        from ..config.decorator import get_default_backend
+
+        try:
+            if get_default_backend() is not None:
+                return False
+            provider = get_backend_provider()
+            return type(provider) is DefaultBackendProvider and not provider._is_configured()
+        except Exception as e:  # whatever a provider's construction raises: failing toward a backend is the safe side
+            _logger.debug(
+                "Zero-config check failed for %s; resolving a backend instead: %s", function_identifier, redact_error_for_log(e)
+            )
+            return False
+
+    def _settle_zero_config() -> None:
+        """Decide once whether this zero-config candidate runs L1-only, before its first call's lookup or
+        its first invalidation. The answer holds for the wrapper's life, as a resolved backend does."""
+        nonlocal _zero_config_pending
+        with invalidation._pid_lock(_zero_config_locks):
+            if not _zero_config_pending:
+                return
+            if _nothing_configured():
+                _enter_l1_only()
+                # DEBUG, not WARNING: no config is a supported setup. Still traceable when a deployment
+                # that lost its REDIS_URL quietly caches per process.
+                _logger.debug(
+                    "Zero-config: %s caches L1-only, in process (no set_default_backend(), backend provider, "
+                    "CACHEKIT_* selector or REDIS_URL)",
+                    function_identifier,
+                )
+            elif _l1_cache is not None:
+                invalidation.register(_registry_id, _evict)  # deferred from decoration: see the register below
+            # Last: a caller that reads it False without the lock then reads the state set above.
+            _zero_config_pending = False
+
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:  # noqa: PLR0912
         # Bypass check (5-10μs savings)
@@ -1761,6 +1826,9 @@ def create_cache_wrapper(
                     count_toward_breaker=False,  # pre-admission, never reached the backend
                 )
                 return func(*args, **kwargs)
+
+            if _zero_config_pending:
+                _settle_zero_config()
 
             # L1-ONLY MODE: Store raw Python objects (no serialization).
             # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
@@ -2151,6 +2219,9 @@ def create_cache_wrapper(
                     count_toward_breaker=False,  # pre-admission, never reached the backend
                 )
                 return await func(*args, **kwargs)
+
+            if _zero_config_pending:
+                _settle_zero_config()
 
             # L1-ONLY MODE: Store raw Python objects (no serialization).
             # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
@@ -2963,6 +3034,9 @@ def create_cache_wrapper(
         """
         nonlocal _backend
 
+        if _zero_config_pending:
+            _settle_zero_config()
+
         # L1-ONLY MODE: Skip backend lookup entirely
         # This fixes the sentinel problem: when backend=None is explicitly passed,
         # we should NOT try to get a backend from the provider
@@ -2994,6 +3068,9 @@ def create_cache_wrapper(
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
         """Async invalidate_cache: the same deletes, run off the event loop, and the same return value."""
         nonlocal _backend
+
+        if _zero_config_pending:
+            _settle_zero_config()
 
         # L1-ONLY MODE: Skip backend lookup entirely
         # This fixes the sentinel problem: when backend=None is explicitly passed,
@@ -3074,6 +3151,8 @@ def create_cache_wrapper(
     def cache_clear() -> None:
         """Clear cache statistics and invalidate all cached entries."""
         _stats.clear()
+        if _zero_config_pending:
+            _settle_zero_config()
         # In L1-only mode, invalidation is synchronous (no backend I/O needed)
         # so cache_clear() works for both sync and async functions.
         if inspect.iscoroutinefunction(func) and not _l1_only_mode:
@@ -3084,8 +3163,9 @@ def create_cache_wrapper(
 
     # Other processes' invalidations reach this function's L1 through the process's listener. Only a
     # backed wrapper with an L1 registers: in L1-only mode nothing is shared, so nothing is announced.
-    # Registered weakly: the wrapper's _cachekit_evict attribute is what keeps _evict alive.
-    if _l1_cache is not None and not _l1_only_mode:
+    # Registered weakly: the wrapper's _cachekit_evict attribute is what keeps _evict alive. A zero-config
+    # candidate registers once _settle_zero_config() finds it backed.
+    if _l1_cache is not None and not _l1_only_mode and not _zero_config_pending:
         invalidation.register(_registry_id, _evict)
 
     if inspect.iscoroutinefunction(func):

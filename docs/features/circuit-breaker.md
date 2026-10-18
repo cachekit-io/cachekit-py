@@ -92,7 +92,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 
 **Example scenario**:
 ```
-Pod A starts at 12:00:00 with Redis down (auto-detected backend, built on the first call)
+Pod A starts at 12:00:00 with Redis down (backend selected by REDIS_URL, built on the first call)
 Requests 1-5: each call tries to build the backend, the connect fails, fetch runs uncached;
              the 5th failure within 60 s OPENS the circuit
 Requests 6-34: Circuit OPEN, fetch runs uncached without trying to connect

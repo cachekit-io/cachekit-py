@@ -2,13 +2,13 @@
 
 # Backend Guide
 
-Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis (default), File (local), Memcached, and CachekitIO (managed SaaS). You can also run in [L1-only mode](none.md) with `backend=None`, or implement custom backends for any key-value store.
+Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis, File (local), Memcached, and CachekitIO (managed SaaS). With no backend configured, a plaintext decorator runs in [L1-only mode](none.md), as `backend=None` does; encrypted and interop decorators still need a backend ([Nothing Configured](#4-nothing-configured-l1-only)). You can also implement custom backends for any key-value store.
 
 ## Overview
 
 cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. The `BaseBackend` protocol defines a minimal synchronous interface — five methods — that any backend must implement to be compatible with cachekit.
 
-**Key insight**: Backends are completely optional. If you don't specify a backend, cachekit uses RedisBackend with your configured Redis connection.
+**Key insight**: Backends are optional. A decorator without `backend=` resolves one at its first call per [Backend Resolution Priority](#backend-resolution-priority): Redis when `CACHEKIT_REDIS_URL` or `REDIS_URL` is set, and L1-only for a plaintext, non-interop decorator when nothing is configured.
 
 ## BaseBackend Protocol
 
@@ -217,7 +217,7 @@ Exception: an explicit `stale_ttl` validates SWR capability at decoration, so se
 CachekitIO default *before* importing modules that use it. `@cache.io` is not affected:
 it builds its own `CachekitIOBackend` and never consults `set_default_backend()`.
 
-### 3. Environment Variable Auto-Detection (Lowest Priority)
+### 3. Environment Variable Auto-Detection
 
 If no explicit backend and no module-level default, `DefaultBackendProvider`
 picks a backend at the function's first call from the one environment selector that is
@@ -230,7 +230,8 @@ set exactly one.
 | `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
 | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
-| none of the above: `REDIS_URL`, or nothing set | Redis, as above (localhost fallback) |
+| none of the above: `REDIS_URL` | Redis, as above |
+| nothing set at all | plaintext, non-interop decorators: [L1-only](#4-nothing-configured-l1-only), no backend; secure, `encryption=True` and `interop=` decorators: Redis at `redis://localhost:6379` |
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
@@ -271,12 +272,6 @@ circuit breaker is open before the backend was ever resolved, which runs the fun
 The check is on the id's type only. L1 is shared by every tenant (see
 above), so do not rely on the `TypeError` to keep tenants apart.
 
-**Resolution order**:
-1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
-2. Module-level default via `set_default_backend()` (checked at decoration, and
-   again at first call if still unset)
-3. Environment auto-detection per the table above
-
 #### Upgrading to 0.20.0
 
 If your deployment used cachekit under more than one tenant, purge the Redis entries that
@@ -284,7 +279,7 @@ earlier releases wrote. A call with no tenant set counts as the tenant `default`
 that only ever used one tenant is unaffected.
 
 In earlier releases, a decorated function that resolved Redis from the environment
-(`CACHEKIT_REDIS_URL`, `REDIS_URL` or the localhost default), or a backend taken from
+(`CACHEKIT_REDIS_URL`, `REDIS_URL`, or the localhost default those releases used when neither was set), or a backend taken from
 `RedisBackendProvider.get_backend()`, stayed bound to the tenant that was current when the
 backend was first obtained. Every tenant's L2 writes through it then landed under that one
 tenant's `t:<tenant>:` prefix. The binding was per function, so a process serving one tenant
@@ -352,6 +347,54 @@ Other changes you may notice:
   `uuid.UUID` raises `TypeError`, as above; this includes a `bool`, an `IntEnum` member and a
   `bytearray`. Convert an `IntEnum` member with `int()` and a `bytearray` with `bytes()` first.
 
+### 4. Nothing Configured: L1-only
+
+With no explicit backend, no module-level default, no backend provider of your own
+registered, no `CACHEKIT_*` selector and no `REDIS_URL`, a decorator caches in L1 only,
+exactly as if it had been written with [`backend=None`](none.md). It makes no connection
+attempt and logs no warning:
+
+```python
+from cachekit import cache
+
+@cache
+def square(x: int) -> int:
+    return x * x
+
+for _ in range(20):
+    square(4)
+
+info = square.cache_info()
+assert (info.misses, info.l1_hits) == (1, 19)  # ran once, then served from L1
+```
+
+That cache is per process: nothing is shared with other processes, and an
+`invalidate_cache()` in one process does not reach another. Values are held by reference,
+so mutating a returned object mutates the cached one. With `l1_enabled=False` nothing is
+cached at all. The choice is made at the function's first call, or at its first
+`invalidate_cache()`, `ainvalidate_cache()` or `cache_clear()` if one comes earlier, and kept: set a backend (any
+tier above) before either.
+
+This tier does not apply to `@cache.secure`, `encryption=True` or `interop=`. L1-only
+holds raw Python objects, which cannot be ciphertext or the shared interop format, so
+these still resolve a backend with nothing configured, and get Redis at
+`RedisBackendConfig`'s default URL, `redis://localhost:6379`.
+
+> [!WARNING]
+> Earlier releases connected to `redis://localhost:6379` when nothing was configured. If
+> you relied on that, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`) to
+> keep using that Redis.
+
+### Resolution Order
+
+1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
+2. Module-level default via `set_default_backend()` (checked at decoration, and
+   again at first call if still unset)
+3. A backend provider of your own registered with the DI container, else environment
+   auto-detection per the table above
+4. Nothing configured: L1-only for a plaintext, non-interop decorator; secure, `encryption=True` and
+   `interop=` decorators still resolve Redis at `redis://localhost:6379`
+
 ## Performance Considerations
 
 ### Backend Latency Comparison
@@ -360,7 +403,7 @@ Other changes you may notice:
 |---------|---------|----------|-------|
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
 | **File** | set = fsync, flat in cache size, except eviction, rejection and the 30 s rescan, which scan the directory; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
-| **Redis** | 1-7ms | Shared cache across pods | Production default |
+| **Redis** | 1-7ms | Shared cache across pods | Recommended production backend |
 | **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
 | **HTTP API** | 10-100ms | Custom cloud services | Network dependent |
 | **DynamoDB** | 100-500ms | Serverless, low-traffic | High availability |

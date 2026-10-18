@@ -26,9 +26,21 @@ CacheKit provides a unified caching API with pluggable backends. You write `@cac
 once; the backend (Redis, CachekitIO, Memcached, or File / L1-only) is selected from
 your environment. See [Choose Your Backend](#choose-your-backend) for the full menu.
 
-By default, `@cache` auto-detects the backend from env vars, falling back to Redis at
-localhost (12-factor convention), so the fastest path to a working cache is to point
-it at a local Redis:
+With nothing configured, `@cache` caches in L1 only, in process, like `lru_cache`. It
+makes no connection attempt and logs no warning:
+
+```python
+from cachekit import cache
+
+@cache  # nothing configured: L1-only, per process
+def expensive_function():
+    return do_work()
+```
+
+That cache is not shared between processes, holds values by reference, and is chosen at
+the function's first call ([details](backends/README.md#4-nothing-configured-l1-only)).
+To share it across processes, select a backend from the environment before the first
+call. For a local Redis:
 
 ```bash
 # 1. Run Redis
@@ -38,13 +50,7 @@ docker run -p 6379:6379 redis
 export REDIS_URL="redis://localhost:6379"
 ```
 
-```python
-from cachekit import cache
-
-@cache  # Auto-detects backend (defaults to Redis at localhost)
-def expensive_function():
-    return do_work()
-```
+The same `@cache` now caches in L1 and Redis.
 
 > [!TIP]
 > **What you get out of the box:**
@@ -229,7 +235,7 @@ docker run -p 6379:6379 redis
 ### Environment Setup
 
 ```bash
-# Redis (auto-detected default — falls back to localhost)
+# Redis (12-factor; with no selector set at all, plaintext decorators cache L1-only)
 export REDIS_URL="redis://localhost:6379"
 
 # Optional: explicit Redis configuration

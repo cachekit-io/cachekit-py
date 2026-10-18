@@ -235,7 +235,7 @@ assert calls == [1, 2, 1, 2]
 
 | Backend the decorator resolves | L2 entries deleted |
 |--------------------------------|--------------------|
-| Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (the default, no `backend=`), or a backend from `RedisBackendProvider` | Every entry **any process** wrote for the function, for the calling tenant |
+| Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `backend=`), or a backend from `RedisBackendProvider` | Every entry **any process** wrote for the function, for the calling tenant |
 | `RedisBackend` passed as `backend=`, File, Memcached, CachekitIO | Only entries **this process** wrote or read |
 | L1-only (`backend=None`) | No L2; this process's L1 only |
 
