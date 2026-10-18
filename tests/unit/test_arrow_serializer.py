@@ -6,6 +6,7 @@ Tests DataFrame serialization, return_format variants, error handling, and perfo
 from __future__ import annotations
 
 import io
+import sys
 from collections.abc import Mapping
 
 import pytest
@@ -189,13 +190,9 @@ class TestReturnFormatVariants:
         assert "b" in result.column_names
         assert result.num_rows == 3
 
-    @pytest.mark.skipif(True, reason="Skip polars test if not installed (optional dependency)")
     def test_return_format_polars(self):
         """return_format='polars' produces polars.DataFrame."""
-        try:
-            import polars as pl
-        except ImportError:
-            pytest.skip("polars not installed")
+        pl = pytest.importorskip("polars")
 
         serializer = ArrowSerializer(return_format="polars")
         df = pd.DataFrame({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})
@@ -204,18 +201,16 @@ class TestReturnFormatVariants:
         result = serializer.deserialize(data)
 
         assert isinstance(result, pl.DataFrame)
-        assert result.shape == (3, 2)
+        assert result.equals(pl.from_pandas(df))
 
-    def test_polars_not_installed_raises_helpful_error(self):
-        """Deserialize with polars format when polars not installed raises clear error."""
+    def test_polars_not_installed_raises_helpful_error(self, monkeypatch):
+        """Deserialize with polars format when polars is not installed raises SerializationError."""
         serializer = ArrowSerializer(return_format="polars")
-        df = pd.DataFrame({"a": [1, 2, 3]})
+        data, _ = serializer.serialize(pd.DataFrame({"a": [1, 2, 3]}))
+        monkeypatch.setitem(sys.modules, "polars", None)  # makes `import polars` raise ImportError
 
-        data, _ = serializer.serialize(df)
-
-        # Mock ImportError scenario (polars not installed)
-        # We can't easily force ImportError in test, but the code path is tested via coverage
-        # If polars is installed, this will work. If not, it will raise SerializationError.
+        with pytest.raises(SerializationError, match="polars not installed"):
+            serializer.deserialize(data)
 
 
 class TestDictOfArrays:
@@ -466,13 +461,9 @@ class TestMemoryMappedDeserialization:
 class TestPolarsSupport:
     """Test polars DataFrame support via __arrow_c_stream__ interface."""
 
-    @pytest.mark.skipif(True, reason="Skip polars test if not installed (optional dependency)")
     def test_polars_dataframe_round_trip(self):
         """polars DataFrame can be serialized via Arrow C Stream interface."""
-        try:
-            import polars as pl
-        except ImportError:
-            pytest.skip("polars not installed")
+        pl = pytest.importorskip("polars")
 
         serializer = ArrowSerializer(return_format="polars")
         df = pl.DataFrame({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})
@@ -481,14 +472,7 @@ class TestPolarsSupport:
         result = serializer.deserialize(data, metadata)
 
         assert isinstance(result, pl.DataFrame)
-        assert result.shape == (3, 2)
-
-    def test_polars_serialization_requires_arrow_c_stream(self):
-        """polars serialization uses __arrow_c_stream__ protocol."""
-        # This test documents the implementation detail that polars DataFrames
-        # are detected via __arrow_c_stream__ interface (zero-copy).
-        # We can't test this without polars installed, but the code path is covered.
-        pass
+        assert result.equals(df)
 
 
 class TestCompression:

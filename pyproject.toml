@@ -250,6 +250,9 @@ dev = [
     # OrjsonSerializer support — now the [json] optional extra; kept here so the
     # orjson tests, doctests, and markdown-docs still resolve it in dev/CI.
     "orjson>=3.9.0",
+    # ArrowSerializer return_format="polars" tests (zero-copy column aliasing). Not in `test`:
+    # polars ships abi3 wheels only, which a free-threaded interpreter cannot install.
+    "polars>=2.0.0",
 ]
 # Linux CI only - Atheris requires libFuzzer (not available on macOS without building LLVM)
 fuzz = [
