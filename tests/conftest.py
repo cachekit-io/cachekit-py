@@ -178,8 +178,9 @@ if PYTEST_REDIS_AVAILABLE:
         try:
             yield PerRequestRedisBackend(client, tenant)
         finally:
-            for key in client.scan_iter(match=f"t:{tenant}:*"):
-                client.delete(key)
+            keys = list(client.scan_iter(match=f"t:{tenant}:*"))
+            if keys:
+                client.delete(*keys)
             client.close()
 
 

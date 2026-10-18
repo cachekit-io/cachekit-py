@@ -13,13 +13,13 @@ development. This contract is checked on the second and third calls, which are h
   caller the cached object itself, so there the two hits are asserted to be the same object.
 
 Axes: every serializer spelling that accepts the value, File through its bytes read and (for the
-spellings that can take it) its mmap read, Redis, and ``backend=None``.
+spellings that can take it) its mmap read, Redis, and ``backend=None`` (once per value, under "auto").
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -30,7 +30,7 @@ pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("orjson")
 
-from cachekit import cache, serializers  # noqa: E402
+from cachekit import cache, cache_handler, serializers  # noqa: E402
 from cachekit.backends.file import FileBackend  # noqa: E402
 from cachekit.backends.file.config import FileBackendConfig  # noqa: E402
 from cachekit.config.singleton import reset_settings  # noqa: E402
@@ -58,7 +58,7 @@ def _frame(rows: int) -> pd.DataFrame:
         {
             "i": np.arange(rows, dtype=np.int64),
             "f": np.arange(rows, dtype=np.float64) / 3,
-            "t": pd.date_range("2024-01-01", periods=rows, freq="s"),
+            "t": pd.date_range("2024-01-01", periods=rows, freq="s").astype("datetime64[ns]"),  # pandas 3 defaults to [us]
             "c": pd.Categorical(np.array(["red", "green", "blue"])[np.arange(rows) % 3]),
             "s": [f"row-{n}" for n in range(rows)],
             "b": np.arange(rows) % 2 == 0,
@@ -83,7 +83,9 @@ def _uncompressed_arrow(monkeypatch: pytest.MonkeyPatch) -> str:
     takes the mmap read (``CacheSerializationHandler.supports_mmap_read``).
     """
     monkeypatch.setenv("CACHEKIT_ARROW_COMPRESSION", "none")
-    monkeypatch.setattr(serializers, "_serializer_cache", {})  # "arrow" resolves its codec once, then is cached
+    # "arrow" resolves its codec once, then both caches hold the instance; the decorator reads the second.
+    monkeypatch.setattr(serializers, "_serializer_cache", {})
+    monkeypatch.setattr(cache_handler, "_serializer_instance_cache", {})
     reset_settings()
     return "arrow"
 
@@ -124,20 +126,19 @@ class _BytesOnlyFileBackend(FileBackend):
 def _cases() -> list[Any]:
     cases = []
     for serializer, (_, values) in SERIALIZERS.items():
-        backends = ("file-mmap", "file-bytes", "redis", "none") if serializer in MMAP_READ else ("file-bytes", "redis", "none")
+        backends = ("file-mmap", "file-bytes", "redis") if serializer in MMAP_READ else ("file-bytes", "redis")
+        if serializer == "auto":  # backend=None stores the object and never serializes, so one spelling covers it
+            backends = (*backends, "none")
         for value in values:
             for backend in backends:
-                marks = []
-                if value == "frame-one-batch" and serializer in ARROW_ROUTED and backend != "none":
-                    marks.append(READ_ONLY_ARROW_FRAME)
-                if backend == "redis":  # in tests/unit so the PR lane runs it; the marker says it needs Redis
-                    marks.append(pytest.mark.integration)
+                read_only = value == "frame-one-batch" and serializer in ARROW_ROUTED and backend != "none"
+                marks = [READ_ONLY_ARROW_FRAME] if read_only else []
                 cases.append(pytest.param(serializer, value, backend, marks=marks, id=f"{serializer}-{value}-{backend}"))
     return cases
 
 
 @pytest.fixture(autouse=True)
-def _small_record_batches(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _small_record_batches(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(arrow_serializer, "_TARGET_BATCH_BYTES", BATCH_BYTES)
     yield
     reset_settings()  # drop any settings _uncompressed_arrow loaded from its env override
@@ -216,6 +217,9 @@ def test_cache_hit_behaves_like_the_cached_value(
     third = compute()
 
     assert runs == 1, "the second and third calls must be hits"
+    if serializer == "arrow-uncompressed":
+        resolved = list(cache_handler._serializer_instance_cache.values())
+        assert [s.compression for s in resolved] == [None], "the uncompressed axis must not fall back to a codec"
     if backend_name == "file-mmap":
         assert backend.mmap_hits == 2, "the mmap axis must read through the mmap"
     _assert_equal(second, expected)
