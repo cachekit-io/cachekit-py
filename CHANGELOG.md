@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.24.0](https://github.com/cachekit-io/cachekit-py/compare/v0.23.0...v0.24.0) (2026-10-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **decorators:** a custom key= key carries the decorated function's identity (LAB-10003) ([#583](https://github.com/cachekit-io/cachekit-py/issues/583))
+
+### Bug Fixes
+
+* **arrow:** return writable pandas frames from single-batch Arrow reads (LAB-10013) ([#582](https://github.com/cachekit-io/cachekit-py/issues/582)) ([73e57c2](https://github.com/cachekit-io/cachekit-py/commit/73e57c23e1a640548e9430daee7f3b2c0bf0ac1d))
+* **decorators:** a custom key= key carries the decorated function's identity (LAB-10003) ([#583](https://github.com/cachekit-io/cachekit-py/issues/583)) ([087d4af](https://github.com/cachekit-io/cachekit-py/commit/087d4af780327e051a5bb91545fa6f8eea30dada))
+
+
+### Performance Improvements
+
+* **arrow:** zero-copy File-backend reads for ArrowSerializer instances and Arrow/polars results (LAB-9999) ([#581](https://github.com/cachekit-io/cachekit-py/issues/581)) ([5d4e106](https://github.com/cachekit-io/cachekit-py/commit/5d4e10676b5707c6ff7a85f9ca5f1ca75752edea))
+
 ## [0.23.0](https://github.com/cachekit-io/cachekit-py/compare/v0.22.0...v0.23.0) (2026-10-18)
 
 
