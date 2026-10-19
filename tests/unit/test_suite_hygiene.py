@@ -7,7 +7,7 @@ ten ``@pytest.mark.skip`` tests, a module that skipped 35 functions at import, a
 green; this does. It flags, statically:
 
 * **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, a bare
-  ``skipif`` that is never called, and ``@pytest.mark.skip`` anywhere, including ``pytestmark``,
+  ``skipif`` that is never called (also when bound to a name: call it where it is applied), and ``@pytest.mark.skip`` anywhere, including ``pytestmark``,
   ``pytest.param(marks=...)`` and a marker a hook adds, by object or by name
   (``item.add_marker("skip")``). A skip that depends on something is
   ``skipif(<condition>, reason=...)``, which a hook can add as well.
@@ -105,20 +105,21 @@ class _Module:
         return None
 
     def asserts(self, fn: Func, cls: str | None, seen: frozenset[int] = frozenset(), scope: dict | None = None) -> bool:
-        """``scope``: the functions defined inside the enclosing test, which a nested function may call.
+        """``scope``: the nested functions visible where ``fn`` is defined, each with its own such scope.
 
-        Only a callee found in ``scope`` inherits it: a module-level helper or ``self.`` method
-        cannot see the test's nested defs, so its calls resolve at module level.
+        A call resolves lexically, as Python does: to a function nested in ``fn`` or in an enclosing
+        function, else to the module or a ``self.`` method, none of which sees the test's nested defs.
         """
         if id(fn) in seen:
             return False
         nodes = list(_own_nodes(fn))
         if any(_is_signal(n) for n in nodes):
             return True
-        scope = {**(scope or {}), **{n.name: n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}}
+        inner = dict(scope or {})
+        inner.update({n.name: (n, inner) for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))})
         calls = [n for n in nodes if isinstance(n, ast.Call)]
         callees = (
-            (scope[c.func.id], scope) if isinstance(c.func, ast.Name) and c.func.id in scope else (self._callee(cls, c), None)
+            inner[c.func.id] if isinstance(c.func, ast.Name) and c.func.id in inner else (self._callee(cls, c), None)
             for c in calls
         )
         return any(self.asserts(c, cls, seen | {id(fn)}, s) for c, s in callees if c is not None)
@@ -168,8 +169,12 @@ def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST], aliases: d
         name = _dotted(node)
         if name.endswith("mark.skip"):
             return "pytest.mark.skip: use skipif(<condition>, reason=...)"
-        parent = parents.get(node)
-        if name.endswith("mark.skipif") and not (isinstance(parent, ast.Call) and parent.func is node):
+        parent = parents.get(node)  # called, or a method such as .with_args(...) taking the condition
+        if (
+            name.endswith("mark.skipif")
+            and not (isinstance(parent, ast.Call) and parent.func is node)
+            and not isinstance(parent, ast.Attribute)
+        ):
             return "skipif without a condition never runs"
         return None
     if not isinstance(node, ast.Call):
@@ -328,6 +333,43 @@ def test_aliased_xfail():
     assert len("ok") == 2
 
 
+def test_nested_sibling_resolves_where_it_is_defined():
+    def check():
+        return 1
+
+    def sibling():
+        check()
+
+    def run():
+        def check():
+            assert len("ok") == 2
+
+        sibling()
+
+    run()
+
+
+def test_nested_sibling_assert_found_where_it_is_defined():
+    def check():
+        assert len("ok") == 2
+
+    def sibling():
+        check()
+
+    def run():
+        def check():
+            return 1
+
+        sibling()
+
+    run()
+
+
+@pytest.mark.skipif.with_args(False, reason="with_args takes the condition")
+def test_skipif_with_args_is_conditional():
+    assert len("ok") == 2
+
+
 def test_nested_def_does_not_reach_a_module_helper():
     def quiet_check():
         assert len("ok") == 2
@@ -407,6 +449,7 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
         "test_assert_free asserts nothing",
         "test_assert_true_is_not_a_check asserts nothing",
         "test_nested_def_does_not_reach_a_module_helper asserts nothing",
+        "test_nested_sibling_resolves_where_it_is_defined asserts nothing",
         "test_thread_target_assert_is_not_a_check asserts nothing",
         "unconditional pytest.skip()",
         "unconditional pytest.skip()",
