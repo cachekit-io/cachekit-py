@@ -143,22 +143,24 @@ def test_backpressure_limit(record_property) -> None:
     num_threads = 20  # More threads than limit
     iterations_per_thread = 5
     latencies: list[int] = []
-    wrong: list[int] = []
+    wrong: list[tuple[int, str]] = []
     lock = threading.Lock()
 
     def worker(thread_id: int) -> None:
         for i in range(iterations_per_thread):
             item_id = thread_id * 100 + i
             start = time.perf_counter_ns()
+            # Recorded, not asserted: an assert in a thread is only printed, never fails the test
             try:
-                ok = get_data(item_id) == {"id": item_id, "result": "data"}
-            except Exception:
-                ok = False  # counted: an assert in a thread is only printed, never fails the test
+                result = get_data(item_id)
+                cause = None if result == {"id": item_id, "result": "data"} else f"wrong value {result!r}"
+            except Exception as exc:
+                cause = repr(exc)
             elapsed = time.perf_counter_ns() - start
             with lock:
                 latencies.append(elapsed)
-                if not ok:
-                    wrong.append(item_id)
+                if cause is not None:
+                    wrong.append((item_id, cause))
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
     start_time = time.perf_counter()
@@ -183,7 +185,7 @@ def test_backpressure_limit(record_property) -> None:
     record_property("p95_ms", round(p95 / 1_000_000, 2))
     record_property("rejected_permits", load_control["rejected_count"])
 
-    assert wrong == [], f"{len(wrong)} callers got an error or a wrong value"
+    assert wrong == [], f"{len(wrong)} callers got an error or a wrong value, first: {wrong[:3]}"
     assert len(latencies) == num_threads * iterations_per_thread
     # 20 callers on 50ms operations always fill the 5 slots; the cap must hold at that point.
     assert backend.max_in_flight == max_concurrent, f"{backend.max_in_flight} backend operations ran at once"
