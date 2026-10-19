@@ -402,6 +402,7 @@ get_score(2)  # served from cache
 info = get_score.cache_info()
 # CacheInfo has 9 fields: hits, misses, l1_hits, l2_hits, maxsize,
 # currsize, l2_avg_latency_ms, last_operation_at, session_id
+assert (info.hits, info.misses) == (1, 1)  # the second call was a hit
 assert info.l1_hits + info.l2_hits == info.hits  # every hit is L1 or L2
 ```
 

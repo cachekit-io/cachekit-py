@@ -12,6 +12,8 @@ This module provides:
 
 import os
 import sys
+from collections.abc import Iterator
+from unittest import mock
 
 import pytest
 
@@ -348,8 +350,13 @@ def setup_di_for_redis_isolation(request):
     """
     Auto-use fixture that sets up DI for Redis test isolation.
 
-    This runs for every test and ensures DI uses isolated Redis when available.
+    This runs for every test and ensures DI uses isolated Redis when available. A test that requests
+    ``nothing_configured`` opts out: it installs the real default provider and needs no Redis.
     """
+    if "nothing_configured" in request.fixturenames:
+        yield
+        return
+
     if not PYTEST_REDIS_AVAILABLE:
         pytest.fail("pytest-redis is required. Install with: uv pip install pytest-redis")
 
@@ -411,6 +418,42 @@ def setup_di_for_redis_isolation(request):
 
         container.register(BackendProviderInterface, DefaultBackendProvider, singleton=True)
         container.register(CacheClientProvider, DefaultCacheClientProvider, singleton=True)
+
+
+@pytest.fixture
+def nothing_configured(monkeypatch: pytest.MonkeyPatch) -> Iterator[mock.MagicMock]:
+    """Clean slate: the production DefaultBackendProvider, no CACHEKIT_* variable, no REDIS_URL, no default backend.
+
+    Opts the test out of setup_di_for_redis_isolation, so it runs with no Redis. Yields a spy on
+    DefaultBackendProvider.get_backend that fails the test if it builds anything.
+    """
+    from cachekit.backends.provider import BackendProviderInterface, DefaultBackendProvider
+    from cachekit.config import reset_settings
+    from cachekit.di import DIContainer
+    from tests.fixtures.zero_config import clear_cachekit_env
+
+    clear_cachekit_env(monkeypatch)
+    reset_settings()  # settings already built from the cleared variables would still hold them
+    monkeypatch.setattr("cachekit.config.decorator._default_backend", None)
+    monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, DefaultBackendProvider())
+    with mock.patch.object(
+        DefaultBackendProvider, "get_backend", autospec=True, side_effect=AssertionError("get_backend() called")
+    ) as spy:
+        yield spy
+    reset_settings()
+
+
+@pytest.fixture
+def no_redis_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail on any Redis provider or client construction."""
+    from cachekit.backends.redis import provider as redis_provider
+
+    def refuse(*args, **kwargs) -> None:
+        raise AssertionError("Redis built with nothing configured")
+
+    monkeypatch.setattr(redis_provider.RedisBackendProvider, "__init__", refuse)
+    monkeypatch.setattr("redis.Redis.__init__", refuse)
+    monkeypatch.setattr("redis.asyncio.Redis.__init__", refuse)
 
 
 # =============================================================================

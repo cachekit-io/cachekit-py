@@ -27,6 +27,7 @@ from cachekit.backends.provider import (
     SimpleLogger,
 )
 from cachekit.hash_utils import redact_cache_key  # noqa: I001
+from tests.fixtures.zero_config import clear_cachekit_env
 
 
 @pytest.mark.unit
@@ -284,30 +285,32 @@ class TestDefaultBackendProvider:
                 assert backend is mock_instance
                 mock_ckio.assert_called_once()
 
-    def test_get_backend_falls_through_to_redis_without_api_key(self) -> None:
-        """No CACHEKIT_API_KEY → falls through to Redis."""
+    def test_get_backend_falls_through_to_redis_without_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nothing configured → Redis from RedisBackendConfig, at its default URL.
+
+        Still the documented contract for the decorators that resolve a backend with nothing configured
+        (@cache.secure, encryption=True, interop=): docs/backends/README.md, "Nothing Configured". A
+        plaintext decorator never asks: it runs L1-only (tests/unit/test_zero_config_l1.py).
+        """
+        clear_cachekit_env(monkeypatch)
         provider = DefaultBackendProvider()
 
-        with mock.patch.dict("os.environ", {}, clear=False):
-            import os
+        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
+            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
+                mock_config_instance = mock.MagicMock()
+                mock_config_class.from_env.return_value = mock_config_instance
+                mock_config_instance.redis_url = "redis://localhost:6379"
 
-            os.environ.pop("CACHEKIT_API_KEY", None)
+                mock_provider_instance = mock.MagicMock()
+                mock_backend_instance = mock.MagicMock()
+                mock_provider_class.return_value = mock_provider_instance
+                mock_provider_instance.get_shared_backend.return_value = mock_backend_instance
 
-            with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-                with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+                backend = provider.get_backend()
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_shared_backend.return_value = mock_backend_instance
-
-                    backend = provider.get_backend()
-
-                    assert backend is mock_backend_instance
-                    mock_config_class.from_env.assert_called_once()
+                assert backend is mock_backend_instance
+                mock_config_class.from_env.assert_called_once()
+                mock_provider_class.assert_called_once_with("redis://localhost:6379", config=mock_config_instance)
 
     def test_get_backend_caches_result(self) -> None:
         """Second call returns cached backend, no re-init."""

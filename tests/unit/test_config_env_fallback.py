@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.config import CachekitConfig
+from tests.fixtures.zero_config import clear_cachekit_env
 
 
 class TestRedisBackendConfigEnv:
@@ -13,15 +14,8 @@ class TestRedisBackendConfigEnv:
 
     def test_redis_config_default_values_no_env(self, monkeypatch):
         """Test default values when no env vars are set."""
-        # Clear all possible env vars
-        env_vars = [
-            "CACHEKIT_REDIS_URL",
-            "CACHEKIT_CONNECTION_POOL_SIZE",
-            "CACHEKIT_SOCKET_KEEPALIVE",
-            "CACHEKIT_DISABLE_HIREDIS",
-        ]
-        for var in env_vars:
-            monkeypatch.delenv(var, raising=False)
+        # Clear all possible env vars. CI sets REDIS_URL to the default URL, which would hide a changed default.
+        clear_cachekit_env(monkeypatch)
 
         config = RedisBackendConfig()
         assert config.redis_url == "redis://localhost:6379"
