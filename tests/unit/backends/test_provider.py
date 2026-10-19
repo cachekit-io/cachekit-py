@@ -27,7 +27,7 @@ from cachekit.backends.provider import (
     SimpleLogger,
 )
 from cachekit.hash_utils import redact_cache_key  # noqa: I001
-from tests.fixtures.zero_config import clear_backend_env
+from tests.fixtures.zero_config import clear_cachekit_env
 
 
 @pytest.mark.unit
@@ -292,7 +292,7 @@ class TestDefaultBackendProvider:
         (@cache.secure, encryption=True, interop=): docs/backends/README.md, "Nothing Configured". A
         plaintext decorator never asks: it runs L1-only (tests/unit/test_zero_config_l1.py).
         """
-        clear_backend_env(monkeypatch)
+        clear_cachekit_env(monkeypatch)
         provider = DefaultBackendProvider()
 
         with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:

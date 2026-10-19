@@ -3,7 +3,7 @@
 from cachekit.backends.redis.client import reset_global_pool
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.config import CachekitConfig, reset_settings
-from tests.fixtures.zero_config import clear_backend_env
+from tests.fixtures.zero_config import clear_cachekit_env
 
 
 class TestConfigSeparation:
@@ -43,7 +43,7 @@ class TestConfigSeparation:
 
     def test_redis_backend_config_defaults(self, monkeypatch):
         """Test that RedisBackendConfig has sensible defaults."""
-        clear_backend_env(monkeypatch)  # CI sets REDIS_URL to the default URL, which would hide a changed default
+        clear_cachekit_env(monkeypatch)  # CI sets REDIS_URL to the default URL, which would hide a changed default
         redis_config = RedisBackendConfig()
 
         assert redis_config.redis_url == "redis://localhost:6379"

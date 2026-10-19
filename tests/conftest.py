@@ -12,6 +12,8 @@ This module provides:
 
 import os
 import sys
+from collections.abc import Iterator
+from unittest import mock
 
 import pytest
 
@@ -419,25 +421,26 @@ def setup_di_for_redis_isolation(request):
 
 
 @pytest.fixture
-def nothing_configured(monkeypatch: pytest.MonkeyPatch):
-    """Clean slate: the production DefaultBackendProvider, no selector, no REDIS_URL, no default backend.
+def nothing_configured(monkeypatch: pytest.MonkeyPatch) -> Iterator[mock.MagicMock]:
+    """Clean slate: the production DefaultBackendProvider, no CACHEKIT_* variable, no REDIS_URL, no default backend.
 
     Opts the test out of setup_di_for_redis_isolation, so it runs with no Redis. Yields a spy on
     DefaultBackendProvider.get_backend that fails the test if it builds anything.
     """
-    from unittest import mock
-
     from cachekit.backends.provider import BackendProviderInterface, DefaultBackendProvider
+    from cachekit.config import reset_settings
     from cachekit.di import DIContainer
-    from tests.fixtures.zero_config import clear_backend_env
+    from tests.fixtures.zero_config import clear_cachekit_env
 
-    clear_backend_env(monkeypatch)
+    clear_cachekit_env(monkeypatch)
+    reset_settings()  # settings already built from the cleared variables would still hold them
     monkeypatch.setattr("cachekit.config.decorator._default_backend", None)
     monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, DefaultBackendProvider())
     with mock.patch.object(
         DefaultBackendProvider, "get_backend", autospec=True, side_effect=AssertionError("get_backend() called")
     ) as spy:
         yield spy
+    reset_settings()
 
 
 @pytest.fixture

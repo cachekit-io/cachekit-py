@@ -24,7 +24,7 @@ from cachekit.config.decorator import DecoratorConfig, set_default_backend
 from cachekit.config.nested import L1CacheConfig
 from cachekit.decorators.wrapper import InvalidationOutcome
 from cachekit.di import DIContainer
-from tests.fixtures.zero_config import BACKEND_ENV, SELECTORS, clear_backend_env
+from tests.fixtures.zero_config import BACKEND_ENV, SELECTORS, clear_cachekit_env
 
 # The presets that may run zero-config. secure (encryption), io (its own backend) and local (always
 # L1-only) are out of scope.
@@ -432,7 +432,7 @@ class TestEncryptedAndInteropUnchanged:
 
 
 def test_is_configured_reads_every_selector_in_any_case(monkeypatch: pytest.MonkeyPatch) -> None:
-    clear_backend_env(monkeypatch)
+    clear_cachekit_env(monkeypatch)
     provider = DefaultBackendProvider()
     assert provider._is_configured() is False
     for var in BACKEND_ENV:  # uppercase names: test_one_selector_resolves_a_backend
@@ -447,7 +447,7 @@ def test_is_configured_reads_every_selector_in_any_case(monkeypatch: pytest.Monk
 @pytest.mark.parametrize("var", SELECTORS)
 def test_empty_other_casing_does_not_hide_a_selector(var: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """pydantic keeps one of two spellings, possibly the empty one; _detect() still routes on the exact-case one."""
-    clear_backend_env(monkeypatch)
+    clear_cachekit_env(monkeypatch)
     monkeypatch.setenv(var, "configured")
     monkeypatch.setenv(var.lower(), "")
     provider = DefaultBackendProvider()
