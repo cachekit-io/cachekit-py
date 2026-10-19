@@ -99,22 +99,24 @@ class TestReliabilitySimple:
             # Falls back to executing the function
             assert result2 == {"result": 40}
 
-    @pytest.mark.skip(reason="Mocking Redis failure is complex due to connection pool")
-    def test_health_check_with_redis_failure(self, redis_client):
+    def test_health_check_with_redis_failure(self, redis_test_client):
         """Test health check when Redis is down."""
         health_checker = get_health_checker()
 
-        # Mock Redis ping failure
-        with patch.object(redis_client, "ping", side_effect=ConnectionError()):
+        # The health checker reaches Redis through the DI client provider, which the test session
+        # binds to redis_test_client: failing that client's ping is Redis going down.
+        with patch.object(redis_test_client, "ping", side_effect=ConnectionError("Redis down")):
             result = health_checker.check_health(force=True)
 
-            # Should be unhealthy
-            assert result.status == HealthStatus.UNHEALTHY
-            assert not result.is_healthy
+        # Should be unhealthy
+        assert result.status == HealthStatus.UNHEALTHY
+        assert not result.is_healthy
 
-            # Redis component should be unhealthy
-            redis_component = next(c for c in result.components if c.name == "redis")
-            assert redis_component.status == HealthStatus.UNHEALTHY
+        # Redis component should be unhealthy
+        redis_component = next(c for c in result.components if c.name == "redis")
+        assert redis_component.status == HealthStatus.UNHEALTHY
+        assert redis_component.message == "Redis health check failed: Redis down"
+        assert redis_component.details["error_type"] == "ConnectionError"
 
     # DELETED: test_connection_pool_statistics
     # Reason: RedisConnectionPoolManager and get_pool_stats() no longer exist.

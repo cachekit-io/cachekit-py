@@ -1,27 +1,17 @@
 """
-Production Data Patterns Testing for PyRedis Cache Pro
+Production data patterns through AutoSerializer (serializer="auto"), the type-preserving cache serializer.
 
-This module validates the cache serialization system against realistic enterprise
-data patterns commonly encountered in production environments. Focus is on:
-
-- Complex business data structures (user profiles, API responses, etc.)
-- Large-scale data processing (time-series, search results)
-- Mixed-type collections with deep nesting
-- Performance validation (not optimization - just "doesn't explode")
-- Data integrity preservation across complex structures
-
-REQUIREMENTS per CLAUDE.md:
-- Type fidelity is NON-NEGOTIABLE (100% roundtrip accuracy)
-- Enterprise features over micro-optimization
-- Real-world scenarios, not theoretical edge cases
-- Simple pass/fail criteria (KISS principles)
+Realistic business payloads (user profiles, API responses, time series, deep config, audit logs,
+dashboards, mixed collections) must read back equal to what was written, with every container and
+scalar type intact.
 """
 
 import datetime
-import time
 from typing import Any
 
 import pytest
+
+from cachekit.serializers.auto_serializer import AutoSerializer
 
 try:
     import numpy as np
@@ -29,9 +19,6 @@ try:
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
-
-# Import from compatibility wrapper
-from tests.critical.cache_serializer_compat import CACHE_SERIALIZER_AVAILABLE, CacheSerializer  # noqa: E402
 
 
 class ProductionDataGenerator:
@@ -352,187 +339,66 @@ class ProductionDataGenerator:
         }
 
 
-def validate_roundtrip_integrity(serializer: CacheSerializer, data: Any, test_name: str) -> None:
-    """Validate that serialization/deserialization preserves data structure"""
-    # Serialize
-    start_serialize = time.perf_counter()
-    serialized, metadata = serializer.serialize(data)
-    serialize_duration = time.perf_counter() - start_serialize
-
-    # Deserialize
-    start_deserialize = time.perf_counter()
-    deserialized = serializer.deserialize(serialized)
-    deserialize_duration = time.perf_counter() - start_deserialize
-
-    # Log performance (not asserting - just monitoring)
-    pattern = getattr(metadata, "pattern", "unknown")
-    print(
-        f"✓ {test_name} - Serialize: {serialize_duration:.4f}s, "
-        f"Deserialize: {deserialize_duration:.4f}s, Size: {len(serialized)} bytes, "
-        f"Pattern: {pattern}"
-    )
-
-    # Validate basic structure preservation
-    validate_structure_preservation(data, deserialized, test_name)
-
-
-def validate_structure_preservation(original: Any, result: Any, context: str) -> None:
-    """Validate structure preservation with enterprise-aware type handling"""
-    if type(original) is not type(result):
-        # Allow documented type conversions (tuple -> list, set -> list)
-        if isinstance(original, tuple) and isinstance(result, list):
-            assert len(original) == len(result), f"{context}: Tuple->List length mismatch"
-            return
-        elif isinstance(original, set) and isinstance(result, list):
-            assert len(original) == len(result), f"{context}: Set->List length mismatch"
-            return
-        else:
-            raise AssertionError(f"{context}: Type mismatch: {type(original).__name__} -> {type(result).__name__}")
-
+def assert_identical(original: Any, result: Any, path: str = "value") -> None:
+    """Deep equality that also requires every node to keep its exact type: == alone treats True, 1 and 1.0 as equal
+    and cannot compare arrays."""
+    assert type(result) is type(original), f"{path}: {type(original).__name__} read back as {type(result).__name__}"
     if isinstance(original, dict):
-        assert len(original) == len(result), f"{context}: Dict length mismatch"
-        for key in original.keys():
-            assert key in result, f"{context}: Missing key '{key}' in result"
+        assert result.keys() == original.keys(), f"{path}: keys differ"
+        for key, value in original.items():
+            assert_identical(value, result[key], f"{path}[{key!r}]")
     elif isinstance(original, (list, tuple)):
-        assert len(original) == len(result), f"{context}: Sequence length mismatch"
-    elif isinstance(original, (str, int, float, bool)) or original is None:
-        assert original == result, f"{context}: Primitive value mismatch: {original} != {result}"
+        assert len(result) == len(original), f"{path}: length differs"
+        for i, (want, got) in enumerate(zip(original, result, strict=True)):
+            assert_identical(want, got, f"{path}[{i}]")
+    elif HAS_NUMPY and isinstance(original, np.ndarray):
+        assert result.dtype == original.dtype, f"{path}: dtype differs"
+        np.testing.assert_array_equal(result, original, err_msg=path)
+    else:
+        assert result == original, f"{path}: {original!r} read back as {result!r}"
 
 
-def validate_reasonable_performance(
-    serializer: CacheSerializer, data: Any, test_name: str, max_serialize_ms: float, max_deserialize_ms: float
-) -> None:
-    """Performance benchmark (simple threshold check, not optimization)"""
-    start = time.perf_counter()
-    serialized, _metadata = serializer.serialize(data)
-    serialize_time = (time.perf_counter() - start) * 1000  # Convert to ms
-
-    assert serialize_time <= max_serialize_ms, (
-        f"{test_name}: Serialization too slow: {serialize_time:.1f}ms (max: {max_serialize_ms}ms)"
-    )
-
-    start = time.perf_counter()
-    _deserialized = serializer.deserialize(serialized)
-    deserialize_time = (time.perf_counter() - start) * 1000  # Convert to ms
-
-    assert deserialize_time <= max_deserialize_ms, (
-        f"{test_name}: Deserialization too slow: {deserialize_time:.1f}ms (max: {max_deserialize_ms}ms)"
-    )
-
-    print(f"✓ {test_name} performance: {serialize_time:.1f}ms serialize, {deserialize_time:.1f}ms deserialize")
+def validate_roundtrip_integrity(serializer: AutoSerializer, data: Any) -> None:
+    serialized, metadata = serializer.serialize(data)
+    assert_identical(data, serializer.deserialize(serialized, metadata))
 
 
-@pytest.mark.skipif(not CACHE_SERIALIZER_AVAILABLE, reason="Cache serializer not available")
 class TestProductionDataPatterns:
-    """Test realistic enterprise data patterns"""
+    """Realistic enterprise payloads must survive a round trip unchanged."""
 
     def setup_method(self):
-        """Set up test fixtures"""
-        self.serializer = CacheSerializer()
+        self.serializer = AutoSerializer()
         self.data_generator = ProductionDataGenerator()
 
-    def test_user_profile_with_complex_permissions(self):
-        """Test user profiles with different permission structures"""
-        for user_id in [1, 5, 10, 50, 100]:
-            user_profile = self.data_generator.create_user_profile(user_id)
+    @pytest.mark.parametrize("user_id", [0, 1, 5, 10, 50, 100])
+    def test_user_profile_with_complex_permissions(self, user_id):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_user_profile(user_id))
 
-            validate_roundtrip_integrity(self.serializer, user_profile, f"user_profile_{user_id}")
+    @pytest.mark.parametrize("size", [0, 10, 100, 1000, 5000])
+    def test_large_api_response_structure(self, size):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_large_api_response(size))
 
-    @pytest.mark.skip(reason="Slow test - handles large data")
-    def test_large_api_response_structure(self):
-        """Test different API response sizes"""
-        test_sizes = [10, 100, 1000]
+    @pytest.mark.parametrize("size", [0, 100, 1440])
+    def test_time_series_metrics_data(self, size):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_time_series_data(size))
 
-        for size in test_sizes:
-            api_response = self.data_generator.create_large_api_response(size)
+    @pytest.mark.parametrize("depth", range(1, 9))
+    def test_deeply_nested_configuration(self, depth):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_configuration_object(depth))
 
-            validate_roundtrip_integrity(self.serializer, api_response, f"api_response_{size}_records")
+    @pytest.mark.parametrize("size", [0, 10, 50, 200])
+    def test_search_results_with_metadata(self, size):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_search_results(size))
 
-            # Ensure performance doesn't explode for larger responses
-            if size >= 1000:
-                validate_reasonable_performance(
-                    self.serializer,
-                    api_response,
-                    f"large_api_response_{size}",
-                    5000.0,  # 5 second max serialize
-                    5000.0,  # 5 second max deserialize
-                )
+    @pytest.mark.parametrize("size", [50, 500])
+    def test_audit_log_with_timestamps(self, size):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_audit_log(size))
 
-    def test_time_series_metrics_data(self):
-        """Test different time series sizes (enterprise monitoring scenarios)"""
-        test_sizes = [100, 1440]  # 100 points, 1 day (1440 min)
-
-        for size in test_sizes:
-            time_series = self.data_generator.create_time_series_data(size)
-
-            validate_roundtrip_integrity(self.serializer, time_series, f"time_series_{size}_points")
-
-            # Performance validation for larger datasets
-            if size >= 1440:
-                validate_reasonable_performance(
-                    self.serializer,
-                    time_series,
-                    f"time_series_{size}_points",
-                    3000.0,  # 3 second max serialize
-                    3000.0,  # 3 second max deserialize
-                )
-
-    def test_deeply_nested_configuration(self):
-        """Test different nesting depths (enterprise config scenarios)"""
-        for depth in range(1, 9):
-            config = self.data_generator.create_configuration_object(depth)
-
-            validate_roundtrip_integrity(self.serializer, config, f"config_depth_{depth}")
-
-    def test_search_results_with_metadata(self):
-        """Test different result set sizes"""
-        test_sizes = [10, 50, 200]
-
-        for size in test_sizes:
-            search_results = self.data_generator.create_search_results(size)
-
-            validate_roundtrip_integrity(self.serializer, search_results, f"search_results_{size}_items")
-
-            # Performance check for larger result sets
-            if size >= 200:
-                validate_reasonable_performance(
-                    self.serializer,
-                    search_results,
-                    f"search_results_{size}",
-                    2000.0,  # 2 second max serialize
-                    2000.0,  # 2 second max deserialize
-                )
-
-    def test_audit_log_with_timestamps(self):
-        """Test different audit log sizes (enterprise audit requirements)"""
-        test_sizes = [50, 500]
-
-        for size in test_sizes:
-            audit_log = self.data_generator.create_audit_log(size)
-
-            validate_roundtrip_integrity(self.serializer, audit_log, f"audit_log_{size}_entries")
-
-            # Performance validation for larger logs
-            if size >= 500:
-                validate_reasonable_performance(
-                    self.serializer,
-                    audit_log,
-                    f"audit_log_{size}_entries",
-                    4000.0,  # 4 second max serialize
-                    4000.0,  # 4 second max deserialize
-                )
-
-    def test_dashboard_widget_configurations(self):
-        """Test different dashboard complexities"""
-        widget_counts = [5, 20, 50]
-
-        for count in widget_counts:
-            dashboard = self.data_generator.create_dashboard_config(count)
-
-            validate_roundtrip_integrity(self.serializer, dashboard, f"dashboard_{count}_widgets")
+    @pytest.mark.parametrize("count", [5, 20, 50])
+    def test_dashboard_widget_configurations(self, count):
+        validate_roundtrip_integrity(self.serializer, self.data_generator.create_dashboard_config(count))
 
     def test_mixed_type_collections(self):
-        """Test complex mixed-type collection mimicking real enterprise data"""
         mixed_collection = {
             "user_profile": self.data_generator.create_user_profile(42),
             "recent_searches": self.data_generator.create_search_results(10),
@@ -544,66 +410,30 @@ class TestProductionDataPatterns:
                 "expires_at": "2024-08-03T16:30:00Z",
                 "data_sources": ["user_service", "search_service", "metrics_service", "config_service"],
             },
-            "mixed_array": [
-                "string_value",
-                12345,
-                67.89,
-                True,
-                [1, 2, 3],  # tuple would convert to list
-                {},
-            ],
+            "mixed_array": ["string_value", 12345, 67.89, True, (1, 2, 3), {4, 5}, frozenset({"x"}), {}],
         }
-
-        validate_roundtrip_integrity(self.serializer, mixed_collection, "complex_mixed_enterprise_data")
-
-    def test_large_json_api_response(self):
-        """Test a large JSON API response scenario"""
-        large_response = self.data_generator.create_large_api_response(5000)  # 5k records
-
-        # Measure serialized size
-        serialized, _metadata = self.serializer.serialize(large_response)
-        size_mb = len(serialized) / (1024 * 1024)
-
-        print(f"✓ Large JSON response: {size_mb:.2f} MB serialized")
-
-        # Ensure it deserializes correctly
-        _deserialized = self.serializer.deserialize(serialized)
-
-        # Performance should be reasonable (not optimized, just not exploding)
-        validate_reasonable_performance(
-            self.serializer,
-            large_response,
-            f"large_json_response_{size_mb:.1f}MB",
-            10000.0,  # 10 second max serialize (this is large!)
-            10000.0,  # 10 second max deserialize
-        )
+        validate_roundtrip_integrity(self.serializer, mixed_collection)
 
     def test_enterprise_data_integrity_edge_cases(self):
-        """Test edge cases specific to enterprise data patterns"""
         edge_case_data = {
-            "empty_structures": {
-                "empty_user_profile": self.data_generator.create_user_profile(0),
-                "empty_search_results": self.data_generator.create_search_results(0),
-                "empty_time_series": self.data_generator.create_time_series_data(0),
-            },
             "null_values": {
                 "nullable_field": None,
                 "empty_string": "",
                 "zero_value": 0,
+                "zero_float": 0.0,
                 "false_value": False,
             },
             "special_characters": {
                 "unicode_text": "🚀 Enterprise 企业 🔒",
                 "special_chars": "Special chars: @#$%^&*()[]{}|\\:;\"'<>,.?/",
                 "newlines": "Line 1\nLine 2\r\nLine 3",
+                "nul": "a\x00b",
             },
         }
-
-        validate_roundtrip_integrity(self.serializer, edge_case_data, "enterprise_edge_cases")
+        validate_roundtrip_integrity(self.serializer, edge_case_data)
 
     @pytest.mark.skipif(not HAS_NUMPY, reason="NumPy not available")
     def test_numpy_array_enterprise_scenarios(self):
-        """Test NumPy arrays in enterprise contexts"""
         enterprise_with_numpy = {
             "metrics_array": np.array([1.0, 2.5, 3.7, 4.2, 5.9]),
             "time_series_matrix": np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
@@ -613,13 +443,16 @@ class TestProductionDataPatterns:
                 "generated_at": "2024-08-03T15:30:00Z",
             },
         }
+        validate_roundtrip_integrity(self.serializer, enterprise_with_numpy)
 
-        validate_roundtrip_integrity(self.serializer, enterprise_with_numpy, "enterprise_numpy_arrays")
-
+    @pytest.mark.xfail(
+        strict=True,
+        raises=TypeError,
+        reason="AutoSerializer encodes a DataFrame only as the top-level value; nested in a dict it is refused as a "
+        "custom class, while the docs list DataFrames as preserved without that limit",
+    )
     def test_pandas_dataframe_enterprise_scenarios(self):
-        """Test Pandas DataFrames in enterprise contexts"""
         pd = pytest.importorskip("pandas")
-        # Create enterprise-style DataFrame
         df = pd.DataFrame(
             {
                 "user_id": [1, 2, 3, 4, 5],
@@ -629,32 +462,26 @@ class TestProductionDataPatterns:
                 "active": [True, True, False, True, True],
             }
         )
-
         enterprise_with_dataframe = {
             "employee_data": df,
-            "report_metadata": {
-                "generated_by": "hr_system",
-                "report_date": "2024-08-03",
-                "department_count": len(df["department"].unique()),
-                "total_employees": len(df),
-            },
+            "report_metadata": {"generated_by": "hr_system", "report_date": "2024-08-03", "total_employees": len(df)},
         }
-
-        validate_roundtrip_integrity(self.serializer, enterprise_with_dataframe, "enterprise_dataframe")
+        serialized, metadata = self.serializer.serialize(enterprise_with_dataframe)
+        result = self.serializer.deserialize(serialized, metadata)
+        pd.testing.assert_frame_equal(result["employee_data"], df)
+        assert result["report_metadata"] == enterprise_with_dataframe["report_metadata"]
 
     def test_datetime_objects_enterprise_patterns(self):
-        """Test datetime objects in enterprise data structures"""
+        # timedelta is not in AutoSerializer's supported set (datetime, date, time), so it is not part of this payload
         now = datetime.datetime.now()
         today = datetime.date.today()
         current_time = datetime.time(14, 30, 45)
-        delta = datetime.timedelta(days=7, hours=3)
-
         enterprise_datetime_data = {
             "audit_log": {
                 "created_at": now,
+                "created_at_utc": now.replace(tzinfo=datetime.timezone.utc),
                 "date_only": today,
                 "time_only": current_time,
-                "retention_period": delta,
             },
             "user_activity": {
                 "last_login": now - datetime.timedelta(hours=2),
@@ -662,26 +489,4 @@ class TestProductionDataPatterns:
                 "account_created": today - datetime.timedelta(days=30),
             },
         }
-
-        validate_roundtrip_integrity(self.serializer, enterprise_datetime_data, "enterprise_datetime_patterns")
-
-    def test_performance_under_concurrent_load_simulation(self):
-        """Test performance characteristics under simulated concurrent load"""
-        # Simulate multiple different enterprise data types being cached simultaneously
-        concurrent_data_types = [
-            ("user_profile", self.data_generator.create_user_profile(1)),
-            ("api_response", self.data_generator.create_large_api_response(100)),
-            ("time_series", self.data_generator.create_time_series_data(500)),
-            ("config", self.data_generator.create_configuration_object(4)),
-            ("search_results", self.data_generator.create_search_results(50)),
-        ]
-
-        # Test that each can be serialized/deserialized quickly
-        for data_type, data in concurrent_data_types:
-            validate_reasonable_performance(
-                self.serializer,
-                data,
-                f"concurrent_{data_type}",
-                1000.0,  # 1 second max for concurrent scenarios
-                1000.0,  # 1 second max for concurrent scenarios
-            )
+        validate_roundtrip_integrity(self.serializer, enterprise_datetime_data)

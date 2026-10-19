@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 
 import pytest
 
@@ -65,10 +66,22 @@ def setup_di_for_redis_isolation():
 
 
 @pytest.fixture
-def memcached_config() -> MemcachedBackendConfig:
-    """Config pointing at the test Memcached instance."""
+def key_prefix() -> str:
+    """A wire-key prefix no other test, xdist worker or concurrent run uses.
+
+    Every worker shares one Memcached, so tests cannot isolate with flush_all: a flush wipes the
+    keys another worker's test has just written, and that test then reads a miss. Memcached has
+    no per-client keyspace, so each test gets its own prefix instead.
+    """
+    return f"it_{uuid.uuid4().hex[:16]}:"
+
+
+@pytest.fixture
+def memcached_config(key_prefix: str) -> MemcachedBackendConfig:
+    """Config pointing at the test Memcached instance, inside this test's keyspace."""
     return MemcachedBackendConfig(
         servers=[f"{MEMCACHED_HOST}:{MEMCACHED_PORT}"],
+        key_prefix=key_prefix,
         connect_timeout=2.0,
         timeout=2.0,
     )
@@ -76,30 +89,14 @@ def memcached_config() -> MemcachedBackendConfig:
 
 @pytest.fixture
 def backend(memcached_config: MemcachedBackendConfig) -> MemcachedBackend:
-    """Provide a MemcachedBackend connected to a real server, flushed between tests."""
-    b = MemcachedBackend(memcached_config)
-    # Flush all keys before each test for isolation
-    b._client.flush_all()
-    yield b
-    # Cleanup after test
-    try:
-        b._client.flush_all()
-    except Exception:
-        pass
+    """Provide a MemcachedBackend connected to a real server, in a keyspace of its own."""
+    return MemcachedBackend(memcached_config)
 
 
 @pytest.fixture
-def prefixed_backend() -> MemcachedBackend:
-    """Backend with a key prefix for isolation tests."""
-    config = MemcachedBackendConfig(
-        servers=[f"{MEMCACHED_HOST}:{MEMCACHED_PORT}"],
-        key_prefix="test_ns:",
-        connect_timeout=2.0,
-        timeout=2.0,
-    )
-    b = MemcachedBackend(config)
-    # No flush_all here — the 'backend' fixture handles global flush
-    yield b
+def prefixed_backend(memcached_config: MemcachedBackendConfig) -> MemcachedBackend:
+    """Backend whose prefix extends ``backend``'s, so the two share no wire keys."""
+    return MemcachedBackend(memcached_config.model_copy(update={"key_prefix": f"{memcached_config.key_prefix}test_ns:"}))
 
 
 # ---------------------------------------------------------------------------
@@ -160,17 +157,22 @@ class TestCRUDRoundTrip:
 class TestTTLExpiry:
     """Verify server-side TTL expiry with real Memcached."""
 
+    # Memcached keeps time in whole seconds on a clock it ticks once a second, and a key set with
+    # ttl=N expires at the N-th tick after the set. The tick can land just after the set, so a key
+    # lives between N-1 and N seconds: ttl=1 can already be gone on the very next read.
+
     def test_key_expires_after_ttl(self, backend: MemcachedBackend) -> None:
         """Key should disappear after TTL seconds."""
-        backend.set("ephemeral", b"gone_soon", ttl=1)
+        backend.set("ephemeral", b"gone_soon", ttl=2)  # lives at least 1s, so the read below hits
         assert backend.get("ephemeral") == b"gone_soon"
-        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock). Gone
+        # within 2s of the set; the third second is margin for a late tick.
         time.sleep(3)
         assert backend.get("ephemeral") is None
 
     def test_key_alive_before_ttl(self, backend: MemcachedBackend) -> None:
         """Key should be present before TTL expires."""
-        backend.set("alive", b"still_here", ttl=5)
+        backend.set("alive", b"still_here", ttl=5)  # lives at least 4s
         time.sleep(0.5)
         assert backend.get("alive") == b"still_here"
 
@@ -196,22 +198,21 @@ class TestKeyPrefixIsolation:
     """Verify key_prefix provides namespace isolation."""
 
     def test_prefixed_keys_isolated(self, prefixed_backend: MemcachedBackend, backend: MemcachedBackend) -> None:
-        """Keys from prefixed backend should not collide with unprefixed."""
-        # Set unprefixed first, then prefixed — avoids flush_all ordering issue
-        backend.set("shared_name", b"unprefixed_value")
+        """One logical key under two prefixes is two wire keys: neither write clobbers the other."""
+        backend.set("shared_name", b"outer_value")
         prefixed_backend.set("shared_name", b"prefixed_value")
 
         assert prefixed_backend.get("shared_name") == b"prefixed_value"
-        assert backend.get("shared_name") == b"unprefixed_value"
+        assert backend.get("shared_name") == b"outer_value"
 
     def test_delete_only_affects_own_prefix(self, prefixed_backend: MemcachedBackend, backend: MemcachedBackend) -> None:
-        """Deleting a prefixed key should not affect unprefixed."""
+        """Deleting under one prefix leaves the same logical key under another prefix intact."""
         prefixed_backend.set("to_del", b"prefixed")
-        backend.set("to_del", b"unprefixed")
+        backend.set("to_del", b"outer")
 
         prefixed_backend.delete("to_del")
         assert prefixed_backend.get("to_del") is None
-        assert backend.get("to_del") == b"unprefixed"
+        assert backend.get("to_del") == b"outer"
 
 
 # ---------------------------------------------------------------------------
@@ -263,17 +264,7 @@ class TestConcurrentThreadSafety:
     the realistic usage pattern (e.g., one backend per web worker).
     """
 
-    def _make_backend(self) -> MemcachedBackend:
-        """Create a fresh backend for per-thread use."""
-        return MemcachedBackend(
-            MemcachedBackendConfig(
-                servers=[f"{MEMCACHED_HOST}:{MEMCACHED_PORT}"],
-                connect_timeout=2.0,
-                timeout=2.0,
-            )
-        )
-
-    def test_concurrent_writes_no_corruption(self, backend: MemcachedBackend) -> None:
+    def test_concurrent_writes_no_corruption(self, memcached_config: MemcachedBackendConfig) -> None:
         """10 threads x 50 ops each — no data corruption."""
         num_threads = 10
         ops_per_thread = 50
@@ -281,7 +272,7 @@ class TestConcurrentThreadSafety:
         errors: list[str] = []
 
         def worker(tid: int) -> None:
-            local_backend = self._make_backend()
+            local_backend = MemcachedBackend(memcached_config)
             try:
                 barrier.wait(timeout=10)
                 for i in range(ops_per_thread):
@@ -302,7 +293,7 @@ class TestConcurrentThreadSafety:
 
         assert not errors, f"Thread errors: {errors}"
 
-    def test_concurrent_read_write_delete(self, backend: MemcachedBackend) -> None:
+    def test_concurrent_read_write_delete(self, memcached_config: MemcachedBackendConfig) -> None:
         """Mixed read/write/delete operations under contention."""
         num_threads = 5
         ops = 100
@@ -310,7 +301,7 @@ class TestConcurrentThreadSafety:
         barrier = threading.Barrier(num_threads)
 
         def mixed_worker(tid: int) -> None:
-            local_backend = self._make_backend()
+            local_backend = MemcachedBackend(memcached_config)
             try:
                 barrier.wait(timeout=10)
                 for i in range(ops):
@@ -385,24 +376,26 @@ class TestDecoratorIntegration:
             call_count += 1
             return a + b
 
-        # First call — cache miss
-        result1 = add(2, 3)
-        assert result1 == 5
-        assert call_count == 1
+        # The default backend is process-global: reset it even when an assertion fails, or every
+        # later test on this worker inherits this test's backend.
+        try:
+            # First call — cache miss
+            result1 = add(2, 3)
+            assert result1 == 5
+            assert call_count == 1
 
-        # Second call — cache hit
-        result2 = add(2, 3)
-        assert result2 == 5
-        assert call_count == 1  # Not incremented
+            # Second call — cache hit
+            result2 = add(2, 3)
+            assert result2 == 5
+            assert call_count == 1  # Not incremented
 
-        # Different args — cache miss
-        result3 = add(10, 20)
-        assert result3 == 30
-        assert call_count == 2
-
-        # Clean up
-        set_default_backend(None)
-        add.cache_clear()
+            # Different args — cache miss
+            result3 = add(10, 20)
+            assert result3 == 30
+            assert call_count == 2
+        finally:
+            set_default_backend(None)
+            add.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -447,31 +440,23 @@ class TestBatchedWholeFunctionInvalidation:
 
         from cachekit import cache
 
-        config = MemcachedBackendConfig(
-            servers=[f"{MEMCACHED_HOST}:{MEMCACHED_PORT}"],
-            key_prefix="batch_ns:",
-            connect_timeout=2.0,
-            timeout=2.0,
-        )
-        prefixed = MemcachedBackend(config)
-
-        @cache(backend=prefixed, ttl=60, namespace="mc_batched")
+        @cache(backend=backend, ttl=60, namespace="mc_batched")
         def f(x: int) -> int:
             return x
 
         keys: list[str] = []
-        real_set = prefixed.set
+        real_set = backend.set
 
         def recording_set(key: str, value: bytes, ttl: int | None = None) -> None:
             keys.append(key)
             real_set(key, value, ttl)
 
-        with patch.object(prefixed, "set", side_effect=recording_set):
+        with patch.object(backend, "set", side_effect=recording_set):
             for i in range(1500):
                 f(i)
         assert len(keys) == 1500
-        assert all(prefixed.get(k) is not None for k in keys)
-        assert all(prefixed._client.get(k) is None for k in keys[:5])  # stored under the prefix only
+        assert all(backend.get(k) is not None for k in keys)
+        assert all(backend._client.get(k) is None for k in keys[:5])  # stored under the prefix only
 
         with (
             patch.object(MemcachedBackend, "_delete_many", autospec=True, side_effect=MemcachedBackend._delete_many) as batch,
@@ -481,4 +466,4 @@ class TestBatchedWholeFunctionInvalidation:
 
         assert batch.call_count == 1
         assert single.call_count == 0
-        assert all(prefixed.get(k) is None for k in keys)
+        assert all(backend.get(k) is None for k in keys)

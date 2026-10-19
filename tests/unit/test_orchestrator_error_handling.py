@@ -14,11 +14,25 @@ from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.hash_utils import redact_key_for_log
 
 
+def _structured(caplog: pytest.LogCaptureFixture) -> list[dict]:
+    return [r.structured for r in caplog.records if hasattr(r, "structured")]
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def _record_metrics(orchestrator: FeatureOrchestrator, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    metrics: list[dict] = []
+    monkeypatch.setattr(orchestrator.metrics_collector, "record_cache_operation", lambda **kw: metrics.append(kw))
+    return metrics
+
+
 class TestErrorHandlerOrchestration:
     """Test error handler orchestration logic."""
 
-    def test_handle_cache_error_doesnt_raise(self):
-        """Error handler must never raise - fail open principle."""
+    def test_handle_cache_error_doesnt_raise(self, caplog):
+        """Error handler must never raise - fail open principle. It records each failure instead."""
         orchestrator = FeatureOrchestrator(
             namespace="test",
             circuit_breaker_enabled=True,
@@ -26,59 +40,65 @@ class TestErrorHandlerOrchestration:
             enable_structured_logging=True,
         )
 
-        # Should not raise for any error type
-        orchestrator.handle_cache_error(
-            error=ValueError("test error"),
-            operation="cache_get",
-            cache_key="test:key",
-            duration_ms=1.5,
-        )
+        with caplog.at_level(logging.WARNING):
+            orchestrator.handle_cache_error(
+                error=ValueError("test error"),
+                operation="cache_get",
+                cache_key="test:key",
+                duration_ms=1.5,
+            )
+            orchestrator.handle_cache_error(
+                error=RuntimeError("runtime error"),
+                operation="key_generation",
+                cache_key="<generation_failed>",
+                duration_ms=0.0,
+            )
 
-        orchestrator.handle_cache_error(
-            error=RuntimeError("runtime error"),
-            operation="key_generation",
-            cache_key="<generation_failed>",
-            duration_ms=0.0,
-        )
+        assert _warnings(caplog) == [
+            f"Cache operation 'cache_get' failed for key '{redact_cache_key('test:key')}': ValueError",
+            "Cache operation 'key_generation' failed for key '<generation_failed>': RuntimeError",
+        ]
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 2
 
-        # If we get here, test passes - no exceptions raised
-
-    def test_handle_cache_error_uses_default_namespace(self):
+    def test_handle_cache_error_uses_default_namespace(self, caplog):
         """Error handler should use orchestrator namespace when not provided."""
         orchestrator = FeatureOrchestrator(namespace="default_namespace")
 
-        # Don't pass namespace parameter
-        orchestrator.handle_cache_error(
-            error=ValueError("test"),
-            operation="cache_set",
-            cache_key="test:key",
-            duration_ms=2.5,
-        )
+        with caplog.at_level(logging.INFO):
+            orchestrator.handle_cache_error(
+                error=ValueError("test"),
+                operation="cache_set",
+                cache_key="test:key",
+                duration_ms=2.5,
+            )
 
-        # Implicit test: if it logged with wrong namespace, we'd see it in logs
-        # But we're not testing logs directly (implementation detail)
-        # Just verify it doesn't crash
+        [structured] = _structured(caplog)
+        assert structured["namespace"] == "default_namespace"
+        assert structured["operation"] == "cache_set_failed"
 
-    def test_handle_cache_error_accepts_extra_context(self):
-        """Error handler should accept arbitrary extra context via kwargs."""
+    def test_handle_cache_error_accepts_extra_context(self, caplog):
+        """Extra keyword context reaches the structured log record."""
         orchestrator = FeatureOrchestrator(namespace="test")
 
-        # Should accept extra context for enriched logging
-        orchestrator.handle_cache_error(
-            error=ConnectionError("redis timeout"),
-            operation="lock_acquisition",
-            cache_key="test:lock:key",
-            duration_ms=5000.0,
-            # Extra context
-            serializer="default",
-            retry_count=3,
-            error_code="TIMEOUT",
-        )
+        with caplog.at_level(logging.INFO):
+            orchestrator.handle_cache_error(
+                error=ConnectionError("redis timeout"),
+                operation="lock_acquisition",
+                cache_key="test:lock:key",
+                duration_ms=5000.0,
+                serializer="default",
+                retry_count=3,
+                error_code="TIMEOUT",
+            )
 
-        # Test passes if no exception
+        [structured] = _structured(caplog)
+        assert structured["serializer"] == "default"
+        assert structured["retry_count"] == 3
+        assert structured["error_code"] == "TIMEOUT"
+        assert structured["duration_ms"] == 5000.0
 
-    def test_handle_cache_error_with_all_features_disabled(self):
-        """Error handler should work even when all features are disabled."""
+    def test_handle_cache_error_with_all_features_disabled(self, caplog):
+        """With every feature off there is nothing to record into, but the plain warning still logs."""
         orchestrator = FeatureOrchestrator(
             namespace="minimal",
             circuit_breaker_enabled=False,
@@ -87,19 +107,23 @@ class TestErrorHandlerOrchestration:
             enable_structured_logging=False,
         )
 
-        # Should still work (graceful degradation)
-        orchestrator.handle_cache_error(
-            error=ValueError("error with no features"),
-            operation="cache_get",
-            cache_key="test:key",
-            duration_ms=1.0,
-        )
+        with caplog.at_level(logging.INFO):
+            orchestrator.handle_cache_error(
+                error=ValueError("error with no features"),
+                operation="cache_get",
+                cache_key="test:key",
+                duration_ms=1.0,
+            )
 
-        # Test passes if no exception
+        assert orchestrator.circuit_breaker is None
+        assert orchestrator.metrics_collector is None
+        assert _structured(caplog) == []
+        assert _warnings(caplog) == [f"Cache operation 'cache_get' failed for key '{redact_cache_key('test:key')}': ValueError"]
 
-    def test_handle_cache_error_operation_types(self):
-        """Error handler should accept all documented operation types."""
-        orchestrator = FeatureOrchestrator(namespace="test")
+    def test_handle_cache_error_operation_types(self, caplog, monkeypatch):
+        """Each documented operation type is recorded as a failed metric and logged under its own name."""
+        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=False)
+        metrics = _record_metrics(orchestrator, monkeypatch)
 
         # All operation types from wrapper.py
         operation_types = [
@@ -111,15 +135,17 @@ class TestErrorHandlerOrchestration:
             "lock_acquisition",
         ]
 
-        for op_type in operation_types:
-            orchestrator.handle_cache_error(
-                error=Exception(f"error in {op_type}"),
-                operation=op_type,
-                cache_key="test:key",
-                duration_ms=1.0,
-            )
+        with caplog.at_level(logging.WARNING):
+            for op_type in operation_types:
+                orchestrator.handle_cache_error(
+                    error=Exception(f"error in {op_type}"),
+                    operation=op_type,
+                    cache_key="test:key",
+                    duration_ms=1.0,
+                )
 
-        # Test passes if no exceptions for any operation type
+        assert [(m["operation"], m["success"]) for m in metrics] == [(op, False) for op in operation_types]
+        assert [msg.split("'")[1] for msg in _warnings(caplog)] == operation_types
 
 
 class TestErrorHandlerContract:
@@ -157,11 +183,11 @@ class TestErrorHandlerContract:
         assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 0
         assert [(m["operation"], m["success"]) for m in metrics] == [("cache_get_deserialize", False)]
 
-    def test_error_handler_preserves_operation_context(self):
-        """Error handler must set operation context correctly."""
+    def test_error_handler_preserves_operation_context(self, monkeypatch):
+        """The failure metric carries the operation and duration passed to the handler."""
         orchestrator = FeatureOrchestrator(namespace="test", collect_stats=True)
+        metrics = _record_metrics(orchestrator, monkeypatch)
 
-        # Call error handler with specific operation
         orchestrator.handle_cache_error(
             error=RuntimeError("context test"),
             operation="cache_get",
@@ -169,8 +195,7 @@ class TestErrorHandlerContract:
             duration_ms=2.5,
         )
 
-        # Operation context is thread-local and gets cleared, but we verified
-        # it doesn't crash - that's the contract
+        assert metrics == [{"operation": "cache_get", "namespace": "test", "success": False, "duration_ms": 2.5}]
 
     def test_error_handler_with_multiple_errors(self):
         """Error handler should handle multiple errors in sequence without degradation."""
@@ -201,48 +226,61 @@ class TestErrorHandlerContract:
 class TestErrorHandlerEdgeCases:
     """Test edge cases and boundary conditions."""
 
-    def test_error_handler_with_empty_cache_key(self):
-        """Error handler should handle empty cache key."""
+    def test_error_handler_with_empty_cache_key(self, caplog):
+        """An empty key is no sentinel: it is redacted like any other key."""
         orchestrator = FeatureOrchestrator(namespace="test")
 
-        orchestrator.handle_cache_error(
-            error=ValueError("empty key test"),
-            operation="key_generation",
-            cache_key="",  # Empty key
-            duration_ms=0.0,
-        )
+        with caplog.at_level(logging.INFO):
+            orchestrator.handle_cache_error(
+                error=ValueError("empty key test"),
+                operation="key_generation",
+                cache_key="",
+                duration_ms=0.0,
+            )
 
-        # Test passes if no exception
+        digest = redact_cache_key("")
+        [structured] = _structured(caplog)
+        assert structured["cache_key"] == digest
+        assert _warnings(caplog) == [f"Cache operation 'key_generation' failed for key '{digest}': ValueError"]
 
-    def test_error_handler_with_very_long_error_message(self):
-        """Error handler should handle very long error messages without truncation issues."""
+    def test_error_handler_with_very_long_error_message(self, caplog):
+        """A long error message is never interpolated: only the exception type reaches the logs."""
         orchestrator = FeatureOrchestrator(namespace="test")
 
         long_message = "error " * 1000  # 6000 characters
-        orchestrator.handle_cache_error(
-            error=ValueError(long_message),
-            operation="cache_get",
-            cache_key="test:key",
-            duration_ms=1.0,
-        )
+        with caplog.at_level(logging.INFO):
+            orchestrator.handle_cache_error(
+                error=ValueError(long_message),
+                operation="cache_get",
+                cache_key="test:key",
+                duration_ms=1.0,
+            )
 
-        # Test passes if no exception
+        assert caplog.records
+        assert not any(long_message in record.getMessage() for record in caplog.records)
+        assert _warnings(caplog) == [f"Cache operation 'cache_get' failed for key '{redact_cache_key('test:key')}': ValueError"]
 
-    def test_error_handler_with_unicode_error_messages(self):
-        """Error handler should handle unicode in error messages."""
+    def test_error_handler_with_unicode_error_messages(self, caplog):
+        """A unicode key is redacted to its digest, and the unicode error text is not logged."""
         orchestrator = FeatureOrchestrator(namespace="test")
 
-        orchestrator.handle_cache_error(
-            error=ValueError("错误消息 🔥 émojis"),
-            operation="cache_get",
-            cache_key="test:key:🔑",
-            duration_ms=1.0,
-        )
+        with caplog.at_level(logging.INFO):
+            orchestrator.handle_cache_error(
+                error=ValueError("错误消息 🔥 émojis"),
+                operation="cache_get",
+                cache_key="test:key:🔑",
+                duration_ms=1.0,
+            )
 
-        # Test passes if no exception
+        [structured] = _structured(caplog)
+        assert structured["cache_key"] == redact_cache_key("test:key:🔑")
+        assert structured["error"] == "ValueError"
+        assert _warnings(caplog) == [
+            f"Cache operation 'cache_get' failed for key '{redact_cache_key('test:key:🔑')}': ValueError"
+        ]
 
-    def test_error_handler_with_nested_exceptions(self):
-        """Error handler should handle exceptions with causes."""
+    def test_error_handler_with_nested_exceptions(self, caplog):
+        """A chained exception is reported as the outer type; the cause's text is not logged."""
         orchestrator = FeatureOrchestrator(namespace="test")
 
         try:
@@ -251,14 +289,18 @@ class TestErrorHandlerEdgeCases:
             except ValueError as e:
                 raise RuntimeError("wrapped error") from e
         except RuntimeError as nested_error:
-            orchestrator.handle_cache_error(
-                error=nested_error,
-                operation="cache_get",
-                cache_key="test:key",
-                duration_ms=1.0,
-            )
+            with caplog.at_level(logging.INFO):
+                orchestrator.handle_cache_error(
+                    error=nested_error,
+                    operation="cache_get",
+                    cache_key="test:key",
+                    duration_ms=1.0,
+                )
 
-        # Test passes if no exception
+        [structured] = _structured(caplog)
+        assert structured["error_type"] == "RuntimeError"
+        assert not any("root cause" in record.getMessage() for record in caplog.records)
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 1
 
 
 class TestCacheKeyRedaction:

@@ -11,16 +11,21 @@ This test suite measures performance under realistic production workloads:
 CRITICAL: These tests provide CONSERVATIVE numbers for marketing claims.
 They measure worst-case realistic scenarios, not ideal conditions.
 
-Plaintext benchmarks state encryption=False: test_encryption_overhead runs only with
-CACHEKIT_MASTER_KEY set, and a present key with no stated intent raises at decoration.
+The figures are informational: printed and recorded with ``record_property``, never asserted.
+On a loaded host a p95 moves by multiples, so a wall-clock target fails on a busy neighbour, not
+on a regression. Each test asserts that the calls it timed took the path it names: the cached
+function ran once, an L1 hit never reached L2, the value came back intact.
+
+Plaintext benchmarks state encryption=False: a CACHEKIT_MASTER_KEY in the environment with no
+stated intent raises at decoration.
 """
 
 from __future__ import annotations
 
 import asyncio
 import gc
-import os
 import random
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -39,7 +44,21 @@ except ImportError:
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.decorators import cache
 
-from .stats_utils import balanced_order, benchmark_with_gc_handling, difference_band, measure_with_jit_warmup, summarize
+from .stats_utils import (
+    PerformanceResult,
+    balanced_order,
+    benchmark_with_gc_handling,
+    difference_band,
+    measure_with_jit_warmup,
+    summarize,
+)
+
+
+def _record(record_property, result: PerformanceResult, prefix: str = "") -> None:
+    """Attach the run-level estimate and the raw p95 to the test's report."""
+    record_property(f"{prefix}center_{result.unit}", round(result.center, 2))
+    record_property(f"{prefix}p95_{result.unit}", round(result.p95, 2))
+
 
 # =============================================================================
 # Realistic Test Payloads
@@ -155,7 +174,7 @@ def medium_dataframe() -> pd.DataFrame:
 
 
 @pytest.mark.performance
-def test_decorator_overhead_complex_dict() -> None:
+def test_decorator_overhead_complex_dict(record_property) -> None:
     """Measure decorator overhead with realistic API response payload.
 
     Tests the full stack:
@@ -167,9 +186,12 @@ def test_decorator_overhead_complex_dict() -> None:
     This is what users actually experience - not trivial int payloads.
     """
     payload = create_complex_dict("medium")  # ~10KB realistic API response
+    calls = 0
 
     @cache(backend=None, encryption=False)  # L1-only to isolate decorator + serialization
     def get_api_response(request_id: int) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
         return payload
 
     # Prime cache
@@ -197,24 +219,22 @@ def test_decorator_overhead_complex_dict() -> None:
     print("\n  L1 pure (bytes lookup):        ~500ns p95")
     print(f"  Decorator + complex payload:   {result.p95:.0f}ns p95")
     print(f"  Overhead ratio:                {result.p95 / 500:.1f}x")
+    _record(record_property, result)
 
-    # Conservative target: <300μs for complex payloads (10KB)
-    # This includes full stack: decorator + serialization + L1 + deserialization
-    # Raw p95 measured 14-16μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 10%.
-    target_ns = 300_000
-    if result.exceeded_target(target_ns):
-        raise AssertionError(f"Complex payload overhead {result.p95:.0f}ns exceeds {target_ns}ns target (p95)")
-
-    print(f"\n✅ Complex payload validated: {result.p95:.0f}ns ({result.p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target")
+    assert calls == 1, f"{calls - 1} timed calls missed L1"
+    assert get_api_response(1) == payload
 
 
 @pytest.mark.performance
-def test_decorator_overhead_dataclass() -> None:
+def test_decorator_overhead_dataclass(record_property) -> None:
     """Measure decorator overhead with custom dataclass."""
     user = create_user_model(42)
+    calls = 0
 
     @cache(backend=None, encryption=False)
     def get_user(user_id: int) -> User:
+        nonlocal calls
+        calls += 1
         return user
 
     # Prime cache
@@ -239,18 +259,15 @@ def test_decorator_overhead_dataclass() -> None:
     print("  Payload: User dataclass with nested dicts")
     print("  Stack: Decorator + msgpack + L1 + deserialize")
 
-    # Target: <200μs for dataclass (smaller than 10KB dict)
-    # Raw p95 measured 14-15μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 6%.
-    target_ns = 200_000
-    if result.exceeded_target(target_ns):
-        raise AssertionError(f"Dataclass overhead {result.p95:.0f}ns exceeds {target_ns}ns target (p95)")
+    _record(record_property, result)
 
-    print(f"\n✅ Dataclass validated: {result.p95:.0f}ns ({result.p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target")
+    assert calls == 1, f"{calls - 1} timed calls missed L1"
+    assert get_user(42) == user
 
 
 @pytest.mark.performance
 @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not available")
-def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
+def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame, record_property) -> None:
     """Measure decorator overhead on an L1 hit returning a DataFrame (10K rows).
 
     L1-only (``backend=None``): the hit returns the stored frame object, so nothing is serialized
@@ -258,8 +275,12 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
     ``tests/unit/test_real_dataset.py``.
     """
 
+    calls = 0
+
     @cache(backend=None, serializer="auto", encryption=False)
     def get_data(query_id: int) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
         return medium_dataframe
 
     # Prime cache
@@ -284,17 +305,14 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
     print("  Payload: 10K row DataFrame (~400KB)")
     print("  L1-only hit: returns the stored object, no serializer runs")
 
-    # Target: <10ms. This measures decorator overhead + L1 cache behavior; no serializer runs.
-    # Raw p95 measured 13-15μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 11%.
-    target_us = 10_000
-    if result.exceeded_target(target_us):
-        raise AssertionError(f"DataFrame overhead {result.p95:.0f}μs exceeds {target_us}μs target (p95)")
+    _record(record_property, result)
 
-    print(f"\n✅ DataFrame validated: {result.p95:.0f}μs < {target_us}μs target")
+    assert calls == 1, f"{calls - 1} timed calls missed L1"
+    pd.testing.assert_frame_equal(get_data(1), medium_dataframe)
 
 
 @pytest.mark.performance
-def test_decorator_overhead_l1_hit_with_backend() -> None:
+def test_decorator_overhead_l1_hit_with_backend(record_property) -> None:
     """Measure the L1 hit users get with an L2 backend configured (Redis, CachekitIO).
 
     With a backend, L1 holds the serialized bytes and a hit deserializes them, unlike the
@@ -335,15 +353,11 @@ def test_decorator_overhead_l1_hit_with_backend() -> None:
     print("  Payload: 100-user nested dict (23.5KB as MessagePack)")
     print("  Stack:   Decorator + key gen + L1 bytes lookup + msgpack deserialize (L2 never reached)")
 
-    # Smoke ceiling, not a claim. Deserializing 23.5KB dominates: raw p95 measured 431μs (2026-10-04),
-    # against 9μs for the L1-only hit of the same dict, which never deserializes.
-    target_ns = 3_000_000
-    if result.exceeded_target(target_ns):
-        raise AssertionError(f"L1 hit with backend {result.p95:.0f}ns exceeds {target_ns}ns target (p95)")
+    # Deserializing 23.5KB dominates: raw p95 measured 431μs (2026-10-04), against 9μs for the
+    # L1-only hit of the same dict, which never deserializes.
+    _record(record_property, result)
 
-    print(
-        f"\n✅ L1 hit with backend validated: {result.p95:.0f}ns ({result.p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target"
-    )
+    assert get_api_response(1) == payload
 
 
 # =============================================================================
@@ -352,7 +366,7 @@ def test_decorator_overhead_l1_hit_with_backend() -> None:
 
 
 @pytest.mark.performance
-def test_concurrent_cache_access() -> None:
+def test_concurrent_cache_access(record_property) -> None:
     """Measure per-call execution time while 10 threads call one key at once.
 
     Tests:
@@ -371,8 +385,12 @@ def test_concurrent_cache_access() -> None:
     iterations_per_thread = 1_000
     runs = 5
 
+    calls = 0
+
     @cache(backend=None, encryption=False)
     def get_data(item_id: int) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
         return payload
 
     # Prime the cache and warm up as the single-threaded guards do
@@ -420,12 +438,10 @@ def test_concurrent_cache_access() -> None:
     print("  Payload:    100-user nested dict, @cache(backend=None)")
     print("  Contention: All threads hitting same key (worst case)")
 
-    # Conservative target: <500μs p95 under 10-thread contention
-    target_ns = 500_000
-    if result.exceeded_target(target_ns):
-        raise AssertionError(f"Concurrent access p95 {result.p95:.0f}ns exceeds {target_ns}ns target")
+    _record(record_property, result)
 
-    print(f"\n✅ Concurrent access validated: {result.p95:.0f}ns ({result.p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target")
+    assert result.samples == runs * num_threads * iterations_per_thread
+    assert calls == 1, f"{calls - 1} contended calls missed L1"
 
 
 # =============================================================================
@@ -434,7 +450,7 @@ def test_concurrent_cache_access() -> None:
 
 
 @pytest.mark.performance
-def test_encryption_overhead() -> None:
+def test_encryption_overhead(record_property) -> None:
     """Measure encryption overhead for AES-256-GCM.
 
     Compares:
@@ -443,10 +459,8 @@ def test_encryption_overhead() -> None:
 
     This is critical for @cache.secure marketing claims.
     """
-    # Check if encryption is available
-    master_key = os.environ.get("CACHEKIT_MASTER_KEY")
-    if not master_key:
-        pytest.skip("CACHEKIT_MASTER_KEY not set - cannot test encryption")
+    # A throwaway key: this measures the cipher, not a deployment's key.
+    master_key = secrets.token_hex(32)
 
     payload = create_complex_dict("medium")
 
@@ -510,13 +524,18 @@ def test_encryption_overhead() -> None:
     print("  Algorithm:   AES-256-GCM")
     print("  L1 storage:  Encrypted bytes (no plaintext in memory)")
 
-    # Target: encryption overhead <3x (conservative), on run medians: the raw p95 of either arm
-    # moved 49-95% between back-to-back runs on a loaded host (2026-10-03).
-    max_ratio = 3.0
-    if ratio >= max_ratio:
-        raise AssertionError(f"Encryption overhead {ratio:.2f}x exceeds {max_ratio}x target (run medians)")
+    # Informational, on run medians: the raw p95 of either arm moved 49-95% between back-to-back
+    # runs on a loaded host (2026-10-03), and the ratio follows.
+    _record(record_property, result_plain, "plain_")
+    _record(record_property, result_encrypted, "encrypted_")
+    record_property("encrypted_plain_ratio", round(ratio, 3))
 
-    print(f"\n✅ Encryption overhead validated: {ratio:.2f}x < {max_ratio}x target")
+    assert get_data_plain(1) == get_data_encrypted(1) == payload
+    # Both arms stored the same payload once. Had the encrypted arm skipped the cipher, its entry
+    # would carry the plain arm's (compressed) body verbatim.
+    (plain_blob,), (encrypted_blob,) = backend_plain.store.values(), backend_encrypted.store.values()
+    middle = len(plain_blob) // 2
+    assert plain_blob[middle : middle + 64] not in encrypted_blob, "the encrypted entry carries the plain body"
 
 
 # =============================================================================
@@ -526,7 +545,7 @@ def test_encryption_overhead() -> None:
 
 @pytest.mark.performance
 @pytest.mark.integration
-def test_redis_l2_roundtrip() -> None:
+def test_redis_l2_roundtrip(perf_redis_backend, record_property) -> None:
     """Measure full Redis L2 roundtrip with serialization.
 
     Tests:
@@ -536,29 +555,21 @@ def test_redis_l2_roundtrip() -> None:
     - Deserialization
     - L1 population
 
-    This is L1 miss → L2 hit path (realistic production scenario).
-    Requires Redis to be running.
+    This is L1 miss → L2 hit path (realistic production scenario), on the suite's pytest-redis
+    server.
     """
-    from cachekit.backends.redis import RedisBackend
-
-    # Check Redis availability
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    try:
-        backend = RedisBackend(redis_url=redis_url)
-        # Test connection by trying a basic operation
-        backend.exists("__health_check__")
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
-
     from cachekit.config.nested import L1CacheConfig
 
     payload = create_complex_dict("medium")
+    calls = 0
 
     # Use L2-only mode to force Redis on every call
-    config = DecoratorConfig(backend=backend, l1=L1CacheConfig(enabled=False), encryption=False)
+    config = DecoratorConfig(backend=perf_redis_backend, l1=L1CacheConfig(enabled=False), encryption=False)
 
     @cache(config=config)
     def get_data(item_id: int) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
         return payload
 
     # Prime Redis
@@ -588,14 +599,12 @@ def test_redis_l2_roundtrip() -> None:
     print("  Deserialization:   ~10-50μs (msgpack)")
     print(f"  Total measured:    {result.p95:.2f}μs")
 
-    # Conservative target: <10ms for local Redis (includes network + deserialize)
     # Raw p95 measured 1.5-3.0ms (2026-10-03); back-to-back drift: two identical runs moved p95 by 101%
-    # on a loaded host (the run-level median moved 5%), so the margin is what keeps this stable.
-    target_us = 10_000
-    if result.exceeded_target(target_us):
-        raise AssertionError(f"Redis L2 roundtrip {result.p95:.0f}μs exceeds {target_us}μs target (p95)")
+    # on a loaded host (the run-level median moved 5%).
+    _record(record_property, result)
 
-    print(f"\n✅ Redis L2 roundtrip validated: {result.p95:.0f}μs < {target_us}μs target")
+    assert calls == 1, f"{calls - 1} timed calls missed L2"
+    assert get_data(1) == payload
 
 
 # =============================================================================
@@ -605,7 +614,7 @@ def test_redis_l2_roundtrip() -> None:
 
 @pytest.mark.performance
 @pytest.mark.asyncio
-async def test_async_decorator_overhead() -> None:
+async def test_async_decorator_overhead(record_property) -> None:
     """Measure async decorator overhead with realistic payload.
 
     Async adds:
@@ -616,9 +625,12 @@ async def test_async_decorator_overhead() -> None:
     Compare with sync version to quantify async tax.
     """
     payload = create_complex_dict("medium")
+    calls = 0
 
     @cache(backend=None, encryption=False)
     async def get_data_async(item_id: int) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
         await asyncio.sleep(0)  # Yield control
         return payload
 
@@ -633,7 +645,7 @@ async def test_async_decorator_overhead() -> None:
     latencies = []
     for _ in range(5_000):
         start = time.perf_counter_ns()
-        await get_data_async(1)
+        result = await get_data_async(1)
         end = time.perf_counter_ns()
         latencies.append(end - start)
 
@@ -656,14 +668,11 @@ async def test_async_decorator_overhead() -> None:
     print("  Stack:   Async decorator + L1 hit")
     print(f"  Note:    Sync version measured at ~{35000:.0f}ns in test_end_to_end_latency.py")
 
-    # Target: <400μs for async (7-8x sync due to coroutine + event loop overhead)
-    # Async adds: coroutine creation, event loop scheduling, await machinery
-    # This is realistic overhead for async Python operations
-    target_ns = 400_000
-    if p95 >= target_ns:
-        raise AssertionError(f"Async decorator overhead {p95:.0f}ns exceeds {target_ns}ns target (p95)")
+    record_property("median_ns", round(median, 1))
+    record_property("p95_ns", round(p95, 1))
 
-    print(f"\n✅ Async decorator validated: {p95:.0f}ns < {target_ns}ns target")
+    assert calls == 1, f"{calls - 1} timed calls missed L1"
+    assert result == payload
 
 
 if __name__ == "__main__":

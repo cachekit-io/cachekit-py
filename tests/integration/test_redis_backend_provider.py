@@ -211,12 +211,23 @@ class TestRedisBackendProviderFactory:
 
         provider.close()
 
-    def test_provider_closeables(self, isolated_redis_url):
-        """Test provider cleanup with close()."""
+    def test_provider_closeables(self, redis_isolated, isolated_redis_url):
+        """close() drops the provider's server connections."""
         provider = RedisBackendProvider(isolated_redis_url)
+        client_id = provider._client.client_id()
 
-        # Should not raise error
+        def live_ids():
+            return {int(c["id"]) for c in redis_isolated.client_list()}
+
+        assert client_id in live_ids()
+
         provider.close()
+
+        # The server reaps a closed socket asynchronously, so give it a moment rather than racing it
+        deadline = time.monotonic() + 2.0
+        while client_id in live_ids() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert client_id not in live_ids()
 
 
 @pytest.mark.integration

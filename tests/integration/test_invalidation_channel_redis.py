@@ -498,10 +498,30 @@ _SO_ATTACH_FILTER = 26  # Linux; the socket module does not export it
 _DROP_ALL = struct.pack("HBBI", 0x06, 0, 0, 0)  # classic BPF: BPF_RET | BPF_K, accept 0 bytes
 
 
+def _attach_drop_all(sock: socket.socket, program: ctypes.Array[ctypes.c_char]) -> None:
+    sock.setsockopt(socket.SOL_SOCKET, _SO_ATTACH_FILTER, struct.pack("HL", 1, ctypes.addressof(program)))  # sock_fprog
+
+
+def _socket_filter_refused() -> str | None:
+    """Why this kernel refuses an unprivileged socket filter, or None when it attaches one.
+
+    Linux normally lets any process filter its own sockets, but some hardened kernels answer
+    SO_ATTACH_FILTER with EPERM. Only EPERM means "refused": any other error is a fault in the
+    filter itself, and raises.
+    """
+    program = ctypes.create_string_buffer(_DROP_ALL)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            _attach_drop_all(probe, program)
+        except PermissionError as exc:
+            return f"this kernel refuses SO_ATTACH_FILTER on an unprivileged socket ({exc}), so no peer can be silenced"
+    return None
+
+
 class _Relay:
     """A TCP relay to Redis whose client-facing sockets can be turned into a black hole.
 
-    ``blackhole()`` attaches a drop-all classic-BPF filter (SO_ATTACH_FILTER, no privilege needed)
+    ``blackhole()`` attaches a drop-all classic-BPF filter (SO_ATTACH_FILTER, unprivileged on stock Linux)
     to every client-facing socket and closes the upstream: the kernel discards the client's segments
     before TCP sees them, so nothing is acknowledged and nothing is sent, as with a peer that went
     silent. A relay that only read and discarded the bytes would not do: its kernel still ACKs them,
@@ -541,9 +561,8 @@ class _Relay:
                 pass
 
     def blackhole(self) -> None:
-        program = struct.pack("HL", 1, ctypes.addressof(self._filter))  # struct sock_fprog
         for client, upstream in self._pairs:
-            client.setsockopt(socket.SOL_SOCKET, _SO_ATTACH_FILTER, program)
+            _attach_drop_all(client, self._filter)
             self._dead.add(client)
             upstream.shutdown(socket.SHUT_RDWR)
 
@@ -579,6 +598,8 @@ class TestListenerSilentPeer:
     def test_listener_resubscribes_after_its_peer_goes_silent(
         self, tcp_client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        if refused := _socket_filter_refused():
+            pytest.skip(refused)
         kw = tcp_client.connection_pool.connection_kwargs
         relay = _Relay((kw["host"], kw["port"]))
         try:

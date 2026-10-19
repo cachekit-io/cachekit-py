@@ -79,39 +79,37 @@ class TestRustSerializerFunctionality(RedisIsolationMixin):
         assert result2["call_number"] == 1  # Should still be 1 (cached)
         assert call_count == 1  # Function not called again
 
-    @pytest.mark.skip(reason="Legacy test - MessagePack doesn't serialize Python sets natively")
     def test_rust_serializer_type_preservation(self):
-        """CRITICAL: Rust serializer must preserve Python types correctly."""
+        """CRITICAL: serializer="auto" must preserve Python container types through a backend round trip."""
         call_count = 0
 
-        @cache(ttl=300)
+        # The default serializer is cross-language and turns tuples into lists; type fidelity is the auto serializer's promise
+        @cache(ttl=300, serializer="auto")
         def get_typed_data(data_id):
             nonlocal call_count
             call_count += 1
             return {
                 "id": data_id,
-                "tuple": (1, 2, 3),  # Should remain tuple
-                "set": {1, 2, 3},  # May become list (acceptable)
-                "bool_true": True,  # Must remain bool
-                "bool_false": False,  # Must remain bool
+                "tuple": (1, 2, 3),
+                "set": {1, 2, 3},
+                "frozenset": frozenset({"a", "b"}),
+                "bool_true": True,
+                "bool_false": False,
                 "call_number": call_count,
             }
 
-        # First call - cache miss
         result1 = get_typed_data(3)
-        # Rust serializer preserves tuples correctly and converts sets to lists
-        assert result1["tuple"] == (1, 2, 3)  # Correct tuple preservation
-        assert sorted(result1["set"]) == [1, 2, 3]  # Acceptable conversion
-        assert result1["bool_true"] is True
-        assert result1["bool_false"] is False
-        assert result1["call_number"] == 1
         assert call_count == 1
 
-        # Second call - cache hit
+        # The hit is decoded from stored bytes, so it is the result that shows whether types survived
         result2 = get_typed_data(3)
+        assert call_count == 1
         assert result2 == result1
-        assert result2["call_number"] == 1  # Should still be 1 (cached)
-        assert call_count == 1  # Function not called again
+        assert type(result2["tuple"]) is tuple
+        assert type(result2["set"]) is set
+        assert type(result2["frozenset"]) is frozenset
+        assert result2["bool_true"] is True
+        assert result2["bool_false"] is False
 
     @pytest.mark.slow
     def test_rust_serializer_large_data(self):

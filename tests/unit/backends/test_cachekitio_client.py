@@ -203,9 +203,17 @@ class TestCloseHttpClients:
         assert _is_closed(lease.client)
         assert not _cached()
 
-    def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
-        """Calling close when no client exists does not raise."""
-        close_http_clients()  # no client created yet — must not raise
+    def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:
+        """Closing with no client cached, before any lease or after a close, does not raise and leaves the cache empty."""
+        assert not _cached()
+        close_http_clients()
+        assert not _cached()
+
+        lease = lease_http_client(config)
+        close_http_clients()
+        close_http_clients()
+        assert _is_closed(lease.client)
+        assert not _cached()
 
 
 @pytest.mark.unit

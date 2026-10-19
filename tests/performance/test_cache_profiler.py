@@ -2,6 +2,9 @@
 
 This profiler breaks down the 450-500ns hit latency into individual components
 to identify the actual bottleneck. Uses manual instrumentation to avoid profiler overhead.
+
+The timings are a printed profile, never asserted (a loaded host moves them by multiples). Each
+test asserts, from the cache's own hit/miss counters, that the calls it timed were hits.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from cachekit.l1_cache import CacheEntry, L1Cache
 
 
 @pytest.mark.performance
-def test_l1_cache_component_breakdown() -> None:
+def test_l1_cache_component_breakdown(record_property) -> None:
     """Profile individual components of cache.get() hit path.
 
     Breaks down the 450-500ns into:
@@ -167,12 +170,19 @@ def test_l1_cache_component_breakdown() -> None:
     print("\n6. ACTUAL cache.get() MEASUREMENT")
     print("-" * 80)
     get_latencies = []
+    stats_before = cache.get_stats()
 
     for _ in range(iterations):
         start = time.perf_counter_ns()
         found, value = cache.get(test_key)
         end = time.perf_counter_ns()
         get_latencies.append(end - start)
+
+    stats_after = cache.get_stats()
+    assert (found, value) == (True, test_value)
+    assert stats_after["hits"] - stats_before["hits"] == iterations
+    assert stats_after["misses"] == stats_before["misses"] == 0
+    record_property("get_p95_ns", round(statistics.quantiles(get_latencies, n=20)[18], 1))
 
     get_p50 = statistics.median(get_latencies)
     get_p95 = statistics.quantiles(get_latencies, n=20)[18]
@@ -262,6 +272,11 @@ def test_l1_cache_dict_size_impact() -> None:
             end = time.perf_counter_ns()
             latencies.append(end - start)
 
+        # The entries were planted in the cache's state directly; every timed get must have hit one.
+        stats = cache.get_stats()
+        assert (found, value) == (True, entry.value)
+        assert (stats["hits"], stats["misses"]) == (1000 + iterations, 0), f"size {size}: {stats}"
+
         p95 = statistics.quantiles(latencies, n=20)[18]
         mean = statistics.mean(latencies)
         results.append((size, mean, p95))
@@ -295,6 +310,7 @@ def test_l1_cache_lock_contention() -> None:
 
     thread_counts = [1, 2, 4, 8]
     iterations_per_thread = 10_000
+    wrong_values: list[int] = []
 
     print("\n" + "=" * 80)
     print("LOCK CONTENTION IMPACT")
@@ -306,14 +322,18 @@ def test_l1_cache_lock_contention() -> None:
 
         def worker(result_lock=lock, result_list=latencies):
             local_latencies = []
+            wrong = 0
             for _ in range(iterations_per_thread):
                 start = time.perf_counter_ns()
                 found, value = cache.get(test_key)
                 end = time.perf_counter_ns()
                 local_latencies.append(end - start)
+                # Counted, not asserted: an assert in a thread is only printed, never fails the test.
+                wrong += value != test_value
 
             with result_lock:
                 result_list.extend(local_latencies)
+                wrong_values.append(wrong)
 
         # Launch threads
         threads = []
@@ -334,6 +354,11 @@ def test_l1_cache_lock_contention() -> None:
         print(f"Threads: {num_threads:>2}  |  Mean: {mean:>8.1f}ns  |  P95: {p95:>8.1f}ns  |  P99: {p99:>8.1f}ns")
 
     print("\nNote: Lock contention grows with thread count")
+
+    # Contention must serve no wrong value and lose no counter update.
+    assert wrong_values == [0] * sum(thread_counts)
+    stats = cache.get_stats()
+    assert (stats["hits"], stats["misses"]) == (sum(thread_counts) * iterations_per_thread, 0)
 
 
 if __name__ == "__main__":

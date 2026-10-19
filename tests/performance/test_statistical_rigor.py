@@ -5,7 +5,11 @@ Demonstrates best practices for performance testing:
 - A run-level confidence interval (t over per-run medians), not just a p95 point estimate
 - Percentiles over every raw sample: outliers are counted, never filtered
 - JIT warmup with variance monitoring
-- Conservative thresholds (use p95, not mean)
+
+The figures are informational: printed and recorded with ``record_property``, never asserted. A
+nanosecond interval measured on one host says nothing about a loaded one, and a threshold
+on it fails on a busy neighbour, not a regression. Each test asserts from the cache's own hit/miss
+counters that every call it timed took the path it reports (hit or miss).
 """
 
 from __future__ import annotations
@@ -14,18 +18,29 @@ import pytest
 
 from cachekit.l1_cache import L1Cache
 
-from .stats_utils import benchmark_with_gc_handling, coefficient_of_variation
+from .stats_utils import PerformanceResult, benchmark_with_gc_handling, coefficient_of_variation
+
+
+def _record(record_property, prefix: str, result: PerformanceResult) -> None:
+    """Attach the run-level estimate and the raw p95 to the test's report."""
+    record_property(f"{prefix}_center_{result.unit}", round(result.center, 1))
+    record_property(f"{prefix}_ci95_upper_{result.unit}", round(result.ci_95_upper, 1))
+    record_property(f"{prefix}_p95_{result.unit}", round(result.p95, 1))
+
+
+def _counts(cache: L1Cache) -> tuple[int, int]:
+    stats = cache.get_stats()
+    return stats["hits"], stats["misses"]
 
 
 @pytest.mark.performance
-def test_l1_cache_hit_statistically_rigorous() -> None:
+def test_l1_cache_hit_statistically_rigorous(record_property) -> None:
     """L1 cache hit latency with statistical rigor.
 
     Runs benchmark 5 times independently with:
     - A run-level confidence interval to detect real changes
     - Every raw sample kept (outliers counted as a diagnostic)
     - JIT stabilization monitoring
-    - Conservative p95 threshold (not mean)
 
     This is the "right way" to benchmark small operations.
     """
@@ -49,27 +64,20 @@ def test_l1_cache_hit_statistically_rigorous() -> None:
     print(f"\n{result}")
     print(
         f"\nInterpretation:\n"
-        f"  • p95={result.p95:.0f}ns is the conservative threshold\n"
+        f"  • p95={result.p95:.0f}ns over every raw sample (no tail claim at 5 runs)\n"
         f"  • 95% CI=[{result.ci_95_lower:.0f}, {result.ci_95_upper:.0f}]ns: the run-level estimate (mean of per-run medians)\n"
         f"  • {result.outlier_count} outliers counted (kept in every percentile)\n"
         f"  • JIT warmed up in {result.jit_warmup_samples:,} iterations\n"
     )
 
-    # Conservative threshold: must pass consistently (95% CI upper bound, over 5 run medians).
-    # Upper bound measured 609-640ns (2026-10-03); back-to-back drift: two identical runs moved it by 5%.
-    target_ns = 1000
-    if result.ci_95_upper >= target_ns:
-        raise AssertionError(
-            f"L1 cache hit latency confidence interval [{result.ci_95_lower:.0f}, {result.ci_95_upper:.0f}]ns\n"
-            f"exceeds {target_ns}ns target (at 95% confidence)\n"
-            f"This is a real regression, not measurement noise."
-        )
+    _record(record_property, "hit", result)
 
-    print(f"✅ L1 cache hits validated (95% CI upper: {result.ci_95_upper:.0f}ns < {target_ns}ns target)")
+    hits, misses = _counts(cache)
+    assert misses == 0 and hits >= result.samples, f"{misses} timed lookups missed"
 
 
 @pytest.mark.performance
-def test_l1_cache_miss_statistically_rigorous() -> None:
+def test_l1_cache_miss_statistically_rigorous(record_property) -> None:
     """L1 cache miss latency with statistical rigor.
 
     Misses should be fast - validates dict lookup performance.
@@ -96,21 +104,14 @@ def test_l1_cache_miss_statistically_rigorous() -> None:
 
     print(f"\n{result}")
 
-    # Misses should be sub-microsecond (dict lookup + key miss detection + the f-string key).
-    # Re-baselined from 500 ns: neither the old pooled CI nor the run-level one met it here.
-    # Upper bound measured 671-716ns (2026-10-03); back-to-back drift: two identical runs moved it by 7%.
-    target_ns = 1000
-    if result.ci_95_upper >= target_ns:
-        raise AssertionError(
-            f"L1 cache miss latency confidence interval [{result.ci_95_lower:.0f}, {result.ci_95_upper:.0f}]ns\n"
-            f"exceeds {target_ns}ns target (at 95% confidence)"
-        )
+    _record(record_property, "miss", result)
 
-    print(f"✅ L1 cache misses validated (95% CI upper: {result.ci_95_upper:.0f}ns < {target_ns}ns target)")
+    hits, misses = _counts(cache)
+    assert hits == 0 and misses == counter[0] >= result.samples
 
 
 @pytest.mark.performance
-def test_l1_cache_comparison_with_effect_size() -> None:
+def test_l1_cache_comparison_with_effect_size(record_property) -> None:
     """Demonstrate effect size detection: compare hit vs miss performance.
 
     Shows how to detect whether an observed difference is meaningful
@@ -131,6 +132,8 @@ def test_l1_cache_comparison_with_effect_size() -> None:
         warmup_iterations=1000,
         unit="ns",
     )
+    hits_after_hit_arm = _counts(cache)
+    assert hits_after_hit_arm[1] == 0, "a timed hit missed"
 
     # Benchmark misses (same cache)
     counter = [0]
@@ -175,13 +178,16 @@ def test_l1_cache_comparison_with_effect_size() -> None:
     else:
         print("\n⚠️  Difference is NOT statistically significant (measurement noise)")
 
-    # Verify both are under thresholds
-    assert hit_result.p95 < 1000, f"Hit p95 {hit_result.p95:.0f}ns exceeds target"
-    assert miss_result.p95 < 1000, f"Miss p95 {miss_result.p95:.0f}ns exceeds target"
+    _record(record_property, "hit", hit_result)
+    _record(record_property, "miss", miss_result)
+    record_property("difference_significant", is_significant)
+
+    # The miss arm added misses only: the two arms timed the paths they are named for.
+    assert _counts(cache) == (hits_after_hit_arm[0], counter[0])
 
 
 @pytest.mark.performance
-def test_confidence_intervals_matter() -> None:
+def test_confidence_intervals_matter(record_property) -> None:
     """Demonstrates where the uncertainty comes from: runs, not samples.
 
     Ten times the samples per run barely narrows the run-level interval, because what varies
@@ -227,22 +233,25 @@ def test_confidence_intervals_matter() -> None:
         "  the next run would not reproduce. To narrow it, add runs, not samples."
     )
 
-    # Both should pass
-    assert result_small.p95 < 1000
-    assert result_large.p95 < 1000
+    _record(record_property, "small", result_small)
+    _record(record_property, "large", result_large)
+
+    # Same runs, ten times the samples per run: the comparison is only about samples per run.
+    assert (result_small.runs, result_large.runs) == (5, 5)
+    assert result_large.samples == 10 * result_small.samples
+    assert _counts(cache)[1] == 0, "a timed lookup missed"
 
 
 @pytest.mark.performance
-def test_l1_cache_speedup_ratio_validation() -> None:
-    """Validate that L1 cache hit and miss are both sub-microsecond.
+def test_l1_cache_speedup_ratio_validation(record_property) -> None:
+    """Report L1 hit and miss latency, and the hit/miss ratio.
 
     In L1-only mode (no L2 backend), hits and misses are both fast dict
     operations. Hits include LRU bookkeeping (move_to_end), so they may
     be slightly slower than misses — this is expected.
 
     Real speedup (10-20x) only manifests when L2 backend (Redis/SaaS)
-    adds network latency to misses. This test validates absolute
-    performance bounds for both paths.
+    adds network latency to misses.
     """
     cache = L1Cache(max_memory_mb=100)
 
@@ -259,6 +268,8 @@ def test_l1_cache_speedup_ratio_validation() -> None:
         warmup_iterations=1000,
         unit="ns",
     )
+    hits_after_hit_arm = _counts(cache)
+    assert hits_after_hit_arm[1] == 0, "a timed hit missed"
 
     # Measure miss performance (different keys, never cached)
     counter = [0]
@@ -280,26 +291,20 @@ def test_l1_cache_speedup_ratio_validation() -> None:
     print(f"  Hit mean:   {hit_result.mean:.0f}ns")
     print(f"  Miss mean:  {miss_result.mean:.0f}ns")
 
-    # Both operations must be sub-microsecond (1000ns)
-    assert hit_result.p95 < 1000, f"L1 hit p95 {hit_result.p95:.0f}ns exceeds 1000ns target"
-    assert miss_result.p95 < 1000, f"L1 miss p95 {miss_result.p95:.0f}ns exceeds 1000ns target"
+    # Informational: a hit's LRU bookkeeping makes it a little slower than a miss, but the ratio
+    # of two sub-microsecond means follows host load, not cachekit.
+    overhead_ratio = hit_result.mean / miss_result.mean
+    print(f"  Hit/Miss ratio: {overhead_ratio:.2f}x")
+    _record(record_property, "hit", hit_result)
+    _record(record_property, "miss", miss_result)
+    record_property("hit_miss_ratio", round(overhead_ratio, 3))
 
-    # Hit overhead from LRU bookkeeping should be bounded (< 2x miss time)
-    # Hits do more work (move_to_end), so they can be slower — but not drastically
-    if miss_result.mean > 0:
-        overhead_ratio = hit_result.mean / miss_result.mean
-        print(f"  Hit/Miss ratio: {overhead_ratio:.2f}x")
-        assert overhead_ratio < 2.0, (
-            f"L1 hit overhead too high: {overhead_ratio:.1f}x miss time "
-            f"(hit={hit_result.mean:.0f}ns, miss={miss_result.mean:.0f}ns)"
-        )
-
-    print("✅ L1 cache performance validated (both paths sub-microsecond)")
+    assert _counts(cache) == (hits_after_hit_arm[0], counter[0])
 
 
 @pytest.mark.performance
-def test_l1_cache_consistency_with_coefficient_of_variation() -> None:
-    """Report how consistent L1 cache performance is from run to run. Informational: no assert.
+def test_l1_cache_consistency_with_coefficient_of_variation(record_property) -> None:
+    """Report how consistent L1 cache performance is from run to run. The CV is informational.
 
     The CV of run medians measures the host as much as cachekit: on a loaded host it crossed 0.20
     in at least 2 of 6 back-to-back runs (2026-10-03) with nothing changed, so it cannot gate.
@@ -344,14 +349,17 @@ def test_l1_cache_consistency_with_coefficient_of_variation() -> None:
     print(f"  Rating:     {consistency}")
 
     print(f"ℹ️  Consistency (informational): CV={cv:.3f}")
+    record_property("cv_run_medians", round(cv, 4))
+
+    # The CV is over 5 run medians of hits; a miss among them would time the wrong path.
+    assert len(result.run_medians) == 5
+    hits, misses = _counts(cache)
+    assert misses == 0 and hits >= result.samples, f"{misses} timed lookups missed"
 
 
 @pytest.mark.performance
-def test_l1_cache_with_multiple_payload_sizes() -> None:
-    """Validate L1 cache performance across different payload sizes.
-
-    Tests that cache performance scales reasonably with payload size.
-    """
+def test_l1_cache_with_multiple_payload_sizes(record_property) -> None:
+    """Report L1 cache hit latency across payload sizes (informational)."""
     cache = L1Cache(max_memory_mb=100)
 
     payload_configs = {
@@ -378,6 +386,7 @@ def test_l1_cache_with_multiple_payload_sizes() -> None:
         )
 
         results[size_name] = result
+        assert cache.get(f"payload:{size_name}:test") == (True, payload)
 
     # Print comparison
     print(f"\n{'=' * 70}")
@@ -389,13 +398,12 @@ def test_l1_cache_with_multiple_payload_sizes() -> None:
         print(f"  P95:   {result.p95:>10.0f}ns")
         print(f"  P99:   {result.p99:>10.0f}ns")
 
-    # Validate that performance degrades gracefully with size
-    # (small payload should be faster than large, but not by much - still under 2KB)
     tiny_mean = results["tiny"].mean
     large_mean = results["large"].mean
+    for size_name, result in results.items():
+        _record(record_property, size_name, result)
 
-    # Large payload can be up to 3x slower (still < 2KB)
-    assert large_mean < 2000, f"Large payload L1 hit should be < 2000ns, got {large_mean:.0f}ns"
-    print("\n✅ Payload size performance validated")
-    print(f"   Tiny (50B):  {tiny_mean:.0f}ns")
+    print(f"\n   Tiny (50B):  {tiny_mean:.0f}ns")
     print(f"   Large (10K): {large_mean:.0f}ns ({(large_mean / tiny_mean):.1f}x slower)")
+
+    assert _counts(cache)[1] == 0, "a timed lookup missed"

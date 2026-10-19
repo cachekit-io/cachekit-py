@@ -1,88 +1,59 @@
 """End-to-end cache latency profiling - all layers and code paths.
 
 Measures complete cache flow:
-- Decorator overhead
 - L1 hit path (with decorator)
-- L1 miss → L2 backend
-- With serialization (msgpack)
-- With encryption (if enabled)
-- CacheHandler layer isolation
+- L1 miss (function call + populate)
+- L1 hit and pure L2 hit with a Redis backend
+- Async decorator L1 hit
+
+Timings are informational (printed and recorded with ``record_property``); each test asserts
+that the path it timed is the path it claims: hits never call the function, an L1 hit never
+reads L2, and every L1-disabled call reads L2.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import statistics
 import time
+from unittest.mock import patch
 
 import pytest
 
 from cachekit.decorators import cache
 
-# =============================================================================
-# 1. DECORATOR OVERHEAD (isolated)
-# =============================================================================
 
-
-@pytest.mark.performance
-def test_decorator_overhead_isolation() -> None:
-    """Measure @cache decorator overhead independent of cache operations.
-
-    This isolates the decorator machinery (argument binding, context extraction,
-    function invocation) without any cache hit/miss/serialization.
-    """
-    call_count = 0
-
-    @cache(backend=None)  # L1-only, minimal backend overhead
-    def simple_func(x: int) -> int:
-        nonlocal call_count
-        call_count += 1
-        return x * 2
-
-    # Prime and warm up
-    simple_func(1)
-    for _ in range(1000):
-        simple_func(999)  # Different arg each time to avoid caching
-
-    print("\n" + "=" * 80)
-    print("1. DECORATOR OVERHEAD (no caching)")
-    print("=" * 80)
-
-    latencies = []
-    for i in range(100_000):
-        # Force cache miss by using different argument each time
-        start = time.perf_counter_ns()
-        simple_func(100_000 + i)
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
-
+def _report(record_property, label: str, latencies: list[int]) -> None:
+    """Print and record mean/p50/p95 of one measured path."""
+    mean = statistics.mean(latencies)
     p50 = statistics.median(latencies)
     p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-    stdev = statistics.stdev(latencies)
-
-    print("Decorator + function call (no cache):")
-    print(f"  Mean:   {mean:>8.1f} ns")
-    print(f"  P50:    {p50:>8.1f} ns")
-    print(f"  P95:    {p95:>8.1f} ns")
-    print(f"  StdDev: {stdev:>8.1f} ns")
+    print(f"{label}:")
+    print(f"  Mean:   {mean:>10.1f} ns ({mean / 1000:>6.2f} μs)")
+    print(f"  P50:    {p50:>10.1f} ns ({p50 / 1000:>6.2f} μs)")
+    print(f"  P95:    {p95:>10.1f} ns ({p95 / 1000:>6.2f} μs)")
+    record_property("mean_ns", round(mean, 1))
+    record_property("p50_ns", round(p50, 1))
+    record_property("p95_ns", round(p95, 1))
 
 
 # =============================================================================
-# 2. L1 HIT THROUGH DECORATOR
+# 1. L1 HIT THROUGH DECORATOR
 # =============================================================================
 
 
 @pytest.mark.performance
-def test_decorator_l1_cache_hit_latency() -> None:
+def test_decorator_l1_cache_hit_latency(record_property) -> None:
     """Measure @cache decorator + L1 hit latency.
 
     This is the hot path users care about - decorator overhead + L1 lookup.
     """
+    call_count = 0
 
     @cache(backend=None)  # L1-only
     def cached_func(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
         return x * 2
 
     # Prime the cache
@@ -93,42 +64,36 @@ def test_decorator_l1_cache_hit_latency() -> None:
         cached_func(42)
 
     print("\n" + "=" * 80)
-    print("2. L1 HIT WITH DECORATOR (hot path)")
+    print("1. L1 HIT WITH DECORATOR (hot path)")
     print("=" * 80)
 
     latencies = []
     for _ in range(100_000):
         start = time.perf_counter_ns()
-        cached_func(42)  # Same arg = L1 hit
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
+        result = cached_func(42)  # Same arg = L1 hit
+        latencies.append(time.perf_counter_ns() - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-    stdev = statistics.stdev(latencies)
-
-    print("Decorator + L1 cache hit:")
-    print(f"  Mean:   {mean:>8.1f} ns")
-    print(f"  P50:    {p50:>8.1f} ns")
-    print(f"  P95:    {p95:>8.1f} ns")
-    print(f"  StdDev: {stdev:>8.1f} ns")
+    _report(record_property, "Decorator + L1 cache hit", latencies)
+    assert result == 84
+    assert call_count == 1, f"{call_count - 1} measured calls missed L1"
 
 
 # =============================================================================
-# 3. L1 MISS (with L1-only backend)
+# 2. L1 MISS (with L1-only backend)
 # =============================================================================
 
 
 @pytest.mark.performance
-def test_decorator_l1_miss_latency() -> None:
+def test_decorator_l1_miss_latency(record_property) -> None:
     """Measure @cache decorator + L1 miss path.
 
     L1 miss forces function invocation + cache population.
     """
+    called_with: list[int] = []
 
     @cache(backend=None)  # L1-only
     def cached_func(x: int) -> int:
+        called_with.append(x)
         return x * 2
 
     # Warm up
@@ -136,152 +101,130 @@ def test_decorator_l1_miss_latency() -> None:
         cached_func(1)
 
     print("\n" + "=" * 80)
-    print("3. L1 MISS (different arg each time)")
+    print("2. L1 MISS (different arg each time)")
     print("=" * 80)
 
+    args = range(100_000, 110_000)  # Fewer iterations - misses are slower
     latencies = []
-    for i in range(10_000):  # Fewer iterations - misses are slower
+    results = []
+    for x in args:
         start = time.perf_counter_ns()
-        cached_func(100_000 + i)  # Different arg = L1 miss
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
+        results.append(cached_func(x))  # Different arg = L1 miss
+        latencies.append(time.perf_counter_ns() - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    print("Decorator + L1 cache miss (function call + populate):")
-    print(f"  Mean:   {mean:>8.1f} ns")
-    print(f"  P50:    {p50:>8.1f} ns")
-    print(f"  P95:    {p95:>8.1f} ns")
+    _report(record_property, "Decorator + L1 cache miss (function call + populate)", latencies)
+    assert results == [x * 2 for x in args]
+    assert called_with == [1, *args], "every new argument must miss and run the function exactly once"
 
 
 # =============================================================================
-# 4. WITH REDIS BACKEND (L1 hit, L2 available but not accessed)
+# 3. WITH REDIS BACKEND (L1 hit, L2 available but not accessed)
 # =============================================================================
 
 
 @pytest.mark.performance
-def test_decorator_redis_backend_l1_hit() -> None:
+def test_decorator_redis_backend_l1_hit(perf_redis_backend, record_property) -> None:
     """Measure @cache with Redis backend, L1 hit.
 
     Redis is available but L1 hit avoids going to L2.
     """
-    from cachekit.backends.redis import RedisBackend
-
-    # Configure Redis backend
-    try:
-        backend = RedisBackend(redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"))
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
+    backend = perf_redis_backend
+    call_count = 0
 
     @cache(backend=backend)
     def cached_func(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
         return x * 2
 
     # Prime L1 cache
-    try:
-        cached_func(42)
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
+    cached_func(42)
 
     # Warm up
     for _ in range(1000):
         cached_func(42)
 
     print("\n" + "=" * 80)
-    print("4. REDIS BACKEND - L1 HIT (L2 not accessed)")
+    print("3. REDIS BACKEND - L1 HIT (L2 not accessed)")
     print("=" * 80)
 
     latencies = []
-    for _ in range(100_000):
-        start = time.perf_counter_ns()
-        cached_func(42)  # L1 hit, L2 not accessed
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
+    with patch.object(backend, "get", wraps=backend.get) as l2_get:
+        for _ in range(100_000):
+            start = time.perf_counter_ns()
+            result = cached_func(42)  # L1 hit, L2 not accessed
+            latencies.append(time.perf_counter_ns() - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    print("Decorator + Redis backend + L1 cache hit:")
-    print(f"  Mean:   {mean:>8.1f} ns")
-    print(f"  P50:    {p50:>8.1f} ns")
-    print(f"  P95:    {p95:>8.1f} ns")
+    _report(record_property, "Decorator + Redis backend + L1 cache hit", latencies)
+    assert result == 84
+    assert call_count == 1
+    assert l2_get.call_count == 0, f"{l2_get.call_count} measured calls read L2"
 
 
 # =============================================================================
-# 5. WITH REDIS BACKEND (L1 miss → L2 hit)
+# 4. WITH REDIS BACKEND (L1 miss → L2 hit)
 # =============================================================================
 
 
 @pytest.mark.performance
-def test_decorator_redis_backend_l1_miss_l2_hit() -> None:
-    """Measure @cache with Redis backend, L1 miss → L2 hit.
+def test_decorator_redis_backend_l1_miss_l2_hit(perf_redis_backend, record_property) -> None:
+    """Measure @cache with Redis backend, L1 disabled: every call is an L2 hit.
 
-    First invocation populates Redis, subsequent calls hit L1 or L2.
-    This measures the L2 path without network overhead.
+    The first call populates Redis; every measured call then reads it back.
     """
-    from cachekit.backends.redis import RedisBackend
     from cachekit.config.nested import L1CacheConfig
     from cachekit.decorators import DecoratorConfig
 
-    # Configure Redis backend
-    try:
-        backend = RedisBackend(redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"))
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
-
+    backend = perf_redis_backend
     config = DecoratorConfig(backend=backend, l1=L1CacheConfig(enabled=False))  # Disable L1 to force L2
+    call_count = 0
 
     @cache(config=config)
     def cached_func(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
         return x * 2
 
-    # Prime Redis with some data
-    try:
-        cached_func(42)
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
+    # Prime Redis
+    cached_func(42)
 
     # Warm up
     for _ in range(100):
         cached_func(42)
 
     print("\n" + "=" * 80)
-    print("5. REDIS BACKEND - L1 DISABLED (pure L2 hits)")
+    print("4. REDIS BACKEND - L1 DISABLED (pure L2 hits)")
     print("=" * 80)
 
-    latencies = []
     iterations = 10_000  # L2 is slower, fewer iterations
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        cached_func(42)  # L1 disabled, hits L2 every time
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
+    latencies = []
+    with patch.object(backend, "get", wraps=backend.get) as l2_get:
+        for _ in range(iterations):
+            start = time.perf_counter_ns()
+            result = cached_func(42)  # L1 disabled, hits L2 every time
+            latencies.append(time.perf_counter_ns() - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    print("Decorator + Redis backend (L1 disabled, pure L2):")
-    print(f"  Mean:   {mean:>10.1f} ns ({mean / 1000:>6.2f} μs)")
-    print(f"  P50:    {p50:>10.1f} ns ({p50 / 1000:>6.2f} μs)")
-    print(f"  P95:    {p95:>10.1f} ns ({p95 / 1000:>6.2f} μs)")
+    _report(record_property, "Decorator + Redis backend (L1 disabled, pure L2)", latencies)
+    assert result == 84
+    assert call_count == 1, f"{call_count - 1} calls missed L2"
+    assert l2_get.call_count == iterations, f"{l2_get.call_count} L2 reads for {iterations} calls"
 
 
 # =============================================================================
-# 6. ASYNC DECORATOR
+# 5. ASYNC DECORATOR
 # =============================================================================
 
 
 @pytest.mark.performance
 @pytest.mark.asyncio
-async def test_async_decorator_cache_hit() -> None:
+async def test_async_decorator_cache_hit(record_property) -> None:
     """Measure @cache decorator on async function, L1 hit."""
+    call_count = 0
 
     @cache(backend=None)
     async def async_cached_func(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
         await asyncio.sleep(0)  # Yield control
         return x * 2
 
@@ -293,24 +236,18 @@ async def test_async_decorator_cache_hit() -> None:
         await async_cached_func(42)
 
     print("\n" + "=" * 80)
-    print("6. ASYNC DECORATOR - L1 HIT")
+    print("5. ASYNC DECORATOR - L1 HIT")
     print("=" * 80)
 
     latencies = []
     for _ in range(10_000):  # Async has more overhead, fewer iterations
         start = time.perf_counter_ns()
-        await async_cached_func(42)
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
+        result = await async_cached_func(42)
+        latencies.append(time.perf_counter_ns() - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    print("Async decorator + L1 cache hit:")
-    print(f"  Mean:   {mean:>10.1f} ns ({mean / 1000:>6.2f} μs)")
-    print(f"  P50:    {p50:>10.1f} ns ({p50 / 1000:>6.2f} μs)")
-    print(f"  P95:    {p95:>10.1f} ns ({p95 / 1000:>6.2f} μs)")
+    _report(record_property, "Async decorator + L1 cache hit", latencies)
+    assert result == 84
+    assert call_count == 1, f"{call_count - 1} measured calls missed L1"
 
 
 if __name__ == "__main__":

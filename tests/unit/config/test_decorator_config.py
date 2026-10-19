@@ -826,7 +826,9 @@ class TestUnsupportedKeywords:
         for f in fields(DecoratorConfig):
             if f.name.startswith("_") or f.name in fixed:
                 continue
-            getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset], **{f.name: getattr(defaults, f.name)})
+            value = getattr(defaults, f.name)
+            config = getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset], **{f.name: value})
+            assert getattr(config, f.name) == value, f.name
 
     def test_every_unknown_keyword_is_named(self) -> None:
         with pytest.raises(ConfigurationError, match="does not accept bogus, tll"):

@@ -1237,19 +1237,22 @@ class TestLockingErrorPaths:
         # Mock msvcrt.locking to raise OSError on unlock
         import msvcrt  # type: ignore
 
+        calls: list[tuple[int, int, int]] = []
+
         def mock_locking(fd: int, mode: int, nbytes: int) -> None:
+            calls.append((fd, mode, nbytes))
             raise OSError(errno.EIO, "IO error")
 
         monkeypatch.setattr(msvcrt, "locking", mock_locking)
 
-        # Try to release lock (should not raise)
         test_file = config.cache_dir / "test.txt"
         test_file.write_bytes(b"test")
         fd = os.open(test_file, os.O_WRONLY)
         try:
-            backend._release_file_lock(fd)  # Should not raise
+            backend._release_file_lock(fd)  # the unlock failed, and the error was swallowed
         finally:
             os.close(fd)
+        assert calls == [(fd, msvcrt.LK_UNLCK, 1)]
 
     def test_lock_release_handles_oserror_posix(
         self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
@@ -1263,19 +1266,22 @@ class TestLockingErrorPaths:
         # Mock fcntl.flock to raise OSError on unlock
         import fcntl  # type: ignore
 
+        calls: list[tuple[int, int]] = []
+
         def mock_flock(fd: int, operation: int) -> None:
+            calls.append((fd, operation))
             raise OSError(errno.EIO, "IO error")
 
         monkeypatch.setattr(fcntl, "flock", mock_flock)
 
-        # Try to release lock (should not raise)
         test_file = config.cache_dir / "test.txt"
         test_file.write_bytes(b"test")
         fd = os.open(test_file, os.O_RDONLY)
         try:
-            backend._release_file_lock(fd)  # Should not raise
+            backend._release_file_lock(fd)  # the unlock failed, and the error was swallowed
         finally:
             os.close(fd)
+        assert calls == [(fd, fcntl.LOCK_UN)]
 
 
 @pytest.mark.unit
@@ -1388,11 +1394,12 @@ class TestEvictionErrorPaths:
 
         monkeypatch.setattr(Path, "unlink", mock_unlink)
 
-        # Create backend (cleanup should not crash on exception)
-        config = FileBackendConfig(cache_dir=cache_dir)
-        backend = FileBackend(config)
+        # Construction runs the cleanup; a failed unlink must not fail it
+        backend = FileBackend(FileBackendConfig(cache_dir=cache_dir))
 
-        # Should not crash (best-effort cleanup)
+        assert old_temp.read_bytes() == b"orphaned"  # the unlink failed, so the orphan is still there
+        backend.set("key", b"value")
+        assert backend.get("key") == b"value"
 
 
 @pytest.mark.unit
@@ -1484,22 +1491,29 @@ class TestMaxValueSizeEnforcement:
 class TestSafeUnlinkEdgeCases:
     """Test _safe_unlink error handling."""
 
-    def test_safe_unlink_handles_file_not_found(self, backend: FileBackend) -> None:
-        """Test _safe_unlink handles FileNotFoundError."""
-        # Should not raise
-        backend._safe_unlink("/nonexistent/path/to/file")
+    def test_safe_unlink_handles_file_not_found(self, backend: FileBackend, config: FileBackendConfig) -> None:
+        """Test _safe_unlink handles FileNotFoundError: it reports that this call removed nothing."""
+        assert backend._safe_unlink("/nonexistent/path/to/file") is False
 
-    def test_safe_unlink_handles_oserror(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _safe_unlink handles OSError gracefully."""
+        present = config.cache_dir / "present"
+        present.write_bytes(b"x")
+        assert backend._safe_unlink(str(present)) is True
+        assert not present.exists()
 
-        # Mock os.unlink to raise OSError
+    def test_safe_unlink_handles_oserror(
+        self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test _safe_unlink handles OSError gracefully: it returns False and the file stays."""
+        target = config.cache_dir / "target"
+        target.write_bytes(b"x")
+
         def mock_unlink(path: str) -> None:
             raise OSError(errno.EIO, "IO error")
 
         monkeypatch.setattr(os, "unlink", mock_unlink)
 
-        # Should not raise (best-effort)
-        backend._safe_unlink("/some/path")
+        assert backend._safe_unlink(str(target)) is False
+        assert target.exists()
 
 
 @pytest.mark.unit
@@ -1905,10 +1919,11 @@ class TestMaybeEvictEdgeCases:
         hidden_file = cache_dir / ".hidden"
         hidden_file.write_bytes(b"x" * 500_000)
 
-        # Create regular files to trigger eviction
-        for i in range(3):
+        # 5 x 400 KB passes the 90% trigger of 2 MB, so eviction runs
+        for i in range(5):
             backend.set(f"key_{i}", b"y" * 400_000)
 
+        assert _scan_counters(backend)[0] < 5  # eviction removed entries
         # Hidden file should not be deleted by eviction
         assert hidden_file.exists()
 
@@ -1927,12 +1942,14 @@ class TestMaybeEvictEdgeCases:
         temp_file = cache_dir / "hash.tmp.123.456"
         temp_file.write_bytes(b"x" * 500_000)
 
-        # Create regular files to trigger eviction
-        for i in range(3):
+        # 5 x 400 KB passes the 90% trigger of 2 MB, so eviction runs
+        for i in range(5):
             backend.set(f"key_{i}", b"y" * 400_000)
 
+        assert _scan_counters(backend)[0] < 5  # eviction removed entries
         # Temp file should not be deleted by eviction
         # (it would be deleted by cleanup, but not by eviction)
+        assert temp_file.exists()
 
 
 @pytest.mark.unit

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.nested import (
     BackpressureConfig,
     CircuitBreakerConfig,
@@ -45,9 +46,9 @@ class TestL1CacheConfig:
             config.enabled = False  # type: ignore[misc]
 
     def test_validate_success(self) -> None:
-        """Test validation passes for valid config."""
+        """max_size_mb=1, the smallest budget, passes the validation DecoratorConfig runs and is kept as given."""
         config = L1CacheConfig(max_size_mb=1)
-        config.validate()  # Should not raise
+        assert DecoratorConfig(l1=config).l1 is config
 
     def test_validate_max_size_mb_too_small(self) -> None:
         """Test validation fails when max_size_mb < 1."""
@@ -65,7 +66,8 @@ class TestL1CacheConfig:
         assert L1CacheConfig().swr_retry_interval == 10.0
 
     def test_swr_retry_interval_zero_is_valid(self) -> None:
-        L1CacheConfig(swr_retry_interval=0).validate()  # 0 = retry on the next stale read
+        config = L1CacheConfig(swr_retry_interval=0)  # 0 = retry on the next stale read
+        assert DecoratorConfig(l1=config).l1.swr_retry_interval == 0
 
     @pytest.mark.parametrize("bad", [-1, -0.5, float("nan")])
     def test_validate_swr_retry_interval_negative_or_nan(self, bad: float) -> None:
@@ -115,9 +117,9 @@ class TestCircuitBreakerConfig:
             config.enabled = False  # type: ignore[misc]
 
     def test_validate_success(self) -> None:
-        """Test validation passes for valid config."""
+        """Every threshold at its minimum of 1 passes the validation DecoratorConfig runs."""
         config = CircuitBreakerConfig(failure_threshold=1, success_threshold=1, half_open_requests=1)
-        config.validate()  # Should not raise
+        assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
 
     def test_validate_failure_threshold_too_small(self) -> None:
         """Test validation fails when failure_threshold < 1."""
@@ -151,7 +153,9 @@ class TestCircuitBreakerConfig:
             config.validate()
 
     def test_validate_half_open_requests_equal_to_success_threshold(self) -> None:
-        CircuitBreakerConfig(success_threshold=4, half_open_requests=4).validate()
+        """Equal is the smallest probe budget that can still close a cycle; one fewer is refused above."""
+        config = CircuitBreakerConfig(success_threshold=4, half_open_requests=4)
+        assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
 
 
 @pytest.mark.unit
@@ -181,9 +185,9 @@ class TestBackpressureConfig:
             config.enabled = False  # type: ignore[misc]
 
     def test_validate_success(self) -> None:
-        """Test validation passes for valid config."""
+        """max_concurrent_requests=1, the minimum, passes the validation DecoratorConfig runs."""
         config = BackpressureConfig(max_concurrent_requests=1)
-        config.validate()  # Should not raise
+        assert DecoratorConfig(backpressure=config).backpressure is config
 
     def test_validate_max_concurrent_requests_too_small(self) -> None:
         """Test validation fails when max_concurrent_requests < 1."""
@@ -226,13 +230,19 @@ class TestMonitoringConfig:
         with pytest.raises(AttributeError, match="cannot assign to field"):
             config.collect_stats = False  # type: ignore[misc]
 
-    def test_validate_no_constraints(self) -> None:
-        """Test validation passes unconditionally (no constraints)."""
-        config = MonitoringConfig()
-        config.validate()  # Should not raise
-
-        config = MonitoringConfig(collect_stats=False)
-        config.validate()  # Should not raise
+    @pytest.mark.parametrize("collect_stats", [True, False])
+    @pytest.mark.parametrize("enable_structured_logging", [True, False])
+    @pytest.mark.parametrize("enable_prometheus_metrics", [True, False])
+    def test_validate_no_constraints(
+        self, collect_stats: bool, enable_structured_logging: bool, enable_prometheus_metrics: bool
+    ) -> None:
+        """Every combination of the three flags passes the validation DecoratorConfig runs."""
+        config = MonitoringConfig(
+            collect_stats=collect_stats,
+            enable_structured_logging=enable_structured_logging,
+            enable_prometheus_metrics=enable_prometheus_metrics,
+        )
+        assert DecoratorConfig(monitoring=config).monitoring is config
 
     def test_enable_tracing_removed(self) -> None:
         """enable_tracing was a no-op and is gone: passing it fails loudly."""
@@ -283,9 +293,11 @@ class TestEncryptionConfig:
             config.enabled = True  # type: ignore[misc]
 
     def test_validate_disabled_no_error(self) -> None:
-        """Test validation passes when encryption disabled."""
-        config = EncryptionConfig(enabled=False)
-        config.validate()  # Should not raise
+        """enabled=False skips the tenant-mode check that enabled=True fails on the same fields."""
+        config = EncryptionConfig(enabled=False, master_key="a" * 64)
+        assert DecoratorConfig(encryption=config).encryption is config
+        with pytest.raises(ConfigurationError, match="Encryption requires explicit tenant mode"):
+            EncryptionConfig(enabled=True, master_key="a" * 64).validate()
 
     def test_validate_enabled_without_master_key(self) -> None:
         """Test validation fails when enabled=True but master_key=None."""
@@ -296,7 +308,7 @@ class TestEncryptionConfig:
     def test_validate_single_tenant_mode_success(self) -> None:
         """Test validation passes for single-tenant mode."""
         config = EncryptionConfig(enabled=True, master_key="a" * 64, single_tenant_mode=True)
-        config.validate()  # Should not raise
+        assert DecoratorConfig(encryption=config).encryption is config
 
     def test_validate_multi_tenant_mode_success(self) -> None:
         """Test validation passes for multi-tenant mode."""
@@ -305,7 +317,7 @@ class TestEncryptionConfig:
             return "tenant-123"
 
         config = EncryptionConfig(enabled=True, master_key="a" * 64, tenant_extractor=tenant_extractor)
-        config.validate()  # Should not raise
+        assert DecoratorConfig(encryption=config).encryption.tenant_extractor is tenant_extractor
 
     def test_validate_no_tenant_mode_specified(self) -> None:
         """Test validation fails when neither tenant mode is specified."""
@@ -336,7 +348,7 @@ class TestEncryptionConfig:
             single_tenant_mode=True,
             deployment_uuid="deployment-uuid-123",
         )
-        config.validate()  # Should not raise
+        assert DecoratorConfig(encryption=config).encryption.deployment_uuid == "deployment-uuid-123"
 
     def test_master_key_not_in_repr(self) -> None:
         """master_key must not appear in repr (CWE-532: sensitive data in logs)."""

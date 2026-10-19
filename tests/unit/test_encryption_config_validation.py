@@ -8,14 +8,21 @@ and production environment warnings.
 from __future__ import annotations
 
 import logging
+import secrets
+from unittest.mock import patch
 
 import pytest
 
+from cachekit import cache
+from cachekit.backends.file import FileBackend
+from cachekit.backends.file.config import FileBackendConfig
 from cachekit.config import ConfigurationError, validate_encryption_config
 from cachekit.config.singleton import reset_settings
 
 # Mark all tests in this module as unit tests
 pytestmark = pytest.mark.unit
+
+ENV_KEY_WARNING = "Master key loaded from environment variable"
 
 
 @pytest.fixture(autouse=True)
@@ -32,14 +39,6 @@ def _fresh_settings():
 
 class TestEncryptionConfigValidation:
     """Test validate_encryption_config() with various scenarios."""
-
-    def test_validate_no_encryption_passes_without_master_key(self, monkeypatch):
-        """Non-encrypted config should pass validation without master key."""
-        # Remove master key from environment
-        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
-
-        # Should not raise when encryption=False
-        validate_encryption_config(encryption=False)
 
     def test_validate_missing_master_key_raises_configuration_error(self, monkeypatch):
         """CRITICAL: Missing master key must raise ConfigurationError with actionable message."""
@@ -97,28 +96,6 @@ class TestEncryptionConfigValidation:
             # Should raise ConfigurationError
             with pytest.raises(ConfigurationError, match="at least 32 bytes"):
                 validate_encryption_config(encryption=True)
-
-    def test_validate_master_key_exactly_32_bytes_passes(self, monkeypatch):
-        """Master key of exactly 32 bytes (256 bits) should pass validation."""
-        import secrets
-
-        # Generate exactly 32 bytes (64 hex chars)
-        master_key = secrets.token_hex(32)
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_key)
-
-        # Should not raise
-        validate_encryption_config(encryption=True)
-
-    def test_validate_master_key_longer_than_32_bytes_passes(self, monkeypatch):
-        """Master key >32 bytes should pass validation."""
-        import secrets
-
-        # Generate 64 bytes (128 hex chars)
-        master_key = secrets.token_hex(64)
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_key)
-
-        # Should not raise
-        validate_encryption_config(encryption=True)
 
     def test_validate_master_key_invalid_hex_format_raises_error(self, monkeypatch):
         """Invalid hex-encoded master key must raise ConfigurationError."""
@@ -201,19 +178,20 @@ class TestEncryptionConfigValidation:
         error_msg = str(exc_info.value)
         assert "16 bytes" in error_msg  # Shows actual length
 
-    def test_validate_called_at_initialization(self, monkeypatch):
-        """Validation should be called at appropriate initialization points."""
-        import secrets
-
-        # Set valid master key
+    def test_validate_called_at_initialization(self, tmp_path):
+        """Decorating a function runs the validation once, with the decorator's encryption flag and key."""
         master_key = secrets.token_hex(32)
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_key)
 
-        # Validation should succeed when called explicitly
-        validate_encryption_config(encryption=True)
+        with patch("cachekit.config.validate_encryption_config", wraps=validate_encryption_config) as spy:
 
-        # Validation should also succeed when encryption is disabled
-        validate_encryption_config(encryption=False)
+            @cache.secure(master_key=master_key, backend=FileBackend(FileBackendConfig(cache_dir=str(tmp_path))))
+            def fn(x):
+                return x
+
+        spy.assert_called_once()
+        (encryption,), kwargs = spy.call_args
+        assert encryption is True
+        assert kwargs["master_key"].get_secret_value() == master_key
 
     def test_validate_production_warning_mentions_kms(self, monkeypatch, caplog):
         """Production warning should mention KMS/secrets management."""
@@ -237,21 +215,31 @@ class TestEncryptionConfigValidation:
 
         assert has_kms_mention, "Production warning should mention secrets management systems"
 
-    def test_validate_encryption_false_skips_all_checks(self, monkeypatch):
-        """When encryption=False, all validation should be skipped."""
-        # Don't set master key at all
-        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+    @pytest.mark.parametrize("env_key", [None, "not_valid_hex", "deadbeef"], ids=["no-key", "non-hex-key", "short-key"])
+    def test_validate_encryption_false_skips_all_checks(self, env_key, monkeypatch, caplog):
+        """encryption=False checks no key, so a missing, non-hex or short one neither raises nor warns."""
+        if env_key is None:
+            monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        else:
+            monkeypatch.setenv("CACHEKIT_MASTER_KEY", env_key)
+        caplog.set_level(logging.WARNING)
 
-        # Should not raise any errors
         validate_encryption_config(encryption=False)
 
-    def test_validate_encryption_default_false(self, monkeypatch):
-        """Default encryption parameter should be False."""
-        # Don't set master key
-        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        assert caplog.records == []
+        with pytest.raises(ConfigurationError):
+            validate_encryption_config(encryption=True)
 
-        # Should not raise (encryption defaults to False)
+    def test_validate_encryption_default_false(self, monkeypatch, caplog):
+        """Default encryption parameter should be False: the call skips the checks encryption=True fails."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "deadbeef")
+        caplog.set_level(logging.WARNING)
+
         validate_encryption_config()
+
+        assert caplog.records == []
+        with pytest.raises(ConfigurationError, match="at least 32 bytes"):
+            validate_encryption_config(encryption=True)
 
     @pytest.mark.parametrize(
         "invalid_key,expected_error_keyword",
@@ -275,25 +263,35 @@ class TestEncryptionConfigValidation:
         error_msg = str(exc_info.value).lower()
         assert expected_error_keyword.lower() in error_msg
 
-    def test_validate_with_uppercase_hex_key(self, monkeypatch):
+    # Each accepted key is paired with the same key with one non-hex character, which is refused: the
+    # pair shows the env key was read and hex-parsed, so the acceptance is the parser's, not a skipped check.
+    def test_validate_with_uppercase_hex_key(self, monkeypatch, caplog):
         """Uppercase hex characters in master key should be valid."""
-        import secrets
-
-        # Generate key with uppercase hex
         master_key = secrets.token_hex(32).upper()
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_key)
+        caplog.set_level(logging.WARNING)
 
-        # Should not raise
         validate_encryption_config(encryption=True)
 
-    def test_validate_with_mixed_case_hex_key(self, monkeypatch):
+        assert [r.getMessage() for r in caplog.records if ENV_KEY_WARNING in r.getMessage()]
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "G" + master_key[1:])
+        reset_settings()
+        with pytest.raises(ConfigurationError, match="hex-encoded"):
+            validate_encryption_config(encryption=True)
+
+    def test_validate_with_mixed_case_hex_key(self, monkeypatch, caplog):
         """Mixed case hex characters in master key should be valid."""
-        # Create mixed case hex key (32 bytes = 64 hex chars)
-        master_key = "DeAdBeEf" * 8  # 64 hex chars
+        master_key = "DeAdBeEf" * 8  # 64 hex chars = 32 bytes
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_key)
+        caplog.set_level(logging.WARNING)
 
-        # Should not raise
         validate_encryption_config(encryption=True)
+
+        assert [r.getMessage() for r in caplog.records if ENV_KEY_WARNING in r.getMessage()]
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "G" + master_key[1:])
+        reset_settings()
+        with pytest.raises(ConfigurationError, match="hex-encoded"):
+            validate_encryption_config(encryption=True)
 
 
 class TestConfigurationErrorMessages:

@@ -28,7 +28,6 @@ from cachekit.interop import (
     canonical_args_bytes,
     decode_interop_value,
     encode_interop_value,
-    ensure_interop_backend_compatible,
     generate_interop_key,
     validate_interop_config,
 )
@@ -133,12 +132,6 @@ class TestStrictDecode:
         # 0xc1 is the one byte the MessagePack spec never assigns
         with pytest.raises(InteropDecodeError, match="well-formed"):
             decode_interop_value(b"\xc1")
-
-
-class TestBackendGuard:
-    def test_none_backend_is_compatible(self):
-        # lazily-resolved backends are re-checked per call after resolution
-        ensure_interop_backend_compatible(None)
 
 
 class TestReservedNamespaces:

@@ -451,37 +451,30 @@ def test_api_key_authentication(cache_io_decorator, clean_cache):
     assert info.currsize is None or info.currsize >= 1
 
 
-@pytest.mark.skip(reason="Requires invalid API key setup - implement if needed")
-def test_invalid_api_key(sdk_config, clean_cache):
-    """Test invalid API key raises clear error.
+def test_invalid_api_key(sdk_config, monkeypatch):
+    """An unknown API key is refused by the server and surfaces as an AUTHENTICATION BackendError.
 
-    Validates:
-    - Invalid API key raises authentication error
-    - Error message is clear and actionable
-
-    Note: Skipped by default - requires test environment with invalid key.
+    The decorator degrades on this error rather than raising it (test_sdk_error_handling.py::test_401_unauthorized),
+    so the refusal is checked at the backend, where it is raised.
     """
-    import os
+    import uuid
 
-    # Set invalid API key
-    original_key = os.environ.get("CACHEKITIO_API_TOKEN")
-    os.environ["CACHEKITIO_API_TOKEN"] = "invalid_key_123"
+    from cachekit.backends.cachekitio.backend import CachekitIOBackend
+    from cachekit.backends.errors import BackendError, BackendErrorType
 
-    try:
+    monkeypatch.setenv("CACHEKIT_ALLOW_CUSTOM_HOST", "true")  # the dev target is off the SDK's host allowlist
+    bogus_key = f"ck_invalid_{uuid.uuid4().hex}"
+    backend = CachekitIOBackend(api_url=sdk_config["api_url"], api_key=bogus_key, timeout=10.0)
 
-        @cache.io
-        def protected_function(x: int) -> int:
-            return x * 2
+    with pytest.raises(BackendError) as exc_info:
+        backend.get("sdk_e2e:invalid_api_key")
 
-        # Should raise authentication error
-        with pytest.raises(Exception) as exc_info:
-            protected_function(5)
-
-        assert "401" in str(exc_info.value) or "Unauthorized" in str(exc_info.value)
-    finally:
-        # Restore original key
-        if original_key:
-            os.environ["CACHEKITIO_API_TOKEN"] = original_key
+    error = exc_info.value
+    assert error.error_type is BackendErrorType.AUTHENTICATION
+    assert error.is_authentication
+    assert str(error).startswith("Authentication failed: HTTP 40")
+    assert bogus_key not in str(error)
+    assert bogus_key not in repr(error)
 
 
 # ============================================================================

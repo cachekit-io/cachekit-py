@@ -4,11 +4,26 @@ Tests that EncryptionWrapper can wrap any serializer (OrjsonSerializer, ArrowSer
 to enable zero-knowledge caching for any data type.
 """
 
-import numpy as np
-import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer, StandardSerializer
+from cachekit.serializers import AutoSerializer, EncryptionWrapper, SerializerProtocol, StandardSerializer
+
+# numpy, pandas, pyarrow and orjson come from the [data] and [json] extras, which an install of only
+# the test dependency group (the free-threaded lane) lacks: each test skips on the ones it needs.
+
+
+def _orjson_serializer() -> SerializerProtocol:
+    pytest.importorskip("orjson")
+    from cachekit.serializers import OrjsonSerializer
+
+    return OrjsonSerializer()
+
+
+def _arrow_serializer() -> SerializerProtocol:
+    pytest.importorskip("pyarrow")
+    from cachekit.serializers import ArrowSerializer
+
+    return ArrowSerializer()
 
 
 class TestEncryptionWrapperComposability:
@@ -38,7 +53,7 @@ class TestEncryptionWrapperComposability:
 
     def test_encryption_wrapper_with_orjson_serializer(self, master_key):
         """EncryptionWrapper with OrjsonSerializer (JSON) works for zero-knowledge API caching."""
-        orjson_wrapper = EncryptionWrapper(serializer=OrjsonSerializer(), master_key=master_key, tenant_id="api-tenant")
+        orjson_wrapper = EncryptionWrapper(serializer=_orjson_serializer(), master_key=master_key, tenant_id="api-tenant")
 
         # API response with PII
         api_response = {
@@ -62,7 +77,8 @@ class TestEncryptionWrapperComposability:
 
     def test_encryption_wrapper_with_arrow_serializer(self, master_key):
         """EncryptionWrapper with ArrowSerializer (DataFrames) works for zero-knowledge ML caching."""
-        arrow_wrapper = EncryptionWrapper(serializer=ArrowSerializer(), master_key=master_key, tenant_id="ml-tenant")
+        pd = pytest.importorskip("pandas")
+        arrow_wrapper = EncryptionWrapper(serializer=_arrow_serializer(), master_key=master_key, tenant_id="ml-tenant")
 
         # Sensitive ML features
         df = pd.DataFrame(
@@ -84,8 +100,8 @@ class TestEncryptionWrapperComposability:
 
     def test_tenant_isolation_across_different_serializers(self, master_key):
         """Different tenants with different serializers cannot decrypt each other's data."""
-        tenant_a = EncryptionWrapper(serializer=OrjsonSerializer(), master_key=master_key, tenant_id="tenant-a")
-        tenant_b = EncryptionWrapper(serializer=OrjsonSerializer(), master_key=master_key, tenant_id="tenant-b")
+        tenant_a = EncryptionWrapper(serializer=_orjson_serializer(), master_key=master_key, tenant_id="tenant-a")
+        tenant_b = EncryptionWrapper(serializer=_orjson_serializer(), master_key=master_key, tenant_id="tenant-b")
 
         data = {"secret": "confidential"}
         cache_key = "test:tenant:isolation"
@@ -102,7 +118,7 @@ class TestEncryptionWrapperComposability:
     def test_zero_knowledge_opaque_storage_workflow(self, master_key):
         """Simulate zero-knowledge pattern: client encrypts, backend stores opaque blobs."""
         # Client encrypts JSON API response
-        client_wrapper = EncryptionWrapper(serializer=OrjsonSerializer(), master_key=master_key, tenant_id="customer-123")
+        client_wrapper = EncryptionWrapper(serializer=_orjson_serializer(), master_key=master_key, tenant_id="customer-123")
 
         sensitive_data = {"api_key": "sk_live_abc123", "webhook_secret": "whsec_xyz789"}
         cache_key = "test:zero-knowledge:secrets"
@@ -160,6 +176,8 @@ class TestEncryptionWrapperComposability:
         Series, the DataFrame msgpack-columnar fallback (pyarrow absent), and the
         checksum-only numpy path (never LZ4, so False regardless of integrity checking).
         """
+        np = pytest.importorskip("numpy")
+        pd = pytest.importorskip("pandas")
         from cachekit._rust_serializer import ByteStorage
 
         def is_enveloped(data) -> bool:
@@ -186,10 +204,11 @@ class TestEncryptionWrapperComposability:
 
     def test_encryption_metadata_preserves_format_information(self, master_key):
         """Encryption metadata correctly preserves underlying serialization format."""
+        pd = pytest.importorskip("pandas")
         serializers = [
             (StandardSerializer(), "msgpack"),
-            (OrjsonSerializer(), "orjson"),
-            (ArrowSerializer(), "arrow"),
+            (_orjson_serializer(), "orjson"),
+            (_arrow_serializer(), "arrow"),
         ]
 
         for serializer, expected_format in serializers:

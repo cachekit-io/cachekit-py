@@ -155,13 +155,12 @@ def test_session_read_lock_free_after_init(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.performance
-def test_session_id_read_overhead_ns() -> None:
-    """Wall-clock: per-call ``get_session_id()`` overhead stays cheap.
+def test_session_id_read_overhead_ns(record_property) -> None:
+    """Wall-clock: report per-call ``get_session_id()`` overhead (informational).
 
-    CI-excluded (``performance`` without ``slow``) because wall-clock timing is
-    machine-dependent; the ceiling is deliberately loose to catch only a gross
-    regression (e.g. per-call locking or UUID regeneration reintroduced), not
-    to police nanoseconds. Run via ``make benchmark``-style perf sessions.
+    The regressions a time ceiling was meant to catch are asserted deterministically instead:
+    per-call locking by test_session_read_lock_free_after_init, and UUID regeneration here, by
+    every timed call returning the same id.
     """
     iterations = 100_000
 
@@ -170,10 +169,12 @@ def test_session_id_read_overhead_ns() -> None:
         session_mod.get_session_id()
 
     latencies = []
+    ids = set()
     for _ in range(iterations):
         start = time.perf_counter_ns()
-        session_mod.get_session_id()
+        session_id = session_mod.get_session_id()
         latencies.append(time.perf_counter_ns() - start)
+        ids.add(session_id)
 
     p50 = statistics.median(latencies)
     p95 = statistics.quantiles(latencies, n=20)[18]
@@ -187,9 +188,7 @@ def test_session_id_read_overhead_ns() -> None:
     print(f"P95:         {p95:>10.1f} ns")
     print(f"P99:         {p99:>10.1f} ns")
 
-    ceiling_ns = 20_000
-    if p95 >= ceiling_ns:
-        raise AssertionError(
-            f"get_session_id() p95 {p95:.0f}ns exceeds {ceiling_ns}ns ceiling — "
-            f"likely per-call locking or UUID regeneration reintroduced on the hot path"
-        )
+    record_property("p50_ns", round(p50, 1))
+    record_property("p95_ns", round(p95, 1))
+
+    assert ids == {session_mod.get_session_id()}, f"{len(ids)} distinct session ids: the id is regenerated per call"
