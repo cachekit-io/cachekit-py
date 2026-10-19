@@ -56,8 +56,6 @@ Tests the full stack with realistic payloads and workloads:
 | `test_redis_l2_roundtrip` | 10KB dict + pytest-redis | Network + serialize |
 | `test_async_decorator_overhead` | 10KB dict + async | Async machinery |
 
-**Key Insight**: Decorator + serialization overhead is **500x** larger than raw cache lookup.
-
 ### 2. `test_reliability_under_load.py` - **Reliability Framework Tests**
 
 Tests that reliability features work under production stress:
@@ -73,32 +71,22 @@ Tests that reliability features work under production stress:
 ### 3. `test_l1_cache_latency.py` - **L1 Cache Microbenchmarks**
 
 Measures raw L1 cache performance (dict operations only), asserting from the cache's hit/miss
-counters that each timed lookup took the path it reports:
+counters that each timed lookup took the path it reports.
 
-- L1 hit: ~500ns p95 (raw dict lookup)
-- L1 miss: ~200ns p95 (key not found)
-- L1 put: ~2μs p95 (insert + LRU)
-
-**WARNING**: These numbers are NOT what users experience. Full decorator stack is 500x slower.
+**WARNING**: These numbers are NOT what users experience: they leave out the decorator and serialization.
 
 ### 4. `test_end_to_end_latency.py` - **Decorator Path Analysis**
 
 Measures decorator overhead in isolation (L1 hit, L1 miss, Redis-backed L1 hit and pure L2 hit,
-async L1 hit), asserting the function call count and which calls read Redis:
+async L1 hit), asserting the function call count and which calls read Redis.
 
-- Decorator + L1 hit (int payload): ~36μs p95
-- Async decorator: ~17μs p95
-
-**WARNING**: Uses trivial payloads (int). Real payloads are 10-100x slower.
+**WARNING**: Uses trivial payloads (int); real payloads cost more to serialize.
 
 ### 5. `test_serializer_benchmarks.py` - **Serialization Performance**
 
-Compares serializers (manual timing):
-
-- ArrowSerializer: ~50-100x faster than msgpack
-- orjson vs MessagePack speed and serialized size (JSON-heavy data)
-
-**Key Insight**: For DataFrames, ArrowSerializer is critical.
+Compares serializers (manual timing, printed): ArrowSerializer against MessagePack for DataFrames,
+and orjson against MessagePack for JSON-heavy data. Asserted: every round trip is equal, and the
+seeded JSON-heavy data serializes smaller with MessagePack than with orjson.
 
 ### 6. `test_backend_wrapper_overhead.py` - **Per-Request Pattern**
 
@@ -171,50 +159,21 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ---
 
-## Key Findings
+## Figures
 
-### What Users Actually Experience (P95)
-
-| Scenario | Latency | Context |
-|----------|---------|---------|
-| **Complex dict (10KB)** | **250μs** | Full decorator stack + msgpack |
-| **User dataclass** | **100μs** | Smaller payload |
-| **Concurrent (10 threads)** | **258μs** | Minimal lock contention (+8μs) |
-| **Redis L2 (local)** | **2-5ms** | Network RTT dominates |
-
-### What Microbenchmarks Show (MISLEADING)
-
-| Scenario | Latency | Why Misleading |
-|----------|---------|----------------|
-| **L1 cache hit** | 500ns | Ignores decorator + serialization |
-| **L1 cache miss** | 200ns | No serialization, trivial payload |
-| **Decorator + int** | 36μs | Trivial payload, no serialization |
-
-**Reality Check**: Full stack with realistic payloads is **500x slower** than raw cache microbenchmarks.
+These tests print figures and assert behaviour; none of them is a source for a number. Quote a
+figure only from [docs/performance.md, Measured Figures](../../docs/performance.md#measured-figures),
+which dates each one and names the guard that produced it.
 
 ---
 
 ## Marketing Guidelines
 
-### Conservative Claims (Measured, Not Asserted)
+### What the Tests Back
 
-No test checks these figures: the tests above print them and assert behaviour only. Re-measure
-before quoting one.
-
-1. **"200-300μs for realistic payloads"**
-   - Measured (printed, not asserted): 250μs p95 for 10KB dicts in test_production_realism.py
-   - Context: Full decorator stack
-
-2. **"Eliminates 90% of network latency"**
-   - Measured (printed, not asserted): L1 hit 0.25ms, Redis RTT 2-5ms
-   - Savings: ~2-4.75ms
-
-3. **"Concurrent-safe"**
+1. **"Concurrent-safe"**
    - Asserted: 10 threads on one key raise nothing and every call hits L1 (test_concurrent_cache_access).
      No test measures contention overhead, so make no overhead claim
-
-4. **"ArrowSerializer: 50-100x faster for DataFrames"**
-   - Measured (printed, not asserted) in test_serializer_benchmarks.py
 
 ### ❌ Avoid These Claims (Misleading)
 
@@ -226,22 +185,6 @@ before quoting one.
 
 3. **"Zero overhead"**
    - Decorator + serialization + reliability features have cost
-
----
-
-## Performance Budget
-
-No test enforces these wall-clock budgets, and the measured column is one past run. The
-regression gate is the instruction budget (`make perf-ir`, above).
-
-| Component | Budget | Measured |
-|-----------|--------|----------|
-| Decorator machinery | 20μs | ~20μs |
-| Key generation | 5μs | ~2μs |
-| Serialization (10KB) | 150μs | ~100μs |
-| L1 cache lookup | 1μs | 0.5μs |
-| Deserialization (10KB) | 150μs | ~100μs |
-| **Total** | **<350μs** | **~250μs** |
 
 ---
 

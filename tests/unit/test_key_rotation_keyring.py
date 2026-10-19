@@ -531,13 +531,12 @@ class TestRepeatRefusedAtDecoration:
         reset_settings()
         import cachekit.cache_handler as cache_handler
 
-        loads: list[None] = []
-        monkeypatch.setattr(cache_handler, "get_settings", lambda: loads.append(None) or get_settings())
+        # pytest.fail raises a BaseException, so an `except Exception` in the constructor cannot swallow it.
+        monkeypatch.setattr(cache_handler, "get_settings", lambda: pytest.fail("building the handler loaded settings"))
 
         handler = CacheSerializationHandler(encryption=False, encryption_fail_closed=False)
 
         assert handler.encryption is False
-        assert loads == []
         # The keyring setting really is malformed: loading it fails.
         with pytest.raises(ValidationError, match="previous_master_keys"):
             get_settings()

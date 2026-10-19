@@ -21,6 +21,8 @@ import pytest
 
 from cachekit.serializers import EncryptionWrapper, StandardSerializer
 
+from .stats_utils import percentile
+
 
 def benchmark_serializer(
     serializer, data: Any, iterations: int = 10_000, cache_key: str = "bench:encryption"
@@ -63,9 +65,8 @@ def benchmark_serializer(
         end = time.perf_counter_ns()
         latencies.append(end - start)
 
-    latencies.sort()
     mean = sum(latencies) / len(latencies)
-    p95 = latencies[int(len(latencies) * 0.95)]
+    p95 = percentile(latencies, 95)
 
     return {"mean": mean, "p95": p95, "payload": serialized, "result": result}
 

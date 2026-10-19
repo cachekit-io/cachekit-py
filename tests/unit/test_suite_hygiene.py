@@ -35,6 +35,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 TESTS = Path(__file__).resolve().parents[1]
 RAISING_CHECKS = frozenset({"pytest.raises", "pytest.warns", "pytest.fail", "pytest.deprecated_call", "self.fail"})
 CONDITIONAL = (ast.If, ast.IfExp, ast.Try, ast.ExceptHandler, ast.BoolOp, ast.For, ast.AsyncFor, ast.While, ast.Match)
@@ -98,19 +100,19 @@ class _Module:
             return self.classes[cls].get(func.attr)
         return None
 
-    def asserts(self, fn: Func, cls: str | None, seen: frozenset[int] = frozenset()) -> bool:
+    def asserts(self, fn: Func, cls: str | None, seen: frozenset[int] = frozenset(), scope: dict | None = None) -> bool:
+        """``scope``: the functions defined inside the enclosing test, which a nested function may call."""
         if id(fn) in seen:
             return False
         nodes = list(_own_nodes(fn))
         if any(_is_signal(n) for n in nodes):
             return True
-        nested = {n.name: n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        scope = {**(scope or {}), **{n.name: n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}}
         calls = [n for n in nodes if isinstance(n, ast.Call)]
         callees = (
-            nested.get(c.func.id) if isinstance(c.func, ast.Name) and c.func.id in nested else self._callee(cls, c)
-            for c in calls
+            scope.get(c.func.id) if isinstance(c.func, ast.Name) and c.func.id in scope else self._callee(cls, c) for c in calls
         )
-        return any(self.asserts(c, cls, seen | {id(fn)}) for c in callees if c is not None)
+        return any(self.asserts(c, cls, seen | {id(fn)}, scope) for c in callees if c is not None)
 
 
 def _own_nodes(fn: Func):
@@ -177,7 +179,9 @@ def scan(root: Path) -> list[str]:
     return sorted(out)
 
 
-def test_no_dead_or_assertion_free_tests() -> None:
+def test_no_dead_or_assertion_free_tests(pytestconfig: pytest.Config) -> None:
+    # The scan leaves bare xfails to pytest; without xfail_strict they would pass whether or not they fail.
+    assert pytestconfig.getini("xfail_strict"), "set xfail_strict = true under [tool.pytest.ini_options]"
     violations = scan(TESTS)
     assert not violations, (
         "Dead or assertion-free tests. Fix the test, delete it, or mark it xfail(strict=True) naming the defect; "
@@ -186,6 +190,7 @@ def test_no_dead_or_assertion_free_tests() -> None:
 
 
 PLANTED = """
+import asyncio
 import threading
 
 import pytest
@@ -213,8 +218,8 @@ def test_lenient_xfail():
     assert len("ok") == 2
 
 
-@pytest.mark.xfail(reason="strict through xfail_strict")
-def test_xfail_is_strict_by_default():
+@pytest.mark.xfail(reason="pytest makes it strict: xfail_strict")
+def test_bare_xfail_is_not_flagged():
     assert len("ok") == 2
 
 
@@ -234,6 +239,17 @@ def test_nested_helper_called_by_name_counts():
         assert len("ok") == 2
 
     check()
+
+
+def test_sibling_nested_helper_counts():
+    def worker():
+        assert len("ok") == 2
+
+    async def main():
+        await asyncio.gather(asyncio.to_thread(worker))
+        worker()
+
+    asyncio.run(main())
 
 
 @pytest.mark.xfail(strict=True, run=False, reason="never runs")

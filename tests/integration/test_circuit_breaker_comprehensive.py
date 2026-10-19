@@ -26,6 +26,7 @@ Test Coverage:
 
 import logging
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -236,26 +237,33 @@ class TestCircuitBreakerRaceConditions:
         # Circuit should be in HALF_OPEN state
         assert self.circuit_breaker.state == CircuitState.HALF_OPEN
 
-    def test_concurrent_metrics_collection(self):
+    def test_concurrent_failures_are_all_counted(self):
         """Concurrent failures are counted exactly: none lost, none doubled.
 
         The threshold sits above the total so the breaker stays CLOSED and every failure lands in
         the rolling window; a failure recorded once OPEN would be dropped and hide a lost update.
+        A barrier and a tiny switch interval make the threads interleave inside record_failure.
         """
-        threads, per_thread = 5, 50
-        breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=10_000, success_threshold=3, timeout_seconds=0.1))
+        threads, per_thread = 8, 2000
+        breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=10**6))
+        barrier = threading.Barrier(threads)
 
         def record_failures():
+            barrier.wait()
             for _ in range(per_thread):
                 breaker.record_failure()
 
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            for future in [executor.submit(record_failures) for _ in range(threads)]:
-                future.result()
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                for future in [executor.submit(record_failures) for _ in range(threads)]:
+                    future.result()
+        finally:
+            sys.setswitchinterval(interval)
 
         assert breaker.state == CircuitState.CLOSED
         assert breaker.failure_count == threads * per_thread
-        assert breaker.get_stats()["failure_count"] == threads * per_thread
 
 
 class TestCircuitBreakerIntegration:
