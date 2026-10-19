@@ -251,12 +251,13 @@ class DefaultBackendProvider(BackendProviderInterface):
     def _is_configured(self) -> bool:
         """Whether the environment names a backend: any prefixed selector, or ``REDIS_URL``.
 
-        Read through pydantic-settings with ``case_sensitive=False``, exactly as ``RedisBackendConfig``
-        reads them: a lowercase ``redis_url`` always reached that Redis through ``get_backend()``'s
-        fallback. ``_detect()`` stays case-sensitive on purpose: a lowercase prefixed selector counts as
-        configured here and still resolves Redis there, as before; aligning either method changes routing.
-        A selector ``_detect()`` matches always counts too: with two spellings set, pydantic keeps one
-        (an empty one can win), while ``_detect()`` still routes on the exact-case one.
+        A selector ``_matched()`` finds counts first, because ``_detect()`` routes on it: with two
+        spellings of one set, pydantic keeps one (an empty one can win), while ``_detect()`` still routes
+        on the exact-case one. Then ``_BackendEnv`` reads every name through pydantic-settings with
+        ``case_sensitive=False``, exactly as ``RedisBackendConfig`` reads them: a lowercase ``redis_url``
+        always reached that Redis through ``get_backend()``'s fallback. ``_detect()`` stays case-sensitive
+        on purpose: a lowercase prefixed selector counts as configured here and still resolves Redis
+        there, as before; aligning either method changes routing.
         Never raises: two selectors count as configured, so ``get_backend()`` raises the ambiguity
         error where the decorator already handles a backend that fails to build.
         """

@@ -288,6 +288,21 @@ class CacheInfo(NamedTuple):
         >>> total = info.hits + info.misses
         >>> round(info.hits / total, 2)
         0.83
+
+        Read a decorated function's statistics with ``cache_info()``. With nothing configured, the
+        second call is an L1 hit:
+
+        >>> from cachekit import cache
+        >>> @cache()
+        ... def square(x):
+        ...     return x * x
+        >>> square(4), square(4)
+        (16, 16)
+        >>> info = square.cache_info()
+        >>> info.hits, info.misses, info.l1_hits, info.l2_hits
+        (1, 1, 1, 0)
+        >>> info.maxsize is None and info.currsize is None
+        True
     """
 
     hits: int  # Total cache hits (L1 + L2)
@@ -3143,16 +3158,7 @@ def create_cache_wrapper(
             are unaffected.
 
         Returns:
-            CacheInfo: Named tuple with hits, misses, maxsize, currsize
-
-        Examples:
-            >>> @cache()
-            ... def factorial(n):
-            ...     return n * factorial(n-1) if n else 1
-            >>> factorial(5)
-            120
-            >>> factorial.cache_info()
-            CacheInfo(hits=4, misses=6, maxsize=None, currsize=6)
+            CacheInfo: Named tuple of nine fields; see ``CacheInfo`` for them and an example.
         """
         return _stats.get_info()
 
