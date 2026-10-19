@@ -7,12 +7,20 @@ from __future__ import annotations
 
 import os
 
-import pandas as pd
 import pytest
 
 from cachekit import cache
-from cachekit.serializers.arrow_serializer import ArrowSerializer
+from cachekit.serializers import SerializerProtocol
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
+
+
+def _arrow_serializer() -> SerializerProtocol:
+    # pandas and pyarrow come from the [data] extra, which an install of only the test dependency
+    # group (the free-threaded lane) lacks: each Arrow test skips, the rest still run.
+    pytest.importorskip("pyarrow")
+    from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+    return ArrowSerializer()
 
 
 @pytest.mark.integration
@@ -90,9 +98,10 @@ class TestSerializerBackendIntegration:
 
     def test_arrow_serializer_with_cache_decorator(self, redis_isolated):
         """@cache decorator with ArrowSerializer stores/retrieves DataFrames end-to-end."""
+        pd = pytest.importorskip("pandas")
         call_count = 0
 
-        @cache(ttl=300, serializer=ArrowSerializer())
+        @cache(ttl=300, serializer=_arrow_serializer())
         def load_dataframe(dataset_id: str) -> pd.DataFrame:
             nonlocal call_count
             call_count += 1
@@ -116,8 +125,9 @@ class TestSerializerBackendIntegration:
 
     def test_arrow_bytes_stored_in_redis(self, redis_isolated):
         """Verify Redis stores Arrow IPC format bytes."""
+        pd = pytest.importorskip("pandas")
 
-        @cache(ttl=300, serializer=ArrowSerializer())
+        @cache(ttl=300, serializer=_arrow_serializer())
         def get_data() -> pd.DataFrame:
             return pd.DataFrame({"col": [1, 2, 3]})
 
@@ -140,9 +150,10 @@ class TestSerializerBackendIntegration:
 
     def test_l1_l2_cache_with_arrow_serializer(self, redis_isolated):
         """L1+L2 cache with ArrowSerializer works correctly."""
+        pd = pytest.importorskip("pandas")
         call_count = 0
 
-        @cache(ttl=300, serializer=ArrowSerializer(), l1_enabled=True)
+        @cache(ttl=300, serializer=_arrow_serializer(), l1_enabled=True)
         def compute_dataframe(size: int) -> pd.DataFrame:
             nonlocal call_count
             call_count += 1
@@ -194,9 +205,10 @@ class TestSerializerGracefulDegradation:
 
     def test_corrupted_cache_data_results_in_cache_miss(self, redis_isolated):
         """Corrupted cache data should result in cache miss (graceful degradation)."""
+        pd = pytest.importorskip("pandas")
         call_count = 0
 
-        @cache(ttl=300, serializer=ArrowSerializer())
+        @cache(ttl=300, serializer=_arrow_serializer())
         def get_dataframe() -> pd.DataFrame:
             nonlocal call_count
             call_count += 1
@@ -224,7 +236,7 @@ class TestSerializerGracefulDegradation:
         """ArrowSerializer with non-DataFrame returns uncached result (graceful degradation)."""
         call_count = 0
 
-        @cache(ttl=300, serializer=ArrowSerializer())
+        @cache(ttl=300, serializer=_arrow_serializer())
         def get_scalar_value() -> int:
             nonlocal call_count
             call_count += 1
@@ -279,9 +291,10 @@ class TestSerializerWithEncryptionInProduction:
         REGRESSION (Issue #134): before the fix this silently substituted MessagePack,
         which cannot round-trip a DataFrame, so the cache hit would not equal the source.
         """
+        pd = pytest.importorskip("pandas")
         call_count = 0
 
-        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_rt", encryption=True, single_tenant_mode=True)
+        @cache(ttl=300, serializer=_arrow_serializer(), namespace="enc_arrow_rt", encryption=True, single_tenant_mode=True)
         def load_data(user_id: str) -> pd.DataFrame:
             nonlocal call_count
             call_count += 1
@@ -309,13 +322,13 @@ class TestSerializerWithEncryptionInProduction:
         is the user's Arrow serializer and that the produced metadata carries the Arrow
         wire format (not MessagePack).
         """
+        pd = pytest.importorskip("pandas")
         from cachekit.cache_handler import CacheSerializationHandler
-        from cachekit.serializers.arrow_serializer import ArrowSerializer
         from cachekit.serializers.base import SerializationFormat
 
         deployment_uuid = "00000000-0000-0000-0000-000000000134"
         handler = CacheSerializationHandler(
-            serializer_name=ArrowSerializer(),
+            serializer_name=_arrow_serializer(),
             encryption=True,
             single_tenant_mode=True,
             deployment_uuid=deployment_uuid,
@@ -341,8 +354,9 @@ class TestSerializerWithEncryptionInProduction:
 
     def test_dataframe_index_preserved_with_encrypted_arrow_serializer(self, redis_isolated):
         """DataFrame index is preserved through the encrypted Arrow path end-to-end."""
+        pd = pytest.importorskip("pandas")
 
-        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_idx", encryption=True, single_tenant_mode=True)
+        @cache(ttl=300, serializer=_arrow_serializer(), namespace="enc_arrow_idx", encryption=True, single_tenant_mode=True)
         def get_indexed_data() -> pd.DataFrame:
             return pd.DataFrame({"value": [10, 20, 30]}, index=["a", "b", "c"])
 

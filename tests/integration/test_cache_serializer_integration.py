@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-import numpy as np
+import pytest
 
 from cachekit import cache
 
@@ -34,6 +34,7 @@ class TestCacheSerializerIntegration:
 
     def test_numpy_array_caching(self, redis_test_client):
         """Test caching NumPy arrays with cache serializer."""
+        np = pytest.importorskip("numpy")  # the [data] extra; the free-threaded lane installs only the test group
 
         @cache(ttl=60, namespace="numpy", serializer="default")
         def generate_array(size: int) -> np.ndarray:

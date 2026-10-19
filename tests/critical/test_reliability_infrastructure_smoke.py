@@ -108,43 +108,49 @@ class TestAsyncMetricsCollectorSmoke:
         collector.shutdown()
 
     def test_async_collector_records_counter_without_crash(self):
-        """SMOKE: Recording counter doesn't crash."""
+        """SMOKE: Recorded counters reach the local store and accumulate per label set."""
         collector = AsyncMetricsCollector()
 
-        # Should not raise
         collector.record_counter("test_counter", labels={"foo": "bar"})
         collector.record_counter("test_counter", value=5.0)
+        collector.record_counter("test_counter", value=5.0)
 
-        # Give worker time to process
-        time.sleep(0.1)
-
+        # flush() waits until the worker has processed, not just dequeued, every metric
+        collector.flush()
+        stats = collector.get_stats()
         collector.shutdown()
 
+        assert stats["processed_count"] == 3
+        assert stats["local_metrics"]["test_counter"] == {"foo=bar": 1.0, "default": 10.0}
+
     def test_async_collector_records_gauge_without_crash(self):
-        """SMOKE: Recording gauge doesn't crash."""
+        """SMOKE: Recorded gauges reach the local store, the latest value per label set."""
         collector = AsyncMetricsCollector()
 
-        # Should not raise
+        collector.record_gauge("test_gauge", 7.0)
         collector.record_gauge("test_gauge", 42.0)
         collector.record_gauge("test_gauge", 100.0, labels={"status": "healthy"})
 
-        # Give worker time to process
-        time.sleep(0.1)
-
+        collector.flush()
+        stats = collector.get_stats()
         collector.shutdown()
 
+        assert stats["processed_count"] == 3
+        assert stats["local_metrics"]["test_gauge"] == {"default": 42.0, "status=healthy": 100.0}
+
     def test_async_collector_records_histogram_without_crash(self):
-        """SMOKE: Recording histogram doesn't crash."""
+        """SMOKE: Recorded histogram observations reach the local store per label set."""
         collector = AsyncMetricsCollector()
 
-        # Should not raise
         collector.record_histogram("test_histogram", 1.5)
         collector.record_histogram("test_histogram", 2.5, labels={"operation": "get"})
 
-        # Give worker time to process
-        time.sleep(0.1)
-
+        collector.flush()
+        stats = collector.get_stats()
         collector.shutdown()
+
+        assert stats["processed_count"] == 2
+        assert stats["local_metrics"]["test_histogram"] == {"default": 1.5, "operation=get": 2.5}
 
     def test_async_collector_shutdown_cleans_up(self):
         """SMOKE: Shutdown cleans up worker thread."""

@@ -1,17 +1,18 @@
 """Reliability framework performance under load.
 
 Tests that exercise the production reliability features:
-- Circuit breaker (failure injection, recovery testing)
+- A Redis outage (every call degrades to an uncached call)
 - Backpressure (hitting max_concurrent limits)
 
 CRITICAL: These tests validate that reliability features work under production stress.
 They measure performance degradation when things go wrong, not just happy path.
+
+The assertions are about behaviour: the breaker's state, which calls reached the backend, how
+many backend operations ran at once, and that every caller got its value.
 """
 
 from __future__ import annotations
 
-import os
-import statistics
 import threading
 import time
 from typing import Any
@@ -23,112 +24,55 @@ from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.decorators import cache
 
+from .stats_utils import report
+
 # =============================================================================
-# Test 1: Circuit Breaker Under Failure
+# Test 1: Redis Outage
 # =============================================================================
 
 
 @pytest.mark.performance
 @pytest.mark.integration
-def test_circuit_breaker_failure_injection() -> None:
-    """Measure circuit breaker performance under Redis failures.
+def test_redis_outage_degrades_to_uncached_calls(perf_redis_backend, record_property) -> None:
+    """A Redis outage turns every call into an uncached call: no error reaches the caller.
 
-    Tests:
-    - Circuit opening after failure threshold
-    - Fast-fail latency when circuit is open
-    - Recovery behavior (HALF_OPEN → CLOSED)
-
-    This validates @cache.production graceful degradation claims.
+    Backend read and write failures do not count toward the circuit breaker (docs/error-codes.md,
+    "Circuit breaker open"), so the breaker stays closed and every call keeps trying Redis.
     """
-    from cachekit.backends.redis import RedisBackend
-
-    # Check Redis availability
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    try:
-        backend = RedisBackend(redis_url=redis_url)
-        # Test connection by trying a basic operation
-        backend.exists("__health_check__")
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
-
     from cachekit.config.nested import CircuitBreakerConfig, L1CacheConfig
 
-    # Config with circuit breaker enabled
+    backend = perf_redis_backend
     config = DecoratorConfig(
         backend=backend,
-        l1=L1CacheConfig(enabled=False),  # Force L2 to test circuit breaker
-        circuit_breaker=CircuitBreakerConfig(enabled=True),  # Use defaults (failure_threshold=5)
+        l1=L1CacheConfig(enabled=False),  # every call goes to L2
+        circuit_breaker=CircuitBreakerConfig(enabled=True),
+        encryption=False,
     )
-
-    call_count = 0
 
     @cache(config=config)
     def get_data(item_id: int) -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
         return {"id": item_id, "data": "value"}
 
-    print("\n" + "=" * 80)
-    print("CIRCUIT BREAKER - FAILURE INJECTION")
-    print("=" * 80)
-
-    # Phase 1: Normal operation (circuit CLOSED)
-    print("\nPhase 1: Normal operation (circuit CLOSED)")
     latencies_normal = []
     for i in range(10):
         start = time.perf_counter_ns()
-        result = get_data(i)
-        end = time.perf_counter_ns()
-        latencies_normal.append(end - start)
-        assert result["id"] == i
+        assert get_data(i)["id"] == i
+        latencies_normal.append(time.perf_counter_ns() - start)
 
-    p95_normal = statistics.quantiles(latencies_normal, n=20)[18]
-    print(f"  P95 latency (normal): {p95_normal / 1000:.2f} μs")
-
-    # Phase 2: Inject failures to open circuit
-    print("\nPhase 2: Injecting failures to open circuit")
-
-    # Patch backend.get to raise errors
-    def failing_get(*args, **kwargs):
+    def failing(*args, **kwargs):
         raise BackendError("Simulated Redis failure", error_type=BackendErrorType.TRANSIENT)
 
-    with patch.object(backend, "get", side_effect=failing_get):
-        failures = 0
+    latencies_outage = []
+    with patch.object(backend, "get", side_effect=failing) as l2_get, patch.object(backend, "set", side_effect=failing):
         for i in range(10):
-            try:
-                get_data(100 + i)  # Different keys
-            except Exception:
-                failures += 1
+            start = time.perf_counter_ns()
+            assert get_data(100 + i)["id"] == 100 + i, "an outage must degrade to an uncached call, not an error"
+            latencies_outage.append(time.perf_counter_ns() - start)
+    assert l2_get.call_count == 10, "every call during the outage should still try Redis"
+    assert get_data.get_health_status()["circuit_breaker"]["state"] == "closed"
 
-        print(f"  Failures triggered: {failures}/10")
-        print("  Circuit should be OPEN now")
-
-    # Phase 3: Measure fast-fail latency (circuit OPEN)
-    print("\nPhase 3: Fast-fail latency (circuit OPEN)")
-    latencies_open = []
-
-    # Circuit should be open, requests should fail fast
-    for i in range(20):
-        start = time.perf_counter_ns()
-        try:
-            get_data(200 + i)  # Different keys
-        except Exception:
-            pass  # Expected - circuit is open
-        end = time.perf_counter_ns()
-        latencies_open.append(end - start)
-
-    p95_open = statistics.quantiles(latencies_open, n=20)[18]
-    print(f"  P95 latency (circuit open): {p95_open / 1000:.2f} μs")
-    print(f"  Fast-fail speedup: {p95_normal / p95_open:.1f}x faster")
-
-    # Validate fast-fail is significantly faster than normal Redis roundtrip
-    # Circuit open should be <250μs (allowing for GC/system variance), normal is ~2-5ms
-    assert p95_open < 250_000, f"Circuit open latency {p95_open / 1000:.0f}μs should be <250μs (fast-fail)"
-
-    print("\n✅ Circuit breaker validated:")
-    print(f"   - Normal operation:  {p95_normal / 1000:.2f} μs")
-    print(f"   - Fast-fail (open):  {p95_open / 1000:.2f} μs")
-    print(f"   - Speedup:           {p95_normal / p95_open:.1f}x")
+    report(record_property, "Normal", latencies_normal, "normal_")
+    report(record_property, "Outage", latencies_outage, "outage_")
 
 
 # =============================================================================
@@ -136,119 +80,111 @@ def test_circuit_breaker_failure_injection() -> None:
 # =============================================================================
 
 
+class _SlowBackend:
+    """In-process L2 whose operations take ``delay`` seconds and count how many run at once."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.store: dict[str, bytes] = {}
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self._lock = threading.Lock()
+
+    def _op(self, fn, *args):
+        with self._lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            time.sleep(self.delay)
+            return fn(*args)
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+    def get(self, key: str) -> bytes | None:
+        return self._op(self.store.get, key)
+
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        self._op(self.store.__setitem__, key, value)
+
+    def delete(self, key: str) -> bool:
+        return self.store.pop(key, None) is not None
+
+    def exists(self, key: str) -> bool:
+        return key in self.store
+
+    def health_check(self) -> tuple[bool, dict[str, str]]:
+        return True, {"backend_type": "slow"}
+
+
 @pytest.mark.performance
-def test_backpressure_limit() -> None:
-    """Measure backpressure behavior when hitting max_concurrent limit.
+def test_backpressure_limit(record_property) -> None:
+    """Backpressure caps concurrent backend operations at max_concurrent_requests.
 
-    Tests:
-    - Queuing behavior when limit is reached
-    - Queue timeout enforcement
-    - Latency increase under backpressure
-
-    This validates that backpressure protects against overload.
+    It gates backend I/O, not the cached function, so it needs a backend: 20 threads drive a
+    backend whose every operation takes 50ms. A caller that cannot get a permit in time
+    degrades to an uncached call, so every caller must still get its value.
     """
     from cachekit.config.nested import BackpressureConfig
 
-    # Config with low concurrency limit to trigger backpressure
+    backend = _SlowBackend(delay=0.05)
+    max_concurrent = 5
     config = DecoratorConfig(
-        backend=None,  # L1-only
-        backpressure=BackpressureConfig(
-            enabled=True,
-            max_concurrent_requests=5,  # Low limit to trigger easily
-            timeout=0.5,  # 500ms queue timeout
-        ),
+        backend=backend,
+        backpressure=BackpressureConfig(enabled=True, max_concurrent_requests=max_concurrent),
+        encryption=False,
     )
 
-    slow_call_count = 0
-    slow_call_duration_ms = 100  # Simulate slow function
-
     @cache(config=config)
-    def slow_function(item_id: int) -> dict[str, Any]:
-        nonlocal slow_call_count
-        slow_call_count += 1
-        time.sleep(slow_call_duration_ms / 1000)  # Simulate slow work
+    def get_data(item_id: int) -> dict[str, Any]:
         return {"id": item_id, "result": "data"}
-
-    print("\n" + "=" * 80)
-    print("BACKPRESSURE - CONCURRENT LIMIT")
-    print("=" * 80)
-    print("\nConfig:")
-    print("  max_concurrent_requests: 5")
-    print("  queue_timeout: 0.5s")
-    print(f"  slow_function duration: {slow_call_duration_ms}ms")
 
     num_threads = 20  # More threads than limit
     iterations_per_thread = 5
-
     latencies: list[int] = []
-    queued_count = 0
-    timeout_count = 0
+    wrong: list[tuple[int, str]] = []
     lock = threading.Lock()
 
     def worker(thread_id: int) -> None:
-        """Worker thread that tries to access slow cached function."""
-        nonlocal queued_count, timeout_count
-
         for i in range(iterations_per_thread):
+            item_id = thread_id * 100 + i
             start = time.perf_counter_ns()
+            # Recorded, not asserted: an assert in a thread is only printed, never fails the test
             try:
-                slow_function(thread_id * 100 + i)
-                end = time.perf_counter_ns()
+                result = get_data(item_id)
+                cause = None if result == {"id": item_id, "result": "data"} else f"wrong value {result!r}"
+            except Exception as exc:
+                cause = repr(exc)
+            elapsed = time.perf_counter_ns() - start
+            with lock:
+                latencies.append(elapsed)
+                if cause is not None:
+                    wrong.append((item_id, cause))
 
-                with lock:
-                    latencies.append(end - start)
-                    # If latency > slow_call_duration, we were queued
-                    if (end - start) > (slow_call_duration_ms * 1_000_000):
-                        queued_count += 1
-
-            except Exception:
-                end = time.perf_counter_ns()
-                with lock:
-                    timeout_count += 1
-                    # Record timeout latency too
-                    latencies.append(end - start)
-
-    # Launch threads
-    threads = []
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
     start_time = time.perf_counter()
-    for i in range(num_threads):
-        t = threading.Thread(target=worker, args=(i,))
-        threads.append(t)
+    for t in threads:
         t.start()
-
-    # Wait for completion
     for t in threads:
         t.join()
     elapsed_time = time.perf_counter() - start_time
 
-    # Analyze results
-    if latencies:
-        mean = statistics.mean(latencies)
-        median = statistics.median(latencies)
-        p95 = statistics.quantiles(latencies, n=20)[18]
-        p99 = statistics.quantiles(latencies, n=100)[98]
+    load_control = get_data.get_health_status()["components"]["load_control"]
 
-        print("\nResults:")
-        print(f"  Total requests:  {num_threads * iterations_per_thread}")
-        print(f"  Completed:       {len(latencies) - timeout_count}")
-        print(f"  Queued:          {queued_count}")
-        print(f"  Timeouts:        {timeout_count}")
-        print(f"  Total time:      {elapsed_time:.2f}s")
-        print("\nLatencies:")
-        print(f"  Mean:    {mean / 1_000_000:.2f} ms")
-        print(f"  Median:  {median / 1_000_000:.2f} ms")
-        print(f"  P95:     {p95 / 1_000_000:.2f} ms")
-        print(f"  P99:     {p99 / 1_000_000:.2f} ms")
+    print("\n" + "=" * 80)
+    print("BACKPRESSURE - CONCURRENT LIMIT")
+    print("=" * 80)
+    print(f"  Requests:            {len(latencies)} ({num_threads} threads)")
+    print(f"  Max backend in flight: {backend.max_in_flight} (limit {max_concurrent})")
+    print(f"  Rejected permits:    {load_control['rejected_count']}")
+    print(f"  Total time:          {elapsed_time:.2f}s")
+    report(record_property, "Caller latency", latencies)
+    record_property("rejected_permits", load_control["rejected_count"])
 
-        # Validate backpressure worked
-        assert queued_count > 0 or timeout_count > 0, "Backpressure should have been triggered"
-
-        print("\n✅ Backpressure validated:")
-        print("   - Concurrency limit enforced")
-        print(f"   - {queued_count} requests queued")
-        print(f"   - {timeout_count} requests timed out")
-    else:
-        pytest.fail("No latency measurements collected")
+    assert wrong == [], f"{len(wrong)} callers got an error or a wrong value, first: {wrong[:3]}"
+    assert len(latencies) == num_threads * iterations_per_thread
+    # 20 callers on 50ms operations always fill the 5 slots; the cap must hold at that point.
+    assert backend.max_in_flight == max_concurrent, f"{backend.max_in_flight} backend operations ran at once"
 
 
 # =============================================================================
@@ -258,7 +194,7 @@ def test_backpressure_limit() -> None:
 
 @pytest.mark.performance
 @pytest.mark.integration
-def test_full_stack_under_load() -> None:
+def test_full_stack_under_load(perf_redis_backend, record_property) -> None:
     """Measure full stack performance with ALL reliability features enabled.
 
     Tests:
@@ -269,17 +205,6 @@ def test_full_stack_under_load() -> None:
 
     This is the MOST REALISTIC test - all features enabled like production.
     """
-    from cachekit.backends.redis import RedisBackend
-
-    # Check Redis availability
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    try:
-        backend = RedisBackend(redis_url=redis_url)
-        # Test connection by trying a basic operation
-        backend.exists("__health_check__")
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
-
     from cachekit.config.nested import (
         BackpressureConfig,
         CircuitBreakerConfig,
@@ -288,20 +213,24 @@ def test_full_stack_under_load() -> None:
     )
 
     # Production config - ALL features enabled
+    backend = perf_redis_backend
     config = DecoratorConfig(
         backend=backend,
         l1=L1CacheConfig(enabled=True),
         circuit_breaker=CircuitBreakerConfig(enabled=True),
         backpressure=BackpressureConfig(enabled=True, max_concurrent_requests=50),
         monitoring=MonitoringConfig(collect_stats=True),
+        encryption=False,
     )
 
     call_count = 0
+    call_lock = threading.Lock()  # phase 4 increments from 10 threads; without the GIL `+=` can lose one
 
     @cache(config=config)
     def get_data(item_id: int) -> dict[str, Any]:
         nonlocal call_count
-        call_count += 1
+        with call_lock:
+            call_count += 1
         return {"id": item_id, "data": "x" * 1000}  # 1KB payload
 
     print("\n" + "=" * 80)
@@ -318,18 +247,21 @@ def test_full_stack_under_load() -> None:
     print("\nPhase 1: Priming L1 cache")
     for i in range(100):
         get_data(i)
+    assert call_count == 100
 
     # Phase 2: Measure L1 hits (hot path)
     print("\nPhase 2: Measuring L1 hits (hot path)")
     latencies_l1 = []
-    for _ in range(1000):
-        start = time.perf_counter_ns()
-        get_data(42)  # Same key = L1 hit
-        end = time.perf_counter_ns()
-        latencies_l1.append(end - start)
+    with patch.object(backend, "get", wraps=backend.get) as l2_get:
+        for _ in range(1000):
+            start = time.perf_counter_ns()
+            result = get_data(42)  # Same key = L1 hit
+            end = time.perf_counter_ns()
+            latencies_l1.append(end - start)
+    assert result["id"] == 42
+    assert (call_count, l2_get.call_count) == (100, 0), "an L1 hit ran the function or read Redis"
 
-    p95_l1 = statistics.quantiles(latencies_l1, n=20)[18]
-    print(f"  P95 latency (L1 hit): {p95_l1 / 1000:.2f} μs")
+    report(record_property, "L1 hit", latencies_l1, "l1_hit_")
 
     # Phase 3: Measure L1 miss → L2 hit
     print("\nPhase 3: Measuring L1 miss → L2 hit")
@@ -340,14 +272,16 @@ def test_full_stack_under_load() -> None:
     l1.clear()
 
     latencies_l2 = []
-    for i in range(100, 200):  # Keys already in Redis from Phase 1
-        start = time.perf_counter_ns()
-        get_data(i)  # L1 miss → L2 hit → populate L1
-        end = time.perf_counter_ns()
-        latencies_l2.append(end - start)
+    with patch.object(backend, "get", wraps=backend.get) as l2_get:
+        for i in range(100):  # Keys already in Redis from Phase 1
+            start = time.perf_counter_ns()
+            result = get_data(i)  # L1 miss → L2 hit → populate L1
+            end = time.perf_counter_ns()
+            latencies_l2.append(end - start)
+            assert result["id"] == i
+    assert (call_count, l2_get.call_count) == (100, 100), "an L1 miss did not come from Redis"
 
-    p95_l2 = statistics.quantiles(latencies_l2, n=20)[18]
-    print(f"  P95 latency (L1 miss → L2 hit): {p95_l2 / 1000:.2f} μs")
+    report(record_property, "L1 miss → L2 hit", latencies_l2, "l2_hit_")
 
     # Phase 4: Concurrent load test
     print("\nPhase 4: Concurrent load test (10 threads)")
@@ -355,16 +289,20 @@ def test_full_stack_under_load() -> None:
     iterations_per_thread = 100
 
     latencies_concurrent: list[int] = []
+    wrong: list[int] = []
     lock = threading.Lock()
 
     def worker(thread_id: int) -> None:
         for i in range(iterations_per_thread):
+            item_id = thread_id * 1000 + i
             start = time.perf_counter_ns()
-            get_data(thread_id * 1000 + i)
+            result = get_data(item_id)
             end = time.perf_counter_ns()
 
             with lock:
                 latencies_concurrent.append(end - start)
+                if result["id"] != item_id:
+                    wrong.append(item_id)  # an assert in a thread is only printed, never fails the test
 
     threads = []
     for i in range(num_threads):
@@ -375,28 +313,12 @@ def test_full_stack_under_load() -> None:
     for t in threads:
         t.join()
 
-    p95_concurrent = statistics.quantiles(latencies_concurrent, n=20)[18]
-    print(f"  P95 latency (concurrent): {p95_concurrent / 1000:.2f} μs")
+    report(record_property, f"Concurrent ({num_threads} threads)", latencies_concurrent, "concurrent_")
 
-    # Summary
-    print("\n" + "=" * 80)
-    print("FULL STACK SUMMARY")
-    print("=" * 80)
-    print(f"L1 hit:               {p95_l1 / 1000:>8.2f} μs (p95)")
-    print(f"L1 miss → L2 hit:     {p95_l2 / 1000:>8.2f} μs (p95)")
-    print(f"Concurrent (10 threads): {p95_concurrent / 1000:>8.2f} μs (p95)")
-    print("\nOverhead breakdown:")
-    print(f"  L2 overhead over L1:     {(p95_l2 - p95_l1) / 1000:.2f} μs")
-    print(f"  Concurrent overhead:     {(p95_concurrent - p95_l1) / 1000:.2f} μs")
-
-    # Validate full stack performance is acceptable
-    # L1 hit should be <100μs even with all features enabled
-    assert p95_l1 < 100_000, f"L1 hit with full stack {p95_l1 / 1000:.0f}μs exceeds 100μs target"
-
-    print("\n✅ Full stack validated:")
-    print("   - All reliability features enabled")
-    print(f"   - L1 hit: {p95_l1 / 1000:.2f}μs < 100μs target")
-    print("   - Performance acceptable under production config")
+    # Thread 0's keys 0-99 are cached from phases 1-3; the other 9 threads' 900 keys are new.
+    assert wrong == []
+    assert len(latencies_concurrent) == num_threads * iterations_per_thread
+    assert call_count == 100 + (num_threads - 1) * iterations_per_thread
 
 
 if __name__ == "__main__":

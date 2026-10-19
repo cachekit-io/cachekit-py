@@ -5,7 +5,7 @@ Benchmark numbers are only trustworthy if you can tell (a) which machine produce
 them — `system_fingerprint` + `fingerprint_hash`; (b) that the machine was not
 throttled or loaded while measuring — `check_measurement_environment`; and (c) that
 the timer itself measures what you think — `calibrate_timer`. `conftest.py` wires
-the first two into a session banner; `test_measurement_calibration.py` asserts the
+the first two into a session banner; `test_measurement_calibration.py` runs the
 third. Salvaged (minimally) from the pyredis-cache-pro prototype's measurement layer.
 """
 
@@ -112,7 +112,7 @@ def check_measurement_environment() -> EnvVerdict:
     return EnvVerdict(trustworthy=not warnings, warnings=warnings)
 
 
-def calibrate_timer(sleep_ms: float = 1.0, samples: int = 50) -> tuple[bool, str]:
+def calibrate_timer(sleep_ms: float = 1.0, samples: int = 50) -> tuple[bool, str, float]:
     """Self-check the measurement instrument: time a known sleep, confirm sanity.
 
     A 1 ms sleep that measures ~1 ms means the `perf_counter_ns` loop captures the
@@ -121,6 +121,9 @@ def calibrate_timer(sleep_ms: float = 1.0, samples: int = 50) -> tuple[bool, str
     lying and no benchmark on this machine can be trusted. The window is deliberately
     generous on the high side to absorb OS scheduling overshoot — it catches only gross
     errors, not precision. Reuses `coefficient_of_variation` for the stability report.
+
+    Returns the window verdict, a one-line report, and the median in ns: a loaded host
+    overshoots the high side by itself, so a caller can hold the low side alone.
     """
     expected_ns = sleep_ms * 1_000_000.0
     time.sleep(sleep_ms / 1000.0)  # one untimed warmup sleep
@@ -139,4 +142,4 @@ def calibrate_timer(sleep_ms: float = 1.0, samples: int = 50) -> tuple[bool, str
         f"{median_ns / 1_000_000:.3f} ms (CV {cv:.2f}); "
         f"honest window [{sleep_ms * 0.8:.2f}, {sleep_ms * 3.0:.2f}] ms"
     )
-    return trustworthy, message
+    return trustworthy, message, median_ns

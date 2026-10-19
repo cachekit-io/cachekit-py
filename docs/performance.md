@@ -24,7 +24,8 @@ Every figure on this page comes from a guard in `tests/performance/`:
 - **Every raw sample kept**: percentiles cover all samples; outliers are counted, never filtered
 - **Warm-up**: each run warms up for at least 5,000 calls (2,000 for the raw L1 guard), stopping once the last 1,000 calls vary by less than 10%, and at most twice that minimum. The 10-thread guard warms up 5,000 calls once, then 100 per thread before each run
 - **Pre-flight**: each session prints whether the host is throttled or loaded (`measurement_env.py`)
-- **No tail claims at 5 runs**: the `P95` line of a guard's summary reads "inconclusive" unless it has at least 10 runs and 400 samples (the `P99` line needs 10 runs and 2,000 samples). Every guard below runs 5, so both lines read "inconclusive" and this page quotes no tail percentile. The guards' own lines after the summary ("Total measured", the ✅ line, "Decorator + complex payload") still print the raw p95 of every sample, which their thresholds check; at 5 runs that number does not support a tail claim
+- **No tail claims at 5 runs**: the `P95` line of a guard's summary reads "inconclusive" unless it has at least 10 runs and 400 samples (the `P99` line needs 10 runs and 2,000 samples). Every guard below runs 5, so both lines read "inconclusive" and this page quotes no tail percentile. The guards' own lines after the summary ("Total measured", "Decorator + complex payload") still print the raw p95 of every sample, and record it with `record_property`; no guard asserts on it, and at 5 runs it does not support a tail claim
+- **Behaviour, not budgets**: a guard asserts that its timed calls took the path it names (the cached function ran once, an L1 hit never reached L2, the value came back intact), never a time
 
 ## Measured Figures
 
@@ -49,8 +50,8 @@ uv run pytest tests/performance/test_production_realism.py -v -s \
 uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous -v -s
 uv run pytest tests/performance/test_production_realism.py -v -s \
   -k "with_backend or concurrent or encryption_overhead"
-# The Redis guard skips unless Redis answers at REDIS_URL (default redis://localhost:6379)
-# The encryption guard skips unless CACHEKIT_MASTER_KEY is set (64 hex characters)
+# The Redis guard uses the pytest-redis server the suite starts (or REDIS_URL's, when set)
+# The encryption guard generates a throwaway key; it needs no CACHEKIT_MASTER_KEY
 ```
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
@@ -202,7 +203,7 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 ## Performance Regression Testing
 
-Wall-clock benchmarks do not gate CI: on a shared machine one guard's run-level band reaches ±39% (see [Measured Figures](#measured-figures)). The wall-clock suites below are informational:
+Wall-clock benchmarks do not gate CI, and no test in `tests/performance/` asserts a time budget: on a shared machine one guard's run-level band reaches ±39% (see [Measured Figures](#measured-figures)). The wall-clock suites below run in the default `pytest tests/` invocation, report their figures, and fail only on behaviour:
 
 ```bash
 uv run pytest tests/performance/ -v -m performance

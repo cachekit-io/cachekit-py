@@ -335,9 +335,8 @@ class TestUUIDFormatValidation:
         ],
     )
     def test_validate_valid_uuid_formats(self, valid_uuid):
-        """UUID validation should accept all valid UUID formats."""
-        # Should not raise exception
-        _validate_tenant_id_format(valid_uuid)
+        """UUID validation should accept all valid UUID formats: the extractor returns the id unchanged."""
+        assert ArgumentNameExtractor().extract((), {"tenant_id": valid_uuid}) == valid_uuid
 
     @pytest.mark.parametrize(
         "invalid_uuid,expected_error",
@@ -357,18 +356,6 @@ class TestUUIDFormatValidation:
         """UUID validation should reject invalid UUID formats."""
         with pytest.raises(ValueError, match=expected_error):
             _validate_tenant_id_format(invalid_uuid)
-
-    def test_validate_nil_uuid(self):
-        """Nil UUID (all zeros) should be valid."""
-        nil_uuid = "00000000-0000-0000-0000-000000000000"
-        # Should not raise exception
-        _validate_tenant_id_format(nil_uuid)
-
-    def test_validate_uuid_object(self):
-        """UUID objects should be validated correctly."""
-        tenant_uuid = uuid.uuid4()
-        # Should not raise exception when converted to string
-        _validate_tenant_id_format(str(tenant_uuid))
 
 
 class TestFailClosedBehavior:

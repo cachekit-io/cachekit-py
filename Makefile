@@ -108,6 +108,8 @@ install: ## Install dependencies
 
 test: test-python test-rust-unit ## Run all tests (Python + Rust)
 
+# Every suite run over $(TEST_DIR) passes --ignore=$(TEST_DIR)/fuzzing: --doctest-modules imports
+# the fuzz_*.py harnesses, which need atheris from the `fuzz` group (run them with `make fuzz-quick`).
 test-python: setup-logs ## Run Python tests only
 	@echo "$(BLUE)Running Python tests...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/python_$(TIMESTAMP).log$(RESET)"
@@ -120,7 +122,7 @@ test-python: setup-logs ## Run Python tests only
 test-quick: setup-logs ## Run fast tests (skip slow tests)
 	@echo "$(BLUE)Running fast tests (excluding slow tests)...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/quick_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest $(TEST_DIR) -q --tb=short -m "not slow" --basetemp=$(TEST_BASETEMP) 2>&1 | tee $(LOG_TEST_DIR)/quick_$(TIMESTAMP).log; then \
+	@if ! uv run pytest $(TEST_DIR) --ignore=$(TEST_DIR)/fuzzing -q --tb=short -m "not slow" --basetemp=$(TEST_BASETEMP) 2>&1 | tee $(LOG_TEST_DIR)/quick_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Fast tests failed$(RESET)"; \
 		exit 1; \
 	fi
@@ -133,6 +135,7 @@ test-cov: setup-logs ## Run tests with coverage
 	@echo "$(BLUE)Running tests with coverage...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/cov_$(TIMESTAMP).log$(RESET)"
 	@if ! uv run pytest $(TEST_DIR) \
+		--ignore=$(TEST_DIR)/fuzzing \
 		--cov=$(PACKAGE_NAME) \
 		--cov-report=term-missing \
 		--cov-report=html:reports/htmlcov \

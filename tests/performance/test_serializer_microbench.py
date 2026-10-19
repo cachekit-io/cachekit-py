@@ -10,10 +10,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer, OrjsonSerializer
+# The [data] and [json] extras.
+pd = pytest.importorskip("pandas")
+pytest.importorskip("pyarrow")
+pytest.importorskip("orjson")
+
+from cachekit.serializers import ArrowSerializer, OrjsonSerializer  # noqa: E402  (needs pyarrow, orjson)
 
 
 @pytest.fixture(autouse=True)

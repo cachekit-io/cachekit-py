@@ -529,15 +529,29 @@ class TestRepeatRefusedAtDecoration:
         keyring setting cannot stop it being built. Its later operations may still read settings."""
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", "not-hex")
         reset_settings()
+        import cachekit.cache_handler as cache_handler
 
-        CacheSerializationHandler(encryption=False, encryption_fail_closed=False)
+        # pytest.fail raises a BaseException, so an `except Exception` in the constructor cannot swallow it.
+        monkeypatch.setattr(cache_handler, "get_settings", lambda: pytest.fail("building the handler loaded settings"))
+
+        handler = CacheSerializationHandler(encryption=False, encryption_fail_closed=False)
+
+        assert handler.encryption is False
+        # The keyring setting really is malformed: loading it fails.
+        with pytest.raises(ValidationError, match="previous_master_keys"):
+            get_settings()
 
     def test_encryption_disabled_handler_is_not_refused(self, monkeypatch):
         """It never encrypts, so spends no nonce budget; its config-drift keyring fault stays a read-time miss."""
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", KA.hex())
         reset_settings()
 
-        CacheSerializationHandler(encryption=False, master_key=KA.hex())
+        handler = CacheSerializationHandler(encryption=False, master_key=KA.hex())
+
+        # Byte-identical to a keyless handler's output: the key is held but never used to encrypt.
+        written = handler.serialize_data({"a": 1}, cache_key="k")
+        assert written == CacheSerializationHandler(encryption=False).serialize_data({"a": 1}, cache_key="k")
+        assert handler.deserialize_data(written, cache_key="k") == {"a": 1}
 
 
 class _KeyringSpy:

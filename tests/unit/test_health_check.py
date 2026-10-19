@@ -279,28 +279,33 @@ class TestHealthChecker:
         assert component.status == HealthStatus.HEALTHY
         assert "not in use" in component.message
 
-    @pytest.mark.skip(reason="Metrics API changed - needs separate fix")
     def test_metrics_health_check_success(self, health_checker):
         """Test metrics collection health check."""
-        with patch("cachekit.health.PROMETHEUS.available", True):
-            mock_sample = Mock()
-            mock_sample.value = 100
-            mock_metric = Mock()
-            mock_metric.collect.return_value = [Mock(samples=[mock_sample])]
+        # The check sums every label series of cache_operations_total in the in-process metrics store
+        metrics = {"cache_operations_total": {"operation=get": 60.0, "operation=set": 40.0}}
+        with patch("cachekit.reliability.metrics_collection.get_all_metrics", return_value=metrics):
+            component = health_checker._check_metrics_collection()
 
-            with patch("cachekit.health.cache_operations", mock_metric):
-                component = health_checker._check_metrics_collection()
-
-                assert component.name == "metrics"
-                assert component.status == HealthStatus.HEALTHY
-                assert "being collected" in component.message
-                assert component.details["cache_operations_total"] == 100
+        assert component.name == "metrics"
+        assert component.status == HealthStatus.HEALTHY
+        assert "being collected" in component.message
+        assert component.details == {"cache_operations_total": 100, "collectors_active": True}
 
     def test_metrics_health_check_unavailable(self, health_checker):
         """Test metrics check when Prometheus not available."""
-        # PROMETHEUS.available is a read-only property, skip test
-        # Metrics collection is optional and doesn't affect core functionality
-        pytest.skip("PROMETHEUS.available is a read-only property")
+        # PROMETHEUS.available is a read-only property, so stand in for the whole OptionalImport
+        with (
+            patch("cachekit.health.PROMETHEUS", Mock(available=False)),
+            patch.object(health_checker, "_check_redis_sync", return_value=ComponentHealth("redis", HealthStatus.HEALTHY)),
+            patch.object(health_checker, "_check_metrics_collection") as mock_metrics,
+        ):
+            result = health_checker.check_health()
+
+        # Metrics collection is optional: without Prometheus the FULL check skips it, and it
+        # costs the overall status nothing
+        mock_metrics.assert_not_called()
+        assert [c.name for c in result.components] == ["redis", "connection_pool", "circuit_breaker"]
+        assert result.status == HealthStatus.DEGRADED  # only the uninitialised pool degrades it
 
     def test_overall_status_determination(self, health_checker):
         """Test overall status determination logic."""
@@ -326,7 +331,6 @@ class TestHealthChecker:
         ]
         assert health_checker._determine_overall_status(components) == HealthStatus.UNHEALTHY
 
-    @pytest.mark.skip(reason="Metrics API changed - needs separate fix")
     def test_sync_health_check_integration(self, health_checker):
         """Test complete synchronous health check."""
         with (

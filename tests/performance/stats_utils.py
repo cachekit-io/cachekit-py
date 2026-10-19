@@ -108,7 +108,7 @@ class PerformanceResult:
     runs: int
     mean: float
     median: float
-    p95: float  # all raw samples: a guard may assert on it; a claim needs p95_ci
+    p95: float  # all raw samples; a claim needs p95_ci
     p99: float
     stdev: float
     run_medians: list[float]
@@ -153,10 +153,6 @@ class PerformanceResult:
     def ci_95_upper(self) -> float:
         """Upper end of the 95% t-interval on center."""
         return self.center + self.band
-
-    def exceeded_target(self, target: float) -> bool:
-        """Check if p95 over all raw samples reaches the target (conservative: p95, not mean)."""
-        return self.p95 >= target
 
 
 def summarize(name: str, runs: Sequence[Sequence[float]], unit: str = "ns") -> PerformanceResult:
@@ -277,6 +273,27 @@ def benchmark_with_gc_handling(
     result.jit_stabilized = jit_stabilized
     result.jit_warmup_samples = jit_warmup_samples
     return result
+
+
+def report(record_property, label: str, data: Sequence[float] | PerformanceResult, prefix: str = "") -> None:
+    """Print one measured path's p50 and p95 and attach them to the test's report.
+
+    Raw samples are taken as ns. A PerformanceResult also reports its run-level ``center``.
+
+    >>> props = {}
+    >>> report(props.__setitem__, "demo", range(1, 101))
+    <BLANKLINE>
+    demo: p50 50.5 ns, p95 96.0 ns
+    >>> props
+    {'p50_ns': 50.5, 'p95_ns': 96.0}
+    """
+    if isinstance(data, PerformanceResult):
+        unit, figures = data.unit, {"p50": data.median, "p95": data.p95, "center": data.center}
+    else:
+        unit, figures = "ns", {"p50": statistics.median(data), "p95": percentile(data, 95)}
+    print(f"\n{label}: " + ", ".join(f"{name} {value:,.1f} {unit}" for name, value in figures.items()))
+    for name, value in figures.items():
+        record_property(f"{prefix}{name}_{unit}", round(value, 1))
 
 
 def balanced_order(runs_per_arm: int, rng: random.Random, arms: str = "AB") -> str:

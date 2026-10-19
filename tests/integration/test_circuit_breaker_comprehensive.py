@@ -25,14 +25,18 @@ Test Coverage:
 """
 
 import logging
+import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from unittest.mock import patch
 
 import pytest
+import redis
 
 from cachekit import cache
+from cachekit.backends.redis.provider import PerRequestRedisBackend
 from cachekit.config import DecoratorConfig
 from cachekit.config.nested import (
     CircuitBreakerConfig as DecoratorCircuitBreakerConfig,
@@ -233,97 +237,135 @@ class TestCircuitBreakerRaceConditions:
         # Circuit should be in HALF_OPEN state
         assert self.circuit_breaker.state == CircuitState.HALF_OPEN
 
-    @pytest.mark.skip(reason="Test expects cumulative metrics, but success_count/failure_count are state machine counters")
-    def test_concurrent_metrics_collection(self):
-        """Test that metrics collection is thread-safe."""
+    def test_concurrent_failures_are_all_counted(self):
+        """Concurrent failures are counted exactly: none lost, none doubled.
 
-        def record_operations():
-            """Record operations concurrently."""
-            for i in range(100):
-                if i % 2 == 0:
-                    self.circuit_breaker.record_success()
-                else:
-                    self.circuit_breaker.record_failure()
+        The threshold sits above the total so the breaker stays CLOSED and every failure lands in
+        the rolling window; a failure recorded once OPEN would be dropped and hide a lost update.
+        A barrier and a tiny switch interval make the threads interleave inside record_failure.
+        """
+        threads, per_thread = 8, 2000
+        breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=10**6))
+        barrier = threading.Barrier(threads)
 
-        # Start multiple threads
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(record_operations) for _ in range(5)]
-            for future in as_completed(futures):
-                future.result()
+        def record_failures():
+            barrier.wait()
+            for _ in range(per_thread):
+                breaker.record_failure()
 
-        # Note: success_count/failure_count are state machine counters, not cumulative metrics
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                for future in [executor.submit(record_failures) for _ in range(threads)]:
+                    future.result()
+        finally:
+            sys.setswitchinterval(interval)
+
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == threads * per_thread
 
 
 class TestCircuitBreakerIntegration:
     """Test circuit breaker integration with Redis cache decorators."""
 
-    def test_sync_decorator_integration(self, redis_test_client):
-        """Test circuit breaker integration with sync decorator."""
+    def test_sync_decorator_integration(self, redis_backend):
+        """An exception the decorated function raises reaches the caller and never counts toward the breaker.
+
+        It says nothing about backend health, so a function failing more often than failure_threshold
+        must not switch off its own caching.
+        """
         call_count = 0
 
-        @cache(config=DecoratorConfig(ttl=60, circuit_breaker=DecoratorCircuitBreakerConfig(enabled=True)))
-        def test_function():
+        @cache(
+            config=DecoratorConfig(
+                ttl=60, backend=redis_backend, circuit_breaker=DecoratorCircuitBreakerConfig(enabled=True, failure_threshold=2)
+            )
+        )
+        def test_function(x):
             nonlocal call_count
             call_count += 1
-            if call_count <= 3:
-                raise ConnectionError("Simulated Redis failure")
-            return f"success_{call_count}"
+            if x == "bad":
+                raise ConnectionError("raised by the function")
+            return f"success_{x}"
 
-        # First few calls should fail and trigger circuit breaker
-        for _ in range(5):
-            try:
-                _result = test_function()
-            except Exception:
-                pass  # Expected failures
+        for _ in range(3):
+            with pytest.raises(ConnectionError, match="raised by the function"):
+                test_function("bad")
+        assert call_count == 3  # every call ran: a raise is never cached
 
-        # Circuit should be open and prevent further calls
-        # This would be verified by checking metrics or state
+        breaker = test_function.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+
+        assert test_function("good") == "success_good"
+        assert test_function("good") == "success_good"
+        assert call_count == 4  # the second call is a cache hit
 
     @pytest.mark.asyncio
-    async def test_async_decorator_integration(self):
-        """Test circuit breaker integration with async decorator."""
+    async def test_async_decorator_integration(self, redis_backend):
+        """As the sync test: an async function's own exception never counts toward the breaker."""
         call_count = 0
 
-        @cache(config=DecoratorConfig(ttl=60, circuit_breaker=DecoratorCircuitBreakerConfig(enabled=True)))
-        async def async_test_function():
+        @cache(
+            config=DecoratorConfig(
+                ttl=60, backend=redis_backend, circuit_breaker=DecoratorCircuitBreakerConfig(enabled=True, failure_threshold=2)
+            )
+        )
+        async def async_test_function(x):
             nonlocal call_count
             call_count += 1
-            if call_count <= 3:
-                raise ConnectionError("Simulated Redis failure")
-            return f"success_{call_count}"
+            if x == "bad":
+                raise ConnectionError("raised by the function")
+            return f"success_{x}"
 
-        # First few calls should fail
-        for _ in range(5):
-            try:
-                _result = await async_test_function()
-            except Exception:
-                pass  # Expected failures
-
-    def test_error_classification(self, redis_test_client):
-        """Test that circuit breaker correctly classifies errors."""
-
-        @cache(config=DecoratorConfig(ttl=60, circuit_breaker=DecoratorCircuitBreakerConfig(enabled=True)))
-        def test_function(error_type):
-            if error_type == "connection":
-                raise ConnectionError("Connection failed")
-            elif error_type == "timeout":
-                raise TimeoutError("Operation timed out")
-            elif error_type == "value":
-                raise ValueError("Invalid value")  # Should not trigger circuit breaker
-            return "success"
-
-        # Connection and timeout errors should trigger circuit breaker
         for _ in range(3):
-            try:
-                test_function("connection")
-            except ConnectionError:
-                pass
+            with pytest.raises(ConnectionError, match="raised by the function"):
+                await async_test_function("bad")
+        assert call_count == 3
 
-        # ValueError should not trigger circuit breaker
+        breaker = async_test_function.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+
+        assert await async_test_function("good") == "success_good"
+        assert await async_test_function("good") == "success_good"
+        assert call_count == 4
+
+    def test_error_classification(self, caplog):
+        """Reads and writes against an unreachable Redis are misses, not breaker failures.
+
+        Documented in docs/error-codes.md (Circuit breaker open): backend read and write failures
+        do not count. The function runs and returns its value on every call, and the breaker stays
+        CLOSED well past failure_threshold.
+        """
+        with socket.socket() as probe:  # a port nothing listens on once the probe closes
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        down = redis.Redis(host="127.0.0.1", port=port, socket_connect_timeout=0.5, socket_timeout=0.5)
+        calls = []
+
+        @cache(
+            config=DecoratorConfig(
+                ttl=60,
+                backend=PerRequestRedisBackend(down, "cb-classification"),
+                circuit_breaker=DecoratorCircuitBreakerConfig(enabled=True, failure_threshold=2),
+            )
+        )
+        def test_function(x):
+            calls.append(x)
+            return f"value_{x}"
+
         try:
-            test_function("value")
-        except ValueError:
-            pass
+            for i in range(5):
+                assert test_function(i) == f"value_{i}"
+        finally:
+            down.close()
+
+        assert calls == [0, 1, 2, 3, 4]
+        # Every read reached the backend and failed, so there were failures to count, and none was counted
+        failed_reads = [r for r in caplog.records if r.getMessage().startswith("Backend error getting key")]
+        assert len(failed_reads) == 5
+        breaker = test_function.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
 
 
 class TestCircuitBreakerStateLogging:
@@ -357,17 +399,17 @@ class TestCircuitBreakerStateLogging:
         final_logs = [record for record in caplog.records if "circuit breaker" in record.message.lower()]
         assert len(final_logs) >= len(state_logs)
 
-    @pytest.mark.skip(reason="CircuitBreaker doesn't log metrics at DEBUG level; only state transitions")
     def test_metrics_logging(self, caplog):
-        """Test that circuit breaker metrics are logged."""
-        caplog.set_level(logging.DEBUG)
+        """Outcomes that change no state log nothing: the breaker logs transitions, not per-call metrics."""
+        caplog.set_level(logging.DEBUG, logger="cachekit.reliability.circuit_breaker")
 
-        # Record some operations
+        # One failure stays under failure_threshold=2; a success while CLOSED changes nothing
         self.circuit_breaker.record_success()
         self.circuit_breaker.record_failure()
 
-        # Note: Circuit breaker only logs state transitions (INFO/WARNING),
-        # not individual metric updates at DEBUG level
+        assert self.circuit_breaker.state == CircuitState.CLOSED
+        assert self.circuit_breaker.failure_count == 1
+        assert [r for r in caplog.records if r.name == "cachekit.reliability.circuit_breaker"] == []
 
 
 class TestCircuitBreakerProductionScenarios:

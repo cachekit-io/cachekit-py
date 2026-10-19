@@ -540,28 +540,27 @@ class TestAsyncPoolClosure:
         # Async pool disconnect should have been called via create_task
         assert disconnect_called, "Async pool disconnect() should be scheduled when event loop exists"
 
-    def test_reset_global_pool_handles_no_event_loop(self):
+    def test_reset_global_pool_handles_no_event_loop(self, caplog):
         """reset_global_pool() should handle case when no event loop is running.
 
         When called from sync context, it should log and rely on GC for cleanup.
         """
+        from cachekit.backends.redis import client
         from cachekit.backends.redis.client import reset_global_pool
 
-        # Create a mock async pool
         mock_async_pool = MagicMock()
         mock_async_pool.disconnect = AsyncMock()
 
-        with patch(
-            "cachekit.backends.redis.client._async_pool_instance",
-            mock_async_pool,
-        ):
+        with patch("cachekit.backends.redis.client._async_pool_instance", mock_async_pool):
             with patch("cachekit.backends.redis.client._pool_instance", None):
-                # Should NOT raise - handles missing event loop gracefully
-                reset_global_pool()
+                with caplog.at_level("DEBUG", logger="cachekit.backends.redis.client"):
+                    reset_global_pool()
+                # Read inside the patch: leaving it restores the attribute it replaced
+                assert client._async_pool_instance is None
 
-        # In sync context without event loop, disconnect is NOT called
-        # (relies on GC instead)
-        # This is expected behavior
+        # No loop to await on, so the coroutine is never created and the pool is left to GC
+        mock_async_pool.disconnect.assert_not_called()
+        assert any("relying on GC" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.unit

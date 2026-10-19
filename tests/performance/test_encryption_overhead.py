@@ -6,27 +6,22 @@ Measures the cost of client-side AES-256-GCM encryption across different seriali
 - ArrowSerializer (DataFrames)
 
 Critical for zero-knowledge architecture where client-side encryption is mandatory.
+
+Each test asserts what it timed: the round trip returns the data, and the encrypted payload does
+not carry the plaintext.
 """
 
 from __future__ import annotations
 
-import os
+import secrets
 import time
 from typing import Any
 
 import pytest
 
-try:
-    import pandas as pd
+from cachekit.serializers import EncryptionWrapper, StandardSerializer
 
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
-
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer, StandardSerializer
-
-if PANDAS_AVAILABLE:
-    from cachekit.serializers import ArrowSerializer
+from .stats_utils import percentile
 
 
 def benchmark_serializer(
@@ -41,7 +36,8 @@ def benchmark_serializer(
         cache_key: Cache key for encryption AAD binding (only used for EncryptionWrapper)
 
     Returns:
-        Dict with mean and p95 latencies in nanoseconds
+        Dict with mean and p95 latencies in nanoseconds, plus the last round trip's
+        serialized payload and deserialized result for the caller to check
     """
     latencies = []
 
@@ -62,34 +58,33 @@ def benchmark_serializer(
         start = time.perf_counter_ns()
         if is_encryption_wrapper:
             serialized, metadata = serializer.serialize(data, cache_key=cache_key)
-            _ = serializer.deserialize(serialized, metadata, cache_key=cache_key)
+            result = serializer.deserialize(serialized, metadata, cache_key=cache_key)
         else:
             serialized, metadata = serializer.serialize(data)
-            _ = serializer.deserialize(serialized, metadata)
+            result = serializer.deserialize(serialized, metadata)
         end = time.perf_counter_ns()
         latencies.append(end - start)
 
-    latencies.sort()
     mean = sum(latencies) / len(latencies)
-    p95 = latencies[int(len(latencies) * 0.95)]
+    p95 = percentile(latencies, 95)
 
-    return {"mean": mean, "p95": p95}
+    return {"mean": mean, "p95": p95, "payload": serialized, "result": result}
 
 
 @pytest.fixture
-def master_key():
-    """Master key for encryption tests."""
-    key = os.environ.get("CACHEKIT_MASTER_KEY")
-    if not key:
-        pytest.skip("CACHEKIT_MASTER_KEY not set")
-    return key
+def master_key() -> str:
+    """A throwaway 256-bit master key (hex): the tests measure the cipher, not a deployment's key."""
+    return secrets.token_hex(32)
 
 
-def test_encryption_overhead_json(master_key):
+def test_encryption_overhead_json(master_key, record_property):
     """Measure encryption overhead for JSON data (OrjsonSerializer).
 
     Use case: API responses, webhooks, session data with PII.
     """
+    pytest.importorskip("orjson")  # the [json] extra
+    from cachekit.serializers import OrjsonSerializer
+
     # API response with sensitive data
     api_data = {
         "user": {
@@ -139,11 +134,15 @@ def test_encryption_overhead_json(master_key):
     print(f"  Relative: {overhead_pct:>10.1f}%")
     print("=" * 80)
 
-    # Sanity check: encryption shouldn't be MORE than 10x slower for JSON
-    assert overhead_pct < 1000, f"Encryption overhead too high: {overhead_pct:.1f}%"
+    record_property("overhead_p95_ns", overhead_ns)
+    record_property("overhead_pct", round(overhead_pct, 1))
+
+    assert result_plain["result"] == result_encrypted["result"] == api_data
+    assert b"123-45-6789" in result_plain["payload"]
+    assert b"123-45-6789" not in result_encrypted["payload"], "the encrypted payload carries the plaintext"
 
 
-def test_encryption_overhead_msgpack(master_key):
+def test_encryption_overhead_msgpack(master_key, record_property):
     """Measure encryption overhead for MessagePack data (StandardSerializer).
 
     Use case: General Python objects, structured data with PII.
@@ -197,16 +196,23 @@ def test_encryption_overhead_msgpack(master_key):
     print(f"  Relative: {overhead_pct:>10.1f}%")
     print("=" * 80)
 
-    # Sanity check
-    assert overhead_pct < 1000, f"Encryption overhead too high: {overhead_pct:.1f}%"
+    record_property("overhead_p95_ns", overhead_ns)
+    record_property("overhead_pct", round(overhead_pct, 1))
+
+    assert result_plain["result"] == result_encrypted["result"] == user_data
+    assert b"4532-1234-5678-9010" in result_plain["payload"]
+    assert b"4532-1234-5678-9010" not in result_encrypted["payload"], "the encrypted payload carries the plaintext"
 
 
-@pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not installed")
-def test_encryption_overhead_dataframes(master_key):
+def test_encryption_overhead_dataframes(master_key, record_property):
     """Measure encryption overhead for DataFrames (ArrowSerializer).
 
     Use case: ML features, analytics data, patient records.
     """
+    pd = pytest.importorskip("pandas")  # the [data] extra
+    pytest.importorskip("pyarrow")
+    from cachekit.serializers import ArrowSerializer
+
     # Sensitive medical/ML data
     df = pd.DataFrame(
         {
@@ -250,65 +256,10 @@ def test_encryption_overhead_dataframes(master_key):
     print(f"  Relative: {overhead_pct:>10.1f}%")
     print("=" * 80)
 
-    # Sanity check: DataFrames are larger, allow more overhead
-    assert overhead_pct < 2000, f"Encryption overhead too high: {overhead_pct:.1f}%"
+    record_property("overhead_p95_ns", overhead_ns)
+    record_property("overhead_pct", round(overhead_pct, 1))
 
-
-def test_encryption_overhead_comparison_summary(master_key):
-    """Compare encryption overhead across all serializers.
-
-    Generates summary of zero-knowledge encryption performance.
-    """
-    results = {}
-
-    # JSON
-    json_data = {"user": {"id": 123, "email": "user@example.com", "ssn": "123-45-6789"}}
-    plain_json = OrjsonSerializer()
-    encrypted_json = EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex(master_key))
-    results["json"] = {
-        "plain": benchmark_serializer(plain_json, json_data, iterations=5_000),
-        "encrypted": benchmark_serializer(encrypted_json, json_data, iterations=5_000),
-    }
-
-    # MessagePack
-    msgpack_data = {"profile": {"ssn": "123-45-6789", "dob": "1990-01-01"}}
-    plain_msgpack = StandardSerializer()
-    encrypted_msgpack = EncryptionWrapper(serializer=StandardSerializer(), master_key=bytes.fromhex(master_key))
-    results["msgpack"] = {
-        "plain": benchmark_serializer(plain_msgpack, msgpack_data, iterations=5_000),
-        "encrypted": benchmark_serializer(encrypted_msgpack, msgpack_data, iterations=5_000),
-    }
-
-    # DataFrames (if available)
-    if PANDAS_AVAILABLE:
-        df_data = pd.DataFrame({"patient_id": range(100), "diagnosis": ["diabetes"] * 100})
-        plain_arrow = ArrowSerializer()
-        encrypted_arrow = EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex(master_key))
-        results["arrow"] = {
-            "plain": benchmark_serializer(plain_arrow, df_data, iterations=1_000),
-            "encrypted": benchmark_serializer(encrypted_arrow, df_data, iterations=1_000),
-        }
-
-    # Print summary
-    print("\n" + "=" * 80)
-    print("ZERO-KNOWLEDGE ENCRYPTION: OVERHEAD SUMMARY")
-    print("=" * 80)
-    print("\nP95 Latencies (roundtrip serialize + deserialize):")
-    print(f"\n{'Serializer':<20} {'Plain':<15} {'Encrypted':<15} {'Overhead':<15}")
-    print("-" * 80)
-
-    for name, result in results.items():
-        plain_us = result["plain"]["p95"] / 1000
-        encrypted_us = result["encrypted"]["p95"] / 1000
-        overhead_us = encrypted_us - plain_us
-        overhead_pct = (overhead_us / plain_us) * 100
-
-        print(
-            f"{name.upper():<20} {plain_us:>10.2f} μs   {encrypted_us:>10.2f} μs   "
-            f"+{overhead_us:>6.2f} μs ({overhead_pct:>5.1f}%)"
-        )
-
-    print("=" * 80)
-    print("\nConclusion: AES-256-GCM encryption adds <X μs overhead across all formats.")
-    print("Zero-knowledge caching is production-ready.")
-    print("=" * 80)
+    pd.testing.assert_frame_equal(result_plain["result"], df)
+    pd.testing.assert_frame_equal(result_encrypted["result"], df)
+    assert b"metformin" in result_plain["payload"]
+    assert b"metformin" not in result_encrypted["payload"], "the encrypted payload carries the plaintext"

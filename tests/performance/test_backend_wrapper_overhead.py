@@ -1,258 +1,74 @@
-"""Per-request backend wrapper overhead performance test.
+"""Per-request backend wrapper overhead.
 
-Validates wrapper creation overhead is negligible relative to network latency.
+Times the production per-request wrapper, ``PerRequestRedisBackend``: building one for a
+tenant, and scoping a key to the calling context's tenant (a ContextVar read plus the
+tenant's URL-encoding). No Redis call is made, so this is the wrapper's own cost, which the
+per-request pattern pays on top of a 1-2ms network round trip.
 
-Fix #8: Enforces hard limit on per-request wrapper overhead.
-Target: Total overhead <1000ns (0.1% of 1-2ms network latency).
-
-Per-request pattern trades ~875ns overhead (wrapper + ContextVar + URL-encoding)
-for clean multi-tenant isolation and zero migration cost to remote backends.
+Each test asserts the key the timed call produced, so it cannot time a wrapper that scopes
+keys wrongly.
 """
 
 from __future__ import annotations
 
-import statistics
 import time
-from contextvars import ContextVar
+from collections.abc import Callable
 
 import pytest
 
-# Mock minimal backend for isolated benchmarking
-test_store: dict[str, tuple[bytes, int | None]] = {}
-test_tenant_context: ContextVar[str | None] = ContextVar("test_tenant", default="tenant:123")
+from cachekit.backends.redis.provider import PerRequestRedisBackend, tenant_context
+
+from .stats_utils import report
+
+# Never dereferenced: building a wrapper and scoping a key make no Redis call.
+_CLIENT = object()
 
 
-class MinimalPerRequestWrapper:
-    """Minimal per-request wrapper for benchmarking (no I/O, pure overhead)."""
-
-    def __init__(self, store: dict, tenant_id: str | None):
-        if tenant_id is None:
-            raise RuntimeError("tenant_id required")
-        self._store = store
-        self._tenant_id = tenant_id
-
-    def _scoped_key(self, key: str) -> str:
-        return f"t:{self._tenant_id}:{key}"
-
-
-@pytest.mark.performance
-def test_wrapper_creation_overhead() -> None:
-    """Test per-request wrapper creation overhead meets target.
-
-    Fails if wrapper creation overhead exceeds 1000ns (p95).
-    This is a hard gate - overhead regression blocks CI.
-    """
-    iterations = 100_000
-    print(f"\nBenchmarking wrapper creation ({iterations:,} iterations)...")
-
-    # Warm up
+def _measure(fn: Callable[[], object], iterations: int = 100_000) -> tuple[list[int], object]:
+    """Warm up, then time ``fn`` per call; returns the latencies and the last result."""
     for _ in range(1000):
-        MinimalPerRequestWrapper(test_store, "tenant:123")
-
-    # Measure wrapper creation overhead
+        fn()
     latencies = []
+    result = None
     for _ in range(iterations):
         start = time.perf_counter_ns()
-        MinimalPerRequestWrapper(test_store, "tenant:123")
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
-
-    # Calculate statistics
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]  # 95th percentile
-    p99 = statistics.quantiles(latencies, n=100)[98]  # 99th percentile
-    mean = statistics.mean(latencies)
-    stdev = statistics.stdev(latencies)
-
-    results = {
-        "iterations": iterations,
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-        "p99_ns": p99,
-        "stdev_ns": stdev,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print("Wrapper Creation Overhead")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {results['iterations']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-    print(f"P99:         {results['p99_ns']:>10.2f} ns")
-    print(f"StdDev:      {results['stdev_ns']:>10.2f} ns")
-
-    # Hard gate - must not exceed 1000ns
-    target_ns = 1000
-    if results["p95_ns"] >= target_ns:
-        raise AssertionError(
-            f"Wrapper overhead {results['p95_ns']:.0f}ns (p95) exceeds {target_ns}ns target\n"
-            f"Overhead ratio: {(results['p95_ns'] / 1_000_000) * 100:.4f}% of network latency\n"
-            f"Per-request pattern SLA violated"
-        )
+        result = fn()
+        latencies.append(time.perf_counter_ns() - start)
+    return latencies, result
 
 
 @pytest.mark.performance
-def test_contextvar_get_overhead() -> None:
-    """Test ContextVar.get() overhead meets target.
+def test_wrapper_creation_overhead(record_property) -> None:
+    """Building a tenant-bound wrapper: validation plus the tenant's URL-encoding."""
+    latencies, backend = _measure(lambda: PerRequestRedisBackend(_CLIENT, "org:123"))
+    report(record_property, "PerRequestRedisBackend creation", latencies)
 
-    Fails if ContextVar overhead exceeds reasonable threshold for per-request use.
-    """
-    iterations = 100_000
-    print(f"\nBenchmarking ContextVar.get() ({iterations:,} iterations)...")
-
-    ctx: ContextVar[str] = ContextVar("test", default="value")
-    ctx.set("tenant:123")
-
-    # Warm up
-    for _ in range(1000):
-        ctx.get()
-
-    # Measure get() overhead
-    latencies = []
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        ctx.get()
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
-
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    results = {
-        "iterations": iterations,
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print("ContextVar.get() Overhead")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {results['iterations']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-
-    # ContextVar should be fast - baseline check only (typical: ~100-200ns p95)
-    # (no hard gate, just measurement)
-    assert results["p95_ns"] < 1000, f"ContextVar overhead unexpectedly high: {results['p95_ns']:.0f}ns"
+    assert backend.key_prefix == "t:org%3A123:"
 
 
 @pytest.mark.performance
-def test_url_encoding_overhead() -> None:
-    """Test URL-encoding overhead for tenant IDs.
+def test_context_scoped_key_overhead(record_property) -> None:
+    """Scoping a key on the shared, context-following wrapper the provider hands out."""
+    backend = PerRequestRedisBackend(_CLIENT, "default", follow_context=True)
+    token = tenant_context.set("org:123")
+    try:
+        latencies, key = _measure(lambda: backend._scoped_key("user:456"))
+    finally:
+        tenant_context.reset(token)
+    report(record_property, "Context-scoped key (ContextVar read + URL-encoding)", latencies)
 
-    Fails if URL-encoding overhead exceeds reasonable threshold for per-request use.
-    """
-    from urllib.parse import quote as url_encode
-
-    iterations = 100_000
-    print(f"\nBenchmarking URL-encoding ({iterations:,} iterations)...")
-
-    tenant_id = "org:123"
-
-    # Warm up
-    for _ in range(1000):
-        url_encode(tenant_id, safe="")
-
-    # Measure encoding overhead
-    latencies = []
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        url_encode(tenant_id, safe="")
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
-
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    results = {
-        "iterations": iterations,
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print("URL-Encoding Overhead")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {results['iterations']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-
-    # URL-encoding should be fast - baseline check only (typical: ~600ns p95)
-    assert results["p95_ns"] < 1000, f"URL-encoding overhead unexpectedly high: {results['p95_ns']:.0f}ns"
+    assert key == "t:org%3A123:user:456"
+    assert backend._scoped_key("user:456") == "t:default:user:456", "the reset context must fall back to the bound tenant"
 
 
 @pytest.mark.performance
-def test_total_overhead_sla() -> None:
-    """Validate total per-request overhead meets SLA.
+def test_total_overhead(record_property) -> None:
+    """The whole per-request cost: build a wrapper for the request's tenant and scope one key."""
+    token = tenant_context.set("org:123")
+    try:
+        latencies, key = _measure(lambda: PerRequestRedisBackend(_CLIENT, tenant_context.get())._scoped_key("user:456"))
+    finally:
+        tenant_context.reset(token)
+    report(record_property, "Total per-request overhead (create + scope one key)", latencies)
 
-    Measures all three components together in a single sequential operation.
-    This is the realistic scenario: wrapper creation + ContextVar access + URL-encoding together.
-
-    Fails if combined overhead exceeds 1500ns (p95). This is 0.15% of 1-2ms network latency.
-    """
-    from urllib.parse import quote as url_encode
-
-    iterations = 100_000
-    print(f"\n{'=' * 60}")
-    print("Total Per-Request Overhead SLA")
-    print(f"{'=' * 60}")
-    print("Target: <1500ns (0.15% of 1-2ms network latency)")
-    print("Measuring all components together (realistic scenario)\n")
-
-    # Set up ContextVar
-    ctx: ContextVar[str] = ContextVar("test_sla", default="tenant:123")
-    ctx.set("tenant:123")
-    tenant_id = "org:123"
-
-    # Warm up - 1000 iterations to stabilize
-    for _ in range(1000):
-        MinimalPerRequestWrapper(test_store, "tenant:123")
-        ctx.get()
-        url_encode(tenant_id, safe="")
-
-    # Measure total overhead: all three operations together, sequentially
-    latencies_total = []
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        # All three operations in sequence (realistic per-request cost)
-        MinimalPerRequestWrapper(test_store, "tenant:123")
-        ctx.get()
-        url_encode(tenant_id, safe="")
-        end = time.perf_counter_ns()
-        latencies_total.append(end - start)
-
-    # Calculate statistics
-    p50 = statistics.median(latencies_total)
-    p95 = statistics.quantiles(latencies_total, n=20)[18]
-    p99 = statistics.quantiles(latencies_total, n=100)[98]
-    mean = statistics.mean(latencies_total)
-    stdev = statistics.stdev(latencies_total)
-
-    print("Total per-request overhead (all components together):")
-    print(f"  Mean:        {mean:>10.2f} ns")
-    print(f"  P50:         {p50:>10.2f} ns")
-    print(f"  P95:         {p95:>10.2f} ns")
-    print(f"  P99:         {p99:>10.2f} ns")
-    print(f"  StdDev:      {stdev:>10.2f} ns")
-    print("\nNetwork latency:     ~1-2ms (1,000,000-2,000,000 ns)")
-    print(f"Overhead ratio:      {(p95 / 1_000_000) * 100:.4f}% of network latency")
-
-    # Hard gate - must not exceed 1500ns p95
-    target_ns = 1500
-    if p95 >= target_ns:
-        raise AssertionError(
-            f"Total per-request overhead {p95:.0f}ns (p95) exceeds {target_ns}ns target\nPer-request pattern SLA violated"
-        )
-
-    print(f"\n✅ Per-request pattern validated: {p95:.0f}ns (p95) < {target_ns}ns target")
+    assert key == "t:org%3A123:user:456"

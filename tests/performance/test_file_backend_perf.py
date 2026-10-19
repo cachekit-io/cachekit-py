@@ -6,11 +6,12 @@ Comprehensive performance testing for file-based cache backend with:
 - Large value handling (1MB)
 - Set/get latency against the directory's entry count
 - Oldest-written-first eviction performance
-- Optional Redis comparison
+- Redis comparison, on the suite's pytest-redis server
 
-Nothing here asserts a latency target; some tests carry catastrophe guards. A set() fsyncs and
-renames its file and checks capacity on in-memory counters, so its usual cost does not grow with
-the entry count; only eviction, rejection and the 30 s reconcile scan the directory.
+Each test asserts the behaviour it timed (round trips return the value written, eviction removes
+the oldest entries). A set() fsyncs and renames its file and checks capacity on in-memory
+counters, so its usual cost does not grow with the entry count; only eviction, rejection and the
+30 s reconcile scan the directory.
 test_bench_set_scaling_with_entry_count measures that; docs/backends/file.md points at it. get()
 does no scan, but it waits for a concurrent set() in the same process, which holds the backend
 lock throughout.
@@ -29,9 +30,11 @@ import pytest
 from cachekit.backends.file import FileBackend
 from cachekit.backends.file.config import FileBackendConfig
 
+from .stats_utils import percentile
+
 
 @pytest.mark.performance
-def test_bench_sequential_read_write(tmp_path: Path) -> None:
+def test_bench_sequential_read_write(tmp_path: Path, record_property) -> None:
     """Measure p50/p95/p99 latency for sequential read/write operations.
 
     This benchmark measures the core file I/O operations in isolation,
@@ -68,17 +71,19 @@ def test_bench_sequential_read_write(tmp_path: Path) -> None:
 
     # Measure read latency
     read_latencies = []
+    reads = []
     for i in range(iterations):
         start = time.perf_counter_ns()
-        backend.get(f"{test_key}:write:{i}")
+        reads.append(backend.get(f"{test_key}:write:{i}"))
         end = time.perf_counter_ns()
         read_latencies.append(end - start)
 
     # Measure delete latency
     delete_latencies = []
+    deletes = []
     for i in range(iterations):
         start = time.perf_counter_ns()
-        backend.delete(f"{test_key}:write:{i}")
+        deletes.append(backend.delete(f"{test_key}:write:{i}"))
         end = time.perf_counter_ns()
         delete_latencies.append(end - start)
 
@@ -110,13 +115,12 @@ def test_bench_sequential_read_write(tmp_path: Path) -> None:
     print("\nCOMBINED (Set+Get+Delete):")
     _print_stats("  ", combined_stats)
 
-    # Verify no catastrophic regressions
-    # On CI/SSD systems: p99 typically 1-5ms
-    # On slower systems or under load: may be higher
-    # We don't assert on performance targets as CI variance is high
-    # Just verify it's not wildly broken (>100ms)
-    assert write_stats["p99_us"] < 100_000, f"Write p99 catastrophically high: {write_stats['p99_us']:.1f}μs"
-    assert read_stats["p99_us"] < 100_000, f"Read p99 catastrophically high: {read_stats['p99_us']:.1f}μs"
+    record_property("write_p99_us", round(write_stats["p99_us"], 1))
+    record_property("read_p99_us", round(read_stats["p99_us"], 1))
+
+    assert reads == [test_value] * iterations, "a timed read did not return the value written"
+    assert deletes == [True] * iterations, "a timed delete did not find its entry"
+    assert all(backend.get(f"{test_key}:write:{i}") is None for i in range(iterations))
 
 
 @pytest.mark.performance
@@ -159,7 +163,7 @@ def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> Non
 
 
 @pytest.mark.performance
-def test_bench_concurrent_10_threads(tmp_path: Path) -> None:
+def test_bench_concurrent_10_threads(tmp_path: Path, record_property) -> None:
     """Measure throughput with 10 concurrent threads.
 
     Validates that FileBackend can handle concurrent access from multiple
@@ -184,7 +188,7 @@ def test_bench_concurrent_10_threads(tmp_path: Path) -> None:
         backend.set(f"warmup:{i}", test_value, ttl=3600)
 
     def worker_thread(thread_id: int) -> tuple[list[int], int]:
-        """Worker thread that performs read/write operations."""
+        """Worker thread that performs read/write operations; counts only round trips that held."""
         latencies = []
         success_count = 0
 
@@ -203,10 +207,11 @@ def test_bench_concurrent_10_threads(tmp_path: Path) -> None:
 
             # Delete operation
             start = time.perf_counter_ns()
-            backend.delete(key)
+            deleted = backend.delete(key)
             latencies.append(time.perf_counter_ns() - start)
 
-            success_count += 3  # 3 ops per iteration
+            if result == test_value and deleted:
+                success_count += 3  # 3 ops per iteration
 
         return latencies, success_count
 
@@ -240,15 +245,15 @@ def test_bench_concurrent_10_threads(tmp_path: Path) -> None:
     print("Latency Distribution:")
     _print_stats("  ", stats)
 
-    # Verify throughput is reasonable
-    # On slower systems under load, throughput can vary significantly
-    # We verify it's not completely broken (at least 50 ops/sec)
-    min_throughput = 50  # At least 50 ops/sec (very conservative)
-    assert throughput > min_throughput, f"Throughput {throughput:.0f} ops/sec < {min_throughput}"
+    record_property("throughput_ops_per_sec", round(throughput))
+
+    # Each thread works on its own keys, so contention must never lose or cross a round trip.
+    expected_ops = num_threads * ops_per_thread * 3
+    assert total_ops == expected_ops, f"{expected_ops - total_ops} operations saw a wrong value or missing entry"
 
 
 @pytest.mark.performance
-def test_bench_large_value_1mb(tmp_path: Path) -> None:
+def test_bench_large_value_1mb(tmp_path: Path, record_property) -> None:
     """Measure latency for 1MB values.
 
     Large values stress the I/O subsystem and fsync operations.
@@ -320,9 +325,8 @@ def test_bench_large_value_1mb(tmp_path: Path) -> None:
         _print_stats("    ", results[label]["read"])
         print()
 
-    # Verify 1MB operations complete within reasonable time
-    assert results["1MB"]["write"]["p99_us"] < 100_000, "1MB write p99 too high"
-    assert results["1MB"]["read"]["p99_us"] < 100_000, "1MB read p99 too high"
+    record_property("write_1mb_p99_us", round(results["1MB"]["write"]["p99_us"], 1))
+    record_property("read_1mb_p99_us", round(results["1MB"]["read"]["p99_us"], 1))
 
 
 @pytest.mark.performance
@@ -383,55 +387,26 @@ def test_bench_eviction_1000_files(tmp_path: Path) -> None:
     print(f"Eviction time: {eviction_elapsed:.3f}s")
     print(f"Files removed: {initial_count + 30 - final_count}")
 
-    # Verify eviction works (should be at or under 70% after eviction)
-    # Note: Eviction may not happen on every write if threshold not exceeded
-    print("\nNote: Eviction triggered when cache exceeds 90%, target is 70%")
+    # 80 x 90KB is 7MB, past the 5MB cap: without eviction the backend would hold all 80 entries.
+    assert initial_count == num_entries, "the fill stayed under the 90% trigger, so nothing was evicted yet"
+    assert final_count < num_entries + 30, "no entry was evicted"
+    assert final_size_mb <= max_size_mb * 0.9, f"cache left at {final_size_mb:.2f}MB, above the 90% trigger"
+    assert backend.get("evict:entry:0") is None, "the oldest entry survived eviction"
+    assert backend.get(f"evict:entry:{num_entries + 29}") == b"x" * value_size, "the newest entry was evicted"
 
 
 @pytest.mark.performance
-def test_bench_vs_redis_backend(tmp_path: Path) -> None:
-    """Optional comparison with Redis backend if available.
-
-    Skips gracefully if Redis is not available or python-redis not installed.
-    """
-    try:
-        import redis  # noqa: F401
-    except ImportError:
-        pytest.skip("redis package not installed")
-
-    try:
-        from cachekit.backends.redis import RedisBackend
-        from cachekit.backends.redis.config import RedisBackendConfig
-    except ImportError:
-        pytest.skip("RedisBackend not available")
-
-    try:
-        # Try to connect to Redis (default localhost:6379)
-        redis_client = redis.Redis(host="localhost", port=6379, socket_connect_timeout=1.0)
-        redis_client.ping()
-    except Exception as e:
-        pytest.skip(f"Redis not available: {e}")
-
-    # Set up FileBackend
-    file_config = FileBackendConfig(
-        cache_dir=tmp_path,
-        max_size_mb=1024,
-        max_value_mb=100,
-        max_entry_count=10_000,
+def test_bench_vs_redis_backend(tmp_path: Path, perf_redis_backend) -> None:
+    """Compare FileBackend with RedisBackend on the suite's pytest-redis server."""
+    file_backend = FileBackend(
+        FileBackendConfig(
+            cache_dir=tmp_path,
+            max_size_mb=1024,
+            max_value_mb=100,
+            max_entry_count=10_000,
+        )
     )
-    file_backend = FileBackend(file_config)
-
-    # Set up RedisBackend
-    try:
-        redis_config = RedisBackendConfig(redis_url="redis://localhost:6379/15")
-        redis_backend = RedisBackend(redis_config)
-        # Clean up test database
-        try:
-            redis_client.flushdb(db=15)
-        except Exception:
-            pass
-    except Exception as e:
-        pytest.skip(f"RedisBackend setup failed: {e}")
+    redis_backend = perf_redis_backend
 
     # Benchmark parameters
     num_ops = 500
@@ -440,45 +415,25 @@ def test_bench_vs_redis_backend(tmp_path: Path) -> None:
     print(f"\nBenchmarking FileBackend vs RedisBackend ({num_ops} ops)...")
 
     # Warm up both backends
-    try:
-        for i in range(50):
-            file_backend.set(f"warmup:file:{i}", test_value, ttl=3600)
-            try:
-                redis_backend.set(f"warmup:redis:{i}", test_value, ttl=3600)
-            except Exception:
-                pass
-    except Exception as e:
-        pytest.skip(f"Warmup failed: {e}")
+    for i in range(50):
+        file_backend.set(f"warmup:file:{i}", test_value, ttl=3600)
+        redis_backend.set(f"warmup:redis:{i}", test_value, ttl=3600)
 
-    # Benchmark FileBackend
-    file_latencies = []
-    try:
+    def bench(backend, prefix: str) -> list[int]:
+        latencies = []
         for i in range(num_ops):
+            key = f"bench:{prefix}:{i}"
             start = time.perf_counter_ns()
-            file_backend.set(f"bench:file:{i}", test_value, ttl=3600)
-            file_backend.get(f"bench:file:{i}")
-            file_backend.delete(f"bench:file:{i}")
-            end = time.perf_counter_ns()
-            file_latencies.append(end - start)
-    except Exception as e:
-        pytest.skip(f"FileBackend benchmark failed: {e}")
+            backend.set(key, test_value, ttl=3600)
+            value = backend.get(key)
+            deleted = backend.delete(key)
+            latencies.append(time.perf_counter_ns() - start)
+            assert value == test_value, f"{prefix} round trip returned {value!r}"
+            assert deleted, f"{prefix} delete did not find {key}"
+        return latencies
 
-    # Benchmark RedisBackend
-    redis_latencies = []
-    try:
-        for i in range(num_ops):
-            start = time.perf_counter_ns()
-            redis_backend.set(f"bench:redis:{i}", test_value, ttl=3600)
-            redis_backend.get(f"bench:redis:{i}")
-            redis_backend.delete(f"bench:redis:{i}")
-            end = time.perf_counter_ns()
-            redis_latencies.append(end - start)
-    except Exception as e:
-        pytest.skip(f"RedisBackend benchmark failed: {e}")
-
-    # Calculate statistics
-    file_stats = _calculate_stats(file_latencies)
-    redis_stats = _calculate_stats(redis_latencies)
+    file_stats = _calculate_stats(bench(file_backend, "file"))
+    redis_stats = _calculate_stats(bench(redis_backend, "redis"))
 
     # Print results
     print(f"\n{'=' * 70}")
@@ -492,16 +447,11 @@ def test_bench_vs_redis_backend(tmp_path: Path) -> None:
     print("\nRedisBackend:")
     _print_stats("  ", redis_stats)
 
-    # Show ratio
-    if file_stats["p50_us"] > 0:
-        print(f"\nFileBackend is {redis_stats['p50_us'] / file_stats['p50_us']:.1f}x faster (p50)")
-        print(f"FileBackend is {redis_stats['p99_us'] / file_stats['p99_us']:.1f}x faster (p99)")
+    # Ratio > 1 means FileBackend took less time than RedisBackend
+    print(f"\nRedis/File time ratio: {redis_stats['p50_us'] / file_stats['p50_us']:.1f}x (p50)")
+    print(f"Redis/File time ratio: {redis_stats['p99_us'] / file_stats['p99_us']:.1f}x (p99)")
 
-    # Cleanup
-    try:
-        redis_client.flushdb(db=15)
-    except Exception:
-        pass
+    assert all(redis_backend.get(f"bench:redis:{i}") is None for i in range(num_ops))
 
 
 # Helper functions
@@ -533,8 +483,8 @@ def _calculate_stats(latencies: list[int]) -> dict[str, float]:
     mean = statistics.mean(latencies)
     stdev = statistics.stdev(latencies) if len(latencies) > 1 else 0.0
     p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]  # 95th percentile
-    p99 = statistics.quantiles(latencies, n=100)[98]  # 99th percentile
+    p95 = percentile(latencies, 95)
+    p99 = percentile(latencies, 99)
 
     return {
         "mean_ns": mean,

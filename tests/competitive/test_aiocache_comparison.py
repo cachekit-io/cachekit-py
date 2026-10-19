@@ -116,16 +116,6 @@ class TestAiocacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_cachekit_has_zero_knowledge_encryption(self):
-        """
-        CLAIM: cachekit has zero-knowledge encryption (AES-256-GCM).
-
-        This is TRUE. Data encrypted client-side, Redis never sees plaintext.
-
-        UNIQUE ADVANTAGE vs aiocache (and most competitors).
-        """
-        pytest.skip("Validated in tests/critical/test_aad_v03_security.py")
-
     def test_cachekit_has_prometheus_metrics(self):
         """
         CLAIM: cachekit has built-in Prometheus metrics.

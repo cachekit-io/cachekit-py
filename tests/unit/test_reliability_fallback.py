@@ -89,26 +89,3 @@ class TestReliabilityFallback:
         with patch.object(CacheOperationHandler, "get_cached_value", side_effect=TimeoutError()):
             result2 = custom_func(10, y=30)
             assert result2 == {"result": 40}
-
-    @pytest.mark.skip(reason="fail_closed only applies to circuit breaker states")
-    def test_fail_closed_strategy(self):
-        """Test fail_closed strategy raises exceptions."""
-
-        @cache(namespace="fail_closed", fallback_strategy="fail_closed", backend=None)
-        def fail_closed_func(x):
-            return x
-
-        # Normal operation
-        result = fail_closed_func("test")
-        assert result == "test"
-
-        # With Redis failure - should raise
-        from cachekit.cache_handler import CacheOperationHandler
-
-        with patch.object(
-            CacheOperationHandler,
-            "get_cached_value",
-            side_effect=ConnectionError("Test error"),
-        ):
-            with pytest.raises(ConnectionError, match="Test error"):
-                fail_closed_func("error")

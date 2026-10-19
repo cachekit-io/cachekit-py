@@ -20,22 +20,12 @@ from cachekit.decorators import cache
 class TestCacheClearAsyncL1Only:
     """cache_clear() works synchronously in L1-only mode (#76 fix)."""
 
-    def test_cache_clear_works_for_async_l1_only(self):
-        """cache_clear() on async + backend=None must NOT raise.
+    def test_cache_clear_actually_clears_async_l1_only(self):
+        """cache_clear() on async + backend=None must not raise, and must actually clear cached entries.
 
         In L1-only mode, invalidation is synchronous (no backend I/O),
         so cache_clear() can safely clear without awaiting.
         """
-
-        @cache(backend=None)
-        async def async_func(x: int) -> int:
-            return x * 2
-
-        # Should NOT raise TypeError
-        async_func.cache_clear()
-
-    def test_cache_clear_actually_clears_async_l1_only(self):
-        """cache_clear() must actually clear cached entries for async L1-only."""
         call_count = 0
 
         @cache(backend=None, ttl=300, namespace="test_clear_async_l1")
@@ -84,15 +74,23 @@ class TestCacheClearSync:
     """cache_clear() always works for sync functions (no regression)."""
 
     def test_cache_clear_does_not_raise_for_sync_function(self):
-        """Sync cache_clear() must NOT raise TypeError."""
+        """Sync cache_clear() must NOT raise TypeError: it clears L1 without consulting a backend."""
+        calls = 0
         with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
             mock_provider.return_value.get_backend.side_effect = RuntimeError("Should not be called!")
 
-            @cache(backend=None)
+            @cache(backend=None, ttl=300, namespace="test_clear_sync_l1")
             def sync_func(x: int) -> int:
+                nonlocal calls
+                calls += 1
                 return x * 2
 
-            sync_func.cache_clear()  # No exception = pass
+            assert sync_func(5) == sync_func(5) == 10
+            assert calls == 1
+            sync_func.cache_clear()
+            assert sync_func(5) == 10
+            assert calls == 2
+            mock_provider.return_value.get_backend.assert_not_called()
 
 
 class TestAsyncInvalidateCacheL1Only:

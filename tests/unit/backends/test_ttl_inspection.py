@@ -287,13 +287,6 @@ class TestRefreshTTLDegradation:
         assert len(user) == 1
         assert "refresh_ttl_on_get" in str(user[0].message)
 
-    async def test_degradation_does_not_raise(self) -> None:
-        ch._TTL_REFRESH_UNSUPPORTED_WARNED.clear()
-        handler = StandardCacheHandler(_NonInspectableBackend())
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            await handler._maybe_refresh_ttl("k", 100)  # graceful: returns without error
-
 
 # ---------------------------------------------------------------------- End-to-end
 

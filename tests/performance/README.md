@@ -4,12 +4,18 @@
 
 **Philosophy**: Test what users ACTUALLY experience, not idealized microbenchmarks.
 
-**One folder, two kinds.** Everything perf lives here. Assertion-based regression
-*guards* (via `stats_utils.py`) assert fixed targets and fail on regression; baseline-
+**One folder, two kinds.** Everything perf lives here. Wall-clock *guards* (via
+`stats_utils.py`) run in the default `pytest tests/` invocation: they print their figures and
+attach them to the JUnit report with `record_property`, and assert only behaviour, such as the
+timed calls being hits, the round trip returning the value, or an L1 hit never reaching L2. They
+assert no time budget: on a loaded host a nanosecond-scale p95 moves by orders of magnitude, so
+a budget fails on a busy neighbour, not a regression. Baseline-
 tracked *benchmarks* (pytest-benchmark, in `test_serializer_microbench.py`) measure a
 distribution and compare against a saved baseline. The two are separated by mechanism,
 not folders: pytest-benchmark tests are selected with `--benchmark-only` and skipped
-elsewhere via the `--benchmark-skip` default in `pyproject.toml`.
+elsewhere via the `--benchmark-skip` default in `pyproject.toml`. Tests that need Redis use the
+suite's pytest-redis server (`perf_redis_backend` in `conftest.py`); encryption tests generate a
+throwaway key. Neither skips: a Redis that does not answer fails the test.
 
 **Measurement integrity.** `measurement_env.py` provides a reproducible system
 fingerprint, an environment pre-flight check (throttling / load), and a timer
@@ -39,68 +45,56 @@ The `serializer_arrow_usgs` and `serializer_auto_usgs` budgets measure it
 
 Tests the full stack with realistic payloads and workloads:
 
-| Test | Payload | What It Measures | Target (P95) | Status |
-|------|---------|------------------|--------------|--------|
-| `test_decorator_overhead_complex_dict` | 10KB nested dict | Full decorator stack | < 300μs | ✅ 250μs |
-| `test_decorator_overhead_dataclass` | User model | Dataclass serialization | < 200μs | ✅ 100μs |
-| `test_decorator_overhead_dataframe` | 10K row DataFrame | DataFrame with msgpack | < 5ms | ⏳ |
-| `test_concurrent_cache_access` | 10KB dict, 10 threads | Lock contention | < 500μs | ✅ 258μs |
-| `test_encryption_overhead` | 10KB dict + AES-256-GCM | Encryption cost | < 3x plain | ⏳ |
-| `test_redis_l2_roundtrip` | 10KB dict + Redis | Network + serialize | < 10ms | ⏳ |
-| `test_async_decorator_overhead` | 10KB dict + async | Async machinery | < 50μs | ⏳ |
-
-**Key Insight**: Decorator + serialization overhead is **500x** larger than raw cache lookup.
+| Test | Payload | What It Measures |
+|------|---------|------------------|
+| `test_decorator_overhead_complex_dict` | 10KB nested dict | Full decorator stack |
+| `test_decorator_overhead_dataclass` | User model | Dataclass L1 hit |
+| `test_decorator_overhead_dataframe` | 10K row DataFrame | L1-only hit, no serializer |
+| `test_decorator_overhead_l1_hit_with_backend` | 10KB dict, in-process L2 | L1 bytes hit + deserialize |
+| `test_concurrent_cache_access` | 10KB dict, 10 threads | Per-call execution time, 10 threads on one key (not contention) |
+| `test_encryption_overhead` | 10KB dict + AES-256-GCM | Encryption cost |
+| `test_redis_l2_roundtrip` | 10KB dict + pytest-redis | Network + serialize |
+| `test_async_decorator_overhead` | 10KB dict + async | Async machinery |
 
 ### 2. `test_reliability_under_load.py` - **Reliability Framework Tests**
 
 Tests that reliability features work under production stress:
 
-| Test | Feature Tested | What It Validates | Status |
-|------|----------------|-------------------|--------|
-| `test_circuit_breaker_failure_injection` | Circuit breaker | Opens after failures, fast-fail behavior | ⏳ |
-| `test_backpressure_limit` | Backpressure | Queue limits, timeout enforcement | ⏳ |
-| `test_full_stack_under_load` | All features | Production config performance | ⏳ |
+| Test | Feature Tested | Scenario |
+|------|----------------|----------|
+| `test_redis_outage_degrades_to_uncached_calls` | Graceful degradation | Redis reads and writes fail; every call runs uncached |
+| `test_backpressure_limit` | Backpressure | 20 callers on a slow backend, capped by `max_concurrent_requests` |
+| `test_full_stack_under_load` | All features | Production config: L1 hits, L1 misses to Redis, concurrent callers |
 
 **Key Insight**: Reliability features add overhead but protect against failures.
 
 ### 3. `test_l1_cache_latency.py` - **L1 Cache Microbenchmarks**
 
-Tests raw L1 cache performance (dict operations only):
+Measures raw L1 cache performance (dict operations only), asserting from the cache's hit/miss
+counters that each timed lookup took the path it reports.
 
-- L1 hit: ~500ns p95 (raw dict lookup)
-- L1 miss: ~200ns p95 (key not found)
-- L1 put: ~2μs p95 (insert + LRU)
-
-**WARNING**: These numbers are NOT what users experience. Full decorator stack is 500x slower.
+**WARNING**: These numbers are NOT what users experience: they leave out the decorator and serialization.
 
 ### 4. `test_end_to_end_latency.py` - **Decorator Path Analysis**
 
-Tests decorator overhead in isolation:
+Measures decorator overhead in isolation (L1 hit, L1 miss, Redis-backed L1 hit and pure L2 hit,
+async L1 hit), asserting the function call count and which calls read Redis.
 
-- Decorator + L1 hit (int payload): ~36μs p95
-- Async decorator: ~17μs p95
-
-**WARNING**: Uses trivial payloads (int). Real payloads are 10-100x slower.
+**WARNING**: Uses trivial payloads (int); real payloads cost more to serialize.
 
 ### 5. `test_serializer_benchmarks.py` - **Serialization Performance**
 
-Compares serializers for DataFrames:
-
-- ArrowSerializer: ~50-100x faster than msgpack
-- Memory-mapped deserialization (Arrow)
-- Serialized size comparison
-
-**Key Insight**: For DataFrames, ArrowSerializer is critical.
+Compares serializers (manual timing, printed): ArrowSerializer against MessagePack for DataFrames,
+and orjson against MessagePack for JSON-heavy data. Asserted: every round trip is equal, and the
+seeded JSON-heavy data serializes smaller with MessagePack than with orjson.
 
 ### 6. `test_backend_wrapper_overhead.py` - **Per-Request Pattern**
 
-Tests per-request wrapper creation overhead:
+Times the production `PerRequestRedisBackend` with no Redis call: building one, scoping a key to
+the calling context's tenant (ContextVar read + URL-encoding), and both together. Each test
+asserts the scoped key.
 
-- Wrapper creation: <1μs p95
-- ContextVar access: <200ns p95
-- URL encoding: <600ns p95
-
-**Key Insight**: Per-request pattern adds negligible overhead (<0.15% of network latency).
+**Key Insight**: Per-request scoping makes no Redis call; its cost is printed, not asserted.
 
 ### 7. `test_large_object_memory.py` - **Memory Regression Guards** (CI-gated: `performance and slow`)
 
@@ -153,9 +147,8 @@ uv run pytest tests/performance/ -v -s -m performance
 uv run pytest tests/performance/test_production_realism.py -v -s
 ```
 
-### Reliability Tests (Requires Redis)
+### Reliability Tests (Redis from pytest-redis, as for the whole suite)
 ```bash
-export REDIS_URL=redis://localhost:6379
 uv run pytest tests/performance/test_reliability_under_load.py -v -s -m integration
 ```
 
@@ -166,47 +159,21 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ---
 
-## Key Findings
+## Figures
 
-### What Users Actually Experience (P95)
-
-| Scenario | Latency | Context |
-|----------|---------|---------|
-| **Complex dict (10KB)** | **250μs** | Full decorator stack + msgpack |
-| **User dataclass** | **100μs** | Smaller payload |
-| **Concurrent (10 threads)** | **258μs** | Minimal lock contention (+8μs) |
-| **Redis L2 (local)** | **2-5ms** | Network RTT dominates |
-
-### What Microbenchmarks Show (MISLEADING)
-
-| Scenario | Latency | Why Misleading |
-|----------|---------|----------------|
-| **L1 cache hit** | 500ns | Ignores decorator + serialization |
-| **L1 cache miss** | 200ns | No serialization, trivial payload |
-| **Decorator + int** | 36μs | Trivial payload, no serialization |
-
-**Reality Check**: Full stack with realistic payloads is **500x slower** than raw cache microbenchmarks.
+These tests print figures and assert behaviour; none of them is a source for a number. Quote a
+figure only from [docs/performance.md, Measured Figures](../../docs/performance.md#measured-figures),
+which dates each one and names the guard that produced it.
 
 ---
 
 ## Marketing Guidelines
 
-### ✅ Conservative Claims (Validated)
+### What the Tests Back
 
-1. **"200-300μs for realistic payloads"**
-   - Measured: 250μs p95 for 10KB dicts
-   - Context: Full decorator stack
-
-2. **"Eliminates 90% of network latency"**
-   - L1 hit: 0.25ms
-   - Redis RTT: 2-5ms
-   - Savings: ~2-4.75ms
-
-3. **"Concurrent-safe with minimal overhead"**
-   - Lock contention: Only +8μs (3% overhead)
-
-4. **"ArrowSerializer: 50-100x faster for DataFrames"**
-   - Validated in test_serializer_benchmarks.py
+1. **"Concurrent-safe"**
+   - Asserted: 10 threads on one key raise nothing and every call hits L1 (test_concurrent_cache_access).
+     No test measures contention overhead, so make no overhead claim
 
 ### ❌ Avoid These Claims (Misleading)
 
@@ -221,26 +188,11 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ---
 
-## Performance Budget
-
-| Component | Budget | Measured | Status |
-|-----------|--------|----------|--------|
-| Decorator machinery | 20μs | ~20μs | ✅ |
-| Key generation | 5μs | ~2μs | ✅ |
-| Serialization (10KB) | 150μs | ~100μs | ✅ |
-| L1 cache lookup | 1μs | 0.5μs | ✅ |
-| Deserialization (10KB) | 150μs | ~100μs | ✅ |
-| **Total** | **<350μs** | **~250μs** | ✅ |
-
-**Result**: Under budget by 100μs (28% margin).
-
----
-
 ## Next Steps
 
 1. ✅ Implement comprehensive test suite, including the encryption-overhead and Redis L2 guards
 2. ✅ Percentiles over every raw sample and run-level inference in `stats_utils.py`
-3. ⏳ Record results for the ⏳ rows above (encryption needs `CACHEKIT_MASTER_KEY`; reliability needs Redis)
+3. ⏳ Record figures for the encryption and Redis rows (both now run in the default suite)
 4. ⏳ Re-run `PROFILING_RESULTS.md` on the current stack
 
 ---

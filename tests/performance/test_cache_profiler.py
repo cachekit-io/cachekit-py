@@ -1,7 +1,9 @@
 """Detailed component-level profiling of L1 cache operations.
 
-This profiler breaks down the 450-500ns hit latency into individual components
-to identify the actual bottleneck. Uses manual instrumentation to avoid profiler overhead.
+This profiler breaks the hit latency down into individual components to find the
+bottleneck. Uses manual instrumentation to avoid profiler overhead.
+
+Each test asserts, from the cache's own hit/miss counters, that the calls it timed were hits.
 """
 
 from __future__ import annotations
@@ -15,216 +17,76 @@ import pytest
 
 from cachekit.l1_cache import CacheEntry, L1Cache
 
+from .stats_utils import percentile, report
+
+
+def _timed(operation, iterations: int) -> list[int]:
+    """Per-call latencies (ns) of ``operation`` over ``iterations`` calls."""
+    latencies = []
+    for _ in range(iterations):
+        start = time.perf_counter_ns()
+        operation()
+        latencies.append(time.perf_counter_ns() - start)
+    return latencies
+
 
 @pytest.mark.performance
-def test_l1_cache_component_breakdown() -> None:
-    """Profile individual components of cache.get() hit path.
+def test_l1_cache_component_breakdown(record_property) -> None:
+    """Profile the pieces of the cache.get() hit path against the whole call.
 
-    Breaks down the 450-500ns into:
-    1. Lock acquisition
-    2. Dict lookup
-    3. TTL check
-    4. LRU move
-    5. Counter update
+    Components: lock acquisition, dict lookup, TTL check (time.time()), LRU move, counter update.
     """
     cache = L1Cache(max_memory_mb=100)
     iterations = 100_000
 
-    # Populate cache
     test_key = "perf:test:key"
     test_value = b"x" * 1024
     cache.put(test_key, test_value, redis_ttl=3600)
-
-    # Warm up
-    for _ in range(1000):
+    for _ in range(1000):  # warm up
         cache.get(test_key)
 
-    print("\n" + "=" * 80)
-    print("L1 CACHE COMPONENT-LEVEL PROFILING")
-    print("=" * 80)
-
-    # Component 1: Lock acquisition overhead
-    print("\n1. LOCK ACQUISITION OVERHEAD")
-    print("-" * 80)
-    lock_latencies = []
     lock = threading.RLock()
-
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        with lock:
-            pass
-        end = time.perf_counter_ns()
-        lock_latencies.append(end - start)
-
-    lock_p50 = statistics.median(lock_latencies)
-    lock_p95 = statistics.quantiles(lock_latencies, n=20)[18]
-    lock_mean = statistics.mean(lock_latencies)
-    lock_stdev = statistics.stdev(lock_latencies)
-
-    print("Empty lock acquire/release:")
-    print(f"  Mean:   {lock_mean:>8.1f} ns")
-    print(f"  P50:    {lock_p50:>8.1f} ns")
-    print(f"  P95:    {lock_p95:>8.1f} ns")
-    print(f"  StdDev: {lock_stdev:>8.1f} ns")
-
-    # Component 2: Dict lookup only (no lock)
-    print("\n2. DICT LOOKUP OVERHEAD")
-    print("-" * 80)
     entry = CacheEntry(value=test_value, expires_at=time.time() + 3600, size_bytes=1024)
     test_dict: dict[str, CacheEntry] = {"key": entry}
+    ordered_dict: OrderedDict[str, CacheEntry] = OrderedDict((f"key_{i}", entry) for i in range(100))
+    counter = [0]
 
-    dict_latencies = []
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        test_dict.get("key")
-        end = time.perf_counter_ns()
-        dict_latencies.append(end - start)
+    def lock_cycle():
+        with lock:
+            pass
 
-    dict_p50 = statistics.median(dict_latencies)
-    dict_p95 = statistics.quantiles(dict_latencies, n=20)[18]
-    dict_mean = statistics.mean(dict_latencies)
-    dict_stdev = statistics.stdev(dict_latencies)
+    def ttl_check():
+        return time.time() >= time.time() + 3600
 
-    print("Dict lookup (hit, single entry):")
-    print(f"  Mean:   {dict_mean:>8.1f} ns")
-    print(f"  P50:    {dict_p50:>8.1f} ns")
-    print(f"  P95:    {dict_p95:>8.1f} ns")
-    print(f"  StdDev: {dict_stdev:>8.1f} ns")
+    def count():
+        counter[0] += 1
 
-    # Component 3: TTL check (time.time() call)
-    print("\n3. TTL CHECK OVERHEAD (time.time())")
-    print("-" * 80)
-    ttl_latencies = []
-
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        now = time.time()
-        _ = now >= (time.time() + 3600)
-        end = time.perf_counter_ns()
-        ttl_latencies.append(end - start)
-
-    ttl_p50 = statistics.median(ttl_latencies)
-    ttl_p95 = statistics.quantiles(ttl_latencies, n=20)[18]
-    ttl_mean = statistics.mean(ttl_latencies)
-    ttl_stdev = statistics.stdev(ttl_latencies)
-
-    print("time.time() call + comparison:")
-    print(f"  Mean:   {ttl_mean:>8.1f} ns")
-    print(f"  P50:    {ttl_p50:>8.1f} ns")
-    print(f"  P95:    {ttl_p95:>8.1f} ns")
-    print(f"  StdDev: {ttl_stdev:>8.1f} ns")
-
-    # Component 4: OrderedDict.move_to_end()
-    print("\n4. LRU MOVE OVERHEAD (OrderedDict.move_to_end)")
-    print("-" * 80)
-    move_latencies = []
-    ordered_dict: OrderedDict[str, CacheEntry] = OrderedDict()
-    for i in range(100):
-        ordered_dict[f"key_{i}"] = entry
-
-    # Move a middle key (more realistic than first/last)
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        ordered_dict.move_to_end("key_50")
-        end = time.perf_counter_ns()
-        move_latencies.append(end - start)
-
-    move_p50 = statistics.median(move_latencies)
-    move_p95 = statistics.quantiles(move_latencies, n=20)[18]
-    move_mean = statistics.mean(move_latencies)
-    move_stdev = statistics.stdev(move_latencies)
-
-    print("OrderedDict.move_to_end (100 entries):")
-    print(f"  Mean:   {move_mean:>8.1f} ns")
-    print(f"  P50:    {move_p50:>8.1f} ns")
-    print(f"  P95:    {move_p95:>8.1f} ns")
-    print(f"  StdDev: {move_stdev:>8.1f} ns")
-
-    # Component 5: Counter increment
-    print("\n5. COUNTER INCREMENT OVERHEAD")
-    print("-" * 80)
-    counter_latencies = []
-    counter = 0
-
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        counter += 1
-        end = time.perf_counter_ns()
-        counter_latencies.append(end - start)
-
-    counter_p50 = statistics.median(counter_latencies)
-    counter_p95 = statistics.quantiles(counter_latencies, n=20)[18]
-    counter_mean = statistics.mean(counter_latencies)
-    counter_stdev = statistics.stdev(counter_latencies)
-
-    print("Counter increment:")
-    print(f"  Mean:   {counter_mean:>8.1f} ns")
-    print(f"  P50:    {counter_p50:>8.1f} ns")
-    print(f"  P95:    {counter_p95:>8.1f} ns")
-    print(f"  StdDev: {counter_stdev:>8.1f} ns")
-
-    # Real cache.get() measurement
-    print("\n6. ACTUAL cache.get() MEASUREMENT")
-    print("-" * 80)
-    get_latencies = []
-
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        found, value = cache.get(test_key)
-        end = time.perf_counter_ns()
-        get_latencies.append(end - start)
-
-    get_p50 = statistics.median(get_latencies)
-    get_p95 = statistics.quantiles(get_latencies, n=20)[18]
-    get_mean = statistics.mean(get_latencies)
-    get_stdev = statistics.stdev(get_latencies)
-
-    print("cache.get() (complete operation):")
-    print(f"  Mean:   {get_mean:>8.1f} ns")
-    print(f"  P50:    {get_p50:>8.1f} ns")
-    print(f"  P95:    {get_p95:>8.1f} ns")
-    print(f"  StdDev: {get_stdev:>8.1f} ns")
-
-    # Summary
-    print("\n" + "=" * 80)
-    print("BREAKDOWN SUMMARY")
-    print("=" * 80)
-
-    component_sum = lock_p95 + dict_p95 + ttl_p95 + move_p95 + counter_p95
     components = {
-        "Lock acquisition": lock_p95,
-        "Dict lookup": dict_p95,
-        "TTL check (time.time)": ttl_p95,
-        "LRU move": move_p95,
-        "Counter increment": counter_p95,
-        "Sum (theoretical)": component_sum,
-        "Actual cache.get()": get_p95,
-        "Overhead (measurement)": get_p95 - component_sum,
+        "lock": ("Lock acquire/release", lock_cycle),
+        "dict": ("Dict lookup (hit, single entry)", lambda: test_dict.get("key")),
+        "ttl": ("TTL check (time.time() + comparison)", ttl_check),
+        "lru": ("OrderedDict.move_to_end (100 entries)", lambda: ordered_dict.move_to_end("key_50")),
+        "counter": ("Counter increment", count),
     }
+    p95s = {}
+    for prefix, (label, operation) in components.items():
+        latencies = _timed(operation, iterations)
+        report(record_property, label, latencies, f"{prefix}_")
+        p95s[label] = percentile(latencies, 95)
 
-    for name, value in components.items():
-        percentage = (value / get_p95 * 100) if get_p95 > 0 else 0
-        print(f"{name:<35} {value:>8.1f} ns ({percentage:>5.1f}%)")
+    stats_before = cache.get_stats()
+    get_latencies = _timed(lambda: cache.get(test_key), iterations)
+    stats_after = cache.get_stats()
+    assert cache.get(test_key) == (True, test_value)
+    assert stats_after["hits"] - stats_before["hits"] == iterations
+    assert stats_after["misses"] == stats_before["misses"] == 0
 
-    print("\n" + "=" * 80)
-    print("INTERPRETATION")
-    print("=" * 80)
-    print(f"""
-The actual cache.get() p95 ({get_p95:.0f}ns) is composed of:
-- Lock acquisition: {lock_p95:.0f}ns ({lock_p95 / get_p95 * 100:.1f}%)
-- Dict lookup: {dict_p95:.0f}ns ({dict_p95 / get_p95 * 100:.1f}%)
-- TTL check: {ttl_p95:.0f}ns ({ttl_p95 / get_p95 * 100:.1f}%)
-- LRU move: {move_p95:.0f}ns ({move_p95 / get_p95 * 100:.1f}%)
-- Counter: {counter_p95:.0f}ns ({counter_p95 / get_p95 * 100:.1f}%)
-- Overhead: {get_p95 - component_sum:.0f}ns ({(get_p95 - component_sum) / get_p95 * 100:.1f}%)
-
-Key insights:
-1. Lock contention is the primary cost (~{lock_p95 / get_p95 * 100:.0f}% of total)
-2. Dict lookup is fast (~{dict_p95 / get_p95 * 100:.0f}% of total)
-3. TTL checking (time.time()) adds ~{ttl_p95 / get_p95 * 100:.0f}% overhead
-4. LRU move is relatively cheap (~{move_p95 / get_p95 * 100:.0f}% of total)
-5. The "overhead" is likely Python interpreter overhead between operations
-""")
+    report(record_property, "cache.get() (complete operation)", get_latencies, "get_")
+    get_p95 = percentile(get_latencies, 95)
+    component_sum = sum(p95s.values())
+    print(f"\nComponent p95s sum to {component_sum:.1f} ns of the {get_p95:.1f} ns cache.get() p95:")
+    for label, value in p95s.items():
+        print(f"  {label:<40} {value:>8.1f} ns ({value / get_p95 * 100:>5.1f}%)")
 
 
 @pytest.mark.performance
@@ -262,24 +124,18 @@ def test_l1_cache_dict_size_impact() -> None:
             end = time.perf_counter_ns()
             latencies.append(end - start)
 
-        p95 = statistics.quantiles(latencies, n=20)[18]
+        # The entries were planted in the cache's state directly; every timed get must have hit one.
+        stats = cache.get_stats()
+        assert (found, value) == (True, entry.value)
+        assert (stats["hits"], stats["misses"]) == (1000 + iterations, 0), f"size {size}: {stats}"
+
+        p95 = percentile(latencies, 95)
         mean = statistics.mean(latencies)
         results.append((size, mean, p95))
         print(f"Size: {size:>6} entries  |  Mean: {mean:>8.1f}ns  |  P95: {p95:>8.1f}ns")
 
-    # Check for scaling impact
-    if results:
-        baseline_p95 = results[0][2]
-        max_p95 = results[-1][2]
-        slowdown = (max_p95 / baseline_p95 - 1) * 100
-
-        print(f"\nScaling impact: {slowdown:+.1f}% slowdown from {sizes[0]} to {sizes[-1]} entries")
-        if slowdown < 5:
-            print("✅ Dict lookup is O(1) - size has minimal impact")
-        elif slowdown < 20:
-            print("⚠️  Dict lookup has minor degradation with size")
-        else:
-            print(f"❌ Dict lookup has significant degradation ({slowdown:.1f}%)")
+    slowdown = (results[-1][2] / results[0][2] - 1) * 100
+    print(f"\nScaling impact: {slowdown:+.1f}% p95 change from {sizes[0]} to {sizes[-1]} entries")
 
 
 @pytest.mark.performance
@@ -295,6 +151,7 @@ def test_l1_cache_lock_contention() -> None:
 
     thread_counts = [1, 2, 4, 8]
     iterations_per_thread = 10_000
+    wrong_values: list[int] = []
 
     print("\n" + "=" * 80)
     print("LOCK CONTENTION IMPACT")
@@ -306,14 +163,18 @@ def test_l1_cache_lock_contention() -> None:
 
         def worker(result_lock=lock, result_list=latencies):
             local_latencies = []
+            wrong = 0
             for _ in range(iterations_per_thread):
                 start = time.perf_counter_ns()
                 found, value = cache.get(test_key)
                 end = time.perf_counter_ns()
                 local_latencies.append(end - start)
+                # Counted, not asserted: an assert in a thread is only printed, never fails the test.
+                wrong += value != test_value
 
             with result_lock:
                 result_list.extend(local_latencies)
+                wrong_values.append(wrong)
 
         # Launch threads
         threads = []
@@ -327,13 +188,18 @@ def test_l1_cache_lock_contention() -> None:
             t.join()
 
         # Analyze
-        p95 = statistics.quantiles(latencies, n=20)[18]
+        p95 = percentile(latencies, 95)
         mean = statistics.mean(latencies)
-        p99 = statistics.quantiles(latencies, n=100)[98]
+        p99 = percentile(latencies, 99)
 
         print(f"Threads: {num_threads:>2}  |  Mean: {mean:>8.1f}ns  |  P95: {p95:>8.1f}ns  |  P99: {p99:>8.1f}ns")
 
     print("\nNote: Lock contention grows with thread count")
+
+    # Contention must serve no wrong value and lose no counter update.
+    assert wrong_values == [0] * sum(thread_counts)
+    stats = cache.get_stats()
+    assert (stats["hits"], stats["misses"]) == (sum(thread_counts) * iterations_per_thread, 0)
 
 
 if __name__ == "__main__":

@@ -6,13 +6,13 @@ They will initially fail, then guide the implementation.
 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
-import redis
 
 from cachekit import cache
-from cachekit.config.nested import L1CacheConfig, MonitoringConfig
+from cachekit.config.nested import CircuitBreakerConfig, L1CacheConfig, MonitoringConfig
 
 
 class TestAsyncCachingTDD:
@@ -131,30 +131,46 @@ class TestAsyncCachingTDD:
         assert call_count == 2  # No additional call
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(
-        reason="KNOWN ISSUE: Async distributed locking with pytest-redis isolated client has threading issues. Lock acquisition fails in test environment. Works in production with real Redis."
-    )
-    async def test_async_concurrent_requests(self):
-        """Concurrent async requests should be handled properly."""
-        call_count = 0
-        call_lock = asyncio.Lock()
+    async def test_async_concurrent_requests(self, monkeypatch):
+        """Concurrent misses on one key run the function once, within a wrapper and across wrappers."""
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
 
-        @cache
+        call_count = 0
+        contenders = 5
+        lock_requests = 0
+        all_contending = asyncio.Event()
+        real_acquire_lock = PerRequestRedisBackend.acquire_lock
+
+        def counting_acquire_lock(self, key, *args, **kwargs):
+            nonlocal lock_requests
+            lock_requests += 1
+            if lock_requests == contenders:
+                all_contending.set()
+            return real_acquire_lock(self, key, *args, **kwargs)
+
+        monkeypatch.setattr(PerRequestRedisBackend, "acquire_lock", counting_acquire_lock)
+
         async def slow_async_operation(value: int) -> int:
             nonlocal call_count
-            async with call_lock:
-                call_count += 1
-            await asyncio.sleep(0.05)  # Simulate slow operation
+            call_count += 1
+            # Hold the lock until every wrapper is waiting on it, so each one really contends.
+            await asyncio.wait_for(all_contending.wait(), timeout=5)
             return value * value
 
-        # Launch 10 concurrent requests for the same value
-        tasks = [slow_async_operation(7) for _ in range(10)]
-        results = await asyncio.gather(*tasks)
+        # Concurrent misses inside one wrapper share one trip in process, so only that trip reaches
+        # the Redis lock. Separate wrappers of one function share the cache key but not that trip:
+        # they contend on the Redis lock as separate processes would.
+        wrappers = [cache(slow_async_operation) for _ in range(contenders)]
 
-        # All should get the same result
-        assert all(r == 49 for r in results)
-        # But function should only be called once (cache stampede prevention)
-        assert call_count == 1
+        # Fewer executor threads than lock waiters. A waiter that held a thread for its whole wait
+        # starved the holder's own Redis calls: every waiter timed out and recomputed.
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+
+        results = await asyncio.gather(*(wrapper(7) for wrapper in wrappers for _ in range(2)))
+
+        assert results == [49] * (2 * contenders)
+        assert lock_requests == contenders  # one trip per wrapper, and every trip took the Redis lock
+        assert call_count == 1  # the lock holder computed; every waiter read its result
 
     @pytest.mark.asyncio
     async def test_async_different_arguments(self):
@@ -177,38 +193,44 @@ class TestAsyncCachingTDD:
         assert results == test_values
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(
-        reason="KNOWN ISSUE: Circuit breaker test needs review after backend refactoring. May need updated error handling."
-    )
-    async def test_async_circuit_breaker(self):
-        """Circuit breaker should fail-fast when open (after threshold failures)."""
-        fail_count = 0
+    async def test_async_unreachable_backend_opens_breaker_and_runs_uncached(self, monkeypatch, redis_isolated):
+        """Failed backend builds open the breaker; while open, calls run uncached and never touch Redis.
 
-        # Circuit breaker enabled by default
+        That the function's own exceptions never count is tests/integration/test_circuit_breaker_comprehensive.py's
+        test_async_decorator_integration.
+        """
+        from cachekit.decorators import wrapper as wrapper_module
+
+        threshold = CircuitBreakerConfig().failure_threshold
+
+        # Redis is down when the backend is first built: a failure that counts.
+        real_resolve = wrapper_module._resolve_lazy_backend
+        backend_down = True
+
+        def resolve():
+            if backend_down:
+                raise ConnectionError("Redis unreachable")
+            return real_resolve()
+
+        monkeypatch.setattr(wrapper_module, "_resolve_lazy_backend", resolve)
+        runs: list[int] = []
+
         @cache
-        async def flaky_async_service(should_fail: bool = False):
-            nonlocal fail_count
-            if should_fail:
-                fail_count += 1
-                raise RuntimeError("Service unavailable")
-            return "success"
+        async def service(x: int) -> int:
+            runs.append(x)
+            return x * 2
 
-        # Successful calls
-        assert await flaky_async_service() == "success"
-        assert await flaky_async_service() == "success"
+        for x in range(threshold):
+            assert await service(x) == x * 2  # degrades to an uncached call, never raises
+        assert service.get_health_status()["circuit_breaker"]["state"] == "open"
 
-        # Trigger failures to open circuit
-        for _ in range(5):  # Default failure threshold
-            with pytest.raises(RuntimeError):
-                await flaky_async_service(should_fail=True)
-
-        # Circuit should be open - calls should fail fast without executing function
-        initial_fail_count = fail_count
-        with pytest.raises(redis.ConnectionError, match="Circuit breaker OPEN"):
-            await flaky_async_service()
-
-        # Function shouldn't have been called (circuit is open, failing fast)
-        assert fail_count == initial_fail_count
+        # Redis is back, but an open breaker keeps every call off it: the function runs each time.
+        backend_down = False
+        keys_before = redis_isolated.dbsize()
+        assert [await service(100), await service(100)] == [200, 200]
+        assert runs == [*range(threshold), 100, 100]
+        assert redis_isolated.dbsize() == keys_before
+        assert service.get_health_status()["circuit_breaker"]["state"] == "open"
 
     @pytest.mark.asyncio
     async def test_async_ttl_expiration(self):
