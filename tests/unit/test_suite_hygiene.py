@@ -6,26 +6,28 @@ ten ``@pytest.mark.skip`` tests, a module that skipped 35 functions at import, a
 77 test functions with no assertion. Nothing stopped the next one landing with CI
 green; this does. It flags, statically:
 
-* **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, and
-  ``@pytest.mark.skip`` anywhere, including ``pytestmark``, ``pytest.param(marks=...)`` and
-  a marker a hook adds. A skip that depends on something is ``skipif(<condition>, reason=...)``,
-  which a hook can add as well.
+* **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, a bare
+  ``skipif`` that is never called, and ``@pytest.mark.skip`` anywhere, including ``pytestmark``,
+  ``pytest.param(marks=...)`` and a marker a hook adds, by object or by name
+  (``item.add_marker("skip")``). A skip that depends on something is
+  ``skipif(<condition>, reason=...)``, which a hook can add as well.
 * **Lenient xfails.** ``xfail(strict=False)`` passes whether or not the test fails (pytest
   runs every other xfail strict, ``xfail_strict`` in pyproject.toml), and
   ``xfail(run=False)`` never runs it.
 * **Unconditional imperative skips.** A ``pytest.skip(...)`` or ``pytest.xfail(...)``
-  statement directly in a function or module body, outside any ``if``/``try``/loop. A
-  skip that depends on the environment (an optional import, a platform) sits inside one
-  of those and passes.
+  statement directly in a function or module body, outside any ``if``/``try``/loop, under
+  any name a module-level import gives it (``from pytest import skip``,
+  ``import pytest as pt``). A skip that depends on the environment (an optional import, a
+  platform) sits inside one of those and passes.
 * **Assertion-free tests.** A ``test_*`` function whose body, and the functions in the
   same module it calls (directly or as ``self.``/``cls.`` methods of its class), contain no
   ``assert``, no ``pytest.raises``/``warns``/``fail``, no ``raise AssertionError`` and no
   call to an ``assert*`` function (``mock.assert_called_once``,
   ``np.testing.assert_array_equal``, ``self.assertEqual``). ``assert True`` does not count,
-  nor does a function defined inside the test that it does not call by name (a thread
-  target's failed assert is only printed). Helpers imported from other modules and
-  assertions inside fixtures do not count either: assert in the test or in a helper
-  defined beside it.
+  nor does a function defined inside the test unless the test, or another function defined
+  inside it that the test calls, calls it by name (a thread target's failed assert is only
+  printed). Helpers imported from other modules and assertions inside fixtures do not count
+  either: assert in the test or in a helper defined beside it.
 
 A test that is meant to show "this does not raise" still asserts the state it leaves
 behind. A test that cannot pass yet is ``xfail(strict=True)`` naming the defect, so it
@@ -103,7 +105,11 @@ class _Module:
         return None
 
     def asserts(self, fn: Func, cls: str | None, seen: frozenset[int] = frozenset(), scope: dict | None = None) -> bool:
-        """``scope``: the functions defined inside the enclosing test, which a nested function may call."""
+        """``scope``: the functions defined inside the enclosing test, which a nested function may call.
+
+        Only a callee found in ``scope`` inherits it: a module-level helper or ``self.`` method
+        cannot see the test's nested defs, so its calls resolve at module level.
+        """
         if id(fn) in seen:
             return False
         nodes = list(_own_nodes(fn))
@@ -112,16 +118,18 @@ class _Module:
         scope = {**(scope or {}), **{n.name: n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}}
         calls = [n for n in nodes if isinstance(n, ast.Call)]
         callees = (
-            scope.get(c.func.id) if isinstance(c.func, ast.Name) and c.func.id in scope else self._callee(cls, c) for c in calls
+            (scope[c.func.id], scope) if isinstance(c.func, ast.Name) and c.func.id in scope else (self._callee(cls, c), None)
+            for c in calls
         )
-        return any(self.asserts(c, cls, seen | {id(fn)}, scope) for c in callees if c is not None)
+        return any(self.asserts(c, cls, seen | {id(fn)}, s) for c, s in callees if c is not None)
 
 
 def _own_nodes(fn: Func):
     """``fn``'s nodes, minus the bodies of the functions and lambdas defined inside it.
 
-    A nested function counts only where ``fn`` calls it by name: an assert in a thread target
-    (``Thread(target=worker)``) only prints a warning when it fails, and never fails the test.
+    A nested function counts only where ``fn``, or a sibling nested function it calls, calls it
+    by name: an assert in a thread target (``Thread(target=worker)``) only prints a warning when
+    it fails, and never fails the test.
     """
     stack = list(ast.iter_child_nodes(fn))
     while stack:
@@ -144,12 +152,33 @@ def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return True
 
 
-def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
-    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip"):
-        return "unconditional @pytest.mark.skip"
+def _pytest_aliases(tree: ast.Module) -> dict[str, str]:
+    """Module-level import names for pytest and its members: ``{"pt": "pytest", "skip": "pytest.skip"}``."""
+    aliases = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            aliases.update({a.asname: a.name for a in node.names if a.name == "pytest" and a.asname})
+        elif isinstance(node, ast.ImportFrom) and node.module == "pytest":
+            aliases.update({a.asname or a.name: f"pytest.{a.name}" for a in node.names})
+    return aliases
+
+
+def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST], aliases: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Attribute):
+        name = _dotted(node)
+        if name.endswith("mark.skip"):
+            return "pytest.mark.skip: use skipif(<condition>, reason=...)"
+        parent = parents.get(node)
+        if name.endswith("mark.skipif") and not (isinstance(parent, ast.Call) and parent.func is node):
+            return "skipif without a condition never runs"
+        return None
     if not isinstance(node, ast.Call):
         return None
     name = _dotted(node.func)
+    if name.endswith("add_marker"):
+        marker = node.args[0] if node.args else _keyword(node, "marker")
+        if isinstance(marker, ast.Constant) and marker.value in ("skip", "skipif"):
+            return f"add_marker({marker.value!r}): use skipif(<condition>, reason=...)"
     if name.endswith("mark.skipif"):
         condition = node.args[0] if node.args else _keyword(node, "condition")
         if condition is None:  # pytest skips on a skipif with no condition
@@ -160,8 +189,10 @@ def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | N
         if isinstance(strict, ast.Constant) and not strict.value:
             return "xfail(strict=False) passes whether or not the test fails"
         return "xfail(run=False) never runs" if isinstance(run, ast.Constant) and not run.value else None
-    if name in ("pytest.skip", "pytest.xfail") and _is_unconditional(node, parents):
-        return f"unconditional {name}()"
+    head, _, rest = name.partition(".")
+    resolved = aliases.get(head, head) + (f".{rest}" if rest else "")
+    if resolved in ("pytest.skip", "pytest.xfail") and _is_unconditional(node, parents):
+        return f"unconditional {resolved}()"
     return None
 
 
@@ -171,9 +202,9 @@ def scan(root: Path) -> list[str]:
     for path in sorted(root.rglob("*.py")):
         mod = _Module(path)
         where = str(path.relative_to(root.parent))
-        parents = _parents(mod.tree)
+        parents, aliases = _parents(mod.tree), _pytest_aliases(mod.tree)
         for node in ast.walk(mod.tree):
-            why = _marker_violation(node, parents)
+            why = _marker_violation(node, parents, aliases)
             if why:
                 out.append(f"{where}:{node.lineno}: {why}")
         if path.name.startswith("test_"):
@@ -198,6 +229,8 @@ import asyncio
 import threading
 
 import pytest
+import pytest as pt
+from pytest import skip
 
 pytestmark = pytest.mark.skip(reason="module")
 
@@ -222,11 +255,18 @@ def test_marker_skip():
     assert len("ok") == 2
 
 
+@pytest.mark.skipif
+def test_bare_skipif():
+    assert len("ok") == 2
+
+
 def pytest_collection_modifyitems(config, items):
     skip_slow = pytest.mark.skipif(not config.getoption("--run-slow"), reason="needs --run-slow")
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
+        elif "broken" in item.keywords:
+            item.add_marker("skip")
 
 
 @pytest.mark.xfail(strict=False, reason="passes either way")
@@ -276,6 +316,32 @@ def test_unrun_xfail():
 def test_imperative_skip():
     pytest.skip("not today")
     assert len("ok") == 2
+
+
+def test_imported_skip():
+    skip("not today")
+    assert len("ok") == 2
+
+
+def test_aliased_xfail():
+    pt.xfail("not today")
+    assert len("ok") == 2
+
+
+def test_nested_def_does_not_reach_a_module_helper():
+    def quiet_check():
+        assert len("ok") == 2
+
+    threading.Thread(target=quiet_check).start()
+    run_quiet_check()
+
+
+def run_quiet_check():
+    quiet_check()
+
+
+def quiet_check():
+    return 1
 
 
 def test_assert_free():
@@ -331,15 +397,20 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
 
     assert sorted(line.split(": ", 1)[1] for line in scan(root)) == [
         "TestThings.test_method_assert_free asserts nothing",
+        "add_marker('skip'): use skipif(<condition>, reason=...)",
+        "pytest.mark.skip: use skipif(<condition>, reason=...)",
+        "pytest.mark.skip: use skipif(<condition>, reason=...)",
+        "skipif without a condition never runs",
         "skipif() without a condition never runs",
         "skipif(1) never runs",
         "skipif(True) never runs",
         "test_assert_free asserts nothing",
         "test_assert_true_is_not_a_check asserts nothing",
+        "test_nested_def_does_not_reach_a_module_helper asserts nothing",
         "test_thread_target_assert_is_not_a_check asserts nothing",
-        "unconditional @pytest.mark.skip",
-        "unconditional @pytest.mark.skip",
         "unconditional pytest.skip()",
+        "unconditional pytest.skip()",
+        "unconditional pytest.xfail()",
         "xfail(run=False) never runs",
         "xfail(strict=False) passes whether or not the test fails",
     ]

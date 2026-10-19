@@ -3,7 +3,7 @@
 Times the production per-request wrapper, ``PerRequestRedisBackend``: building one for a
 tenant, and scoping a key to the calling context's tenant (a ContextVar read plus the
 tenant's URL-encoding). No Redis call is made, so this is the wrapper's own cost, which the
-per-request pattern pays on top of a 1-2ms network round trip.
+per-request pattern pays on top of the network round trip.
 
 Each test asserts the key the timed call produced, so it cannot time a wrapper that scopes
 keys wrongly.
