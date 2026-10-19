@@ -20,13 +20,17 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-import orjson
-import pandas as pd
 import pytest
 
 from cachekit import cache
-from cachekit.serializers import ArrowSerializer, AutoSerializer, OrjsonSerializer
 from cachekit.serializers.base import SerializationFormat, SerializationMetadata
+
+# The [json] and [data] extras: absent under the test-only dependency group.
+orjson = pytest.importorskip("orjson")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("pyarrow")
+
+from cachekit.serializers import ArrowSerializer, AutoSerializer, OrjsonSerializer  # noqa: E402  (needs orjson)
 
 
 @pytest.mark.critical

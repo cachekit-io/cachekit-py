@@ -23,7 +23,6 @@ a wall-clock benchmark and is intentionally CI-excluded.
 
 from __future__ import annotations
 
-import statistics
 import threading
 import time
 
@@ -33,6 +32,8 @@ from cachekit.decorators import cache
 from cachekit.decorators import session as session_mod
 from cachekit.decorators import wrapper as wrapper_mod
 from cachekit.decorators.wrapper import _function_stats_registry, _get_function_stats
+
+from .stats_utils import report
 
 
 class _CountingLock:
@@ -176,19 +177,6 @@ def test_session_id_read_overhead_ns(record_property) -> None:
         latencies.append(time.perf_counter_ns() - start)
         ids.add(session_id)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    p99 = statistics.quantiles(latencies, n=100)[98]
-
-    print(f"\n{'=' * 60}")
-    print("get_session_id() per-call overhead (post-init, lock-free)")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {iterations:>10,}")
-    print(f"P50:         {p50:>10.1f} ns")
-    print(f"P95:         {p95:>10.1f} ns")
-    print(f"P99:         {p99:>10.1f} ns")
-
-    record_property("p50_ns", round(p50, 1))
-    record_property("p95_ns", round(p95, 1))
+    report(record_property, "get_session_id() per call (post-init, lock-free)", latencies)
 
     assert ids == {session_mod.get_session_id()}, f"{len(ids)} distinct session ids: the id is regenerated per call"

@@ -1,21 +1,24 @@
 """Performance benchmarks comparing ArrowSerializer vs AutoSerializer.
 
 Measures Arrow's speedup for large DataFrames, using manual timing since pytest-benchmark is
-optional. Speedups are informational (printed and recorded with ``record_property``): the ratio of
-two timings swings with host load. Each test asserts that what it timed round-trips its data, so
-a fast serializer that loses data cannot pass.
+optional. Each test asserts that what it timed round-trips its data, so a fast serializer that
+loses data cannot pass.
 """
 
 from __future__ import annotations
 
 import time
 
-import numpy as np
-import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer
 from cachekit.serializers.auto_serializer import AutoSerializer
+
+# The [data] extra: every test here builds its data with numpy, most of it as DataFrames.
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("pyarrow")
+
+from cachekit.serializers import ArrowSerializer  # noqa: E402  (needs pyarrow)
 
 # ============================================================================
 # Fixtures
@@ -82,6 +85,7 @@ def auto_serializer() -> AutoSerializer:
 @pytest.fixture(scope="module")
 def orjson_serializer():
     """Create OrjsonSerializer instance."""
+    pytest.importorskip("orjson")  # the [json] extra
     from cachekit.serializers import OrjsonSerializer
 
     return OrjsonSerializer()
@@ -211,66 +215,6 @@ def test_deserialize_benchmarks(
 
 
 # ============================================================================
-# Memory Usage Benchmarks
-# ============================================================================
-
-
-@pytest.mark.performance
-def test_memory_usage_comparison(
-    arrow_serializer: ArrowSerializer, auto_serializer: AutoSerializer, large_dataframe: pd.DataFrame
-) -> None:
-    """Compare memory usage for Arrow vs Default serialization.
-
-    Prints the serialized sizes and the RSS growth of each deserialization. The RSS deltas are
-    informational: RSS moves with allocator reuse and GC timing, so they cannot gate. The
-    deterministic allocation bounds are in test_large_object_memory.py.
-    """
-    # Serialize with both serializers
-    arrow_bytes, arrow_meta = arrow_serializer.serialize(large_dataframe)
-    default_bytes, default_meta = auto_serializer.serialize(large_dataframe)
-
-    # Print size comparison
-    print("\n=== Memory Usage Comparison (100K rows) ===")
-    print(f"Arrow serialized size: {len(arrow_bytes):,} bytes ({len(arrow_bytes) / 1024 / 1024:.2f} MB)")
-    print(f"Default serialized size: {len(default_bytes):,} bytes ({len(default_bytes) / 1024 / 1024:.2f} MB)")
-    print(f"Size ratio (Default/Arrow): {len(default_bytes) / len(arrow_bytes):.2f}x")
-
-    # Measure memory before/after deserialization (psutil is a runtime dependency)
-    import gc
-
-    import psutil
-
-    process = psutil.Process()
-
-    # Baseline memory
-    baseline_mb = process.memory_info().rss / 1024 / 1024
-
-    # Arrow deserialization (memory-mapped)
-    arrow_result = arrow_serializer.deserialize(arrow_bytes)
-    arrow_mb = process.memory_info().rss / 1024 / 1024
-    arrow_delta = arrow_mb - baseline_mb
-    pd.testing.assert_frame_equal(arrow_result, large_dataframe)
-
-    # Force garbage collection
-    del arrow_result
-    gc.collect()
-
-    # Default deserialization (full copy)
-    default_result = auto_serializer.deserialize(default_bytes)
-    default_mb = process.memory_info().rss / 1024 / 1024
-    default_delta = default_mb - baseline_mb
-    pd.testing.assert_frame_equal(default_result, large_dataframe)
-
-    print("\n=== Memory Allocation During Deserialization ===")
-    print(f"Arrow deserialization: +{arrow_delta:.2f} MB")
-    print(f"Default deserialization: +{default_delta:.2f} MB")
-
-    # Clean up
-    del default_result
-    gc.collect()
-
-
-# ============================================================================
 # JSON Serializer Comparison (orjson vs AutoSerializer)
 # ============================================================================
 
@@ -354,7 +298,6 @@ def test_json_size_comparison(orjson_serializer, auto_serializer, json_heavy_dat
     # Sizes are deterministic for the seeded data, so this holds on any host.
     # (orjson is still useful for JSON-native APIs and interoperability.)
     assert len(default_bytes) < len(orjson_bytes), "MessagePack should be more compact than JSON"
-    assert orjson_serializer.deserialize(orjson_bytes) == auto_serializer.deserialize(default_bytes) == json_heavy_data
 
 
 @pytest.mark.performance

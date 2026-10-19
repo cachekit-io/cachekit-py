@@ -7,9 +7,9 @@ the build (see .github/workflows/ci.yml). Tests that want a hard gate can reques
 `measurement_env` fixture and inspect the returned verdict.
 
 Wall-clock figures follow the same rule: a test prints them and attaches them to its report
-with ``record_property``, and asserts only behaviour (the call hit, the round trip is equal).
-A loaded host moves a nanosecond p95 by an order of magnitude, so no wall-clock threshold here
-can tell a regression from a busy neighbour. The deterministic regression gate is the
+with ``record_property`` (``stats_utils.report``), and asserts only behaviour (the call hit, the
+round trip is equal). On a loaded host a nanosecond-scale p95 moves by orders of magnitude, so no
+wall-clock threshold here can tell a regression from a busy neighbour. The deterministic regression gate is the
 instruction budget (``ir_budget.py``).
 """
 

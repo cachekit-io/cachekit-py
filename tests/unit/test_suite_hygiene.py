@@ -8,19 +8,23 @@ green; this does. It flags, statically:
 
 * **Literal skips.** ``skipif(<truthy constant>)`` and ``@pytest.mark.skip`` anywhere,
   including ``pytestmark`` and ``pytest.param(marks=...)``.
-* **Unconditional imperative skips.** A ``pytest.skip(...)`` statement directly in a
-  function or module body, outside any ``if``/``try``/loop. A skip that depends on the
-  environment (an optional import, a platform) sits inside one of those and passes.
-* **Assertion-free tests.** A ``test_*`` function whose body, the helpers it calls and
-  the fixtures it requests contain no ``assert``, no ``pytest.raises``/``warns``/``fail``,
-  no ``raise AssertionError`` and no call to an ``assert*`` function (``mock.assert_called_once``,
-  ``np.testing.assert_array_equal``, ``self.assertEqual``). Helpers resolve within the
-  module (functions, ``self.`` methods, classes in the module) and through ``from tests...``
-  imports; fixtures resolve through the module, its class and the conftest chain.
+* **Lenient xfails.** ``xfail`` without ``strict=True`` passes whether or not the test
+  fails, and ``xfail(run=False)`` never runs it.
+* **Unconditional imperative skips.** A ``pytest.skip(...)`` or ``pytest.xfail(...)``
+  statement directly in a function or module body, outside any ``if``/``try``/loop. A
+  skip that depends on the environment (an optional import, a platform) sits inside one
+  of those and passes.
+* **Assertion-free tests.** A ``test_*`` function whose body, and the functions in the
+  same module it calls (directly or as ``self.``/``cls.`` methods of its class), contain no
+  ``assert``, no ``pytest.raises``/``warns``/``fail``, no ``raise AssertionError`` and no
+  call to an ``assert*`` function (``mock.assert_called_once``,
+  ``np.testing.assert_array_equal``, ``self.assertEqual``). Helpers imported from other
+  modules and assertions inside fixtures do not count: assert in the test or in a helper
+  defined beside it.
 
 A test that is meant to show "this does not raise" still asserts the state it leaves
-behind. A test that cannot run yet is ``xfail(strict=True)`` with a ticket, so it fails
-the day it starts passing.
+behind. A test that cannot pass yet is ``xfail(strict=True)`` naming the defect, so it
+fails the day the defect is fixed.
 """
 
 from __future__ import annotations
@@ -29,8 +33,10 @@ import ast
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parents[1]
-RAISING_CHECKS = frozenset({"raises", "warns", "fail", "deprecated_call"})
-CONDITIONAL = (ast.If, ast.IfExp, ast.Try, ast.ExceptHandler, ast.For, ast.AsyncFor, ast.While, ast.Match)
+RAISING_CHECKS = frozenset({"pytest.raises", "pytest.warns", "pytest.fail", "pytest.deprecated_call", "self.fail"})
+CONDITIONAL = (ast.If, ast.IfExp, ast.Try, ast.ExceptHandler, ast.BoolOp, ast.For, ast.AsyncFor, ast.While, ast.Match)
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
+Func = ast.FunctionDef | ast.AsyncFunctionDef
 
 
 def _dotted(node: ast.AST) -> str:
@@ -50,36 +56,23 @@ def _is_signal(node: ast.AST) -> bool:
         return _dotted(node.exc).endswith("AssertionError")
     if isinstance(node, ast.Call):
         name = _dotted(node.func)
-        last = name.rsplit(".", 1)[-1]
-        return last.lstrip("_").startswith("assert") or name in {f"pytest.{c}" for c in RAISING_CHECKS} or name == "self.fail"
+        return name.rsplit(".", 1)[-1].lstrip("_").startswith("assert") or name in RAISING_CHECKS
     return False
 
 
-def _is_fixture(fn: ast.AST) -> bool:
-    return any(_dotted(d).endswith("fixture") for d in getattr(fn, "decorator_list", ()))
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
 
 
-def _fixture_name(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    for d in fn.decorator_list:
-        for kw in getattr(d, "keywords", ()):
-            if kw.arg == "name" and isinstance(kw.value, ast.Constant):
-                return kw.value.value
-    return fn.name
-
-
-Func = ast.FunctionDef | ast.AsyncFunctionDef
+def _is_true(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and not isinstance(node.value, str) and bool(node.value)
 
 
 class _Module:
-    def __init__(self, path: Path, root: Path) -> None:
-        self.path = path
-        self.name = ".".join(path.relative_to(root.parent).with_suffix("").parts)
+    def __init__(self, path: Path) -> None:
         self.tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         self.funcs: dict[str, Func] = {}
         self.classes: dict[str, dict[str, Func]] = {}
-        self.bases: dict[str, list[str]] = {}
-        self.imports: dict[str, tuple[str, str]] = {}
-        self.fixtures: dict[str, Func] = {}
         for node in self.tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.funcs[node.name] = node
@@ -87,181 +80,95 @@ class _Module:
                 self.classes[node.name] = {
                     n.name: n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                 }
-                self.bases[node.name] = [_dotted(b) for b in node.bases]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for alias in node.names:
-                    self.imports[alias.asname or alias.name] = (node.module, alias.name)
-        for node in ast.walk(self.tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_fixture(node):
-                self.fixtures[_fixture_name(node)] = node
 
+    def tests(self):
+        yield from ((None, fn) for name, fn in self.funcs.items() if name.startswith("test_"))
+        for cls, methods in self.classes.items():
+            if cls.startswith("Test"):
+                yield from ((cls, fn) for name, fn in methods.items() if name.startswith("test_"))
 
-class _Suite:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.modules = {
-            m.name: m for m in (_Module(p, root) for p in sorted(root.rglob("*.py")) if "__pycache__" not in p.parts)
-        }
-        self._memo: dict[tuple[str, int], bool] = {}
-
-    def _callees(self, mod: _Module, cls: str | None, call: ast.Call) -> list[tuple[_Module, Func, str | None]]:
+    def _callee(self, cls: str | None, call: ast.Call) -> Func | None:
         func = call.func
         if isinstance(func, ast.Name):
-            if func.id in mod.funcs:
-                return [(mod, mod.funcs[func.id], None)]
-            target, name = mod, func.id
-            if func.id in mod.imports:
-                module, name = mod.imports[func.id]
-                target = self.modules.get(module)
-                if target is None:
-                    return []
-                if name in target.funcs:
-                    return [(target, target.funcs[name], None)]
-            methods = target.classes.get(name, {})
-            return [(target, methods[m], name) for m in ("__init__", "__call__", "__enter__") if m in methods]
-        if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
-            return []
-        base = func.value.id
-        if base in ("self", "cls") and cls:
-            return [(mod, *found) for found in self._method(mod, cls, func.attr)]
-        if base in mod.classes:
-            return [(mod, *found) for found in self._method(mod, base, func.attr)]
-        if base in mod.imports:
-            module, name = mod.imports[base]
-            target = self.modules.get(f"{module}.{name}")
-            if target and func.attr in target.funcs:
-                return [(target, target.funcs[func.attr], None)]
-        return []
+            return self.funcs.get(func.id)
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in ("self", "cls") and cls:
+            return self.classes[cls].get(func.attr)
+        return None
 
-    def _method(self, mod: _Module, cls: str, attr: str) -> list[tuple[Func, str]]:
-        seen: set[str] = set()
-        stack = [cls]
-        while stack:
-            current = stack.pop()
-            if current in seen or current not in mod.classes:
-                continue
-            seen.add(current)
-            if attr in mod.classes[current]:
-                return [(mod.classes[current][attr], current)]
-            stack.extend(b.rsplit(".", 1)[-1] for b in mod.bases.get(current, []))
-        return []
-
-    def reaches_signal(self, mod: _Module, fn: Func, cls: str | None, stack: frozenset = frozenset()) -> bool:
-        key = (mod.name, fn.lineno)
-        if key in self._memo:
-            return self._memo[key]
-        if key in stack:
+    def asserts(self, fn: Func, cls: str | None, seen: frozenset[int] = frozenset()) -> bool:
+        if id(fn) in seen:
             return False
-        found = any(_is_signal(n) for n in ast.walk(fn)) or any(
-            self.reaches_signal(tm, tf, tc, stack | {key})
-            for call in ast.walk(fn)
-            if isinstance(call, ast.Call)
-            for tm, tf, tc in self._callees(mod, cls, call)
-        )
-        self._memo[key] = found
-        return found
-
-    def _conftests(self, mod: _Module) -> list[_Module]:
-        out = []
-        directory = mod.path.parent
-        while True:
-            conftest = self.modules.get(".".join((directory / "conftest").relative_to(self.root.parent).parts))
-            if conftest:
-                out.append(conftest)
-            if directory == self.root:
-                return out
-            directory = directory.parent
-
-    def fixture_signal(self, mod: _Module, cls: str | None, params: list[str], seen: set[str] | None = None) -> bool:
-        seen = set() if seen is None else seen
-        for param in params:
-            if param in seen:
-                continue
-            seen.add(param)
-            candidates: list[tuple[_Module, Func, str | None]] = []
-            class_methods = mod.classes.get(cls, {}) if cls else {}
-            if param in class_methods and _is_fixture(class_methods[param]):
-                candidates.append((mod, class_methods[param], cls))
-            elif param in mod.fixtures:
-                candidates.append((mod, mod.fixtures[param], None))
-            else:
-                candidates.extend((c, c.fixtures[param], None) for c in self._conftests(mod) if param in c.fixtures)
-            for fm, ff, fc in candidates[:1]:  # the nearest definition is the one pytest uses
-                if self.reaches_signal(fm, ff, fc) or self.fixture_signal(fm, fc, [a.arg for a in ff.args.args], seen):
-                    return True
-        return False
-
-
-def _tests(mod: _Module):
-    for name, fn in mod.funcs.items():
-        if name.startswith("test_"):
-            yield None, fn
-    for cls, methods in mod.classes.items():
-        if cls.startswith("Test"):
-            for name, fn in methods.items():
-                if name.startswith("test_"):
-                    yield cls, fn
+        nodes = list(ast.walk(fn))
+        if any(_is_signal(n) for n in nodes):
+            return True
+        callees = (self._callee(cls, n) for n in nodes if isinstance(n, ast.Call))
+        return any(self.asserts(c, cls, seen | {id(fn)}) for c in callees if c is not None)
 
 
 def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
 
-def _is_unconditional_skip_call(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bool:
-    if _dotted(node.func) not in ("pytest.skip", "skip"):
-        return False
+def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     current = parents.get(node)
-    while current is not None and not isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)):
-        if isinstance(current, CONDITIONAL) or isinstance(current, ast.BoolOp):
+    while current is not None and not isinstance(current, SCOPES):
+        if isinstance(current, CONDITIONAL):
             return False
         current = parents.get(current)
     return True
 
 
-def _skip_violations(mod: _Module, where: str) -> list[str]:
-    out = []
-    parents = _parents(mod.tree)
-    for node in ast.walk(mod.tree):
-        line = f"{where}:{getattr(node, 'lineno', '?')}"
-        if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip"):
-            out.append(f"{line}: unconditional @pytest.mark.skip")
-        elif isinstance(node, ast.Call) and _dotted(node.func).endswith("mark.skipif") and node.args:
-            condition = node.args[0]
-            if isinstance(condition, ast.Constant) and not isinstance(condition.value, str) and condition.value:
-                out.append(f"{line}: skipif({condition.value!r}) never runs")
-        elif isinstance(node, ast.Call) and _is_unconditional_skip_call(node, parents):
-            out.append(f"{line}: unconditional pytest.skip()")
-    return out
+def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
+    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip"):
+        return "unconditional @pytest.mark.skip"
+    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.xfail"):
+        parent = parents.get(node)
+        called = isinstance(parent, ast.Call) and parent.func is node
+        return None if called else "xfail without strict=True passes whether or not the test fails"
+    if not isinstance(node, ast.Call):
+        return None
+    name = _dotted(node.func)
+    if name.endswith("mark.skipif"):
+        condition = node.args[0] if node.args else _keyword(node, "condition")
+        return f"skipif({condition.value!r}) never runs" if _is_true(condition) else None
+    if name.endswith("mark.xfail"):
+        if not _is_true(_keyword(node, "strict")):
+            return "xfail without strict=True passes whether or not the test fails"
+        run = _keyword(node, "run")
+        return "xfail(run=False) never runs" if isinstance(run, ast.Constant) and not run.value else None
+    if name in ("pytest.skip", "pytest.xfail") and _is_unconditional(node, parents):
+        return f"unconditional {name}()"
+    return None
 
 
 def scan(root: Path) -> list[str]:
     """Every hygiene violation under ``root`` (a ``tests``-shaped directory), as ``path:line: why``."""
-    suite = _Suite(root)
     out: list[str] = []
-    for mod in suite.modules.values():
-        where = str(mod.path.relative_to(root.parent))
-        out.extend(_skip_violations(mod, where))
-        if not mod.path.name.startswith("test_"):
-            continue
-        for cls, fn in _tests(mod):
-            if suite.reaches_signal(mod, fn, cls):
-                continue
-            if suite.fixture_signal(mod, cls, [a.arg for a in fn.args.args if a.arg not in ("self", "cls")]):
-                continue
-            out.append(f"{where}:{fn.lineno}: {cls + '.' if cls else ''}{fn.name} asserts nothing")
+    for path in sorted(root.rglob("*.py")):
+        mod = _Module(path)
+        where = str(path.relative_to(root.parent))
+        parents = _parents(mod.tree)
+        for node in ast.walk(mod.tree):
+            why = _marker_violation(node, parents)
+            if why:
+                out.append(f"{where}:{node.lineno}: {why}")
+        if path.name.startswith("test_"):
+            for cls, fn in mod.tests():
+                if not mod.asserts(fn, cls):
+                    out.append(f"{where}:{fn.lineno}: {cls + '.' if cls else ''}{fn.name} asserts nothing")
     return sorted(out)
 
 
 def test_no_dead_or_assertion_free_tests() -> None:
     violations = scan(TESTS)
-    assert not violations, "Dead or assertion-free tests (fix, delete, or xfail(strict=True) with a ticket):\n" + "\n".join(
-        violations
+    assert not violations, (
+        "Dead or assertion-free tests. Fix the test, delete it, or mark it xfail(strict=True) naming the defect; "
+        f"what counts is in the docstring of {Path(__file__).relative_to(TESTS.parent)}:\n" + "\n".join(violations)
     )
 
 
 PLANTED = """
 import pytest
-from tests.helpers import check_it
 
 pytestmark = pytest.mark.skip(reason="module")
 
@@ -271,8 +178,28 @@ def test_literal_skipif():
     assert 1
 
 
+@pytest.mark.skipif(condition=1, reason="never")
+def test_literal_skipif_keyword():
+    assert 1
+
+
 @pytest.mark.skip
 def test_marker_skip():
+    assert 1
+
+
+@pytest.mark.xfail(reason="passes either way")
+def test_lenient_xfail():
+    assert 1
+
+
+@pytest.mark.xfail
+def test_bare_xfail():
+    assert 1
+
+
+@pytest.mark.xfail(strict=True, run=False, reason="never runs")
+def test_unrun_xfail():
     assert 1
 
 
@@ -308,13 +235,12 @@ def test_conditional_skip_is_fine():
 
 
 @pytest.mark.skipif("sys.platform == 'win32'", reason="string conditions are evaluated")
-def test_via_imported_helper(fixture_that_asserts):
+@pytest.mark.xfail(strict=True, raises=ValueError, reason="a known defect")
+def test_via_module_helper():
     check_it()
 
 
-@pytest.fixture
-def fixture_that_asserts():
-    yield
+def check_it():
     assert True
 
 
@@ -327,26 +253,21 @@ def test_mock_assert_counts(mocker):
     mocker.assert_called_once()
 """
 
-HELPERS = """
-def check_it():
-    assert True
-"""
-
 
 def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> None:
     root = tmp_path / "tests"
     root.mkdir()
-    (root / "__init__.py").write_text("")
-    (root / "helpers.py").write_text(HELPERS)
     (root / "test_planted.py").write_text(PLANTED)
 
-    found = {line.split(": ", 1)[1] for line in scan(root)}
-
-    assert found == {
-        "unconditional @pytest.mark.skip",
-        "skipif(True) never runs",
-        "unconditional pytest.skip()",
-        "test_assert_free asserts nothing",
+    assert sorted(line.split(": ", 1)[1] for line in scan(root)) == [
         "TestThings.test_method_assert_free asserts nothing",
-    }
-    assert sum("mark.skip" in line for line in scan(root)) == 2  # pytestmark and the decorator
+        "skipif(1) never runs",
+        "skipif(True) never runs",
+        "test_assert_free asserts nothing",
+        "unconditional @pytest.mark.skip",
+        "unconditional @pytest.mark.skip",
+        "unconditional pytest.skip()",
+        "xfail without strict=True passes whether or not the test fails",
+        "xfail without strict=True passes whether or not the test fails",
+        "xfail(run=False) never runs",
+    ]

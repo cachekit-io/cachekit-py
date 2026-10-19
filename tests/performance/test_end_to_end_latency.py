@@ -6,15 +6,13 @@ Measures complete cache flow:
 - L1 hit and pure L2 hit with a Redis backend
 - Async decorator L1 hit
 
-Timings are informational (printed and recorded with ``record_property``); each test asserts
-that the path it timed is the path it claims: hits never call the function, an L1 hit never
-reads L2, and every L1-disabled call reads L2.
+Each test asserts that the path it timed is the path it claims: hits never call the function,
+an L1 hit never reads L2, and every L1-disabled call reads L2.
 """
 
 from __future__ import annotations
 
 import asyncio
-import statistics
 import time
 from unittest.mock import patch
 
@@ -22,20 +20,7 @@ import pytest
 
 from cachekit.decorators import cache
 
-
-def _report(record_property, label: str, latencies: list[int]) -> None:
-    """Print and record mean/p50/p95 of one measured path."""
-    mean = statistics.mean(latencies)
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    print(f"{label}:")
-    print(f"  Mean:   {mean:>10.1f} ns ({mean / 1000:>6.2f} μs)")
-    print(f"  P50:    {p50:>10.1f} ns ({p50 / 1000:>6.2f} μs)")
-    print(f"  P95:    {p95:>10.1f} ns ({p95 / 1000:>6.2f} μs)")
-    record_property("mean_ns", round(mean, 1))
-    record_property("p50_ns", round(p50, 1))
-    record_property("p95_ns", round(p95, 1))
-
+from .stats_utils import report
 
 # =============================================================================
 # 1. L1 HIT THROUGH DECORATOR
@@ -73,7 +58,7 @@ def test_decorator_l1_cache_hit_latency(record_property) -> None:
         result = cached_func(42)  # Same arg = L1 hit
         latencies.append(time.perf_counter_ns() - start)
 
-    _report(record_property, "Decorator + L1 cache hit", latencies)
+    report(record_property, "Decorator + L1 cache hit", latencies)
     assert result == 84
     assert call_count == 1, f"{call_count - 1} measured calls missed L1"
 
@@ -112,7 +97,7 @@ def test_decorator_l1_miss_latency(record_property) -> None:
         results.append(cached_func(x))  # Different arg = L1 miss
         latencies.append(time.perf_counter_ns() - start)
 
-    _report(record_property, "Decorator + L1 cache miss (function call + populate)", latencies)
+    report(record_property, "Decorator + L1 cache miss (function call + populate)", latencies)
     assert results == [x * 2 for x in args]
     assert called_with == [1, *args], "every new argument must miss and run the function exactly once"
 
@@ -155,7 +140,7 @@ def test_decorator_redis_backend_l1_hit(perf_redis_backend, record_property) -> 
             result = cached_func(42)  # L1 hit, L2 not accessed
             latencies.append(time.perf_counter_ns() - start)
 
-    _report(record_property, "Decorator + Redis backend + L1 cache hit", latencies)
+    report(record_property, "Decorator + Redis backend + L1 cache hit", latencies)
     assert result == 84
     assert call_count == 1
     assert l2_get.call_count == 0, f"{l2_get.call_count} measured calls read L2"
@@ -204,7 +189,7 @@ def test_decorator_redis_backend_l1_miss_l2_hit(perf_redis_backend, record_prope
             result = cached_func(42)  # L1 disabled, hits L2 every time
             latencies.append(time.perf_counter_ns() - start)
 
-    _report(record_property, "Decorator + Redis backend (L1 disabled, pure L2)", latencies)
+    report(record_property, "Decorator + Redis backend (L1 disabled, pure L2)", latencies)
     assert result == 84
     assert call_count == 1, f"{call_count - 1} calls missed L2"
     assert l2_get.call_count == iterations, f"{l2_get.call_count} L2 reads for {iterations} calls"
@@ -245,7 +230,7 @@ async def test_async_decorator_cache_hit(record_property) -> None:
         result = await async_cached_func(42)
         latencies.append(time.perf_counter_ns() - start)
 
-    _report(record_property, "Async decorator + L1 cache hit", latencies)
+    report(record_property, "Async decorator + L1 cache hit", latencies)
     assert result == 84
     assert call_count == 1, f"{call_count - 1} measured calls missed L1"
 

@@ -8,11 +8,10 @@ Comprehensive performance testing for file-based cache backend with:
 - Oldest-written-first eviction performance
 - Redis comparison, on the suite's pytest-redis server
 
-Nothing here asserts a latency or throughput figure: they are printed, and the headline ones
-recorded with ``record_property``. Each test asserts the behaviour it timed instead (round trips
-return the value written, eviction removes the oldest entries). A set() fsyncs and
-renames its file and checks capacity on in-memory counters, so its usual cost does not grow with
-the entry count; only eviction, rejection and the 30 s reconcile scan the directory.
+Each test asserts the behaviour it timed (round trips return the value written, eviction removes
+the oldest entries). A set() fsyncs and renames its file and checks capacity on in-memory
+counters, so its usual cost does not grow with the entry count; only eviction, rejection and the
+30 s reconcile scan the directory.
 test_bench_set_scaling_with_entry_count measures that; docs/backends/file.md points at it. get()
 does no scan, but it waits for a concurrent set() in the same process, which holds the backend
 lock throughout.

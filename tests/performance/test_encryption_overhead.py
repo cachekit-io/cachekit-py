@@ -7,9 +7,8 @@ Measures the cost of client-side AES-256-GCM encryption across different seriali
 
 Critical for zero-knowledge architecture where client-side encryption is mandatory.
 
-The overhead figures are informational (printed and recorded with ``record_property``): a p95
-ratio of two microsecond operations swings with host load. Each test asserts what it timed:
-the round trip returns the data, and the encrypted payload does not carry the plaintext.
+Each test asserts what it timed: the round trip returns the data, and the encrypted payload does
+not carry the plaintext.
 """
 
 from __future__ import annotations
@@ -20,17 +19,7 @@ from typing import Any
 
 import pytest
 
-try:
-    import pandas as pd
-
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
-
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer, StandardSerializer
-
-if PANDAS_AVAILABLE:
-    from cachekit.serializers import ArrowSerializer
+from cachekit.serializers import EncryptionWrapper, StandardSerializer
 
 
 def benchmark_serializer(
@@ -92,6 +81,9 @@ def test_encryption_overhead_json(master_key, record_property):
 
     Use case: API responses, webhooks, session data with PII.
     """
+    pytest.importorskip("orjson")  # the [json] extra
+    from cachekit.serializers import OrjsonSerializer
+
     # API response with sensitive data
     api_data = {
         "user": {
@@ -211,12 +203,15 @@ def test_encryption_overhead_msgpack(master_key, record_property):
     assert b"4532-1234-5678-9010" not in result_encrypted["payload"], "the encrypted payload carries the plaintext"
 
 
-@pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not installed")
 def test_encryption_overhead_dataframes(master_key, record_property):
     """Measure encryption overhead for DataFrames (ArrowSerializer).
 
     Use case: ML features, analytics data, patient records.
     """
+    pd = pytest.importorskip("pandas")  # the [data] extra
+    pytest.importorskip("pyarrow")
+    from cachekit.serializers import ArrowSerializer
+
     # Sensitive medical/ML data
     df = pd.DataFrame(
         {
@@ -267,69 +262,3 @@ def test_encryption_overhead_dataframes(master_key, record_property):
     pd.testing.assert_frame_equal(result_encrypted["result"], df)
     assert b"metformin" in result_plain["payload"]
     assert b"metformin" not in result_encrypted["payload"], "the encrypted payload carries the plaintext"
-
-
-def test_encryption_overhead_comparison_summary(master_key, record_property):
-    """Compare encryption overhead across all serializers.
-
-    Generates summary of zero-knowledge encryption performance.
-    """
-    results = {}
-
-    # JSON
-    json_data = {"user": {"id": 123, "email": "user@example.com", "ssn": "123-45-6789"}}
-    plain_json = OrjsonSerializer()
-    encrypted_json = EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex(master_key))
-    results["json"] = {
-        "plain": benchmark_serializer(plain_json, json_data, iterations=5_000),
-        "encrypted": benchmark_serializer(encrypted_json, json_data, iterations=5_000),
-    }
-
-    # MessagePack
-    msgpack_data = {"profile": {"ssn": "123-45-6789", "dob": "1990-01-01"}}
-    plain_msgpack = StandardSerializer()
-    encrypted_msgpack = EncryptionWrapper(serializer=StandardSerializer(), master_key=bytes.fromhex(master_key))
-    results["msgpack"] = {
-        "plain": benchmark_serializer(plain_msgpack, msgpack_data, iterations=5_000),
-        "encrypted": benchmark_serializer(encrypted_msgpack, msgpack_data, iterations=5_000),
-    }
-
-    # DataFrames (if available)
-    if PANDAS_AVAILABLE:
-        df_data = pd.DataFrame({"patient_id": range(100), "diagnosis": ["diabetes"] * 100})
-        plain_arrow = ArrowSerializer()
-        encrypted_arrow = EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex(master_key))
-        results["arrow"] = {
-            "plain": benchmark_serializer(plain_arrow, df_data, iterations=1_000),
-            "encrypted": benchmark_serializer(encrypted_arrow, df_data, iterations=1_000),
-        }
-
-    # Print summary
-    print("\n" + "=" * 80)
-    print("ZERO-KNOWLEDGE ENCRYPTION: OVERHEAD SUMMARY")
-    print("=" * 80)
-    print("\nP95 Latencies (roundtrip serialize + deserialize):")
-    print(f"\n{'Serializer':<20} {'Plain':<15} {'Encrypted':<15} {'Overhead':<15}")
-    print("-" * 80)
-
-    for name, result in results.items():
-        plain_us = result["plain"]["p95"] / 1000
-        encrypted_us = result["encrypted"]["p95"] / 1000
-        overhead_us = encrypted_us - plain_us
-        overhead_pct = (overhead_us / plain_us) * 100
-        record_property(f"{name}_overhead_pct", round(overhead_pct, 1))
-
-        print(
-            f"{name.upper():<20} {plain_us:>10.2f} μs   {encrypted_us:>10.2f} μs   "
-            f"+{overhead_us:>6.2f} μs ({overhead_pct:>5.1f}%)"
-        )
-
-    print("=" * 80)
-
-    # Each format's encrypted arm round-trips its data and never carries the SSN in the clear.
-    for name, data in (("json", json_data), ("msgpack", msgpack_data)):
-        assert results[name]["encrypted"]["result"] == data, name
-        assert b"123-45-6789" not in results[name]["encrypted"]["payload"], name
-    if PANDAS_AVAILABLE:
-        pd.testing.assert_frame_equal(results["arrow"]["encrypted"]["result"], df_data)
-        assert b"diabetes" not in results["arrow"]["encrypted"]["payload"]

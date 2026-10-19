@@ -38,9 +38,12 @@ from functools import lru_cache
 from typing import Any
 
 import pytest
-from cachetools import TTLCache, cached
 
 from cachekit import cache
+
+# cachetools is a dev-group dependency; the test-only group does not install it.
+cachetools = pytest.importorskip("cachetools")
+TTLCache, cached = cachetools.TTLCache, cachetools.cached
 
 # ---------------------------------------------------------------------------
 # Helpers

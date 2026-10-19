@@ -279,6 +279,27 @@ def benchmark_with_gc_handling(
     return result
 
 
+def report(record_property, label: str, data: Sequence[float] | PerformanceResult, prefix: str = "") -> None:
+    """Print one measured path's p50 and p95 and attach them to the test's report.
+
+    Raw samples are taken as ns. A PerformanceResult also reports its run-level ``center``.
+
+    >>> props = {}
+    >>> report(props.__setitem__, "demo", range(1, 101))
+    <BLANKLINE>
+    demo: p50 50.5 ns, p95 96.0 ns
+    >>> props
+    {'p50_ns': 50.5, 'p95_ns': 96.0}
+    """
+    if isinstance(data, PerformanceResult):
+        unit, figures = data.unit, {"p50": data.median, "p95": data.p95, "center": data.center}
+    else:
+        unit, figures = "ns", {"p50": statistics.median(data), "p95": percentile(data, 95)}
+    print(f"\n{label}: " + ", ".join(f"{name} {value:,.1f} {unit}" for name, value in figures.items()))
+    for name, value in figures.items():
+        record_property(f"{prefix}{name}_{unit}", round(value, 1))
+
+
 def balanced_order(runs_per_arm: int, rng: random.Random, arms: str = "AB") -> str:
     """A random run order with ``runs_per_arm`` runs of each arm, for interleaving A/B or A/A runs.
 

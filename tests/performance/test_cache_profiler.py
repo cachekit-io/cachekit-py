@@ -3,8 +3,7 @@
 This profiler breaks down the 450-500ns hit latency into individual components
 to identify the actual bottleneck. Uses manual instrumentation to avoid profiler overhead.
 
-The timings are a printed profile, never asserted (a loaded host moves them by multiples). Each
-test asserts, from the cache's own hit/miss counters, that the calls it timed were hits.
+Each test asserts, from the cache's own hit/miss counters, that the calls it timed were hits.
 """
 
 from __future__ import annotations
@@ -182,10 +181,10 @@ def test_l1_cache_component_breakdown(record_property) -> None:
     assert (found, value) == (True, test_value)
     assert stats_after["hits"] - stats_before["hits"] == iterations
     assert stats_after["misses"] == stats_before["misses"] == 0
-    record_property("get_p95_ns", round(statistics.quantiles(get_latencies, n=20)[18], 1))
 
     get_p50 = statistics.median(get_latencies)
     get_p95 = statistics.quantiles(get_latencies, n=20)[18]
+    record_property("get_p95_ns", round(get_p95, 1))
     get_mean = statistics.mean(get_latencies)
     get_stdev = statistics.stdev(get_latencies)
 

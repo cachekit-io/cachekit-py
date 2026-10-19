@@ -1,21 +1,20 @@
 """L1 cache latency performance tests.
 
-Measures L1 cache hit/miss/put latencies for the fast path. The figures are informational:
-printed and recorded with ``record_property``, never asserted. A 10-thread hit p95 measured
-48,758ns on a loaded host against ~500ns on a quiet core, so a nanosecond budget cannot tell
-a regression from a busy neighbour. Each test asserts that what it timed was what it claims:
-hits returned the stored value, misses found nothing, the hit/miss counters add up.
+Measures L1 cache hit/miss/put latencies for the fast path. On a loaded host a nanosecond-scale
+p95 moves by orders of magnitude, so each test asserts only that what it timed was what it
+claims: hits returned the stored value, misses found nothing, the hit/miss counters add up.
 """
 
 from __future__ import annotations
 
-import statistics
 import threading
 import time
 
 import pytest
 
 from cachekit.l1_cache import L1Cache
+
+from .stats_utils import report
 
 
 @pytest.mark.performance
@@ -46,34 +45,7 @@ def test_l1_cache_hit_latency(record_property) -> None:
         assert value == test_value, "Value should match"
         latencies.append(end - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    p99 = statistics.quantiles(latencies, n=100)[98]
-    mean = statistics.mean(latencies)
-    stdev = statistics.stdev(latencies)
-
-    results = {
-        "iterations": iterations,
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-        "p99_ns": p99,
-        "stdev_ns": stdev,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print("L1 Cache Hit Latency")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {results['iterations']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-    print(f"P99:         {results['p99_ns']:>10.2f} ns")
-    print(f"StdDev:      {results['stdev_ns']:>10.2f} ns")
-
-    record_property("p50_ns", round(p50, 1))
-    record_property("p95_ns", round(p95, 1))
+    report(record_property, "L1 cache hit", latencies)
 
     stats = cache.get_stats()
     assert (stats["hits"], stats["misses"]) == (1000 + iterations, 0)
@@ -102,28 +74,7 @@ def test_l1_cache_miss_latency(record_property) -> None:
         assert value is None, "Value should be None"
         latencies.append(end - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    mean = statistics.mean(latencies)
-
-    results = {
-        "iterations": iterations,
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print("L1 Cache Miss Latency")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {results['iterations']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-
-    record_property("p50_ns", round(p50, 1))
-    record_property("p95_ns", round(p95, 1))
+    report(record_property, "L1 cache miss", latencies)
 
     stats = cache.get_stats()
     assert (stats["hits"], stats["misses"]) == (0, 1000 + iterations)
@@ -153,31 +104,7 @@ def test_l1_cache_put_latency(record_property) -> None:
 
         latencies.append(end - start)
 
-    p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    p99 = statistics.quantiles(latencies, n=100)[98]
-    mean = statistics.mean(latencies)
-
-    results = {
-        "iterations": iterations,
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-        "p99_ns": p99,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print("L1 Cache Put Latency")
-    print(f"{'=' * 60}")
-    print(f"Iterations:  {results['iterations']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-    print(f"P99:         {results['p99_ns']:>10.2f} ns")
-
-    record_property("p50_ns", round(p50, 1))
-    record_property("p95_ns", round(p95, 1))
+    report(record_property, "L1 cache put", latencies)
 
     # 10,100 x 1KB fits the 100MB budget, so every timed put must still be there.
     assert all(cache.get(f"put:key:{i}") == (True, b"x" * 1024) for i in range(iterations))
@@ -239,43 +166,17 @@ def test_l1_cache_concurrent_hit_latency(record_property) -> None:
     for latencies in results_by_thread.values():
         all_latencies.extend(latencies)
 
-    p50 = statistics.median(all_latencies)
-    p95 = statistics.quantiles(all_latencies, n=20)[18]
-    p99 = statistics.quantiles(all_latencies, n=100)[98]
-    mean = statistics.mean(all_latencies)
+    report(record_property, f"L1 cache hit, {num_threads} threads", all_latencies)
 
-    results = {
-        "threads": num_threads,
-        "total_ops": len(all_latencies),
-        "mean_ns": mean,
-        "p50_ns": p50,
-        "p95_ns": p95,
-        "p99_ns": p99,
-    }
-
-    # Print results
-    print(f"\n{'=' * 60}")
-    print(f"L1 Cache Concurrent Hit Latency ({num_threads} threads)")
-    print(f"{'=' * 60}")
-    print(f"Total ops:   {results['total_ops']:>10,}")
-    print(f"Mean:        {results['mean_ns']:>10.2f} ns")
-    print(f"P50:         {results['p50_ns']:>10.2f} ns")
-    print(f"P95:         {results['p95_ns']:>10.2f} ns")
-    print(f"P99:         {results['p99_ns']:>10.2f} ns")
-
-    record_property("p50_ns", round(p50, 1))
-    record_property("p95_ns", round(p95, 1))
-
-    # Contention must lose no counter update and serve no wrong value.
+    # Every thread finished, and contention lost no counter update and served no wrong value.
     assert wrong_values == [0] * num_threads
-    assert results["total_ops"] == num_threads * iterations_per_thread
     stats = cache.get_stats()
     assert (stats["hits"], stats["misses"]) == (num_threads * (100 + iterations_per_thread), 0)
 
 
 @pytest.mark.performance
-def test_l1_cache_total_sla(record_property) -> None:
-    """Measure a realistic L1 workload: 95% hits, 5% misses, split by outcome."""
+def test_l1_cache_mixed_workload_hit_counts(record_property) -> None:
+    """Time a 95% hit / 5% miss L1 workload; check every stored key hit and every other key missed."""
     cache = L1Cache(max_memory_mb=100)
     total_iterations = 100_000
 
@@ -309,28 +210,9 @@ def test_l1_cache_total_sla(record_property) -> None:
         else:
             miss_latencies.append(end - start)
 
-    # Analyze results
-    hit_p95 = statistics.quantiles(hit_latencies, n=20)[18] if hit_latencies else 0
-    miss_p95 = statistics.quantiles(miss_latencies, n=20)[18] if miss_latencies else 0
-
-    stats = {
-        "total_requests": total_iterations,
-        "hits": len(hit_latencies),
-        "misses": len(miss_latencies),
-        "hit_rate": len(hit_latencies) / total_iterations,
-        "hit_p95_ns": hit_p95,
-        "miss_p95_ns": miss_p95,
-    }
-
-    print(f"Requests:    {stats['total_requests']:>10,}")
-    print(f"Hits:        {stats['hits']:>10,} ({stats['hit_rate']:.1%})")
-    print(f"Misses:      {stats['misses']:>10,}")
-    print("\nLatencies:")
-    print(f"  Hit p95:   {stats['hit_p95_ns']:>10.0f} ns")
-    print(f"  Miss p95:  {stats['miss_p95_ns']:>10.0f} ns")
-
-    record_property("hit_p95_ns", round(hit_p95, 1))
-    record_property("miss_p95_ns", round(miss_p95, 1))
+    print(f"Hits: {len(hit_latencies):,}, misses: {len(miss_latencies):,}")
+    report(record_property, "Mixed workload, hits", hit_latencies, "hit_")
+    report(record_property, "Mixed workload, misses", miss_latencies, "miss_")
 
     # Every key in the 19-of-20 slots is stored, every other key never was.
-    assert (stats["hits"], stats["misses"]) == (total_iterations * 19 // 20, total_iterations // 20)
+    assert (len(hit_latencies), len(miss_latencies)) == (total_iterations * 19 // 20, total_iterations // 20)

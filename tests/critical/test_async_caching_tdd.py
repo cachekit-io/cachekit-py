@@ -193,34 +193,17 @@ class TestAsyncCachingTDD:
         assert results == test_values
 
     @pytest.mark.asyncio
-    async def test_async_circuit_breaker(self, monkeypatch, redis_isolated):
-        """The breaker opens on backend failures, never on the function's own; while open, calls run uncached."""
+    async def test_async_unreachable_backend_opens_breaker_and_runs_uncached(self, monkeypatch, redis_isolated):
+        """Failed backend builds open the breaker; while open, calls run uncached and never touch Redis.
+
+        That the function's own exceptions never count is tests/integration/test_circuit_breaker_comprehensive.py's
+        test_async_decorator_integration.
+        """
         from cachekit.decorators import wrapper as wrapper_module
 
         threshold = CircuitBreakerConfig().failure_threshold
-        fail_count = 0
-        success_count = 0
 
-        @cache
-        async def flaky_async_service(should_fail: bool = False) -> str:
-            nonlocal fail_count, success_count
-            if should_fail:
-                fail_count += 1
-                raise RuntimeError("Service unavailable")
-            success_count += 1
-            return "success"
-
-        # The function's own exceptions reach the caller, are never cached and never count.
-        for attempt in range(1, threshold + 2):
-            with pytest.raises(RuntimeError, match="Service unavailable"):
-                await flaky_async_service(should_fail=True)
-            assert fail_count == attempt
-        breaker = flaky_async_service.get_health_status()["circuit_breaker"]
-        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
-        assert [await flaky_async_service(), await flaky_async_service()] == ["success", "success"]
-        assert success_count == 1  # caching carried on
-
-        # A failure that counts: Redis is down when the backend is first built.
+        # Redis is down when the backend is first built: a failure that counts.
         real_resolve = wrapper_module._resolve_lazy_backend
         backend_down = True
 

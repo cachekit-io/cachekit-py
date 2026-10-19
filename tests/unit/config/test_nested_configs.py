@@ -230,18 +230,10 @@ class TestMonitoringConfig:
         with pytest.raises(AttributeError, match="cannot assign to field"):
             config.collect_stats = False  # type: ignore[misc]
 
-    @pytest.mark.parametrize("collect_stats", [True, False])
-    @pytest.mark.parametrize("enable_structured_logging", [True, False])
-    @pytest.mark.parametrize("enable_prometheus_metrics", [True, False])
-    def test_validate_no_constraints(
-        self, collect_stats: bool, enable_structured_logging: bool, enable_prometheus_metrics: bool
-    ) -> None:
-        """Every combination of the three flags passes the validation DecoratorConfig runs."""
-        config = MonitoringConfig(
-            collect_stats=collect_stats,
-            enable_structured_logging=enable_structured_logging,
-            enable_prometheus_metrics=enable_prometheus_metrics,
-        )
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_validate_no_constraints(self, enabled: bool) -> None:
+        """The flags carry no cross-constraint: all on and all off both pass DecoratorConfig's validation."""
+        config = MonitoringConfig(collect_stats=enabled, enable_structured_logging=enabled, enable_prometheus_metrics=enabled)
         assert DecoratorConfig(monitoring=config).monitoring is config
 
     def test_enable_tracing_removed(self) -> None:

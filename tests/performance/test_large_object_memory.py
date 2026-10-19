@@ -26,13 +26,17 @@ import textwrap
 import tracemalloc
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import pytest
 
-from cachekit.serializers.arrow_serializer import ArrowSerializer
 from cachekit.serializers.base import SerializationMetadata
 from cachekit.serializers.wrapper import SerializationWrapper
+
+# The [data] extra: every bound here is for Arrow DataFrame payloads.
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("pyarrow")
+
+from cachekit.serializers.arrow_serializer import ArrowSerializer  # noqa: E402  (needs pyarrow)
 
 _MB = 1024 * 1024
 

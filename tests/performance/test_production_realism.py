@@ -11,10 +11,8 @@ This test suite measures performance under realistic production workloads:
 CRITICAL: These tests provide CONSERVATIVE numbers for marketing claims.
 They measure worst-case realistic scenarios, not ideal conditions.
 
-The figures are informational: printed and recorded with ``record_property``, never asserted.
-On a loaded host a p95 moves by multiples, so a wall-clock target fails on a busy neighbour, not
-on a regression. Each test asserts that the calls it timed took the path it names: the cached
-function ran once, an L1 hit never reached L2, the value came back intact.
+Each test asserts that the calls it timed took the path it names: the cached function ran once,
+an L1 hit never reached L2, the value came back intact.
 
 Plaintext benchmarks state encryption=False: a CACHEKIT_MASTER_KEY in the environment with no
 stated intent raises at decoration.
@@ -45,20 +43,13 @@ from cachekit.config.decorator import DecoratorConfig
 from cachekit.decorators import cache
 
 from .stats_utils import (
-    PerformanceResult,
     balanced_order,
     benchmark_with_gc_handling,
     difference_band,
     measure_with_jit_warmup,
+    report,
     summarize,
 )
-
-
-def _record(record_property, result: PerformanceResult, prefix: str = "") -> None:
-    """Attach the run-level estimate and the raw p95 to the test's report."""
-    record_property(f"{prefix}center_{result.unit}", round(result.center, 2))
-    record_property(f"{prefix}p95_{result.unit}", round(result.p95, 2))
-
 
 # =============================================================================
 # Realistic Test Payloads
@@ -219,7 +210,7 @@ def test_decorator_overhead_complex_dict(record_property) -> None:
     print("\n  L1 pure (bytes lookup):        ~500ns p95")
     print(f"  Decorator + complex payload:   {result.p95:.0f}ns p95")
     print(f"  Overhead ratio:                {result.p95 / 500:.1f}x")
-    _record(record_property, result)
+    report(record_property, result.name, result)
 
     assert calls == 1, f"{calls - 1} timed calls missed L1"
     assert get_api_response(1) == payload
@@ -259,7 +250,7 @@ def test_decorator_overhead_dataclass(record_property) -> None:
     print("  Payload: User dataclass with nested dicts")
     print("  Stack: Decorator + msgpack + L1 + deserialize")
 
-    _record(record_property, result)
+    report(record_property, result.name, result)
 
     assert calls == 1, f"{calls - 1} timed calls missed L1"
     assert get_user(42) == user
@@ -305,7 +296,7 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame, record_pro
     print("  Payload: 10K row DataFrame (~400KB)")
     print("  L1-only hit: returns the stored object, no serializer runs")
 
-    _record(record_property, result)
+    report(record_property, result.name, result)
 
     assert calls == 1, f"{calls - 1} timed calls missed L1"
     pd.testing.assert_frame_equal(get_data(1), medium_dataframe)
@@ -355,7 +346,7 @@ def test_decorator_overhead_l1_hit_with_backend(record_property) -> None:
 
     # Deserializing 23.5KB dominates: raw p95 measured 431μs (2026-10-04), against 9μs for the
     # L1-only hit of the same dict, which never deserializes.
-    _record(record_property, result)
+    report(record_property, result.name, result)
 
     assert get_api_response(1) == payload
 
@@ -438,7 +429,7 @@ def test_concurrent_cache_access(record_property) -> None:
     print("  Payload:    100-user nested dict, @cache(backend=None)")
     print("  Contention: All threads hitting same key (worst case)")
 
-    _record(record_property, result)
+    report(record_property, result.name, result)
 
     assert result.samples == runs * num_threads * iterations_per_thread
     assert calls == 1, f"{calls - 1} contended calls missed L1"
@@ -526,8 +517,8 @@ def test_encryption_overhead(record_property) -> None:
 
     # Informational, on run medians: the raw p95 of either arm moved 49-95% between back-to-back
     # runs on a loaded host (2026-10-03), and the ratio follows.
-    _record(record_property, result_plain, "plain_")
-    _record(record_property, result_encrypted, "encrypted_")
+    report(record_property, result_plain.name, result_plain, "plain_")
+    report(record_property, result_encrypted.name, result_encrypted, "encrypted_")
     record_property("encrypted_plain_ratio", round(ratio, 3))
 
     assert get_data_plain(1) == get_data_encrypted(1) == payload
@@ -601,7 +592,7 @@ def test_redis_l2_roundtrip(perf_redis_backend, record_property) -> None:
 
     # Raw p95 measured 1.5-3.0ms (2026-10-03); back-to-back drift: two identical runs moved p95 by 101%
     # on a loaded host (the run-level median moved 5%).
-    _record(record_property, result)
+    report(record_property, result.name, result)
 
     assert calls == 1, f"{calls - 1} timed calls missed L2"
     assert get_data(1) == payload
@@ -649,27 +640,8 @@ async def test_async_decorator_overhead(record_property) -> None:
         end = time.perf_counter_ns()
         latencies.append(end - start)
 
-    import statistics
-
-    mean = statistics.mean(latencies)
-    median = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    p99 = statistics.quantiles(latencies, n=100)[98]
-
-    print("\n" + "=" * 80)
-    print("ASYNC DECORATOR OVERHEAD")
-    print("=" * 80)
-    print(f"Mean:     {mean:>10.2f} ns ({mean / 1000:>6.2f} μs)")
-    print(f"Median:   {median:>10.2f} ns ({median / 1000:>6.2f} μs)")
-    print(f"P95:      {p95:>10.2f} ns ({p95 / 1000:>6.2f} μs)")
-    print(f"P99:      {p99:>10.2f} ns ({p99 / 1000:>6.2f} μs)")
-    print("\nContext:")
-    print("  Payload: 10KB complex dict")
-    print("  Stack:   Async decorator + L1 hit")
-    print(f"  Note:    Sync version measured at ~{35000:.0f}ns in test_end_to_end_latency.py")
-
-    record_property("median_ns", round(median, 1))
-    record_property("p95_ns", round(p95, 1))
+    print("\nContext: 10KB complex dict, async decorator + L1 hit")
+    report(record_property, "Async decorator + L1 hit", latencies)
 
     assert calls == 1, f"{calls - 1} timed calls missed L1"
     assert result == payload
