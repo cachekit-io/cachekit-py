@@ -7,9 +7,9 @@ ten ``@pytest.mark.skip`` tests, a module that skipped 35 functions at import, a
 green; this does. It flags, statically:
 
 * **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, and
-  ``@pytest.mark.skip`` outside any ``if``/``except``/``match`` branch, including ``pytestmark``
-  and ``pytest.param(marks=...)``. A conftest hook that adds ``mark.skip`` under an ``if`` passes;
-  one that adds it to every item in a loop does not, since that skips the whole suite.
+  ``mark.skip`` declared in a decorator, a ``pytestmark`` assignment or a
+  ``pytest.param(marks=...)``, outside any ``if``/``try``/loop. A marker a hook adds at run
+  time (``item.add_marker(...)``) follows the hook's logic, which the scan does not judge.
 * **Lenient xfails.** ``xfail(strict=False)`` passes whether or not the test fails (pytest
   runs every other xfail strict, ``xfail_strict`` in pyproject.toml), and
   ``xfail(run=False)`` never runs it.
@@ -42,8 +42,6 @@ import pytest
 TESTS = Path(__file__).resolve().parents[1]
 RAISING_CHECKS = frozenset({"pytest.raises", "pytest.warns", "pytest.fail", "pytest.deprecated_call", "self.fail"})
 CONDITIONAL = (ast.If, ast.IfExp, ast.Try, ast.ExceptHandler, ast.BoolOp, ast.For, ast.AsyncFor, ast.While, ast.Match)
-# A marker added in a loop or a try body lands on every item, so only a branch makes mark.skip conditional.
-BRANCHES = (ast.If, ast.IfExp, ast.ExceptHandler, ast.BoolOp, ast.Match)
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
 Func = ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -137,17 +135,36 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
 
-def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST], conditional: tuple[type, ...] = CONDITIONAL) -> bool:
+def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     current = parents.get(node)
     while current is not None and not isinstance(current, SCOPES):
-        if isinstance(current, conditional):
+        if isinstance(current, CONDITIONAL):
             return False
         current = parents.get(current)
     return True
 
 
+def _is_declared(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    """``node`` sits in a decorator, a ``pytestmark`` assignment or a ``marks=`` argument."""
+    current = parents.get(node)
+    while current is not None and not isinstance(current, ast.stmt):
+        if isinstance(current, ast.keyword) and current.arg == "marks":
+            return True
+        current = parents.get(current)
+    # A def's body is made of statements, so a def reached before any statement holds node in its decorator list.
+    if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return True
+    targets = current.targets if isinstance(current, ast.Assign) else [getattr(current, "target", None)]
+    return any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets)
+
+
 def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
-    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip") and _is_unconditional(node, parents, BRANCHES):
+    if (
+        isinstance(node, ast.Attribute)
+        and _dotted(node).endswith("mark.skip")
+        and _is_declared(node, parents)
+        and _is_unconditional(node, parents)
+    ):
         return "unconditional @pytest.mark.skip"
     if not isinstance(node, ast.Call):
         return None
@@ -224,15 +241,22 @@ def test_marker_skip():
     assert len("ok") == 2
 
 
+CASES = [1, pytest.param(2, marks=[pytest.mark.skip(reason="dead case")])]
+
+
+@pytest.mark.parametrize("n", CASES)
+def test_param_marked_skip(n):
+    assert n > 0
+
+
 def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--run-slow"):
-        for item in items:
-            item.add_marker(pytest.mark.skip(reason="needs --run-slow"))
-
-
-def skip_every_item(items):
+    if config.getoption("--run-slow"):
+        return
+    skip_slow = pytest.mark.skip(reason="needs --run-slow")
     for item in items:
-        item.add_marker(pytest.mark.skip(reason="a loop is not a condition"))
+        if "slow" not in item.keywords:
+            continue
+        item.add_marker(skip_slow)
 
 
 @pytest.mark.xfail(strict=False, reason="passes either way")
