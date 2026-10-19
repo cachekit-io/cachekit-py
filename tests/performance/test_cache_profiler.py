@@ -17,6 +17,8 @@ import pytest
 
 from cachekit.l1_cache import CacheEntry, L1Cache
 
+from .stats_utils import percentile, report
+
 
 @pytest.mark.performance
 def test_l1_cache_component_breakdown(record_property) -> None:
@@ -59,7 +61,7 @@ def test_l1_cache_component_breakdown(record_property) -> None:
         lock_latencies.append(end - start)
 
     lock_p50 = statistics.median(lock_latencies)
-    lock_p95 = statistics.quantiles(lock_latencies, n=20)[18]
+    lock_p95 = percentile(lock_latencies, 95)
     lock_mean = statistics.mean(lock_latencies)
     lock_stdev = statistics.stdev(lock_latencies)
 
@@ -83,7 +85,7 @@ def test_l1_cache_component_breakdown(record_property) -> None:
         dict_latencies.append(end - start)
 
     dict_p50 = statistics.median(dict_latencies)
-    dict_p95 = statistics.quantiles(dict_latencies, n=20)[18]
+    dict_p95 = percentile(dict_latencies, 95)
     dict_mean = statistics.mean(dict_latencies)
     dict_stdev = statistics.stdev(dict_latencies)
 
@@ -106,7 +108,7 @@ def test_l1_cache_component_breakdown(record_property) -> None:
         ttl_latencies.append(end - start)
 
     ttl_p50 = statistics.median(ttl_latencies)
-    ttl_p95 = statistics.quantiles(ttl_latencies, n=20)[18]
+    ttl_p95 = percentile(ttl_latencies, 95)
     ttl_mean = statistics.mean(ttl_latencies)
     ttl_stdev = statistics.stdev(ttl_latencies)
 
@@ -132,7 +134,7 @@ def test_l1_cache_component_breakdown(record_property) -> None:
         move_latencies.append(end - start)
 
     move_p50 = statistics.median(move_latencies)
-    move_p95 = statistics.quantiles(move_latencies, n=20)[18]
+    move_p95 = percentile(move_latencies, 95)
     move_mean = statistics.mean(move_latencies)
     move_stdev = statistics.stdev(move_latencies)
 
@@ -155,7 +157,7 @@ def test_l1_cache_component_breakdown(record_property) -> None:
         counter_latencies.append(end - start)
 
     counter_p50 = statistics.median(counter_latencies)
-    counter_p95 = statistics.quantiles(counter_latencies, n=20)[18]
+    counter_p95 = percentile(counter_latencies, 95)
     counter_mean = statistics.mean(counter_latencies)
     counter_stdev = statistics.stdev(counter_latencies)
 
@@ -182,17 +184,8 @@ def test_l1_cache_component_breakdown(record_property) -> None:
     assert stats_after["hits"] - stats_before["hits"] == iterations
     assert stats_after["misses"] == stats_before["misses"] == 0
 
-    get_p50 = statistics.median(get_latencies)
-    get_p95 = statistics.quantiles(get_latencies, n=20)[18]
-    record_property("get_p95_ns", round(get_p95, 1))
-    get_mean = statistics.mean(get_latencies)
-    get_stdev = statistics.stdev(get_latencies)
-
-    print("cache.get() (complete operation):")
-    print(f"  Mean:   {get_mean:>8.1f} ns")
-    print(f"  P50:    {get_p50:>8.1f} ns")
-    print(f"  P95:    {get_p95:>8.1f} ns")
-    print(f"  StdDev: {get_stdev:>8.1f} ns")
+    report(record_property, "cache.get() (complete operation)", get_latencies, "get_")
+    get_p95 = percentile(get_latencies, 95)
 
     # Summary
     print("\n" + "=" * 80)
@@ -276,7 +269,7 @@ def test_l1_cache_dict_size_impact() -> None:
         assert (found, value) == (True, entry.value)
         assert (stats["hits"], stats["misses"]) == (1000 + iterations, 0), f"size {size}: {stats}"
 
-        p95 = statistics.quantiles(latencies, n=20)[18]
+        p95 = percentile(latencies, 95)
         mean = statistics.mean(latencies)
         results.append((size, mean, p95))
         print(f"Size: {size:>6} entries  |  Mean: {mean:>8.1f}ns  |  P95: {p95:>8.1f}ns")
@@ -346,9 +339,9 @@ def test_l1_cache_lock_contention() -> None:
             t.join()
 
         # Analyze
-        p95 = statistics.quantiles(latencies, n=20)[18]
+        p95 = percentile(latencies, 95)
         mean = statistics.mean(latencies)
-        p99 = statistics.quantiles(latencies, n=100)[98]
+        p99 = percentile(latencies, 99)
 
         print(f"Threads: {num_threads:>2}  |  Mean: {mean:>8.1f}ns  |  P95: {p95:>8.1f}ns  |  P99: {p99:>8.1f}ns")
 

@@ -108,7 +108,7 @@ class PerformanceResult:
     runs: int
     mean: float
     median: float
-    p95: float  # all raw samples: a guard may assert on it; a claim needs p95_ci
+    p95: float  # all raw samples; a claim needs p95_ci
     p99: float
     stdev: float
     run_medians: list[float]
@@ -153,10 +153,6 @@ class PerformanceResult:
     def ci_95_upper(self) -> float:
         """Upper end of the 95% t-interval on center."""
         return self.center + self.band
-
-    def exceeded_target(self, target: float) -> bool:
-        """Check if p95 over all raw samples reaches the target (conservative: p95, not mean)."""
-        return self.p95 >= target
 
 
 def summarize(name: str, runs: Sequence[Sequence[float]], unit: str = "ns") -> PerformanceResult:

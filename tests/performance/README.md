@@ -106,7 +106,7 @@ Times the production `PerRequestRedisBackend` with no Redis call: building one, 
 the calling context's tenant (ContextVar read + URL-encoding), and both together. Each test
 asserts the scoped key.
 
-**Key Insight**: Per-request pattern adds negligible overhead (<0.15% of network latency).
+**Key Insight**: Per-request scoping makes no Redis call; its cost is printed, not asserted.
 
 ### 7. `test_large_object_memory.py` - **Memory Regression Guards** (CI-gated: `performance and slow`)
 
@@ -196,19 +196,22 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ## Marketing Guidelines
 
-### ✅ Conservative Claims (Validated)
+### Conservative Claims (Measured, Not Asserted)
+
+No test checks these figures: the tests above print them and assert behaviour only. Re-measure
+before quoting one.
 
 1. **"200-300μs for realistic payloads"**
-   - Measured: 250μs p95 for 10KB dicts
+   - Measured (printed, not asserted): 250μs p95 for 10KB dicts in test_production_realism.py
    - Context: Full decorator stack
 
 2. **"Eliminates 90% of network latency"**
-   - L1 hit: 0.25ms
-   - Redis RTT: 2-5ms
+   - Measured (printed, not asserted): L1 hit 0.25ms, Redis RTT 2-5ms
    - Savings: ~2-4.75ms
 
-3. **"Concurrent-safe with minimal overhead"**
-   - Lock contention: Only +8μs (3% overhead)
+3. **"Concurrent-safe"**
+   - Asserted: 10 threads on one key raise nothing and every call hits L1 (test_concurrent_cache_access).
+     No test measures contention overhead, so make no overhead claim
 
 4. **"ArrowSerializer: 50-100x faster for DataFrames"**
    - Measured (printed, not asserted) in test_serializer_benchmarks.py
@@ -228,16 +231,17 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ## Performance Budget
 
-| Component | Budget | Measured | Status |
-|-----------|--------|----------|--------|
-| Decorator machinery | 20μs | ~20μs | ✅ |
-| Key generation | 5μs | ~2μs | ✅ |
-| Serialization (10KB) | 150μs | ~100μs | ✅ |
-| L1 cache lookup | 1μs | 0.5μs | ✅ |
-| Deserialization (10KB) | 150μs | ~100μs | ✅ |
-| **Total** | **<350μs** | **~250μs** | ✅ |
+No test enforces these wall-clock budgets, and the measured column is one past run. The
+regression gate is the instruction budget (`make perf-ir`, above).
 
-**Result**: Under budget by 100μs (28% margin).
+| Component | Budget | Measured |
+|-----------|--------|----------|
+| Decorator machinery | 20μs | ~20μs |
+| Key generation | 5μs | ~2μs |
+| Serialization (10KB) | 150μs | ~100μs |
+| L1 cache lookup | 1μs | 0.5μs |
+| Deserialization (10KB) | 150μs | ~100μs |
+| **Total** | **<350μs** | **~250μs** |
 
 ---
 

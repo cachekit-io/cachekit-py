@@ -13,7 +13,6 @@ many backend operations ran at once, and that every caller got its value.
 
 from __future__ import annotations
 
-import statistics
 import threading
 import time
 from typing import Any
@@ -24,6 +23,8 @@ import pytest
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.decorators import cache
+
+from .stats_utils import report
 
 # =============================================================================
 # Test 1: Redis Outage
@@ -69,11 +70,8 @@ def test_redis_outage_degrades_to_uncached_calls(perf_redis_backend, record_prop
     assert l2_get.call_count == 10, "every call during the outage should still try Redis"
     assert get_data.get_health_status()["circuit_breaker"]["state"] == "closed"
 
-    p95_normal = statistics.quantiles(latencies_normal, n=20)[18]
-    p95_outage = statistics.quantiles(latencies_outage, n=20)[18]
-    print(f"\n  P95 latency (normal): {p95_normal / 1000:.2f} μs, (outage): {p95_outage / 1000:.2f} μs")
-    record_property("p95_normal_us", round(p95_normal / 1000, 2))
-    record_property("p95_outage_us", round(p95_outage / 1000, 2))
+    report(record_property, "Normal", latencies_normal, "normal_")
+    report(record_property, "Outage", latencies_outage, "outage_")
 
 
 # =============================================================================
@@ -171,7 +169,6 @@ def test_backpressure_limit(record_property) -> None:
     elapsed_time = time.perf_counter() - start_time
 
     load_control = get_data.get_health_status()["components"]["load_control"]
-    p95 = statistics.quantiles(latencies, n=20)[18]
 
     print("\n" + "=" * 80)
     print("BACKPRESSURE - CONCURRENT LIMIT")
@@ -180,9 +177,7 @@ def test_backpressure_limit(record_property) -> None:
     print(f"  Max backend in flight: {backend.max_in_flight} (limit {max_concurrent})")
     print(f"  Rejected permits:    {load_control['rejected_count']}")
     print(f"  Total time:          {elapsed_time:.2f}s")
-    print(f"  Median:              {statistics.median(latencies) / 1_000_000:.2f} ms")
-    print(f"  P95:                 {p95 / 1_000_000:.2f} ms")
-    record_property("p95_ms", round(p95 / 1_000_000, 2))
+    report(record_property, "Caller latency", latencies)
     record_property("rejected_permits", load_control["rejected_count"])
 
     assert wrong == [], f"{len(wrong)} callers got an error or a wrong value, first: {wrong[:3]}"
@@ -262,8 +257,7 @@ def test_full_stack_under_load(perf_redis_backend, record_property) -> None:
     assert result["id"] == 42
     assert (call_count, l2_get.call_count) == (100, 0), "an L1 hit ran the function or read Redis"
 
-    p95_l1 = statistics.quantiles(latencies_l1, n=20)[18]
-    print(f"  P95 latency (L1 hit): {p95_l1 / 1000:.2f} μs")
+    report(record_property, "L1 hit", latencies_l1, "l1_hit_")
 
     # Phase 3: Measure L1 miss → L2 hit
     print("\nPhase 3: Measuring L1 miss → L2 hit")
@@ -283,8 +277,7 @@ def test_full_stack_under_load(perf_redis_backend, record_property) -> None:
             assert result["id"] == i
     assert (call_count, l2_get.call_count) == (100, 100), "an L1 miss did not come from Redis"
 
-    p95_l2 = statistics.quantiles(latencies_l2, n=20)[18]
-    print(f"  P95 latency (L1 miss → L2 hit): {p95_l2 / 1000:.2f} μs")
+    report(record_property, "L1 miss → L2 hit", latencies_l2, "l2_hit_")
 
     # Phase 4: Concurrent load test
     print("\nPhase 4: Concurrent load test (10 threads)")
@@ -316,23 +309,7 @@ def test_full_stack_under_load(perf_redis_backend, record_property) -> None:
     for t in threads:
         t.join()
 
-    p95_concurrent = statistics.quantiles(latencies_concurrent, n=20)[18]
-    print(f"  P95 latency (concurrent): {p95_concurrent / 1000:.2f} μs")
-
-    # Summary
-    print("\n" + "=" * 80)
-    print("FULL STACK SUMMARY")
-    print("=" * 80)
-    print(f"L1 hit:               {p95_l1 / 1000:>8.2f} μs (p95)")
-    print(f"L1 miss → L2 hit:     {p95_l2 / 1000:>8.2f} μs (p95)")
-    print(f"Concurrent (10 threads): {p95_concurrent / 1000:>8.2f} μs (p95)")
-    print("\nOverhead breakdown:")
-    print(f"  L2 overhead over L1:     {(p95_l2 - p95_l1) / 1000:.2f} μs")
-    print(f"  Concurrent overhead:     {(p95_concurrent - p95_l1) / 1000:.2f} μs")
-
-    record_property("p95_l1_hit_us", round(p95_l1 / 1000, 2))
-    record_property("p95_l2_hit_us", round(p95_l2 / 1000, 2))
-    record_property("p95_concurrent_us", round(p95_concurrent / 1000, 2))
+    report(record_property, f"Concurrent ({num_threads} threads)", latencies_concurrent, "concurrent_")
 
     # Thread 0's keys 0-99 are cached from phases 1-3; the other 9 threads' 900 keys are new.
     assert wrong == []

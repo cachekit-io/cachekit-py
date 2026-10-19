@@ -529,11 +529,16 @@ class TestRepeatRefusedAtDecoration:
         keyring setting cannot stop it being built. Its later operations may still read settings."""
         monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", "not-hex")
         reset_settings()
+        import cachekit.cache_handler as cache_handler
+
+        loads: list[None] = []
+        monkeypatch.setattr(cache_handler, "get_settings", lambda: loads.append(None) or get_settings())
 
         handler = CacheSerializationHandler(encryption=False, encryption_fail_closed=False)
 
         assert handler.encryption is False
-        # The first load of the same settings fails, so the construction above loaded none.
+        assert loads == []
+        # The keyring setting really is malformed: loading it fails.
         with pytest.raises(ValidationError, match="previous_master_keys"):
             get_settings()
 

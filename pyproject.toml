@@ -158,6 +158,8 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# An xfail that starts passing fails the run, so a fixed defect cannot hide behind its marker.
+xfail_strict = true
 addopts = [
     "--strict-markers",
     "--verbose",

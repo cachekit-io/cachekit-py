@@ -8,8 +8,9 @@ green; this does. It flags, statically:
 
 * **Literal skips.** ``skipif(<truthy constant>)`` and ``@pytest.mark.skip`` anywhere,
   including ``pytestmark`` and ``pytest.param(marks=...)``.
-* **Lenient xfails.** ``xfail`` without ``strict=True`` passes whether or not the test
-  fails, and ``xfail(run=False)`` never runs it.
+* **Lenient xfails.** ``xfail(strict=False)`` passes whether or not the test fails (pytest
+  runs every other xfail strict, ``xfail_strict`` in pyproject.toml), and
+  ``xfail(run=False)`` never runs it.
 * **Unconditional imperative skips.** A ``pytest.skip(...)`` or ``pytest.xfail(...)``
   statement directly in a function or module body, outside any ``if``/``try``/loop. A
   skip that depends on the environment (an optional import, a platform) sits inside one
@@ -18,8 +19,10 @@ green; this does. It flags, statically:
   same module it calls (directly or as ``self.``/``cls.`` methods of its class), contain no
   ``assert``, no ``pytest.raises``/``warns``/``fail``, no ``raise AssertionError`` and no
   call to an ``assert*`` function (``mock.assert_called_once``,
-  ``np.testing.assert_array_equal``, ``self.assertEqual``). Helpers imported from other
-  modules and assertions inside fixtures do not count: assert in the test or in a helper
+  ``np.testing.assert_array_equal``, ``self.assertEqual``). ``assert True`` does not count,
+  nor does a function defined inside the test that it does not call by name (a thread
+  target's failed assert is only printed). Helpers imported from other modules and
+  assertions inside fixtures do not count either: assert in the test or in a helper
   defined beside it.
 
 A test that is meant to show "this does not raise" still asserts the state it leaves
@@ -51,7 +54,7 @@ def _dotted(node: ast.AST) -> str:
 
 def _is_signal(node: ast.AST) -> bool:
     if isinstance(node, ast.Assert):
-        return True
+        return not _is_true(node.test)
     if isinstance(node, ast.Raise) and node.exc is not None:
         return _dotted(node.exc).endswith("AssertionError")
     if isinstance(node, ast.Call):
@@ -98,11 +101,30 @@ class _Module:
     def asserts(self, fn: Func, cls: str | None, seen: frozenset[int] = frozenset()) -> bool:
         if id(fn) in seen:
             return False
-        nodes = list(ast.walk(fn))
+        nodes = list(_own_nodes(fn))
         if any(_is_signal(n) for n in nodes):
             return True
-        callees = (self._callee(cls, n) for n in nodes if isinstance(n, ast.Call))
+        nested = {n.name: n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        calls = [n for n in nodes if isinstance(n, ast.Call)]
+        callees = (
+            nested.get(c.func.id) if isinstance(c.func, ast.Name) and c.func.id in nested else self._callee(cls, c)
+            for c in calls
+        )
         return any(self.asserts(c, cls, seen | {id(fn)}) for c in callees if c is not None)
+
+
+def _own_nodes(fn: Func):
+    """``fn``'s nodes, minus the bodies of the functions and lambdas defined inside it.
+
+    A nested function counts only where ``fn`` calls it by name: an assert in a thread target
+    (``Thread(target=worker)``) only prints a warning when it fails, and never fails the test.
+    """
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
 
 
 def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
@@ -121,10 +143,6 @@ def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
 def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
     if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip"):
         return "unconditional @pytest.mark.skip"
-    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.xfail"):
-        parent = parents.get(node)
-        called = isinstance(parent, ast.Call) and parent.func is node
-        return None if called else "xfail without strict=True passes whether or not the test fails"
     if not isinstance(node, ast.Call):
         return None
     name = _dotted(node.func)
@@ -132,9 +150,9 @@ def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | N
         condition = node.args[0] if node.args else _keyword(node, "condition")
         return f"skipif({condition.value!r}) never runs" if _is_true(condition) else None
     if name.endswith("mark.xfail"):
-        if not _is_true(_keyword(node, "strict")):
-            return "xfail without strict=True passes whether or not the test fails"
-        run = _keyword(node, "run")
+        strict, run = _keyword(node, "strict"), _keyword(node, "run")
+        if isinstance(strict, ast.Constant) and not strict.value:
+            return "xfail(strict=False) passes whether or not the test fails"
         return "xfail(run=False) never runs" if isinstance(run, ast.Constant) and not run.value else None
     if name in ("pytest.skip", "pytest.xfail") and _is_unconditional(node, parents):
         return f"unconditional {name}()"
@@ -168,6 +186,8 @@ def test_no_dead_or_assertion_free_tests() -> None:
 
 
 PLANTED = """
+import threading
+
 import pytest
 
 pytestmark = pytest.mark.skip(reason="module")
@@ -175,37 +195,55 @@ pytestmark = pytest.mark.skip(reason="module")
 
 @pytest.mark.skipif(True, reason="never")
 def test_literal_skipif():
-    assert 1
+    assert len("ok") == 2
 
 
 @pytest.mark.skipif(condition=1, reason="never")
 def test_literal_skipif_keyword():
-    assert 1
+    assert len("ok") == 2
 
 
 @pytest.mark.skip
 def test_marker_skip():
-    assert 1
+    assert len("ok") == 2
 
 
-@pytest.mark.xfail(reason="passes either way")
+@pytest.mark.xfail(strict=False, reason="passes either way")
 def test_lenient_xfail():
-    assert 1
+    assert len("ok") == 2
 
 
-@pytest.mark.xfail
-def test_bare_xfail():
-    assert 1
+@pytest.mark.xfail(reason="strict through xfail_strict")
+def test_xfail_is_strict_by_default():
+    assert len("ok") == 2
+
+
+def test_assert_true_is_not_a_check():
+    assert True
+
+
+def test_thread_target_assert_is_not_a_check():
+    def worker():
+        assert len("ok") == 2
+
+    threading.Thread(target=worker).start()
+
+
+def test_nested_helper_called_by_name_counts():
+    def check():
+        assert len("ok") == 2
+
+    check()
 
 
 @pytest.mark.xfail(strict=True, run=False, reason="never runs")
 def test_unrun_xfail():
-    assert 1
+    assert len("ok") == 2
 
 
 def test_imperative_skip():
     pytest.skip("not today")
-    assert 1
+    assert len("ok") == 2
 
 
 def test_assert_free():
@@ -223,7 +261,7 @@ class TestThings:
         self._checks()
 
     def _checks(self):
-        assert True
+        assert len("ok") == 2
 
 
 def test_conditional_skip_is_fine():
@@ -231,7 +269,7 @@ def test_conditional_skip_is_fine():
         import nothing_here  # noqa: F401
     except ImportError:
         pytest.skip("optional")
-    assert 1
+    assert len("ok") == 2
 
 
 @pytest.mark.skipif("sys.platform == 'win32'", reason="string conditions are evaluated")
@@ -241,7 +279,7 @@ def test_via_module_helper():
 
 
 def check_it():
-    assert True
+    assert len("ok") == 2
 
 
 def test_raises_counts():
@@ -264,10 +302,11 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
         "skipif(1) never runs",
         "skipif(True) never runs",
         "test_assert_free asserts nothing",
+        "test_assert_true_is_not_a_check asserts nothing",
+        "test_thread_target_assert_is_not_a_check asserts nothing",
         "unconditional @pytest.mark.skip",
         "unconditional @pytest.mark.skip",
         "unconditional pytest.skip()",
-        "xfail without strict=True passes whether or not the test fails",
-        "xfail without strict=True passes whether or not the test fails",
         "xfail(run=False) never runs",
+        "xfail(strict=False) passes whether or not the test fails",
     ]

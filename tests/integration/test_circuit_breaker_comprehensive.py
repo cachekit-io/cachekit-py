@@ -237,30 +237,25 @@ class TestCircuitBreakerRaceConditions:
         assert self.circuit_breaker.state == CircuitState.HALF_OPEN
 
     def test_concurrent_metrics_collection(self):
-        """Concurrent outcomes keep the counters exact: the trip counts failure_threshold failures, no more."""
+        """Concurrent failures are counted exactly: none lost, none doubled.
 
-        def record_operations():
-            """Record operations concurrently."""
-            for i in range(100):
-                if i % 2 == 0:
-                    self.circuit_breaker.record_success()
-                else:
-                    self.circuit_breaker.record_failure()
+        The threshold sits above the total so the breaker stays CLOSED and every failure lands in
+        the rolling window; a failure recorded once OPEN would be dropped and hide a lost update.
+        """
+        threads, per_thread = 5, 50
+        breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=10_000, success_threshold=3, timeout_seconds=0.1))
 
-        # Start multiple threads
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(record_operations) for _ in range(5)]
-            for future in as_completed(futures):
+        def record_failures():
+            for _ in range(per_thread):
+                breaker.record_failure()
+
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            for future in [executor.submit(record_failures) for _ in range(threads)]:
                 future.result()
 
-        # success_count/failure_count are state machine counters, not cumulative totals: successes
-        # count only in HALF_OPEN, and a failure recorded once OPEN is dropped. A lost or doubled
-        # update under the lock would show as a failure_count other than the threshold.
-        assert self.circuit_breaker.state == CircuitState.OPEN
-        assert self.circuit_breaker.failure_count == self.config.failure_threshold
-        assert self.circuit_breaker.success_count == 0
-        stats = self.circuit_breaker.get_stats()
-        assert (stats["state"], stats["failure_count"], stats["success_count"]) == ("OPEN", self.config.failure_threshold, 0)
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == threads * per_thread
+        assert breaker.get_stats()["failure_count"] == threads * per_thread
 
 
 class TestCircuitBreakerIntegration:

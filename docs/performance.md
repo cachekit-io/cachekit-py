@@ -203,7 +203,7 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 ## Performance Regression Testing
 
-Wall-clock benchmarks do not gate CI, and no test asserts a time budget: on a shared machine one guard's run-level band reaches ±39% (see [Measured Figures](#measured-figures)). The wall-clock suites below run in the default `pytest tests/` invocation, report their figures, and fail only on behaviour:
+Wall-clock benchmarks do not gate CI, and no test in `tests/performance/` asserts a time budget: on a shared machine one guard's run-level band reaches ±39% (see [Measured Figures](#measured-figures)). The wall-clock suites below run in the default `pytest tests/` invocation, report their figures, and fail only on behaviour:
 
 ```bash
 uv run pytest tests/performance/ -v -m performance

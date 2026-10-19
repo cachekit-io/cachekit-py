@@ -6,10 +6,6 @@ import pytest
 
 from cachekit.serializers.auto_serializer import AutoSerializer
 
-# Requires the [data] extra — absent e.g. in the free-threaded CI lane.
-np = pytest.importorskip("numpy")
-pd = pytest.importorskip("pandas")
-
 
 def _roundtrip(value):
     serializer = AutoSerializer()
@@ -33,16 +29,19 @@ class TestAutoSerializerPatterns:
         assert type(result) is bytes
 
     @pytest.mark.parametrize(
-        "arr",
+        "build",
         [
-            np.array([1, 2, 3, 4, 5]),
-            np.array([1.0, 2.0, 3.0]),
-            np.array([[1, 2], [3, 4]]),
-            np.array([True, False, True]),
-            np.zeros((3, 4, 5)),
+            lambda np: np.array([1, 2, 3, 4, 5]),
+            lambda np: np.array([1.0, 2.0, 3.0]),
+            lambda np: np.array([[1, 2], [3, 4]]),
+            lambda np: np.array([True, False, True]),
+            lambda np: np.zeros((3, 4, 5)),
         ],
+        ids=["int", "float", "2d", "bool", "3d-zeros"],
     )
-    def test_numpy_roundtrip(self, arr):
+    def test_numpy_roundtrip(self, build):
+        np = pytest.importorskip("numpy")  # the [data] extra: absent in the free-threaded CI lane
+        arr = build(np)
         result = _roundtrip(arr)
         np.testing.assert_array_equal(result, arr)
         assert result.dtype == arr.dtype
@@ -61,6 +60,7 @@ class TestAutoSerializerPatterns:
         assert _roundtrip(response) == response
 
     def test_dataframe_roundtrip(self):
+        pd = pytest.importorskip("pandas")  # the [data] extra
         df = pd.DataFrame(
             {
                 "int_col": [1, 2, 3],
@@ -92,7 +92,7 @@ class TestAutoSerializerPatterns:
     def test_mixed_types(self):
         data = {
             "primitives": [1, 2.0, "three", True, None],
-            "numpy": np.array([1, 2, 3]).tolist(),
+            "list": [1, 2, 3],
             "nested": {"a": 1, "b": [2, 3], "c": {"d": 4}},
         }
         assert _roundtrip(data) == data

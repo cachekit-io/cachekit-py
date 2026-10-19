@@ -30,6 +30,8 @@ import pytest
 from cachekit.backends.file import FileBackend
 from cachekit.backends.file.config import FileBackendConfig
 
+from .stats_utils import percentile
+
 
 @pytest.mark.performance
 def test_bench_sequential_read_write(tmp_path: Path, record_property) -> None:
@@ -481,8 +483,8 @@ def _calculate_stats(latencies: list[int]) -> dict[str, float]:
     mean = statistics.mean(latencies)
     stdev = statistics.stdev(latencies) if len(latencies) > 1 else 0.0
     p50 = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]  # 95th percentile
-    p99 = statistics.quantiles(latencies, n=100)[98]  # 99th percentile
+    p95 = percentile(latencies, 95)
+    p99 = percentile(latencies, 99)
 
     return {
         "mean_ns": mean,

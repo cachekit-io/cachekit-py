@@ -68,40 +68,6 @@ def test_l1_cache_hit_statistically_rigorous(record_property) -> None:
 
 
 @pytest.mark.performance
-def test_l1_cache_miss_statistically_rigorous(record_property) -> None:
-    """L1 cache miss latency with statistical rigor.
-
-    Misses should be fast - validates dict lookup performance.
-    """
-    cache = L1Cache(max_memory_mb=100)
-
-    # Lookup that will never exist
-    counter = [0]
-
-    def miss_fn() -> None:
-        """Generate unique key for miss."""
-        found, _ = cache.get(f"miss:{counter[0]}")
-        counter[0] += 1
-        assert not found
-
-    result = benchmark_with_gc_handling(
-        name="L1 Cache Miss (Statistically Rigorous)",
-        fn=miss_fn,
-        iterations_per_run=10_000,
-        runs=5,
-        warmup_iterations=1000,
-        unit="ns",
-    )
-
-    print(f"\n{result}")
-
-    report(record_property, result.name, result, "miss_")
-
-    hits, misses = _counts(cache)
-    assert hits == 0 and misses == counter[0] >= result.samples
-
-
-@pytest.mark.performance
 def test_l1_cache_comparison_with_effect_size(record_property) -> None:
     """Demonstrate effect size detection: compare hit vs miss performance.
 
@@ -174,63 +140,6 @@ def test_l1_cache_comparison_with_effect_size(record_property) -> None:
     record_property("difference_significant", is_significant)
 
     # The miss arm added misses only: the two arms timed the paths they are named for.
-    assert _counts(cache) == (hits_after_hit_arm[0], counter[0])
-
-
-@pytest.mark.performance
-def test_l1_cache_hit_miss_ratio_report(record_property) -> None:
-    """Report L1 hit and miss latency and their ratio; check every timed hit hit and every miss missed.
-
-    In L1-only mode both are dict operations, and a hit's LRU bookkeeping (move_to_end) can make it
-    slightly slower than a miss. A real speedup only shows when an L2 backend adds a network round
-    trip to the miss.
-    """
-    cache = L1Cache(max_memory_mb=100)
-
-    # Populate cache for hits
-    for i in range(100):
-        cache.put(f"speedup:key:{i}", b"x" * 1024, redis_ttl=3600)
-
-    # Measure hit performance
-    hit_result = benchmark_with_gc_handling(
-        name="L1 Cache Hits (Speedup Test)",
-        fn=lambda: cache.get("speedup:key:42"),
-        iterations_per_run=10_000,
-        runs=3,
-        warmup_iterations=1000,
-        unit="ns",
-    )
-    hits_after_hit_arm = _counts(cache)
-    assert hits_after_hit_arm[1] == 0, "a timed hit missed"
-
-    # Measure miss performance (different keys, never cached)
-    counter = [0]
-
-    def miss_fn() -> None:
-        found, _ = cache.get(f"speedup:miss:{counter[0]}")
-        counter[0] += 1
-
-    miss_result = benchmark_with_gc_handling(
-        name="L1 Cache Misses (Speedup Test)",
-        fn=miss_fn,
-        iterations_per_run=10_000,
-        runs=3,
-        warmup_iterations=1000,
-        unit="ns",
-    )
-
-    print("\nL1 Performance Analysis:")
-    print(f"  Hit mean:   {hit_result.mean:.0f}ns")
-    print(f"  Miss mean:  {miss_result.mean:.0f}ns")
-
-    # Informational: a hit's LRU bookkeeping makes it a little slower than a miss, but the ratio
-    # of two sub-microsecond means follows host load, not cachekit.
-    overhead_ratio = hit_result.mean / miss_result.mean
-    print(f"  Hit/Miss ratio: {overhead_ratio:.2f}x")
-    report(record_property, hit_result.name, hit_result, "hit_")
-    report(record_property, miss_result.name, miss_result, "miss_")
-    record_property("hit_miss_ratio", round(overhead_ratio, 3))
-
     assert _counts(cache) == (hits_after_hit_arm[0], counter[0])
 
 
