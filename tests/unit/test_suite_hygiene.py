@@ -164,17 +164,20 @@ def _pytest_aliases(tree: ast.Module) -> dict[str, str]:
     return aliases
 
 
+def _is_called(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    parent = parents.get(node)
+    return isinstance(parent, ast.Call) and parent.func is node
+
+
 def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST], aliases: dict[str, str]) -> str | None:
     if isinstance(node, ast.Attribute):
         name = _dotted(node)
         if name.endswith("mark.skip"):
             return "pytest.mark.skip: use skipif(<condition>, reason=...)"
-        parent = parents.get(node)  # called, or a method such as .with_args(...) taking the condition
-        if (
-            name.endswith("mark.skipif")
-            and not (isinstance(parent, ast.Call) and parent.func is node)
-            and not isinstance(parent, ast.Attribute)
-        ):
+        parent = parents.get(node)
+        # The condition arrives in a call: skipif(...) or skipif.with_args(...), both checked below.
+        with_args = isinstance(parent, ast.Attribute) and parent.attr == "with_args" and _is_called(parent, parents)
+        if name.endswith("mark.skipif") and not _is_called(node, parents) and not with_args:
             return "skipif without a condition never runs"
         return None
     if not isinstance(node, ast.Call):
@@ -184,7 +187,7 @@ def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST], aliases: d
         marker = node.args[0] if node.args else _keyword(node, "marker")
         if isinstance(marker, ast.Constant) and marker.value in ("skip", "skipif"):
             return f"add_marker({marker.value!r}): use skipif(<condition>, reason=...)"
-    if name.endswith("mark.skipif"):
+    if name.endswith(("mark.skipif", "mark.skipif.with_args")):
         condition = node.args[0] if node.args else _keyword(node, "condition")
         if condition is None:  # pytest skips on a skipif with no condition
             return "skipif() without a condition never runs"
@@ -370,6 +373,19 @@ def test_skipif_with_args_is_conditional():
     assert len("ok") == 2
 
 
+@pytest.mark.skipif.with_args(True, reason="never")
+def test_skipif_with_args_literal():
+    assert len("ok") == 2
+
+
+@pytest.mark.skipif.with_args(reason="no condition")
+def test_skipif_with_args_without_condition():
+    assert len("ok") == 2
+
+
+skip_mark = pytest.mark.skipif.mark
+
+
 def test_nested_def_does_not_reach_a_module_helper():
     def quiet_check():
         assert len("ok") == 2
@@ -443,8 +459,11 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
         "pytest.mark.skip: use skipif(<condition>, reason=...)",
         "pytest.mark.skip: use skipif(<condition>, reason=...)",
         "skipif without a condition never runs",
+        "skipif without a condition never runs",
+        "skipif() without a condition never runs",
         "skipif() without a condition never runs",
         "skipif(1) never runs",
+        "skipif(True) never runs",
         "skipif(True) never runs",
         "test_assert_free asserts nothing",
         "test_assert_true_is_not_a_check asserts nothing",
