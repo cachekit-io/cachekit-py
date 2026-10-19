@@ -7,8 +7,9 @@ ten ``@pytest.mark.skip`` tests, a module that skipped 35 functions at import, a
 green; this does. It flags, statically:
 
 * **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, and
-  ``@pytest.mark.skip`` outside any ``if``/``try``/loop, including ``pytestmark`` and
-  ``pytest.param(marks=...)``. A conftest hook that adds ``mark.skip`` under an ``if`` passes.
+  ``@pytest.mark.skip`` outside any ``if``/``except``/``match`` branch, including ``pytestmark``
+  and ``pytest.param(marks=...)``. A conftest hook that adds ``mark.skip`` under an ``if`` passes;
+  one that adds it to every item in a loop does not, since that skips the whole suite.
 * **Lenient xfails.** ``xfail(strict=False)`` passes whether or not the test fails (pytest
   runs every other xfail strict, ``xfail_strict`` in pyproject.toml), and
   ``xfail(run=False)`` never runs it.
@@ -41,6 +42,8 @@ import pytest
 TESTS = Path(__file__).resolve().parents[1]
 RAISING_CHECKS = frozenset({"pytest.raises", "pytest.warns", "pytest.fail", "pytest.deprecated_call", "self.fail"})
 CONDITIONAL = (ast.If, ast.IfExp, ast.Try, ast.ExceptHandler, ast.BoolOp, ast.For, ast.AsyncFor, ast.While, ast.Match)
+# A marker added in a loop or a try body lands on every item, so only a branch makes mark.skip conditional.
+BRANCHES = (ast.If, ast.IfExp, ast.ExceptHandler, ast.BoolOp, ast.Match)
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
 Func = ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -134,17 +137,17 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
 
-def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST], conditional: tuple[type, ...] = CONDITIONAL) -> bool:
     current = parents.get(node)
     while current is not None and not isinstance(current, SCOPES):
-        if isinstance(current, CONDITIONAL):
+        if isinstance(current, conditional):
             return False
         current = parents.get(current)
     return True
 
 
 def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
-    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip") and _is_unconditional(node, parents):
+    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip") and _is_unconditional(node, parents, BRANCHES):
         return "unconditional @pytest.mark.skip"
     if not isinstance(node, ast.Call):
         return None
@@ -225,6 +228,11 @@ def pytest_collection_modifyitems(config, items):
     if not config.getoption("--run-slow"):
         for item in items:
             item.add_marker(pytest.mark.skip(reason="needs --run-slow"))
+
+
+def skip_every_item(items):
+    for item in items:
+        item.add_marker(pytest.mark.skip(reason="a loop is not a condition"))
 
 
 @pytest.mark.xfail(strict=False, reason="passes either way")
@@ -335,6 +343,7 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
         "test_assert_free asserts nothing",
         "test_assert_true_is_not_a_check asserts nothing",
         "test_thread_target_assert_is_not_a_check asserts nothing",
+        "unconditional @pytest.mark.skip",
         "unconditional @pytest.mark.skip",
         "unconditional @pytest.mark.skip",
         "unconditional pytest.skip()",
