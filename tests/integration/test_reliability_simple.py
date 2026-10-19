@@ -99,8 +99,10 @@ class TestReliabilitySimple:
             # Falls back to executing the function
             assert result2 == {"result": 40}
 
-    def test_health_check_with_redis_failure(self, redis_test_client):
+    def test_health_check_with_redis_failure(self, redis_test_client, monkeypatch):
         """Test health check when Redis is down."""
+        # A private checker: the process-wide one would serve this UNHEALTHY result to later tests for 10s.
+        monkeypatch.setattr("cachekit.health._health_checker", None)
         health_checker = get_health_checker()
 
         # The health checker reaches Redis through the DI client provider, which the test session

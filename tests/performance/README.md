@@ -51,7 +51,7 @@ Tests the full stack with realistic payloads and workloads:
 | `test_decorator_overhead_dataclass` | User model | Dataclass L1 hit |
 | `test_decorator_overhead_dataframe` | 10K row DataFrame | L1-only hit, no serializer |
 | `test_decorator_overhead_l1_hit_with_backend` | 10KB dict, in-process L2 | L1 bytes hit + deserialize |
-| `test_concurrent_cache_access` | 10KB dict, 10 threads | Lock contention |
+| `test_concurrent_cache_access` | 10KB dict, 10 threads | Per-call execution time, 10 threads on one key (not contention) |
 | `test_encryption_overhead` | 10KB dict + AES-256-GCM | Encryption cost |
 | `test_redis_l2_roundtrip` | 10KB dict + pytest-redis | Network + serialize |
 | `test_async_decorator_overhead` | 10KB dict + async | Async machinery |

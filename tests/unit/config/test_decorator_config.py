@@ -765,6 +765,31 @@ class TestConfigFormGuards:
         assert resolved[0].backend is other
 
 
+def _custom_key(*args: object, **kwargs: object) -> str:
+    return "k"
+
+
+# Valid values for every DecoratorConfig field, in order of preference. The acceptance test overrides each field with
+# the first one the preset does not produce on its own: an override equal to the preset's value would pass even if the
+# preset dropped it. A field added to DecoratorConfig needs an entry here.
+_FIELD_VALUES: dict[str, tuple[object, ...]] = {
+    "ttl": (42,),
+    "stale_ttl": (0,),
+    "swr_by_default": (True, False),
+    "namespace": ("override_ns",),
+    "serializer": ("std",),
+    "integrity_checking": (False, True),
+    "key": (_custom_key,),
+    "interop": ("get_user",),
+    "refresh_ttl_on_get": (True,),
+    "ttl_refresh_threshold": (0.25,),
+    "backend": (None,),
+    "encryption": (EncryptionConfig(enabled=False),),
+    **{name: (value,) for name, value in _NESTED_OVERRIDES.items()},
+}
+_COMPANION_KWARGS: dict[str, dict[str, object]] = {"interop": {"namespace": "users"}}  # interop requires a namespace
+
+
 @pytest.mark.unit
 class TestUnsupportedKeywords:
     """A keyword the form does not accept is a ConfigurationError at construction: never the dataclass's TypeError,
@@ -821,13 +846,16 @@ class TestUnsupportedKeywords:
 
     @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
     def test_every_field_the_preset_does_not_fix_is_accepted(self, preset: str) -> None:
-        fixed = {"secure": {"encryption"}, "io": {"backend"}}.get(preset, set())
-        defaults = DecoratorConfig()
+        # secure accepts only its own integrity_checking=True (TestSecureIntegrityChecking.test_classmethod_explicit_true_accepted),
+        # so no accepted override of it differs from the preset's value.
+        fixed = {"secure": {"encryption", "integrity_checking"}, "io": {"backend"}}.get(preset, set())
+        build = getattr(DecoratorConfig, preset)
+        own = build(**_PRESET_KWARGS[preset])
         for f in fields(DecoratorConfig):
             if f.name.startswith("_") or f.name in fixed:
                 continue
-            value = getattr(defaults, f.name)
-            config = getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset], **{f.name: value})
+            value = next(v for v in _FIELD_VALUES[f.name] if v != getattr(own, f.name))
+            config = build(**_PRESET_KWARGS[preset], **_COMPANION_KWARGS.get(f.name, {}), **{f.name: value})
             assert getattr(config, f.name) == value, f.name
 
     def test_every_unknown_keyword_is_named(self) -> None:

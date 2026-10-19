@@ -6,8 +6,9 @@ ten ``@pytest.mark.skip`` tests, a module that skipped 35 functions at import, a
 77 test functions with no assertion. Nothing stopped the next one landing with CI
 green; this does. It flags, statically:
 
-* **Literal skips.** ``skipif(<truthy constant>)`` and ``@pytest.mark.skip`` anywhere,
-  including ``pytestmark`` and ``pytest.param(marks=...)``.
+* **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, and
+  ``@pytest.mark.skip`` outside any ``if``/``try``/loop, including ``pytestmark`` and
+  ``pytest.param(marks=...)``. A conftest hook that adds ``mark.skip`` under an ``if`` passes.
 * **Lenient xfails.** ``xfail(strict=False)`` passes whether or not the test fails (pytest
   runs every other xfail strict, ``xfail_strict`` in pyproject.toml), and
   ``xfail(run=False)`` never runs it.
@@ -143,13 +144,15 @@ def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
 
 
 def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
-    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip"):
+    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip") and _is_unconditional(node, parents):
         return "unconditional @pytest.mark.skip"
     if not isinstance(node, ast.Call):
         return None
     name = _dotted(node.func)
     if name.endswith("mark.skipif"):
         condition = node.args[0] if node.args else _keyword(node, "condition")
+        if condition is None:  # pytest skips on a skipif with no condition
+            return "skipif() without a condition never runs"
         return f"skipif({condition.value!r}) never runs" if _is_true(condition) else None
     if name.endswith("mark.xfail"):
         strict, run = _keyword(node, "strict"), _keyword(node, "run")
@@ -208,9 +211,20 @@ def test_literal_skipif_keyword():
     assert len("ok") == 2
 
 
+@pytest.mark.skipif(reason="no condition")
+def test_skipif_without_condition():
+    assert len("ok") == 2
+
+
 @pytest.mark.skip
 def test_marker_skip():
     assert len("ok") == 2
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-slow"):
+        for item in items:
+            item.add_marker(pytest.mark.skip(reason="needs --run-slow"))
 
 
 @pytest.mark.xfail(strict=False, reason="passes either way")
@@ -315,6 +329,7 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
 
     assert sorted(line.split(": ", 1)[1] for line in scan(root)) == [
         "TestThings.test_method_assert_free asserts nothing",
+        "skipif() without a condition never runs",
         "skipif(1) never runs",
         "skipif(True) never runs",
         "test_assert_free asserts nothing",

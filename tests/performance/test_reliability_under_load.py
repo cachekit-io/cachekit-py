@@ -46,6 +46,7 @@ def test_redis_outage_degrades_to_uncached_calls(perf_redis_backend, record_prop
         backend=backend,
         l1=L1CacheConfig(enabled=False),  # every call goes to L2
         circuit_breaker=CircuitBreakerConfig(enabled=True),
+        encryption=False,
     )
 
     @cache(config=config)
@@ -219,14 +220,17 @@ def test_full_stack_under_load(perf_redis_backend, record_property) -> None:
         circuit_breaker=CircuitBreakerConfig(enabled=True),
         backpressure=BackpressureConfig(enabled=True, max_concurrent_requests=50),
         monitoring=MonitoringConfig(collect_stats=True),
+        encryption=False,
     )
 
     call_count = 0
+    call_lock = threading.Lock()  # phase 4 increments from 10 threads; without the GIL `+=` can lose one
 
     @cache(config=config)
     def get_data(item_id: int) -> dict[str, Any]:
         nonlocal call_count
-        call_count += 1
+        with call_lock:
+            call_count += 1
         return {"id": item_id, "data": "x" * 1000}  # 1KB payload
 
     print("\n" + "=" * 80)
