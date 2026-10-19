@@ -6,12 +6,10 @@ ten ``@pytest.mark.skip`` tests, a module that skipped 35 functions at import, a
 77 test functions with no assertion. Nothing stopped the next one landing with CI
 green; this does. It flags, statically:
 
-* **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, and a
-  declared ``mark.skip`` unless an ``if``/``except``/``match`` branch encloses it (a loop or a
-  ``try`` body applies it every time). Declared means in a decorator or a
-  ``pytest.param(marks=...)``, or bound to ``pytestmark`` or to a name that a decorator,
-  ``marks=`` or ``pytestmark`` reads. A marker a hook adds at run time
-  (``item.add_marker(...)``) follows the hook's logic, which the scan does not judge.
+* **Literal skips.** ``skipif(<truthy constant>)``, ``skipif()`` with no condition, and
+  ``@pytest.mark.skip`` anywhere, including ``pytestmark``, ``pytest.param(marks=...)`` and
+  a marker a hook adds. A skip that depends on something is ``skipif(<condition>, reason=...)``,
+  which a hook can add as well.
 * **Lenient xfails.** ``xfail(strict=False)`` passes whether or not the test fails (pytest
   runs every other xfail strict, ``xfail_strict`` in pyproject.toml), and
   ``xfail(run=False)`` never runs it.
@@ -44,8 +42,6 @@ import pytest
 TESTS = Path(__file__).resolve().parents[1]
 RAISING_CHECKS = frozenset({"pytest.raises", "pytest.warns", "pytest.fail", "pytest.deprecated_call", "self.fail"})
 CONDITIONAL = (ast.If, ast.IfExp, ast.Try, ast.ExceptHandler, ast.BoolOp, ast.For, ast.AsyncFor, ast.While, ast.Match)
-# A declared marker in a loop or a try body applies every time, so only a branch makes mark.skip conditional.
-BRANCHES = (ast.If, ast.IfExp, ast.ExceptHandler, ast.BoolOp, ast.Match)
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
 Func = ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -139,65 +135,17 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
 
-def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST], conditional: tuple[type, ...] = CONDITIONAL) -> bool:
+def _is_unconditional(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     current = parents.get(node)
     while current is not None and not isinstance(current, SCOPES):
-        if isinstance(current, conditional):
+        if isinstance(current, CONDITIONAL):
             return False
         current = parents.get(current)
     return True
 
 
-def _assigned(node: ast.AST) -> set[str]:
-    """The names an assignment binds; empty for any other node."""
-    if isinstance(node, ast.Assign):
-        targets = node.targets
-    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-        targets = [node.target]
-    else:
-        return set()
-    return {t.id for t in targets if isinstance(t, ast.Name)}
-
-
-def _reused_names(tree: ast.AST) -> frozenset[str]:
-    """``pytestmark`` and every name a decorator, a ``marks=`` argument or a ``pytestmark`` value reads.
-
-    A ``mark.skip`` bound to one of them declares a skip; bound to any other name, it is a marker for a hook to add.
-    """
-    names = {"pytestmark"}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            exprs = node.decorator_list
-        elif isinstance(node, ast.keyword) and node.arg == "marks":
-            exprs = [node.value]
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and "pytestmark" in _assigned(node) and node.value:
-            exprs = [node.value]
-        else:
-            continue
-        names |= {n.id for expr in exprs for n in ast.walk(expr) if isinstance(n, ast.Name)}
-    return frozenset(names)
-
-
-def _is_declared(node: ast.AST, parents: dict[ast.AST, ast.AST], reused: frozenset[str]) -> bool:
-    """``node`` sits in a decorator or a ``marks=`` argument, or is bound to a name in ``reused``."""
-    current = parents.get(node)
-    while current is not None and not isinstance(current, ast.stmt):
-        if isinstance(current, ast.keyword) and current.arg == "marks":
-            return True
-        current = parents.get(current)
-    # A def's body is made of statements, so a def reached before any statement holds node in its decorator list.
-    if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return True
-    return current is not None and bool(_assigned(current) & reused)
-
-
-def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST], reused: frozenset[str]) -> str | None:
-    if (
-        isinstance(node, ast.Attribute)
-        and _dotted(node).endswith("mark.skip")
-        and _is_declared(node, parents, reused)
-        and _is_unconditional(node, parents, BRANCHES)
-    ):
+def _marker_violation(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str | None:
+    if isinstance(node, ast.Attribute) and _dotted(node).endswith("mark.skip"):
         return "unconditional @pytest.mark.skip"
     if not isinstance(node, ast.Call):
         return None
@@ -223,9 +171,9 @@ def scan(root: Path) -> list[str]:
     for path in sorted(root.rglob("*.py")):
         mod = _Module(path)
         where = str(path.relative_to(root.parent))
-        parents, reused = _parents(mod.tree), _reused_names(mod.tree)
+        parents = _parents(mod.tree)
         for node in ast.walk(mod.tree):
-            why = _marker_violation(node, parents, reused)
+            why = _marker_violation(node, parents)
             if why:
                 out.append(f"{where}:{node.lineno}: {why}")
         if path.name.startswith("test_"):
@@ -274,40 +222,11 @@ def test_marker_skip():
     assert len("ok") == 2
 
 
-CASES = []
-for n in range(2):
-    CASES.append(pytest.param(n, marks=[pytest.mark.skip(reason="dead case")]))
-
-
-@pytest.mark.parametrize("n", CASES)
-def test_param_marked_skip(n):
-    assert n >= 0
-
-
-SKIP_LATER = pytest.mark.skip(reason="later")
-
-
-@SKIP_LATER
-def test_aliased_skip():
-    assert len("ok") == 2
-
-
-try:
-    import nothing_here_either  # noqa: F401
-except ImportError:
-    pytestmark = [pytest.mark.skip(reason="optional dependency")]
-
-
-SKIP_SLOW = pytest.mark.skip(reason="needs --run-slow")
-
-
 def pytest_collection_modifyitems(config, items):
-    if config.getoption("--run-slow"):
-        return
+    skip_slow = pytest.mark.skipif(not config.getoption("--run-slow"), reason="needs --run-slow")
     for item in items:
-        if "slow" not in item.keywords:
-            continue
-        item.add_marker(SKIP_SLOW)
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
 
 
 @pytest.mark.xfail(strict=False, reason="passes either way")
@@ -418,8 +337,6 @@ def test_scan_flags_each_planted_violation_and_nothing_else(tmp_path: Path) -> N
         "test_assert_free asserts nothing",
         "test_assert_true_is_not_a_check asserts nothing",
         "test_thread_target_assert_is_not_a_check asserts nothing",
-        "unconditional @pytest.mark.skip",
-        "unconditional @pytest.mark.skip",
         "unconditional @pytest.mark.skip",
         "unconditional @pytest.mark.skip",
         "unconditional pytest.skip()",
