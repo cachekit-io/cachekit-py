@@ -8,9 +8,6 @@ This test suite measures performance under realistic production workloads:
 - Redis L2 with network latency
 - Statistical rigor (multiple runs, percentiles over every raw sample, run-level intervals)
 
-CRITICAL: These tests provide CONSERVATIVE numbers for marketing claims.
-They measure worst-case realistic scenarios, not ideal conditions.
-
 Each test asserts that the calls it timed took the path it names: the cached function ran once,
 an L1 hit never reached L2, the value came back intact.
 
@@ -97,7 +94,8 @@ def create_complex_dict(size: str = "medium") -> dict[str, Any]:
     """Create realistic API response payload.
 
     Args:
-        size: "small" (1KB), "medium" (10KB), "large" (100KB)
+        size: "small" (10 users, 2.5KB as MessagePack), "medium" (100 users, 23.5KB),
+            "large" (1,000 users, 239KB)
     """
     if size == "small":
         n_items = 10
@@ -170,16 +168,15 @@ def test_decorator_overhead_complex_dict(record_property) -> None:
 
     Tests the full stack:
     - Argument binding and key generation
-    - Serialization (msgpack with complex nested dict)
     - L1 cache hit path
-    - Deserialization
 
-    This is what users actually experience - not trivial int payloads.
+    L1-only (``backend=None``): the hit returns the stored object, so nothing is serialized. The
+    L1 hit that deserializes is ``test_decorator_overhead_l1_hit_with_backend``.
     """
-    payload = create_complex_dict("medium")  # ~10KB realistic API response
+    payload = create_complex_dict("medium")
     calls = 0
 
-    @cache(backend=None, encryption=False)  # L1-only to isolate decorator + serialization
+    @cache(backend=None, encryption=False)  # L1-only to isolate the decorator
     def get_api_response(request_id: int) -> dict[str, Any]:
         nonlocal calls
         calls += 1
@@ -193,7 +190,7 @@ def test_decorator_overhead_complex_dict(record_property) -> None:
         get_api_response(1)
 
     result = benchmark_with_gc_handling(
-        name="Decorator + L1 Hit (10KB complex dict)",
+        name="Decorator + L1 Hit (100-user dict)",
         fn=measure_fn,
         iterations_per_run=10_000,
         runs=5,
@@ -205,11 +202,8 @@ def test_decorator_overhead_complex_dict(record_property) -> None:
     print("=" * 80)
     print(result)
     print("\nContext:")
-    print("  Payload: 10KB nested dict (realistic API response)")
-    print("  Stack: Decorator + key gen + msgpack + L1 lookup + deserialize")
-    print("\n  L1 pure (bytes lookup):        ~500ns p95")
-    print(f"  Decorator + complex payload:   {result.p95:.0f}ns p95")
-    print(f"  Overhead ratio:                {result.p95 / 500:.1f}x")
+    print("  Payload: 100-user nested dict (realistic API response)")
+    print("  Stack: Decorator + key gen + L1 object lookup (nothing serialized)")
     report(record_property, result.name, result)
 
     assert calls == 1, f"{calls - 1} timed calls missed L1"
@@ -248,7 +242,7 @@ def test_decorator_overhead_dataclass(record_property) -> None:
     print(result)
     print("\nContext:")
     print("  Payload: User dataclass with nested dicts")
-    print("  Stack: Decorator + msgpack + L1 + deserialize")
+    print("  Stack: Decorator + key gen + L1 object lookup (nothing serialized)")
 
     report(record_property, result.name, result)
 
@@ -352,7 +346,7 @@ def test_decorator_overhead_l1_hit_with_backend(record_property) -> None:
 
 
 # =============================================================================
-# Test 2: Concurrent Access - Lock Contention
+# Test 2: Concurrent Access
 # =============================================================================
 
 
@@ -361,7 +355,7 @@ def test_concurrent_cache_access(record_property) -> None:
     """Measure per-call execution time while 10 threads call one key at once.
 
     Tests:
-    - L1 cache lock contention
+    - L1 hits from 10 threads on one key
     - Decorator overhead under load
     - Key generator thread safety
 
@@ -394,10 +388,10 @@ def test_concurrent_cache_access(record_property) -> None:
         try:
             for _ in range(100):
                 get_data(1)
-            barrier.wait()  # every thread measures at once, so they contend
+            barrier.wait()  # every thread starts its timed loop together
             for _ in range(iterations_per_thread):
                 start = time.perf_counter_ns()
-                get_data(1)  # Same key = L1 hit with lock contention
+                get_data(1)  # Same key = L1 hit
                 samples.append(time.perf_counter_ns() - start)
         except Exception as e:
             # A thread's exception is otherwise only printed; abort so the others leave the barrier.
@@ -427,12 +421,12 @@ def test_concurrent_cache_access(record_property) -> None:
     print("\nContext:")
     print(f"  Threads:    {num_threads} x {iterations_per_thread:,} calls per run")
     print("  Payload:    100-user nested dict, @cache(backend=None)")
-    print("  Contention: All threads hitting same key (worst case)")
+    print("  Key:        All threads hit one key")
 
     report(record_property, result.name, result)
 
     assert result.samples == runs * num_threads * iterations_per_thread
-    assert calls == 1, f"{calls - 1} contended calls missed L1"
+    assert calls == 1, f"{calls - 1} concurrent calls missed L1"
 
 
 # =============================================================================
@@ -537,14 +531,12 @@ def test_encryption_overhead(record_property) -> None:
 @pytest.mark.performance
 @pytest.mark.integration
 def test_redis_l2_roundtrip(perf_redis_backend, record_property) -> None:
-    """Measure full Redis L2 roundtrip with serialization.
+    """Measure full Redis L2 roundtrip with deserialization.
 
     Tests:
     - Decorator overhead
-    - Serialization (msgpack)
     - Redis network RTT
-    - Deserialization
-    - L1 population
+    - Deserialization (msgpack)
 
     This is L1 miss → L2 hit path (realistic production scenario), on the suite's pytest-redis
     server.
@@ -583,12 +575,8 @@ def test_redis_l2_roundtrip(perf_redis_backend, record_property) -> None:
     print(result)
     print("\nContext:")
     print("  Mode:    L1 disabled (pure L2)")
-    print("  Payload: 10KB complex dict")
+    print("  Payload: 100-user nested dict (23.5KB as MessagePack)")
     print("  Stack:   Decorator + Redis RTT + msgpack deserialize")
-    print("\nBreakdown:")
-    print("  Network RTT:       ~1-2ms (local Redis)")
-    print("  Deserialization:   ~10-50μs (msgpack)")
-    print(f"  Total measured:    {result.p95:.2f}μs")
 
     # Raw p95 measured 1.5-3.0ms (2026-10-03); back-to-back drift: two identical runs moved p95 by 101%
     # on a loaded host (the run-level median moved 5%).
@@ -640,7 +628,7 @@ async def test_async_decorator_overhead(record_property) -> None:
         end = time.perf_counter_ns()
         latencies.append(end - start)
 
-    print("\nContext: 10KB complex dict, async decorator + L1 hit")
+    print("\nContext: 100-user nested dict, async decorator + L1 hit")
     report(record_property, "Async decorator + L1 hit", latencies)
 
     assert calls == 1, f"{calls - 1} timed calls missed L1"

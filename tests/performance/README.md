@@ -47,14 +47,14 @@ Tests the full stack with realistic payloads and workloads:
 
 | Test | Payload | What It Measures |
 |------|---------|------------------|
-| `test_decorator_overhead_complex_dict` | 10KB nested dict | Full decorator stack |
+| `test_decorator_overhead_complex_dict` | 100-user dict (23.5 KB as MessagePack) | Decorator + L1-only hit, no serializer |
 | `test_decorator_overhead_dataclass` | User model | Dataclass L1 hit |
 | `test_decorator_overhead_dataframe` | 10K row DataFrame | L1-only hit, no serializer |
-| `test_decorator_overhead_l1_hit_with_backend` | 10KB dict, in-process L2 | L1 bytes hit + deserialize |
-| `test_concurrent_cache_access` | 10KB dict, 10 threads | Per-call execution time, 10 threads on one key (not contention) |
-| `test_encryption_overhead` | 10KB dict + AES-256-GCM | Encryption cost |
-| `test_redis_l2_roundtrip` | 10KB dict + pytest-redis | Network + serialize |
-| `test_async_decorator_overhead` | 10KB dict + async | Async machinery |
+| `test_decorator_overhead_l1_hit_with_backend` | 100-user dict, in-process L2 | L1 bytes hit + deserialize |
+| `test_concurrent_cache_access` | 100-user dict, 10 threads | Per-call execution time, 10 threads on one key (not contention) |
+| `test_encryption_overhead` | 100-user dict + AES-256-GCM | Encryption cost |
+| `test_redis_l2_roundtrip` | 100-user dict + pytest-redis | Network + deserialize, L1 disabled |
+| `test_async_decorator_overhead` | 100-user dict + async | Async machinery |
 
 ### 2. `test_reliability_under_load.py` - **Reliability Framework Tests**
 
@@ -161,9 +161,10 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ## Figures
 
-These tests print figures and assert behaviour; none of them is a source for a number. Quote a
-figure only from [docs/performance.md, Measured Figures](../../docs/performance.md#measured-figures),
-which dates each one and names the guard that produced it.
+These tests print figures and assert behaviour; none of them is a source for a timing. Quote a
+timing only from [docs/performance.md, Measured Figures](../../docs/performance.md#measured-figures),
+which dates each one and names the guard that produced it. Instruction budgets come from
+`ir_baselines.json`, and memory bounds from the docstrings of `test_large_object_memory.py`.
 
 ---
 
@@ -192,8 +193,7 @@ which dates each one and names the guard that produced it.
 
 1. ✅ Implement comprehensive test suite, including the encryption-overhead and Redis L2 guards
 2. ✅ Percentiles over every raw sample and run-level inference in `stats_utils.py`
-3. ⏳ Record figures for the encryption and Redis rows (both now run in the default suite)
-4. ⏳ Re-run `PROFILING_RESULTS.md` on the current stack
+3. ⏳ Re-run `PROFILING_RESULTS.md` on the current stack
 
 ---
 
