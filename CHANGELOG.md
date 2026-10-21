@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.1](https://github.com/cachekit-io/cachekit-py/compare/v0.24.0...v0.24.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** floor certifi at 2026.10.19 for PYSEC-2026-4320 (LAB-10251) ([#598](https://github.com/cachekit-io/cachekit-py/issues/598)) ([00d8af5](https://github.com/cachekit-io/cachekit-py/commit/00d8af540b102c6011fa101a225c17bc43bbdf65))
+
 ## [0.24.0](https://github.com/cachekit-io/cachekit-py/compare/v0.23.0...v0.24.0) (2026-10-18)
 
 
