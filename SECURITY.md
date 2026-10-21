@@ -384,8 +384,7 @@ or every read of our own entries fails — which is a wire-size and L1-footprint
 decision, not a drive-by fix. Keeping compression instead means summing each
 buffer's uncompressed-length prefix before decompressing; `pa.ipc.read_message`
 exposes the first buffer's prefix but not the rest, so that needs a
-bounds-checked walk of the record-batch Flatbuffers metadata. Both options
-remain open.
+bounds-checked walk of the record-batch Flatbuffers metadata.
 
 Approaches that do **not** work, so nobody re-derives them: pyarrow exposes no
 read-side size limit and no allocation-limiting memory pool; accumulating

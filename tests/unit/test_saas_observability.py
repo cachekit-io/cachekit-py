@@ -748,7 +748,7 @@ class TestMidPublishMemoryOrdering:
 
     def test_no_header_dropped_when_init_observed_mid_publish(self):
         """The end-to-end regression: backend.py catches session errors and sends
-        NO session headers — the silent telemetry loss the session registry exists to prevent."""
+        NO session headers — the silent telemetry loss."""
         with self._mid_publish_state():
             stats = _FunctionStats("lab511.mid_publish_probe")
             stats.record_miss()

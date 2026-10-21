@@ -68,7 +68,7 @@ class CacheKeyGenerator:
     # Prefix for the code of any serializer identity outside SERIALIZER_CODES. Such a code
     # is this prefix plus 4 hex digits derived from the identity, so it is DISTINCT per
     # serializer rather than one shared bucket: a shared bucket would put every serializer
-    # instance on one key and reproduce the shared-bucket bug exactly — two decorators, same key,
+    # instance on one key — two decorators, same key,
     # different frame tags, each evicting the other on every read at a 0% hit rate. An
     # instance is the only way to configure a built-in (ArrowSerializer(return_format=...)),
     # so that path is common, not exotic.

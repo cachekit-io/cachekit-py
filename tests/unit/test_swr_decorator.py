@@ -638,7 +638,7 @@ class TestOperationHandlerFreshnessDegradation:
         assert op.get_cached_value_with_freshness("k") is None  # RuntimeError -> generic path -> miss
 
     def test_legacy_two_tuple_handler_degrades_to_no_bound(self) -> None:
-        """Compat: a custom CacheHandlerStrategy built against the v0.18.0
+        """A custom CacheHandlerStrategy built against the v0.18.0
         2-tuple (bytes, is_stale) signature must read as fresh_for=None (legacy L1
         lifetime), NOT raise a strict-unpack ValueError that the broad except
         swallows into a permanent every-hit-is-a-miss cache bypass (expert-panel
@@ -701,7 +701,7 @@ class TestOperationHandlerFreshnessDegradation:
         assert calls["n"] == 2
 
     def test_sync_freshness_hit_backfills_l1_unless_stale_or_expired(self) -> None:
-        """Parity: the sync freshness read backfills L1 exactly as the
+        """The sync freshness read backfills L1 exactly as the
         async read does — a fresh hit is recorded (next read is L1, no second
         freshness read), a stale-labelled hit never is, and fresh_for=0 makes
         the backfill a no-op (the remaining-freshness bound reaches the sync

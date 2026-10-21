@@ -145,7 +145,7 @@ class TestDecoratorWithStandardSerializer:
 
         # One shared namespace on purpose: with different namespaces the keys would differ
         # for a reason that has nothing to do with the serializer, and the test would pass
-        # against the shared-key bug it is meant to catch.
+        # against the bug it is meant to catch.
         @cache(ttl=60, serializer="std", namespace="serializer_iso")
         def compute_std(x: int) -> dict:
             nonlocal std_count

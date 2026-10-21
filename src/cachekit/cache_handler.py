@@ -346,7 +346,7 @@ def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
     classes, while instance-level hasattr reads dynamic-attribute objects
     (unittest.mock.Mock, __getattr__ proxies) as SWR-capable and silently
     reroutes their reads through the freshness path — reachable without any SWR
-    config since the freshness-gate widening (the freshness read now runs for
+    config since the gate widening (the freshness read now runs for
     every capable backend, not only when stale_ttl is set).
     """
     return callable(getattr(type(backend), "get_with_freshness", None))
@@ -1495,7 +1495,7 @@ class CacheSerializationHandler:
         Interop entries carry no metadata header, so there is nothing to sniff
         and nothing to forge: with encryption enabled the bytes are ALWAYS
         treated as nonce||ciphertext||tag and authenticated before any decode
-        (fail closed — same CWE-757 posture as the auto-mode plaintext-downgrade fix);
+        (fail closed — same CWE-757 posture as the auto-mode fix);
         without encryption they are decoded as one plain MessagePack document.
         Decode/auth failures raise SerializationError, which callers treat as
         a miss and evict (self-healing overwrite).
@@ -1893,7 +1893,7 @@ class CacheOperationHandler:
         matches :meth:`get_cached_value_async` so the async
         decorator backfills L1 without re-serializing; fresh_for (seconds,
         None = no signal) bounds that backfill to the server's remaining
-        freshness. None on miss/error; the decrypt-failure fail-closed policy
+        freshness. None on miss/error; the fail-closed policy
         propagates DecryptionAuthenticationError.
         """
         try:

@@ -340,8 +340,8 @@ def test_file_backend_bytes_read_python_allocations_bounded(tmp_path: Path) -> N
     assert hit.value == payload
     assert peak / len(payload) < 3.5, (
         f"File-backend bytes read peak {peak / len(payload):.2f}x payload — a full-payload read-side "
-        f"copy crept back in (known cost ~3x: payload os.read + decode + output; the streaming read removed "
-        f"the header slice and the bytes() coercion)"
+        f"copy crept back in (known cost ~3x: payload os.read + decode + output; the header-first read and "
+        f"buffer-protocol retrieve removed the header slice and the bytes() coercion)"
     )
 
 

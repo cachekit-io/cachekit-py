@@ -558,7 +558,7 @@ class EncryptionWrapper:
 
             An entry claiming plaintext is refused outright — the wrapper is
             encryption-mandatory and fails closed on its own (defense-in-depth
-            behind the handler-level plaintext-downgrade guard):
+            behind the handler-level guard):
 
             >>> from cachekit.serializers.base import SerializationFormat
             >>> plain_meta = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK)
@@ -569,7 +569,7 @@ class EncryptionWrapper:
                 ...
             DecryptionAuthenticationError: EncryptionWrapper.deserialize received an entry claiming plaintext ...
         """
-        # SECURITY (defense-in-depth behind the handler's plaintext-downgrade guard):
+        # SECURITY (defense-in-depth behind the handler guard):
         # this wrapper is encryption-mandatory, so an entry claiming plaintext can
         # never be legitimate input here. The frame header carrying this flag is
         # NOT covered by the AES-GCM tag and may be forged; benign migration reads

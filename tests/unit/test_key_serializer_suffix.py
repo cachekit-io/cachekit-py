@@ -249,7 +249,7 @@ class TestSerializerCodeTable:
         assert _suffix(genuine_key) == "1a"
 
     def test_distinct_serializer_instances_get_distinct_codes(self):
-        """The custom bucket must not be shared — a shared one IS the shared-key bug.
+        """The custom bucket must not be shared — a shared one IS the bug.
 
         An instance is the only way to configure a built-in (``ArrowSerializer(...)``), so
         two instance-configured decorators over one function is a normal arrangement, not an
@@ -346,7 +346,7 @@ class _FailOnKeysBackend(_RecordingBackend):
 class TestInvalidationReachesPre020Keys:
     """`invalidate_cache(args)` also deletes the pre-0.20.0 `:{ic}s` entry.
 
-    Before the serializer-code suffix, every generated key ended in `s`. After upgrading, a non-default
+    Before 0.20.0, every generated key ended in `s`. After upgrading, a non-default
     serializer writes and invalidates a new key, so an erasure that deletes only the new
     key returns normally while the pre-upgrade copy survives to its TTL.
     """

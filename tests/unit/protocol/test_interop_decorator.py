@@ -668,7 +668,7 @@ class TestInteropEncryption:
         assert get_user.cache_info().hits == 1
 
     def test_plaintext_entry_under_encryption_is_never_returned(self, backend: DictBackend):
-        """Fail closed (plaintext-downgrade posture): with encryption on, a planted plaintext
+        """Fail closed: with encryption on, a planted plaintext
         msgpack value must not be served — it fails auth, gets evicted, and the
         recomputed value is stored encrypted."""
         import msgpack
@@ -698,8 +698,8 @@ class TestInteropEncryption:
             get_user(42)
         assert not backend.store
 
-    # protocol test-vectors/encryption.json → default_tenant.vectors[default_tenant_interop]
-    #: HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
+    # protocol test-vectors/encryption.json → default_tenant.vectors[default_tenant_interop]:
+    # HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
     # canonical plain-MessagePack value at the `single_int` interop key, sealed by the
     # protocol's stdlib+cryptography reference — NOT by this SDK. Pinned inline so a
     # fixture drift is a conscious change.
