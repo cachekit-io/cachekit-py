@@ -278,4 +278,8 @@ constraint-dependencies = [
     # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering); 26.2 fixes
     # PYSEC-2026-3721 (doubly-encoded index URLs install to arbitrary paths).
     "pip>=26.2",
+    # certifi is a dev-only transitive dep (pip-audit -> requests -> certifi).
+    # 2026.10.19 fixes PYSEC-2026-4320 (distrusts the emSign ECC Root CA - G3,
+    # whose intermediates had compromised keys).
+    "certifi>=2026.10.19",
 ]
