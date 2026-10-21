@@ -52,7 +52,7 @@ class CacheKeyGenerator:
     # Alias spelling -> canonical name. Single source of truth: CacheSerializationHandler
     # reads this to canonicalize the serializer name it writes into the frame header, so
     # the key's serializer code and the stored envelope's serializer tag are derived from
-    # one map and cannot drift apart (#167, LAB-4351). Read-only for the same reason as
+    # one map and cannot drift apart (#167). Read-only for the same reason as
     # SERIALIZER_CODES: mutating it would desync the key from the frame tag.
     SERIALIZER_NAME_ALIASES = MappingProxyType({"std": "default", "standard": "default", "pythonic": "auto"})
 
@@ -68,14 +68,14 @@ class CacheKeyGenerator:
     # Prefix for the code of any serializer identity outside SERIALIZER_CODES. Such a code
     # is this prefix plus 4 hex digits derived from the identity, so it is DISTINCT per
     # serializer rather than one shared bucket: a shared bucket would put every serializer
-    # instance on one key and reproduce LAB-4351 exactly — two decorators, same key,
+    # instance on one key and reproduce the shared-bucket bug exactly — two decorators, same key,
     # different frame tags, each evicting the other on every read at a 0% hit rate. An
     # instance is the only way to configure a built-in (ArrowSerializer(return_format=...)),
     # so that path is common, not exotic.
     # ponytail: 16 bits, so distinct identities collide at ~1/65536 — a hit-rate risk only,
     # since a collision still leaves the frame tags different and the mismatch guard fires.
     # Two instances of the SAME class with different constructor arguments share a code AND
-    # a frame tag, so the guard does NOT separate them; use distinct namespaces (LAB-4351).
+    # a frame tag, so the guard does NOT separate them; use distinct namespaces.
     UNKNOWN_SERIALIZER_CODE = "x"
     _UNKNOWN_CODE_DIGEST_BYTES = 2
 
@@ -237,7 +237,7 @@ class CacheKeyGenerator:
         if _array_bytes_seen is None:
             _array_bytes_seen = [0]
 
-        # Fast path: exact primitives skip the isinstance ladder below (LAB-7068). Matched by
+        # Fast path: exact primitives skip the isinstance ladder below. Matched by
         # exact type, not isinstance(): subclasses (IntEnum, StrEnum, str-mixin Enums) must still
         # reach the Enum branch so their keys stay what they are today. float is excluded because
         # -0.0 must reach the float branch to be normalised to 0.0. Identity checks, not set
@@ -453,9 +453,9 @@ class CacheKeyGenerator:
         ``..`` into a single ``.``, and truncates to 200 chars.  The mapping
         is deterministic: same function → same key.
 
-        Deliberately not memoised (LAB-7068): a shared memo was slower under
+        Deliberately not memoised: a shared memo was slower under
         free-threading than recomputing. Instead each regex pass is skipped when
-        it could not change the name (LAB-7405); the checks keep no state.
+        it could not change the name; the checks keep no state.
         """
         raw = f"{module}.{qualname}"
         # Dots mapped to "_", an ASCII identifier holds only [A-Za-z0-9_.]: with no "..", both passes

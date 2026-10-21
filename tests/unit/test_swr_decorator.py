@@ -1,4 +1,4 @@
-"""Decorator-level stale-while-revalidate (LAB-381).
+"""Decorator-level stale-while-revalidate.
 
 End-to-end behavior through the real decorator + serializer stack against a
 fake SWR-capable backend: serve-stale-immediately, background revalidation
@@ -405,7 +405,7 @@ def _forked_stale_hit_outcome(fork: str) -> object:
 
 
 class TestSWRForkIsolation:
-    """LAB-506 follow-through: SWR scheduler state must not survive fork().
+    """SWR scheduler state must not survive fork().
 
     The per-wrapper refresh pool (in-flight keys and slots) is parent state:
     the parent threads that would clear it don't survive fork, so without a
@@ -622,7 +622,7 @@ class TestOperationHandlerFreshnessDegradation:
         if deserialize_side_effect is not None:
             serialization = mock.MagicMock(spec=CacheSerializationHandler)
             serialization.deserialize_data.side_effect = deserialize_side_effect
-            serialization.encryption_fail_closed = False  # real bool: MagicMock is truthy (LAB-108)
+            serialization.encryption_fail_closed = False  # real bool: MagicMock is truthy
         else:
             serialization = CacheSerializationHandler()
         op = CacheOperationHandler(serialization, CacheKeyGenerator())
@@ -638,7 +638,7 @@ class TestOperationHandlerFreshnessDegradation:
         assert op.get_cached_value_with_freshness("k") is None  # RuntimeError -> generic path -> miss
 
     def test_legacy_two_tuple_handler_degrades_to_no_bound(self) -> None:
-        """LAB-557 compat: a custom CacheHandlerStrategy built against the v0.18.0
+        """Compat: a custom CacheHandlerStrategy built against the v0.18.0
         2-tuple (bytes, is_stale) signature must read as fresh_for=None (legacy L1
         lifetime), NOT raise a strict-unpack ValueError that the broad except
         swallows into a permanent every-hit-is-a-miss cache bypass (expert-panel
@@ -701,7 +701,7 @@ class TestOperationHandlerFreshnessDegradation:
         assert calls["n"] == 2
 
     def test_sync_freshness_hit_backfills_l1_unless_stale_or_expired(self) -> None:
-        """LAB-348 parity: the sync freshness read backfills L1 exactly as the
+        """Parity: the sync freshness read backfills L1 exactly as the
         async read does — a fresh hit is recorded (next read is L1, no second
         freshness read), a stale-labelled hit never is, and fresh_for=0 makes
         the backfill a no-op (the remaining-freshness bound reaches the sync
@@ -853,7 +853,7 @@ def _close_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 
 class TestAsyncSWRStoppedLoop:
-    """LAB-7295: a revalidation left pending on an event loop that stopped (sync code calling
+    """A revalidation left pending on an event loop that stopped (sync code calling
     run_until_complete) or closed without cancelling its tasks keeps its slot and key for the
     hold, then the next revalidation attempt releases both and cancels it."""
 
@@ -1216,7 +1216,7 @@ class TestRevalidationFailureWarnings:
 
 
 class TestPanelFollowUps:
-    """LAB-381 panel fast-follow regressions (fixes on top of the merged #228)."""
+    """Fast-follow regressions (fixes on top of the merged #228)."""
 
     def test_sync_revalidation_preserves_contextvars_for_encryption(self) -> None:
         """Panel MAJ: the daemon thread must see the caller's contextvars. With
@@ -1340,7 +1340,7 @@ class TestFreshnessFailClosedPropagation:
 
 
 class TestFreshForBoundedL1Backfill:
-    """LAB-557 (spec/saas-api.md#remaining-freshness): L1 backfill from an L2
+    """spec/saas-api.md#remaining-freshness: L1 backfill from an L2
     hit is bounded by the server's remaining freshness — an entry read late in
     its freshness window must not be served fresh from L1 past fresh_until."""
 
@@ -1404,7 +1404,7 @@ class TestFreshForBoundedL1Backfill:
         assert seen == [60]  # legacy: the decorator ttl, unchanged behavior
 
     async def test_read_at_freshness_end_is_never_served_fresh_from_l1(self) -> None:
-        """The LAB-557 regression: fresh-labelled hit with 0s remaining must not
+        """The freshness-bound regression: fresh-labelled hit with 0s remaining must not
         be recorded in L1 — the next read goes back to L2 instead of serving a
         locally-resurrected 'fresh' value past the server's freshness end."""
         backend = FakeSWRBackend()

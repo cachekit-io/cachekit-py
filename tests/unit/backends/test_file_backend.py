@@ -1518,7 +1518,7 @@ class TestSafeUnlinkEdgeCases:
 
 @pytest.mark.unit
 class TestSafeUnlinkIfSameInode:
-    """Test _safe_unlink_if_same_inode: LAB-2685, the guard against a path-only unlink
+    """Test _safe_unlink_if_same_inode: the guard against a path-only unlink
     racing a concurrent set() that renamed a fresh entry onto the same path."""
 
     def test_deletes_when_inode_matches(self, backend: FileBackend, config: FileBackendConfig) -> None:
@@ -1559,7 +1559,7 @@ class TestSafeUnlinkIfSameInode:
     def test_expired_get_does_not_delete_entry_renamed_in_by_concurrent_set(
         self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression test for LAB-2685.
+        """Regression test for the path-only unlink race.
 
         get()'s expiry branch decides "expired" from the header read off a held fd, then must
         evict only the file that fd actually read. Racing a concurrent set() in right after
@@ -1567,7 +1567,7 @@ class TestSafeUnlinkIfSameInode:
         real-world case: a reader opens an expired file, a writer's set() renames a fresh entry
         onto the same path, and the reader must not delete the writer's fresh entry. The race is
         injected at the first `os.fstat(fd)` in `get()` -- present both before and after the
-        LAB-2685 fix -- so this fails identically against the pre-fix path-only
+        inode-guard fix -- so this fails identically against the pre-fix path-only
         `_safe_unlink(file_path)` and passes only once eviction is inode-guarded.
         """
         key = "race_key"
@@ -1605,7 +1605,7 @@ class TestSafeUnlinkIfSameInode:
 
 @pytest.mark.unit
 class TestEntryBookkeeping:
-    """LAB-7107: set() checks capacity and the eviction trigger on counters, not directory scans."""
+    """set() checks capacity and the eviction trigger on counters, not directory scans."""
 
     def test_set_and_delete_do_not_scan_the_directory(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         for i in range(50):
@@ -2336,7 +2336,7 @@ class TestMmapBuffer:
 
 @pytest.mark.unit
 class TestShortIO:
-    """POSIX short I/O on the write path, and a file shrinking under a read (LAB-2682).
+    """POSIX short I/O on the write path, and a file shrinking under a read.
 
     Neither is tampering; see the truncated-payload branch in ``FileBackend.get`` for why the
     backend, not the envelope, must be the layer that says so.

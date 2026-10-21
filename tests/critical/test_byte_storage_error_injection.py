@@ -402,7 +402,7 @@ class TestByteStorageErrorInjection(RedisIsolationMixin):
 
 
 class TestByteStorageBufferProtocol:
-    """retrieve() accepts the buffer protocol (LAB-770) — no bytes() coercion needed.
+    """retrieve() accepts the buffer protocol — no bytes() coercion needed.
 
     The zero-copy read path hands retrieve() a memoryview (SerializationWrapper.unwrap
     slices one past the frame header); the PyO3 boundary must take it directly, plus
@@ -521,7 +521,7 @@ class TestByteStorageBufferProtocol:
             storage.retrieve(memoryview(b"not an envelope"))
 
     def test_retrieve_memoryview_adds_no_python_copy(self):
-        """No PYTHON-side full-envelope copy on the memoryview path (LAB-770).
+        """No PYTHON-side full-envelope copy on the memoryview path.
 
         tracemalloc sees only Python-heap allocations: retrieve's output bytes (~1x
         payload for incompressible input). A bytes(data)-style coercion creeping back
@@ -550,7 +550,7 @@ class TestByteStorageBufferProtocol:
 
     def test_standard_serializer_deserialize_non_u8_buffer_raises_serialization_error(self):
         """A non-u8 exporter (rejected as BufferError at the PyO3 boundary) keeps the
-        documented SerializationError contract — pre-LAB-770 bytes() coerced these to
+        documented SerializationError contract — the old bytes() coercion turned these to
         raw bytes and envelope validation rejected them as ValueError."""
         np = pytest.importorskip("numpy")
         from cachekit.serializers.base import SerializationError

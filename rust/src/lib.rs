@@ -2,7 +2,7 @@
 //!
 //! This crate provides thin Python wrappers around the cachekit-core library.
 //! Business logic lives in cachekit-core, with one SDK-owned exception: the untrusted
-//! msgpack decode bound in `msgpack_bounds` (LAB-2503), pending a core-shared walk.
+//! msgpack decode bound in `msgpack_bounds`, pending a core-shared walk.
 
 // Re-export core types for use in Python bindings
 pub use cachekit_core::{ByteStorage, StorageEnvelope};
@@ -28,7 +28,7 @@ use pyo3::prelude::*;
 ///
 /// `gil_used = false` (the PyO3 0.28+ default, made explicit): declares the
 /// module thread-safe under free-threaded CPython so importing it does not
-/// force the GIL back on. Verified by the LAB-511 audit: every `#[pyclass]`
+/// force the GIL back on. Verified by audit: every `#[pyclass]`
 /// exposes only `&self` methods, and shared state in cachekit-core is atomic
 /// or Mutex-guarded — no interior mutability the GIL was papering over. PyO3
 /// enforces `Send + Sync` on every pyclass at compile time.
@@ -38,7 +38,7 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add byte storage class
     m.add_class::<python_bindings::PyByteStorage>()?;
 
-    // ByteStorage.retrieve() envelope-verification-failure taxonomy (LAB-2736). Same
+    // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the
     // bare "_rust_serializer", which breaks pickling back to a parent process otherwise.
     let envelope_integrity_error = m.py().get_type::<python_bindings::EnvelopeIntegrityError>();
@@ -50,7 +50,7 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::verify_checksum_py, m)?)?;
 
-    // Untrusted-decode structural bound (LAB-2503) — zero-copy header walk that
+    // Untrusted-decode structural bound — zero-copy header walk that
     // serializers/base.py::unpackb_bounded runs before every msgpack.unpackb
     m.add_function(wrap_pyfunction!(
         python_bindings::check_msgpack_structure_py,

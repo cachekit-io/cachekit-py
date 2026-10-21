@@ -16,10 +16,10 @@ Key registry control flow (``track_key`` / ``drain_tracked``) against a mocked c
 see ``TestKeyRegistryControlFlow``. The drain script itself runs on real Redis in
 tests/integration/test_key_registry_redis.py.
 
-Regression coverage for LAB-4773: a provider-issued backend scopes each operation to the
+Regression coverage: a provider-issued backend scopes each operation to the
 calling context's tenant (see ``TestProviderIssuedBackendFollowsTheCallingTenant``).
 
-Regression coverage for LAB-5713: an unsupported tenant id type raises through ``@cache`` on both
+Regression coverage: an unsupported tenant id type raises through ``@cache`` on both
 paths, never degraded or counted by the circuit breaker
 (see ``TestUnsupportedTenantIdRaisesThroughTheDecorator``).
 """
@@ -393,7 +393,7 @@ class TestRedisBackendGetContract:
 @pytest.mark.unit
 class TestRedisTtlOpsRunOffTheLoop:
     """get_ttl and refresh_ttl call the sync client from a worker thread, so a Redis round trip
-    never stalls the event loop (LAB-7074)."""
+    never stalls the event loop."""
 
     @staticmethod
     def _backend_with(client: Mock) -> PerRequestRedisBackend:
@@ -700,7 +700,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         with pytest.raises(asyncio.CancelledError), caplog.at_level(logging.WARNING, logger="cachekit.backends.redis.provider"):
             await task
-        # LAB-304: the log names the error by type only — never its text, never a traceback.
+        # The log names the error by type only — never its text, never a traceback.
         assert any(
             r.levelno == logging.WARNING
             and RedisConnectionError.__name__ in r.getMessage()
@@ -749,7 +749,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
     async def test_decorator_runs_uncached_when_redis_goes_away_before_the_lock(self, caplog):
         """A ``SET NX`` failing after a successful call degrades the next miss: the function runs once,
-        uncached, and the raw ``redis.ConnectionError`` never reaches the caller (LAB-5346)."""
+        uncached, and the raw ``redis.ConnectionError`` never reaches the caller."""
         fake = _FakeRedis()
         runs: list[int] = []
 
@@ -863,7 +863,7 @@ class TestClassifyRedisErrorClusterDown:
 
 @pytest.mark.unit
 class TestProviderIssuedBackendFollowsTheCallingTenant:
-    """LAB-4773: the decorator keeps one backend for the life of the process, so a
+    """The decorator keeps one backend for the life of the process, so a
     provider-issued backend must scope each operation to the calling context's tenant."""
 
     @staticmethod
@@ -1074,7 +1074,7 @@ def live_breakers(monkeypatch):
 
 @pytest.mark.unit
 class TestUnsupportedTenantIdRaisesThroughTheDecorator:
-    """LAB-5713: a tenant id of a type _encode_tenant rejects is a caller bug, not a cache fault.
+    """A tenant id of a type _encode_tenant rejects is a caller bug, not a cache fault.
 
     Both wrappers must raise it before the function runs, however the function got its backend and
     whatever the breaker state. Degraded to an uncached call it counted a failure on the

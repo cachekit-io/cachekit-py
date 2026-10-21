@@ -6,7 +6,7 @@ set -euo pipefail
 # The corpus contract: one seed directory per [[bin]] target in Cargo.toml,
 # at corpus/<target>/ — the layout `cargo fuzz run <target>` loads by default.
 # This script fails if any target has no seeds (the drift that buried the
-# original corpus: LAB-1149) or if the total exceeds the 10MB CI budget.
+# original corpus) or if the total exceeds the 10MB CI budget.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUZZ_DIR="$(dirname "$SCRIPT_DIR")"

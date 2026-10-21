@@ -1,7 +1,7 @@
 """Test helpers for driving :class:`CircuitBreaker` through its public API.
 
 ``CircuitBreaker.call()`` / ``.call_async()`` were removed as dead production
-code (LAB-522): the live path — and ``FeatureOrchestrator`` — guards operations
+code: the live path — and ``FeatureOrchestrator`` — guards operations
 with ``should_attempt_call()`` and then records the outcome via
 ``record_success()`` / ``record_failure()``. These helpers reproduce the old
 check -> run -> record convenience flow on top of that public API so the

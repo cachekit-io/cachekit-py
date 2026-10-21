@@ -344,7 +344,7 @@ class EnvelopeShapeError(SerializationError):
     ``[bytes, [8 ints], int, format]`` with at least three slots intact — and was refused;
     or, at write, a value that would decode to one.
 
-    Two populations reach this and the read path cannot tell them apart (LAB-2736): a
+    Two populations reach this and the read path cannot tell them apart: a
     rotted integrity-on envelope whose checksum can no longer be checked, and a legitimate
     top-level 4-element list a caller cached that merely looks like one. Refusing both is
     the chosen corner — returning a rotted envelope hands the caller its compressed payload
@@ -361,7 +361,7 @@ class EnvelopeShapeError(SerializationError):
 
 
 # ---------------------------------------------------------------------------
-# Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
+# Owned untrusted-decode bounds (protocol spec/interop-mode.md → Decode bounds)
 # ---------------------------------------------------------------------------
 
 #: cachekit's own nesting ceiling, enforced by the Rust ``check_msgpack_structure``
@@ -379,7 +379,7 @@ MSGPACK_MAX_NESTING = 1024
 #: (numpy's comma-string dtype parser runs ``ast.literal_eval`` on a forged shape prefix
 #: such as ``"(1,f8"``), ``KeyError`` / ``AttributeError`` (indexing a dict that is not
 #: the shape they wrote); ``BufferError`` is a non-u8 buffer exporter rejected at the
-#: PyO3 boundary (LAB-770). Anything else — above all ``RuntimeError`` for a missing
+#: PyO3 boundary. Anything else — above all ``RuntimeError`` for a missing
 #: optional dependency — is an environment fault, not a bad cache entry, and must bubble.
 PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError, SyntaxError)
 
@@ -390,7 +390,7 @@ PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, Overfl
 #: line (505x); post-#276 the marker/column echoes are capped but ``_dtype_from_untrusted`` still
 #: echoes the full dtype (a 1 MiB forged dtype still floods). ``repr`` escapes newlines but the
 #: read paths log ``str(e)``, so :func:`bounded_error` also collapses them — one poisoned read is
-#: always exactly one bounded log line (LAB-3131).
+#: always exactly one bounded log line.
 ERROR_ECHO_MAX = 512
 
 #: Every char that could split a log record into extra lines or spoof a terminal, escaped so an

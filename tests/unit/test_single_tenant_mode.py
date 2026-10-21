@@ -1,4 +1,4 @@
-"""Tests for single-tenant mode tenant_id resolution (MEDIUM-02, LAB-4666).
+"""Tests for single-tenant mode tenant_id resolution (MEDIUM-02).
 
 Single-tenant mode derives keys and builds AAD from ONE tenant_id, resolved once
 in ``__init__``: explicit ``deployment_uuid`` → ``CACHEKIT_DEPLOYMENT_UUID`` → the

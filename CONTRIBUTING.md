@@ -76,7 +76,7 @@ This project follows a standard code of conduct. Please be respectful and profes
 User-facing docs (the README and `docs/`) follow CacheKit's shared rule on what belongs in them:
 [What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
 `prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
-files, `docs/` and commit messages.
+files, `docs/` and commit messages, and internal ticket ids in every tracked file except `CHANGELOG.md` and vendored protocol fixtures.
 
 ## Code Style Guidelines
 
@@ -230,7 +230,7 @@ The spawned server listens on a unix socket under pytest's base temp directory, 
 
 ## Review Guidance
 
-This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository (tracked internally as LAB-1151). The guidance below documents which paths benefit from security and maintainer review:
+This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository. The guidance below documents which paths benefit from security and maintainer review:
 
 **Security-sensitive paths** — consider requesting review from maintainers:
 - `/rust/` — memory safety, FFI boundaries, cryptography

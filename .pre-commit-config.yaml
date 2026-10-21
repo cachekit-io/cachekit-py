@@ -123,6 +123,17 @@ repos:
         files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
         stages: [pre-commit]
+      - id: no-ticket-ids
+        name: No internal ticket ids in tracked files
+        # Ticket ids only, but in every file: code comments and docstrings are public too.
+        # CHANGELOG.md is generated from PR titles, which carry the one allowed id; the
+        # title-lint workflow shows the title format; protocol fixtures are vendored
+        # byte-for-byte (sha256-pinned), so they change only upstream.
+        language: pygrep
+        entry: '\b(?i:LAB)-[0-9]+'
+        exclude: ^(CHANGELOG\.md|\.github/workflows/pr-title-lint\.yml|tests/unit/protocol/fixtures/.*)$
+        types: [text]
+        stages: [pre-commit]
       - id: no-internal-references-commit-msg
         name: No internal references in commit message
         # Same patterns. git hands this hook the raw message file: "# " comment lines, the diff

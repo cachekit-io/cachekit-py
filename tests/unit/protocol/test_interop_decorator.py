@@ -465,7 +465,7 @@ class TestInteropRejections:
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
 
     def test_key_prefix_appearing_later_fails_closed_per_call_sync_l1_hit(self):
-        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission (LAB-5351),
+        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission,
         and the per-call re-check must still run before it."""
         mutable = DictBackend(key_prefix="")
 
@@ -497,7 +497,7 @@ class TestInteropRejections:
         assert calls == [], "function must NOT run against an incompatible backend"
 
     def test_sync_lazy_provider_prefixing_backend_fails_closed(self):
-        """Sync twin (LAB-5351): the guard still runs on the first sync call, when the backend is
+        """Sync twin: the guard still runs on the first sync call, when the backend is
         resolved lazily behind admission. Checking before resolution alone would be a no-op
         (``ensure_interop_backend_compatible(None)`` returns) and run the function."""
         from cachekit.decorators.wrapper import create_cache_wrapper
@@ -668,7 +668,7 @@ class TestInteropEncryption:
         assert get_user.cache_info().hits == 1
 
     def test_plaintext_entry_under_encryption_is_never_returned(self, backend: DictBackend):
-        """Fail closed (LAB-241 posture): with encryption on, a planted plaintext
+        """Fail closed (plaintext-downgrade posture): with encryption on, a planted plaintext
         msgpack value must not be served — it fails auth, gets evicted, and the
         recomputed value is stored encrypted."""
         import msgpack
@@ -699,7 +699,7 @@ class TestInteropEncryption:
         assert not backend.store
 
     # protocol test-vectors/encryption.json → default_tenant.vectors[default_tenant_interop]
-    # (LAB-4666): HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
+    #: HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
     # canonical plain-MessagePack value at the `single_int` interop key, sealed by the
     # protocol's stdlib+cryptography reference — NOT by this SDK. Pinned inline so a
     # fixture drift is a conscious change.

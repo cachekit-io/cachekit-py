@@ -1,4 +1,4 @@
-"""One inline retry of a shed write (LAB-7686).
+"""One inline retry of a shed write.
 
 A PUT or DELETE answered 503 with ``Retry-After`` of at most 2 s is sent once more after
 exactly that delay; every other failure is sent once. Requests go through the backend's real

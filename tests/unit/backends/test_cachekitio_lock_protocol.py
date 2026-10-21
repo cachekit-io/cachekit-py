@@ -669,7 +669,7 @@ async def _drain_background_releases() -> None:
 
 @pytest.mark.unit
 class TestFillLock:
-    """acquire_fill_lock (LAB-7064): reports a first-attempt grant and releases without blocking the caller."""
+    """acquire_fill_lock: reports a first-attempt grant and releases without blocking the caller."""
 
     @pytest.mark.parametrize(
         ("posts", "expected"),

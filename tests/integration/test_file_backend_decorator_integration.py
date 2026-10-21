@@ -182,7 +182,7 @@ class TestSetDefaultBackendWithFileBackend:
             set_default_backend(original)
 
     def test_set_default_backend_after_decoration(self, tmp_path: Path) -> None:
-        """set_default_backend() called AFTER decoration still takes effect at first call (LAB-4457)."""
+        """set_default_backend() called AFTER decoration still takes effect at first call."""
         original = get_default_backend()
         try:
             set_default_backend(None)

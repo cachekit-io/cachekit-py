@@ -607,7 +607,7 @@ def _live_breaker_config(wrapped) -> dict:
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 class TestDecoratorConfiguresLiveBreaker:
-    """@cache(circuit_breaker=CircuitBreakerConfig(...)) reaches the breaker the wrapper runs (LAB-5340)."""
+    """@cache(circuit_breaker=CircuitBreakerConfig(...)) reaches the breaker the wrapper runs."""
 
     @pytest.mark.parametrize(
         ("knob", "value", "live_key"),
@@ -648,7 +648,7 @@ class TestDecoratorConfiguresLiveBreaker:
 
 
 class TestIntentPresetsKeepLiveBreakerDefaults:
-    """Wiring the knobs must not move any preset's live breaker (LAB-5340 AC-2).
+    """Wiring the knobs must not move any preset's live breaker.
 
     @cache.local is not covered: it is an in-process reference cache with no breaker.
     """
@@ -685,7 +685,7 @@ class _Clock:
 
 
 class TestClosedFailureWindow:
-    """CLOSED opens on failure_threshold failures within a 60 s rolling window (LAB-5352).
+    """CLOSED opens on failure_threshold failures within a 60 s rolling window.
 
     Parity with cachekit-ts and cachekit-rs: successes in CLOSED neither reset the count
     nor extend the window, and failures older than the window stop counting.

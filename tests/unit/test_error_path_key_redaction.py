@@ -1,4 +1,4 @@
-"""Error-path log redaction for backend operations (CWE-532, LAB-304).
+"""Error-path log redaction for backend operations (CWE-532).
 
 Companion to ``tests/unit/test_orchestrator_error_handling.py``'s
 ``TestCacheKeyRedaction``: that file pins ``FeatureOrchestrator.handle_cache_error``;
@@ -249,7 +249,7 @@ class TestInvalidationRedaction:
         _assert_redacted(caplog, backend.received_keys[0])
 
     async def test_legacy_key_failure_logs_redacted_at_error(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A non-default serializer also deletes the pre-0.20.0 key (LAB-5288); both failures log redacted at ERROR."""
+        """A non-default serializer also deletes the pre-0.20.0 key; both failures log redacted at ERROR."""
         error = ValueError(f"illegal input: {TENANT_KEY}")
 
         for invoke in ("sync", "async"):
@@ -706,7 +706,7 @@ class TestDecoratorWrapperRedaction:
 
 
 class TestUnpairedSurrogateKeys:
-    """A key holding an unpaired surrogate degrades like any other key (LAB-7624).
+    """A key holding an unpaired surrogate degrades like any other key.
 
     Such a key cannot be strictly UTF-8 encoded. The redaction digest must still be minted, or
     an L2 failure raises UnicodeEncodeError from the error handler instead of degrading.

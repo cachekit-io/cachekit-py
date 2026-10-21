@@ -542,7 +542,7 @@ class TestBackwardCompatibility:
 
 
 class TestStatsRegistryReDecoration:
-    """LAB-506: re-applying a decorator to the same function must reuse its stats.
+    """Re-applying a decorator to the same function must reuse its stats.
 
     The session ID is derived from process UUID + module.qualname, so it is
     stable across re-decorations — fresh counters under that unchanged ID go
@@ -594,7 +594,7 @@ class TestStatsRegistryReDecoration:
 
 
 class TestForkSessionIsolation:
-    """LAB-506: a forked child must not reuse the parent's session identity.
+    """A forked child must not reuse the parent's session identity.
 
     Inherited counters reset under the parent's session ID read as a replay
     server-side; the child needs a fresh process UUID and zeroed counters.
@@ -652,7 +652,7 @@ class TestForkSessionIsolation:
 
 
 class TestMidPublishMemoryOrdering:
-    """LAB-511: a reader observing a partially published session identity must recover.
+    """A reader observing a partially published session identity must recover.
 
     Under the GIL the assignment order in _ensure_session_initialized makes the
     partial state (pid+id visible, start_ms not yet) unobservable; on free-threaded
@@ -660,7 +660,7 @@ class TestMidPublishMemoryOrdering:
     Rather than trying to win a hardware race, these tests pin the exact state such
     a reader would see and assert it recovers via the lock path instead of hitting
     the "should never happen" RuntimeError that made backend.py silently drop the
-    session headers (the LAB-506 telemetry loss, resurfacing GIL-free).
+    session headers (the session telemetry loss, resurfacing GIL-free).
     """
 
     @contextmanager
@@ -748,7 +748,7 @@ class TestMidPublishMemoryOrdering:
 
     def test_no_header_dropped_when_init_observed_mid_publish(self):
         """The end-to-end regression: backend.py catches session errors and sends
-        NO session headers — the silent telemetry loss LAB-506 exists to prevent."""
+        NO session headers — the silent telemetry loss the session registry exists to prevent."""
         with self._mid_publish_state():
             stats = _FunctionStats("lab511.mid_publish_probe")
             stats.record_miss()
@@ -759,7 +759,7 @@ class TestMidPublishMemoryOrdering:
 
 
 class TestSessionIDUnification:
-    """LAB-506: one process session UUID across decorator and backend paths."""
+    """One process session UUID across decorator and backend paths."""
 
     def test_decorator_and_backend_session_ids_match(self):
         from cachekit.backends.cachekitio.session import get_session_id as backend_session_id
@@ -769,7 +769,7 @@ class TestSessionIDUnification:
 
 
 class TestForkResetHandlers:
-    """LAB-506: the post-fork reset handlers, exercised in-process.
+    """The post-fork reset handlers, exercised in-process.
 
     The real fork path is covered by TestForkSessionIsolation; these tests
     pin the handlers' contracts directly — zeroed counters, replaced locks

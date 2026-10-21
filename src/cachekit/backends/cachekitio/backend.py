@@ -72,12 +72,12 @@ LOCK_ID_HEADER = "X-CacheKit-Lock-Id"
 # legacy X-TTL is server-side migration only (API-44).
 TTL_HEADER = "X-CacheKit-TTL"
 
-# Stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate).
+# Stale-while-revalidate (spec/saas-api.md#stale-while-revalidate).
 # STALE_TTL_HEADER rides PUTs to open a stale-grace window past the fresh TTL;
 # FRESHNESS_HEADER labels every GET/HEAD 200 as fresh|stale. Pre-SWR servers
 # ignore the former and never emit the latter. FRESH_FOR_HEADER carries the
-# remaining freshness in whole seconds on GET 200s (LAB-557,
-# spec/saas-api.md#remaining-freshness); pre-signal servers omit it.
+# remaining freshness in whole seconds on GET 200s
+# (spec/saas-api.md#remaining-freshness); pre-signal servers omit it.
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
@@ -86,14 +86,14 @@ _FRESH_FOR_MAX_S = 2_592_000
 _FRESH_FOR_MAX_DIGITS = 7
 
 # A write the server sheds with 503 + a short Retry-After (request deadline, a retryable store
-# fault) is sent once more, inline, after exactly that delay (LAB-7686). PUT and DELETE are
+# fault) is sent once more, inline, after exactly that delay. PUT and DELETE are
 # idempotent, so a duplicate is harmless. A longer hint (the rate-limiter fault sends 10 s) is
 # honoured by not retrying, rather than by retrying early.
 _RETRY_METHODS = frozenset({"PUT", "DELETE"})
 _MAX_RETRY_AFTER_S = 2
 
 # The SaaS has no bulk delete, so whole-function invalidation sends this many DELETEs at once over
-# the client's pool, one HTTP/1.1 connection each (LAB-7070). Each still takes its own limiter verdict.
+# the client's pool, one HTTP/1.1 connection each. Each still takes its own limiter verdict.
 _DELETE_FANOUT = 16
 # A longer rate-limit hint than this is treated as a deny, not waited out. The tenant limiter's
 # window is 60 s, so a real hint is far below it; the cap only bounds the parse.
@@ -157,13 +157,13 @@ def _rate_limit_delay(error: BackendError) -> int | None:
 
 
 def _parse_fresh_for(value: str | None) -> int | None:
-    """Map an ``X-CacheKit-Fresh-For`` value to seconds (LAB-557, spec/saas-api.md#remaining-freshness).
+    """Map an ``X-CacheKit-Fresh-For`` value to seconds (spec/saas-api.md#remaining-freshness).
 
     Absent = pre-signal server → None (legacy behavior: no bound). Anything but 1-7 ASCII
     digits at most the 30-day TTL cap = drift → 0 (do not extend local service — the
     conservative action, mirroring the unrecognized-freshness → stale rule). The shape check
-    runs before ``int()``, which accepts ``+5``, ``1_0``, whitespace and non-ASCII digits
-    (LAB-7838). Takes the header string, not a response, so it outlives the HTTP client.
+    runs before ``int()``, which accepts ``+5``, ``1_0``, whitespace and non-ASCII digits.
+    Takes the header string, not a response, so it outlives the HTTP client.
 
     Examples:
         >>> _parse_fresh_for("30"), _parse_fresh_for(None), _parse_fresh_for("+5"), _parse_fresh_for("3000000")
@@ -609,9 +609,9 @@ class CachekitIOBackend:
 
         Returns:
             ``(value, is_stale, fresh_for)`` on a hit — ``is_stale`` is True only
-            for an entry in its stale-grace window (LAB-381); ``fresh_for`` is the
+            for an entry in its stale-grace window; ``fresh_for`` is the
             server's remaining freshness in seconds, or None from a pre-signal
-            server (LAB-557) — or None on a miss.
+            server — or None on a miss.
 
         Raises:
             BackendError: If operation fails (network, auth, etc.)
@@ -629,7 +629,7 @@ class CachekitIOBackend:
             value: Bytes to cache
             ttl: Time-to-live in seconds (optional)
             stale_ttl: Stale-grace window in seconds past the fresh TTL
-                (LAB-381 SWR). Only honoured alongside an explicit ``ttl``;
+                (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
 
         Raises:
@@ -821,7 +821,7 @@ class CachekitIOBackend:
             value: Bytes to cache
             ttl: Time-to-live in seconds (optional)
             stale_ttl: Stale-grace window in seconds past the fresh TTL
-                (LAB-381 SWR). Only honoured alongside an explicit ``ttl``;
+                (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
 
         Raises:
@@ -1029,7 +1029,7 @@ class CachekitIOBackend:
     ) -> AsyncIterator[tuple[bool, bool]]:
         """``acquire_lock`` for the decorator's miss path; not part of the LockableBackend protocol.
 
-        Two differences, both so the caller does not wait on a request it does not need (LAB-7064):
+        Two differences, both so the caller does not wait on a request it does not need:
 
         - It yields ``(acquired, uncontended)``. ``uncontended`` is True when the first lock POST
           won: this caller never waited behind another holder. A fill that completed between the

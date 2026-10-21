@@ -112,7 +112,7 @@ def _held_bytes(cache: L1Cache) -> int:
 
 @pytest.mark.unit
 class TestUpdateUnderPressure:
-    """LAB-6897: updating a key whose old entry is LRU must not count its bytes twice."""
+    """Updating a key whose old entry is LRU must not count its bytes twice."""
 
     def test_lru_first_update_keeps_count_and_budget(self):
         cache = L1Cache(max_memory_mb=1)
@@ -386,7 +386,7 @@ def _c_fork_child_outcome() -> object:
 
 @pytest.mark.unit
 class TestCleanupThreadAfterFork:
-    """LAB-4772: a prefork child must run its own L1 cleanup thread."""
+    """A prefork child must run its own L1 cleanup thread."""
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_forked_child_restarts_cleanup_on_first_put(self):
@@ -469,7 +469,7 @@ class TestCleanupThreadAfterFork:
                 found = cache.get("live")[0]  # from the forking thread, never the holder's ident
                 if get_first:
                     q.put({"found": found, "swept": _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)})
-                else:  # no hook ran, so the take-over started no cleanup thread (LAB-7271)
+                else:  # no hook ran, so the take-over started no cleanup thread
                     q.put({"found": found, "cleanup_off": manager._cleanup_thread is None})
 
             process = ctx.Process(target=child, args=(queue,))
@@ -1010,7 +1010,7 @@ class TestCleanupThreadAfterFork:
         assert cache.get("k") == (False, None)
 
     def test_hookless_child_starts_no_cleanup_thread(self, monkeypatch, caplog):
-        """LAB-7271: a fork from C skips CPython's own after-fork repair, so no thread may start there."""
+        """A fork from C skips CPython's own after-fork repair, so no thread may start there."""
         from cachekit import l1_cache
 
         manager = L1CacheManager(default_max_memory_mb=10)

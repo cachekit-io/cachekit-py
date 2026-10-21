@@ -1,4 +1,4 @@
-"""The miss-path lock release survives process exit (LAB-7064).
+"""The miss-path lock release survives process exit.
 
 The decorator's miss path releases the CachekitIO lock in the background, so the caller does not wait on
 the DELETE. These tests pin that it still lands when the decorated call is the last thing a process does:

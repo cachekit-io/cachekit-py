@@ -1,4 +1,4 @@
-"""Async hit-record stats parity (LAB-3765).
+"""Async hit-record stats parity.
 
 The sync wrapper records an L1 hit as ``serializer="l1_memory"`` and an L2
 hit as ``serializer="rust"``, both with the served size; the async L1 and

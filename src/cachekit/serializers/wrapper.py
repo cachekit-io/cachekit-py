@@ -62,7 +62,7 @@ def _require_serializer_name(name: Any) -> str:
     """Reject an entry that records no serializer name (protocol: a nameless value is a mismatch).
 
     Every cachekit-py writer records a name, so its absence means a malformed or tampered entry. Rejecting
-    here, in the one parser, keeps it away from every serializer's decode (LAB-4432).
+    here, in the one parser, keeps it away from every serializer's decode.
     """
     if not isinstance(name, str) or not name:
         raise ValueError("Cache envelope records no serializer name")
@@ -176,7 +176,7 @@ class SerializationWrapper:
         """Build the v3 frame prefix (everything before the payload): MAGIC | VERSION | HDR_LEN | HEADER.
 
         The prefix depends only on the metadata/serializer name, never on the payload bytes, so
-        the streaming write path (LAB-766) can emit it before a single payload byte exists and
+        the streaming write path can emit it before a single payload byte exists and
         the stored frame stays byte-identical to a buffered ``wrap`` of the same payload.
 
         ``align`` pads HEADER with trailing ASCII spaces, counted in HDR_LEN, until

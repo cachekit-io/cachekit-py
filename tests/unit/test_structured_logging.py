@@ -133,7 +133,7 @@ class TestStructuredLogger:
         assert isinstance(context["thread_id"], int)
 
     def test_cache_key_always_redacted(self, logger):
-        """cache_operation always redacts the key via digest (CWE-532, LAB-304)."""
+        """cache_operation always redacts the key via digest (CWE-532)."""
         from unittest.mock import patch as _patch
 
         from cachekit.hash_utils import redact_cache_key

@@ -322,7 +322,7 @@ class TestL1OnlySWRBoundedConcurrency:
 
 @pytest.mark.unit
 class TestL1OnlySWRStoppedLoop:
-    """LAB-7295: an async refresh left pending on an event loop that stopped (sync code calling
+    """An async refresh left pending on an event loop that stopped (sync code calling
     run_until_complete) or closed without cancelling its tasks keeps its slot and key for the
     hold; the next refresh attempt on any key then releases both and cancels it."""
 

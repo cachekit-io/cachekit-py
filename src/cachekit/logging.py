@@ -141,7 +141,7 @@ class StructuredLogger:
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
         """Log cache operation with standard fields."""
         # Always redact: cache keys embed caller-supplied tenant/user identifiers
-        # (CWE-532, LAB-304). PII-pattern masking (SSN/email/...) does not catch
+        # (CWE-532). PII-pattern masking (SSN/email/...) does not catch
         # them, and a raw [:50] prefix is exactly the leak — so neither is an
         # alternative to the digest.
         #

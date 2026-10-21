@@ -1,6 +1,6 @@
-"""Performance guards for the LAB-506 session-stats registry + session identity.
+"""Performance guards for the session-stats registry + session identity.
 
-The LAB-506 fix (PR #233) moved per-function counters into a process-global,
+The session-stats fix (PR #233) moved per-function counters into a process-global,
 lock-guarded registry and unified session-ID derivation onto one PID-aware
 module. Its correctness *and* its performance both rest on one invariant:
 
@@ -69,7 +69,7 @@ class _CountingLock:
 def test_redecoration_reuses_single_stats_object() -> None:
     """Re-decoration (factory / per-call patterns) reuses ONE stats object.
 
-    This is the LAB-506 fix itself: a fresh counter object per decoration would
+    This is the session-stats fix itself: a fresh counter object per decoration would
     send counters backwards under the process-stable session ID. It must also
     be O(1) in registry size — repeated decoration adds no entries.
     """

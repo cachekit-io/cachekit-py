@@ -1,4 +1,4 @@
-"""Sync/async L2-hit parity (cachekit-py#164, LAB-348).
+"""Sync/async L2-hit parity (cachekit-py#164).
 
 An L2 hit must (a) backfill L1 so the next read of the same key never
 re-pays the L2 round-trip, and (b) record ``size_bytes`` as the serialized

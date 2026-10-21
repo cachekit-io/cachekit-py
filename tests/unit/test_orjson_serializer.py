@@ -11,7 +11,7 @@ from uuid import UUID
 import pytest
 
 # OrjsonSerializer requires the [json] extra — absent e.g. in the free-threaded
-# CI lane until orjson ships free-threaded wheels (LAB-511).
+# CI lane until orjson ships free-threaded wheels.
 pytest.importorskip("orjson")
 
 from cachekit.serializers import OrjsonSerializer  # noqa: E402

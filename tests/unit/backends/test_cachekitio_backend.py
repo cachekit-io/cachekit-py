@@ -533,7 +533,7 @@ _MISS_CALLS = [
 
 @pytest.mark.unit
 class TestMissWithoutException:
-    """A 404 on a key read or exists returns the miss without raising (LAB-7066).
+    """A 404 on a key read or exists returns the miss without raising.
 
     The miss path must never build HTTPStatusError or a BackendError: that round-trip
     is pure CPU on every cache miss.

@@ -354,7 +354,7 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         2. A DataFrame survives encrypt -> store-in-Redis -> retrieve -> decrypt unchanged.
         3. The raw bytes in Redis are ciphertext (no plaintext column values).
         """
-        pd = pytest.importorskip("pandas")  # requires the [data] extra (LAB-511)
+        pd = pytest.importorskip("pandas")  # requires the [data] extra
 
         from cachekit.cache_handler import CacheSerializationHandler
         from cachekit.config.nested import EncryptionConfig, L1CacheConfig
@@ -396,7 +396,7 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         # Raw Redis bytes must be ciphertext, not the plaintext column value. Read the key
         # the decorator actually wrote rather than re-deriving one: a custom serializer
         # *instance* keys under its own serializer code, so a hand-built key would name a
-        # different entry (LAB-4351).
+        # different entry.
         written = self.redis_client.keys(self.get_scoped_key("ns:enc_arrow_crit*"))
         assert len(written) == 1, f"Expected exactly one Arrow cache entry, got: {written}"
         raw = self.redis_client.get(written[0])

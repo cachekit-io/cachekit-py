@@ -208,7 +208,7 @@ class TestBlake2bKeyGeneration:
         """Test SERIALIZER_CODES constant is correct."""
         gen = CacheKeyGenerator()
 
-        # Canonical names only — alias spellings live in SERIALIZER_NAME_ALIASES (LAB-4351).
+        # Canonical names only — alias spellings live in SERIALIZER_NAME_ALIASES.
         expected_codes = {
             "default": "s",
             "auto": "a",

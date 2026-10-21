@@ -1,4 +1,4 @@
-"""Cache keys must carry the serializer code (LAB-4351).
+"""Cache keys must carry the serializer code.
 
 `CacheKeyGenerator.generate_key` has always accepted `serializer_type`, but no
 caller on the main read/write path passed it, so every serializer fell back to
@@ -249,7 +249,7 @@ class TestSerializerCodeTable:
         assert _suffix(genuine_key) == "1a"
 
     def test_distinct_serializer_instances_get_distinct_codes(self):
-        """The custom bucket must not be shared — a shared one IS the LAB-4351 bug.
+        """The custom bucket must not be shared — a shared one IS the shared-key bug.
 
         An instance is the only way to configure a built-in (``ArrowSerializer(...)``), so
         two instance-configured decorators over one function is a normal arrangement, not an
@@ -344,9 +344,9 @@ class _FailOnKeysBackend(_RecordingBackend):
 
 @pytest.mark.unit
 class TestInvalidationReachesPre020Keys:
-    """`invalidate_cache(args)` also deletes the pre-0.20.0 `:{ic}s` entry (LAB-5288).
+    """`invalidate_cache(args)` also deletes the pre-0.20.0 `:{ic}s` entry.
 
-    Before LAB-4351 every generated key ended in `s`. After upgrading, a non-default
+    Before the serializer-code suffix, every generated key ended in `s`. After upgrading, a non-default
     serializer writes and invalidates a new key, so an erasure that deletes only the new
     key returns normally while the pre-upgrade copy survives to its TTL.
     """
@@ -546,7 +546,7 @@ def _pin_identity(fn: _F) -> _F:
 
 @pytest.mark.unit
 class TestHashedLegacyKeyMatchesV019:
-    """The legacy twin of a hashed key is byte-identical to the key 0.19.0 wrote (LAB-6361).
+    """The legacy twin of a hashed key is byte-identical to the key 0.19.0 wrote.
 
     Both tests pin one identity, so they share a key: L1 is off, or the second would hit the
     first one's process-wide L1 entry and never reach the backend.

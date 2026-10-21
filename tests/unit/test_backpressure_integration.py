@@ -116,7 +116,7 @@ class TestBackpressureIntegration:
         """Test that backpressure controller actually limits concurrent requests.
 
         Saturation is driven by events, not sleeps: a sleeping backend only overlaps requests
-        if every thread starts within the sleep, which scheduler load breaks (LAB-6381).
+        if every thread starts within the sleep, which scheduler load breaks.
         No worker wait races the test's clock: the holders block until the finally releases
         them, and an overflow request that slips past backpressure returns at once. Only the
         test thread has a deadline, and expiry fails the test; it never frees a permit.

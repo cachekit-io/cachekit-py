@@ -1,4 +1,4 @@
-"""Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time (LAB-7070).
+"""Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time.
 
 The SaaS has no bulk delete, so ``_delete_many`` sends one DELETE per key on a bounded pool.
 Requests go through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py) whose
@@ -165,7 +165,7 @@ async def test_ainvalidate_cache_takes_the_fan_out() -> None:
 
     await f.ainvalidate_cache()
 
-    # Fan-out shape from the server, not the clock (LAB-7889): the held first wave puts 16 DELETEs
+    # Fan-out shape from the server, not the clock: the held first wave puts 16 DELETEs
     # in flight on 16 pool threads. A key deleted outside the pool (per-key loop, serial tail)
     # brings a 17th thread; a pool of fewer than 16 never fills the hold and peaks below 16.
     assert len(server.threads) == _DELETE_FANOUT, len(server.threads)

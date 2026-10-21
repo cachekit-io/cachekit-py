@@ -71,7 +71,7 @@ def cache(
             >>> config.l1.enabled
             True
 
-        Secure refuses L1-only mode — raw objects cannot be ciphertext (LAB-4665):
+        Secure refuses L1-only mode — raw objects cannot be ciphertext:
             >>> @cache.secure(master_key="a" * 64, backend=None)  # doctest: +IGNORE_EXCEPTION_DETAIL
             ... def leaks_plaintext() -> str:
             ...     return "pii"
@@ -102,7 +102,7 @@ def cache(
         config: DecoratorConfig object for RORO-style configuration
         _intent: Internal parameter for intent variants (fast/safe/secure)
         **manual_overrides: Any manual parameter overrides (including serializer).
-            Notable: ``stale_ttl`` (LAB-381 stale-while-revalidate) — a stale-grace
+            Notable: ``stale_ttl`` (stale-while-revalidate) — a stale-grace
             window in seconds past the fresh ``ttl``. During the window an expired
             entry is served immediately and the function re-runs in the background,
             so no request pays the recompute at a TTL boundary. Requires a positive
@@ -185,9 +185,9 @@ def cache(
         # Tier 2 resolution: if no explicit backend and not L1-only mode,
         # check module-level default set via set_default_backend(). Kept here
         # (not only lazily) because decoration-time validation — the interop
-        # backend guard and stale_ttl/SWR capability (LAB-557) — needs the
+        # backend guard and stale_ttl/SWR capability — needs the
         # backend when it is already known. If the default is set LATER, the
-        # wrapper re-consults it at first call (_resolve_lazy_backend, LAB-4457).
+        # wrapper re-consults it at first call (_resolve_lazy_backend).
         # A backend already in config= is explicit and beats the default: fetched here, the
         # default would replace it below — DecoratorConfig.io(api_key=B) under a key-A default
         # would send tenant B's traffic under key A.
@@ -199,7 +199,7 @@ def cache(
             if default_backend is not None:
                 backend = default_backend
 
-        # Flattened l1_enabled flips only l1.enabled, applied AFTER resolution (LAB-4828): every
+        # Flattened l1_enabled flips only l1.enabled, applied AFTER resolution: every
         # preset factory already passes its own l1=, so forwarding it collides, and building it here
         # from L1CacheConfig() would drop the preset's / config='s L1 tuning (minimal swr_enabled=False).
         _has_l1_enabled = "l1_enabled" in overrides

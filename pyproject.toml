@@ -214,7 +214,7 @@ exclude_lines = [
 [dependency-groups]
 # Core test toolchain — everything tests/unit + tests/critical need on ANY
 # interpreter, including free-threaded CPython: the free-threaded CI lane
-# installs ONLY this group (LAB-511). A dep may live here only if it ships
+# installs ONLY this group. A dep may live here only if it ships
 # free-threaded wheels or builds cleanly from source on 3.14t; deps that
 # don't (orjson, numpy, pandas, pyarrow) stay in dev below.
 test = [

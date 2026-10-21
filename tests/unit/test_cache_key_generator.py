@@ -433,7 +433,7 @@ class TestExtendedTypeNormalization:
         """IntEnum and str-mixin Enums are int/str subclasses but must take the Enum branch.
 
         The primitive fast path matches exact types only; an isinstance match would
-        return the member itself, which msgpack strict_types rejects (LAB-7068).
+        return the member itself, which msgpack strict_types rejects.
         """
 
         class Level(IntEnum):
@@ -452,7 +452,7 @@ class TestExtendedTypeNormalization:
         assert key_generator.generate_key(func, (Mode.FAST,), {}) == key_generator.generate_key(func, ("fast",), {})
 
     def test_float_subclass_with_unhashable_metaclass_still_normalizes(self, key_generator):
-        """The fast path must not hash the argument's type (LAB-7068).
+        """The fast path must not hash the argument's type.
 
         A float subclass whose metaclass is unhashable keys like 0.0 on the slow path;
         a set-membership type check would raise TypeError instead.
@@ -881,7 +881,7 @@ class TestFuncNameSanitization:
         ],
     )
     def test_shortcut_matches_regex_path(self, module, qualname):
-        """The pass-skipping checks (LAB-7405) return exactly what the two regex passes would."""
+        """The pass-skipping checks return exactly what the two regex passes would."""
         raw = f"{module}.{qualname}"
         expected = CacheKeyGenerator._DOUBLE_DOT_RE.sub(".", CacheKeyGenerator._FUNC_ALLOWED_RE.sub("_", raw))[
             : CacheKeyGenerator._FUNC_NAME_MAX

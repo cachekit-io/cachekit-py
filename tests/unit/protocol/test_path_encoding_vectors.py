@@ -1,4 +1,4 @@
-"""Cache-key path encoding against the protocol test vectors (LAB-2880, LAB-6550, LAB-8243).
+"""Cache-key path encoding against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/path-encoding.json, vendored from
 cachekit-io/protocol @ f35635445a6a7461f93061aa51332e4f0d25c614 (vectors 1.2.0,

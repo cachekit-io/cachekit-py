@@ -6,7 +6,7 @@ set -euo pipefail
 # Writes seeds into corpus/<target>/ — one directory per [[bin]] name in
 # Cargo.toml, because that is the layout `cargo fuzz run <target>` loads by
 # default. (A previous version wrote a category tree, corpus/byte_storage/…,
-# which no target ever read: LAB-1149.)
+# which no target ever read.)
 #
 # Deterministic *within a pinned dependency set*: same script version + the
 # versions pinned below → byte-identical seeds, so re-runs produce clean git
@@ -77,7 +77,7 @@ def seed(target: str, name: str, data: bytes) -> None:
     # owned. Without it, renaming or dropping a seed leaves the old file
     # committed forever: validate_corpus.sh checks presence and size, not
     # provenance, so the orphan is invisible — corpus drift in the opposite
-    # direction to LAB-1149.
+    # direction to a seed tree no target reads.
     #
     # Scoped to `*.bin`, the naming this script owns. libFuzzer writes its
     # discoveries as extensionless hex digests, so growth runs and committed

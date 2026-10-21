@@ -18,7 +18,7 @@ from cachekit.config.decorator import DecoratorConfig
 
 @pytest.mark.unit
 class TestPresetDefaultTTL:
-    """protocol/spec/intent-presets.md § Default TTL (LAB-4641).
+    """protocol/spec/intent-presets.md § Default TTL.
 
     Rule 1: every preset applies a finite default TTL when the caller supplies none.
     Rule 2: an explicit ttl= overrides it. Rule 4: never-expire is an explicit opt-in —

@@ -1,4 +1,4 @@
-"""Call shape of each decorated path over CachekitIO: which HTTP requests block the caller (LAB-7054).
+"""Call shape of each decorated path over CachekitIO: which HTTP requests block the caller.
 
 Each test runs one decorated call against a fake SaaS behind the backend's real urllib3 client, on a
 fake pool (tests/utils/cachekitio_fakes.py), and pins two things: the ordered list of requests the
@@ -360,7 +360,7 @@ class TestAsyncCallShape:
             return x * 2
 
         shape = await gate.run_async(fn(1))
-        # The first lock POST won after a clean miss: no re-read, and the release is not waited on (LAB-7064).
+        # The first lock POST won after a clean miss: no re-read, and the release is not waited on.
         assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
     async def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
@@ -396,7 +396,7 @@ class TestAsyncCallShape:
         # A waited grant keeps the double-check read: the holder may have filled the key meanwhile.
         assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET"], background=["DELETE /lock"])
 
-    # refresh_ttl_on_get decides from the hit's Fresh-For and never blocks the caller (LAB-7074).
+    # refresh_ttl_on_get decides from the hit's Fresh-For and never blocks the caller.
 
     async def test_refresh_ttl_on_get_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         """Fresh-For under ttl x threshold: the PATCH goes straight to the background, no GET /ttl."""
@@ -508,7 +508,7 @@ class TestAsyncCallShape:
 
     async def test_failed_read_of_a_live_entry(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         """The primary read fails on an entry that is still live, and the first lock POST wins. The post-lock
-        read is the only retry, so it still runs and serves the entry: no recompute, no PUT (LAB-7064)."""
+        read is the only retry, so it still runs and serves the entry: no recompute, no PUT."""
         calls: list[int] = []
 
         @cache(backend=backend, ttl=60, l1_enabled=False)

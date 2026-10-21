@@ -25,7 +25,7 @@ from cachekit._rust_serializer import ByteStorage
 
 # Incompressible payload, large enough that store/retrieve take >=100ms even on
 # fast hardware. GitHub-hosted ubuntu-latest moves ~3.3 GB/s through this path
-# (64 MiB finished in 19-25 ms and tripped the floor below, LAB-3500), so
+# (64 MiB finished in 19-25 ms and tripped the floor below), so
 # 384 MiB gives ~115 ms there and >2x margin over _MIN_CALL_SECONDS. Peak test
 # memory is ~3x the payload (payload + envelope + retrieved copy), ~1.2 GB.
 _PAYLOAD_BYTES = 384 * 1024 * 1024

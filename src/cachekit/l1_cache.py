@@ -20,7 +20,7 @@ from cachekit import _fork
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
 # Default L1 entry lifetime when the caller supplies no TTL. Shared with the
-# decorator's LAB-557 backfill bound: the server's Fresh-For may only ever
+# decorator's freshness backfill bound: the server's Fresh-For may only ever
 # SHORTEN the L1 lifetime relative to this default, never extend it.
 DEFAULT_L1_TTL_SECONDS = 300
 

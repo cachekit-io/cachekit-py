@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 # docs/conftest.py imports numpy/pandas at module level (its fences use them) —
-# absent e.g. in the free-threaded CI lane (LAB-511).
+# absent e.g. in the free-threaded CI lane.
 pytest.importorskip("numpy")
 pytest.importorskip("pandas")
 
