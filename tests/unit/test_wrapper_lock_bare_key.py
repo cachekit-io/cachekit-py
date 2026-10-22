@@ -340,7 +340,7 @@ class _LockFailingBackend(_RecordingLockableBackend):
 @pytest.mark.asyncio
 class TestLockFailureWarningRedactsKey:
     """The 'Lock operation failed' warning interpolates ``{e}`` — a BackendError
-    carrying the cache key must not leak it into the log (CodeRabbit PR #264)."""
+    carrying the cache key must not leak it into the log (#264)."""
 
     async def test_lock_failure_warning_never_logs_raw_key(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = _LockFailingBackend()
@@ -439,7 +439,7 @@ class TestNonCallableLockAttributeFallsBackToLockless:
     ``TypeError`` escaped: the wrapper's handler degrades to lockless execution
     only for a ``BackendError`` and re-raises everything else. So a backend that
     merely declared the attribute broke every decorated call it was supposed to
-    protect (CodeRabbit PR #313).
+    protect (#313).
     """
 
     async def test_non_callable_acquire_lock_does_not_break_the_call(self) -> None:

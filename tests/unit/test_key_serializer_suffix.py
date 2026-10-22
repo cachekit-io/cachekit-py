@@ -67,11 +67,11 @@ class TestSerializerCodeReachesTheKey:
         backend_std = _RecordingBackend()
         backend_auto = _RecordingBackend()
 
-        @cache(backend=backend_std, ttl=60, namespace="lab4351", serializer="std")
+        @cache(backend=backend_std, ttl=60, namespace="sersuffix", serializer="std")
         def compute(x: int) -> dict:
             return {"result": x * 2}
 
-        @cache(backend=backend_auto, ttl=60, namespace="lab4351", serializer="auto")
+        @cache(backend=backend_auto, ttl=60, namespace="sersuffix", serializer="auto")
         def compute_auto(x: int) -> dict:
             return {"result": x * 2}
 
@@ -92,7 +92,7 @@ class TestSerializerCodeReachesTheKey:
         """The decorator, not the test, supplies the serializer. Fails without the fix."""
         backend = _RecordingBackend()
 
-        @cache(backend=backend, ttl=60, namespace=f"lab4351-{serializer}", serializer=serializer)
+        @cache(backend=backend, ttl=60, namespace=f"sersuffix-{serializer}", serializer=serializer)
         def fn(x: int) -> int:
             return x
 
@@ -105,7 +105,7 @@ class TestSerializerCodeReachesTheKey:
         backend = _RecordingBackend()
         calls = 0
 
-        @cache(backend=backend, ttl=60, namespace="lab4351-inv", serializer="auto")
+        @cache(backend=backend, ttl=60, namespace="sersuffix-inv", serializer="auto")
         def fn(x: int) -> int:
             nonlocal calls
             calls += 1
@@ -125,7 +125,7 @@ class TestSerializerCodeReachesTheKey:
         """The ic half of the suffix was correct before this fix and must stay so."""
         backend = _RecordingBackend()
 
-        @cache(backend=backend, ttl=60, namespace="lab4351-ic", serializer="auto", integrity_checking=False)
+        @cache(backend=backend, ttl=60, namespace="sersuffix-ic", serializer="auto", integrity_checking=False)
         def fn(x: int) -> int:
             return x
 
@@ -273,13 +273,13 @@ class TestSerializerCodeTable:
         backend = _RecordingBackend()
         calls = 0
 
-        @cache(backend=backend, ttl=60, namespace="lab4351-inst", serializer=StandardSerializer())
+        @cache(backend=backend, ttl=60, namespace="sersuffix-inst", serializer=StandardSerializer())
         def fa(x: int) -> dict:
             nonlocal calls
             calls += 1
             return {"v": x}
 
-        @cache(backend=backend, ttl=60, namespace="lab4351-inst", serializer=AutoSerializer())
+        @cache(backend=backend, ttl=60, namespace="sersuffix-inst", serializer=AutoSerializer())
         def fb(x: int) -> dict:
             nonlocal calls
             calls += 1
@@ -356,7 +356,7 @@ class TestInvalidationReachesPre020Keys:
         backend = _RecordingBackend()
         calls = 0
 
-        @cache(backend=backend, ttl=None, namespace="lab5288-sync", serializer=serializer)
+        @cache(backend=backend, ttl=None, namespace="legacykey-sync", serializer=serializer)
         def fn(x: int) -> dict:
             nonlocal calls
             calls += 1
@@ -380,7 +380,7 @@ class TestInvalidationReachesPre020Keys:
         backend = _RecordingBackend()
         calls = 0
 
-        @cache(backend=backend, ttl=None, namespace="lab5288-async", serializer=serializer)
+        @cache(backend=backend, ttl=None, namespace="legacykey-async", serializer=serializer)
         async def fn(x: int) -> dict:
             nonlocal calls
             calls += 1
@@ -403,7 +403,7 @@ class TestInvalidationReachesPre020Keys:
         """Code `s` already is the legacy key: no second round-trip."""
         backend = _RecordingBackend()
 
-        @cache(backend=backend, ttl=60, namespace="lab5288-default", serializer="default")
+        @cache(backend=backend, ttl=60, namespace="legacykey-default", serializer="default")
         def fn(x: int) -> int:
             return x
 
@@ -419,7 +419,7 @@ class TestInvalidationReachesPre020Keys:
     async def test_default_serializer_issues_exactly_one_delete_async(self):
         backend = _RecordingBackend()
 
-        @cache(backend=backend, ttl=60, namespace="lab5288-default-async", serializer="default")
+        @cache(backend=backend, ttl=60, namespace="legacykey-default-async", serializer="default")
         async def fn(x: int) -> int:
             return x
 
@@ -436,7 +436,7 @@ class TestInvalidationReachesPre020Keys:
         """Each delete is independent: a failure on one key still attempts the other."""
         backend = _FailOnKeysBackend()
 
-        @cache(backend=backend, ttl=None, namespace="lab5288-fail", serializer="auto")
+        @cache(backend=backend, ttl=None, namespace="legacykey-fail", serializer="auto")
         def fn(x: int) -> int:
             return x
 
@@ -458,7 +458,7 @@ class TestInvalidationReachesPre020Keys:
     async def test_one_failed_delete_does_not_skip_the_other_async(self, failing: str):
         backend = _FailOnKeysBackend()
 
-        @cache(backend=backend, ttl=None, namespace="lab5288-fail-async", serializer="auto")
+        @cache(backend=backend, ttl=None, namespace="legacykey-fail-async", serializer="auto")
         async def fn(x: int) -> int:
             return x
 
@@ -487,14 +487,14 @@ class TestInvalidationReachesPre020Keys:
 
         # key= is read only from DecoratorConfig (the @cache path); fast_mode is internal-only.
         if mode == "key=":
-            wrapped = cache(backend=backend, l1_enabled=False, namespace="lab5288-mode", serializer="auto", key=str)(fn)
+            wrapped = cache(backend=backend, l1_enabled=False, namespace="legacykey-mode", serializer="auto", key=str)(fn)
         elif mode == "interop":
             # Interop requires a cross-SDK serializer, so the default one: its generated key would
             # still differ from the interop key, so only the mode flag stops a second delete.
-            wrapped = cache(backend=backend, l1_enabled=False, namespace="lab5288-mode", interop="lab5288_op")(fn)
+            wrapped = cache(backend=backend, l1_enabled=False, namespace="legacykey-mode", interop="legacykey_op")(fn)
         else:
             wrapped = create_cache_wrapper(
-                fn, backend=backend, l1_enabled=False, namespace="lab5288-mode", serializer="auto", fast_mode=True
+                fn, backend=backend, l1_enabled=False, namespace="legacykey-mode", serializer="auto", fast_mode=True
             )
         wrapped(1)
         (written_key,) = backend.store
@@ -508,7 +508,7 @@ class TestInvalidationReachesPre020Keys:
         """A twin whose delete failed stays tracked, so the next whole-function invalidation retries it."""
         backend = _FailOnKeysBackend()
 
-        @cache(backend=backend, ttl=None, namespace="lab5288-retry", serializer="auto", l1_enabled=False)
+        @cache(backend=backend, ttl=None, namespace="legacykey-retry", serializer="auto", l1_enabled=False)
         def fn(x: int) -> int:
             return x
 
@@ -531,15 +531,15 @@ class TestInvalidationReachesPre020Keys:
 # This literal is the key cachekit 0.19.0 wrote for `fn(1)` under the fixed module, qualname
 # and namespace below, taken from the 0.19.0 wheel:
 #   CacheKeyGenerator().generate_key(fn, (1,), {}, _LONG_NAMESPACE, True)
-_LONG_NAMESPACE = "lab6361_" + "n" * 292
-_V019_LONG_KEY = "ns:lab6361_nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn:8c42af11facf9cd7e05b02ead5c9bdfc"
+_LONG_NAMESPACE = "v019pin_" + "n" * 292
+_V019_LONG_KEY = "ns:v019pin_nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn:fc9f5391cbd2fc1863f67661e15e5f94"
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _pin_identity(fn: _F) -> _F:
     """Fix the identity the key hashes, so the literal does not depend on how pytest imports this file."""
-    fn.__module__ = "lab6361"
+    fn.__module__ = "v019pin"
     fn.__qualname__ = "fn"
     return fn
 

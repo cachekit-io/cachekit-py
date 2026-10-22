@@ -966,7 +966,7 @@ def _numpy_raw(dtype: bytes, shape: bytes) -> bytes:
 class TestForgedNumpyMetadataIsRefused:
     """NUMPY_RAW dtype/shape metadata is untrusted: slicing past the end silently shortens and a
     partial 4-byte chunk used to parse as a dimension, so a forged 1-byte zero shape chunk built
-    an EMPTY array instead of raising (CodeRabbit on cachekit-py#276)."""
+    an EMPTY array instead of raising (#276)."""
 
     @pytest.mark.parametrize(
         ("payload", "why"),

@@ -1,6 +1,6 @@
 """Comprehensive test coverage for per-request backend pattern.
 
-Fix #10: Tests tenant isolation edge cases, concurrent async contexts,
+Tests tenant isolation edge cases, concurrent async contexts,
 fail-fast validation, URL-encoding collision prevention, and ContextVar isolation.
 """
 
@@ -17,14 +17,14 @@ class TestPerRequestBackend:
     """Test per-request backend wrapper behavior."""
 
     def test_fail_fast_validation_none_tenant(self):
-        """Test fail-fast RuntimeError when tenant_id is None (Fix #9)."""
+        """Test fail-fast RuntimeError when tenant_id is None."""
         store = {}
 
         with pytest.raises(RuntimeError, match="tenant_id cannot be None"):
             PerRequestMockBackend(store, tenant_id=None)
 
     def test_url_encoding_prevents_collision(self):
-        """Test URL-encoding prevents key collision (Fix #2, Fix #10)."""
+        """Test URL-encoding prevents key collision."""
         store = {}
 
         # Two tenants with ':' in their IDs that would collide without encoding
@@ -46,7 +46,7 @@ class TestPerRequestBackend:
         assert backend1._scoped_key("user:456") != backend2._scoped_key("user:456")
 
     def test_tenant_isolation_shared_store(self):
-        """Test tenant isolation with shared store (Fix #7, Fix #10)."""
+        """Test tenant isolation with shared store."""
         store = {}
 
         # Two backends sharing same store but different tenants
@@ -67,7 +67,7 @@ class TestPerRequestBackend:
         assert "t:tenant2:key" in store
 
     def test_health_check_no_tenant_leak(self):
-        """Test health_check() doesn't leak tenant_id (Fix #5, Fix #10)."""
+        """Test health_check() doesn't leak tenant_id."""
         store = {}
         backend = PerRequestMockBackend(store, tenant_id="secret-tenant-123")
 
@@ -81,7 +81,7 @@ class TestPerRequestBackend:
 
 
 class TestContextVarIsolation:
-    """Test ContextVar isolation across async contexts (Fix #10)."""
+    """Test ContextVar isolation across async contexts."""
 
     @pytest.mark.asyncio
     async def test_contextvar_isolation_single_task(self):
@@ -107,7 +107,7 @@ class TestContextVarIsolation:
 
     @pytest.mark.asyncio
     async def test_contextvar_isolation_concurrent_tasks(self):
-        """Test ContextVar isolation across 100+ concurrent async tasks (Fix #10)."""
+        """Test ContextVar isolation across 100+ concurrent async tasks."""
         provider = MockBackendProvider()
         results = []
 
@@ -173,10 +173,10 @@ class TestContextVarIsolation:
 
 
 class TestMockBackendProvider:
-    """Test MockBackendProvider behavior (Fix #7)."""
+    """Test MockBackendProvider behavior."""
 
     def test_provider_fail_fast_no_context(self):
-        """Test provider fail-fast when tenant context not set (Fix #9)."""
+        """Test provider fail-fast when tenant context not set."""
         provider = MockBackendProvider()
 
         # Clear context
@@ -187,7 +187,7 @@ class TestMockBackendProvider:
             provider.get_backend()
 
     def test_provider_per_request_wrapper(self):
-        """Test provider creates new wrapper per call (Fix #7)."""
+        """Test provider creates new wrapper per call."""
         provider = MockBackendProvider()
         mock_tenant_context.set("tenant1")
 
@@ -203,7 +203,7 @@ class TestMockBackendProvider:
         assert asyncio.run(backend2.get("key")) == b"value"
 
     def test_provider_shared_store(self):
-        """Test provider uses singleton shared store (Fix #7)."""
+        """Test provider uses singleton shared store."""
         provider = MockBackendProvider()
 
         mock_tenant_context.set("tenant1")
@@ -233,7 +233,7 @@ class TestMockBackendProvider:
 
 
 class TestOptionalProtocols:
-    """Test optional protocol implementations (Fix #6)."""
+    """Test optional protocol implementations."""
 
     @pytest.mark.asyncio
     async def test_ttl_inspectable_protocol(self):

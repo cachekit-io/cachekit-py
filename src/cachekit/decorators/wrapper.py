@@ -1219,8 +1219,8 @@ def create_cache_wrapper(
         legacy baseline is L1Cache's own default (DEFAULT_L1_TTL_SECONDS), so a
         long server remainder is clamped to it — returning raw fresh_for would
         EXTEND local service up to the 30-day cap and turn the bound into the
-        very freshness-extension it exists to prevent (expert-panel finding,
-        CWE-613: server-side DELETE-as-revocation relies on the ≤300s ageout).
+        very freshness-extension it exists to prevent (CWE-613: server-side
+        DELETE-as-revocation relies on the ≤300s ageout).
         """
         if fresh_for is None:
             return ttl
@@ -1397,7 +1397,7 @@ def create_cache_wrapper(
     def _l2_swr_revalidate_sync(slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for sync functions (daemon thread).
 
-        ponytail: per-process single-flight only — the distributed lease API is
+        Per-process single-flight only — the distributed lease API is
         async-only; the lease is a spec SHOULD and duplicate revalidation is benign
         (last-write-wins between fresh values). Add a sync lease if cross-client
         duplicate recomputes ever measurably matter.

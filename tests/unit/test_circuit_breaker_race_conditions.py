@@ -38,7 +38,7 @@ class TestCircuitBreakerRaceConditions:
     def test_concurrent_open_to_half_open_transition(self):
         """Test that only one thread can transition from OPEN to HALF_OPEN.
 
-        This test verifies Requirement 1.1: WHEN multiple threads attempt to
+        This test verifies: WHEN multiple threads attempt to
         transition circuit breaker from OPEN to HALF_OPEN THEN only one thread
         SHALL successfully transition.
         """
@@ -107,7 +107,7 @@ class TestCircuitBreakerRaceConditions:
     def test_half_open_permit_limit_under_concurrency(self):
         """Test that half-open permits never exceed configured limit under concurrent load.
 
-        This test verifies Requirement 1.2: WHEN circuit breaker is in HALF_OPEN
+        This test verifies: WHEN circuit breaker is in HALF_OPEN
         state THEN the number of test requests SHALL never exceed the configured limit.
         """
         config = CircuitBreakerConfig(
@@ -181,8 +181,8 @@ class TestCircuitBreakerRaceConditions:
     def test_state_consistency_under_concurrent_access(self):
         """Test that circuit breaker state remains consistent under concurrent access.
 
-        This test verifies Requirement 1.1 and 1.2: ensuring that state transitions
-        are atomic and permit counting is accurate under high concurrency.
+        This test verifies that state transitions are atomic and permit counting is
+        accurate under high concurrency.
         """
         config = CircuitBreakerConfig(
             failure_threshold=2,

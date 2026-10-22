@@ -803,9 +803,9 @@ class TestDecryptErrorTaxonomy:
         writer = EncryptionWrapper(master_key=K1, tenant_id=TENANT, previous_master_keys=[])
         enc, meta = writer.serialize({"v": 42}, cache_key="key:a")
 
-        # K1 is a decrypt-only entry here, so the read takes the fingerprint
-        # path (decrypt_at) — the path CodeRabbit did not flag but which shares
-        # the binding, and therefore the defect.
+        # K1 is a decrypt-only entry here, so the read takes the fingerprint path
+        # (decrypt_at), not the primary-key path; both share the binding, so both
+        # could relabel a config error as tamper.
         reader = EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[K1])
 
         class _ConfigFailKeyring:
@@ -1120,7 +1120,7 @@ def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryptio
         backend=backend,
         ttl=300,
         l1_enabled=l1_enabled,
-        namespace="lab4841",
+        namespace="keyring-rotation",
         encryption=encryption,
         single_tenant_mode=encryption,
         master_key=K2.hex(),
@@ -1235,7 +1235,7 @@ class TestL2WritesFailLoud:
     async def test_cold_key_write_raises_on_every_call(self, monkeypatch, live_breakers, is_async, make_backend, l1_enabled):
         _settings_previous_keys(monkeypatch, [K2])
         backend = make_backend()
-        l1 = get_l1_cache("lab4841")
+        l1 = get_l1_cache("keyring-rotation")
         l1.clear()
         runs: list[int] = []
         fn = _decorate(backend, runs, is_async=is_async, l1_enabled=l1_enabled)
@@ -1265,7 +1265,7 @@ class TestL2WritesFailLoud:
             def compute(x: int) -> None:
                 raise KeyringConfigurationError("Keyring configuration invalid: nested")
 
-        fn = cache(backend=_ByteStore(), ttl=300, l1_enabled=False, namespace="lab4841")(compute)
+        fn = cache(backend=_ByteStore(), ttl=300, l1_enabled=False, namespace="keyring-rotation")(compute)
         (breaker,) = live_breakers
 
         for _ in range(7):
