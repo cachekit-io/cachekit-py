@@ -121,7 +121,7 @@ jobs:
       run: uv sync --python ${{ matrix.python-version }} --group dev
 
     - name: Run tests (PRs)
-      if: github.event_name == 'pull_request'
+      if: false
       env:
         REDIS_URL: redis://localhost:6379
       run: |
@@ -150,11 +150,11 @@ jobs:
     # Push runs only: the full suite below includes tests/integration/test_memcached_integration.py,
     # which skips its whole module when nothing answers on localhost:11211.
     - name: Start Memcached
-      if: github.event_name == 'push'
+      if: true
       run: bash .github/scripts/start-memcached.sh
 
     - name: Run full test suite (main)
-      if: github.event_name == 'push'
+      if: true
       env:
         REDIS_URL: redis://localhost:6379
       run: |
@@ -177,7 +177,7 @@ jobs:
     # The memcached module skips itself rather than failing when the server is unreachable, so a
     # server that never started, died mid-run or was addressed wrong would pass green with nothing run.
     - name: Check the memcached integration tests ran
-      if: github.event_name == 'push'
+      if: true
       run: python3 .github/scripts/assert-junit-ran.py junit.xml tests.integration.test_memcached_integration
 
     # Executable docs are tests: docstring examples, tests/docs/ and the docs/
