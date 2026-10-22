@@ -1,4 +1,4 @@
-"""Async miss-store stats parity (LAB-3755).
+"""Async miss-store stats parity.
 
 The sync wrapper records its miss-store as ``operation="set", serializer="rust"``.
 The async wrapper's two miss-store sites — under the distributed lock and on the

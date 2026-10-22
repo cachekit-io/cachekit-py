@@ -203,7 +203,7 @@ class TestWrapperLockTimeoutFallback:
 
         # The warning must reference the redacted digest of the BARE cache_key —
         # a ``:lock``-suffixed key would digest differently, so the bare-key
-        # contract is still pinned. Raw keys never reach logs (CWE-532, LAB-304).
+        # contract is still pinned. Raw keys never reach logs (CWE-532).
         timeout_warnings = [r for r in caplog.records if "Failed to acquire lock" in r.message]
         assert len(timeout_warnings) == 1, (
             f"expected exactly one lock-timeout warning; got {[r.message for r in caplog.records]!r}"
@@ -247,7 +247,7 @@ class TestWrapperLockOperationFailureFallback:
 
         # The lock-operation-failed warning must reference the redacted digest of
         # the bare cache_key — a ``:lock``-suffixed key would digest differently.
-        # Raw keys never reach logs (CWE-532, LAB-304).
+        # Raw keys never reach logs (CWE-532).
         lock_failed_warnings = [r for r in caplog.records if "Lock operation failed" in r.message]
         assert len(lock_failed_warnings) == 1, (
             f"expected one lock-operation-failed warning; got {[r.message for r in caplog.records]!r}"

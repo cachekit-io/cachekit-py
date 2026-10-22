@@ -1,5 +1,5 @@
 """Path-injection regression: the cache key MUST be percent-encoded into the
-CachekitIO request path (LAB-2846, CWE-22 / CWE-20).
+CachekitIO request path (CWE-22 / CWE-20).
 
 Before the fix, the raw key was interpolated unquoted into
 ``/v1/cache/{key}``. The HTTP client then (httpx, at the time) normalised
@@ -15,8 +15,7 @@ arbitrary ``api.cachekit.io`` endpoints with the application's bearer token:
 
 A bare ``.`` / ``..`` key has no safe wire form (percent-encoded dots are collapsed
 server-side), and neither do the route tokens ``health`` / ``ttl`` / ``lock`` or the
-empty key: those six are rejected before any request (protocol rule 2, LAB-2880,
-LAB-6550). See ``SECURITY.md``.
+empty key: those six are rejected before any request (protocol rule 2). See ``SECURITY.md``.
 
 These tests drive the real backend methods through the backend's real client on a
 fake pool (tests/utils/cachekitio_fakes.py) and assert on the path the client hands
@@ -188,7 +187,7 @@ def test_health_endpoint_untouched() -> None:
     assert pool.requests[0].path == "/v1/cache/health"
 
 
-# ---- reserved segments: rejected before any request is made (LAB-2880) -----
+# ---- reserved segments: rejected before any request is made -----
 
 
 def _assert_rejected(exc: BackendError, pool: FakePool) -> None:

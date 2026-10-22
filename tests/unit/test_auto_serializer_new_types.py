@@ -6,7 +6,7 @@ Tests:
 - Nested complex objects with new types
 - Error detection for unsupported types (Pydantic, ORM, custom classes)
 - Security: _safe_hasattr prevents code execution
-- LAB-2503 exception contract: forged payloads and object-hook diagnostics fail closed as SerializationError
+- Exception contract: forged payloads and object-hook diagnostics fail closed as SerializationError
 """
 
 from __future__ import annotations

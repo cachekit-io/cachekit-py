@@ -222,7 +222,7 @@ class BufferReadableBackend(Protocol):
 @runtime_checkable
 class BufferWritableBackend(Protocol):
     """Optional protocol for backends that can accept a value written incrementally through a
-    seekable sink, instead of one materialized ``bytes`` blob (LAB-766, write-side twin of
+    seekable sink, instead of one materialized ``bytes`` blob (write-side twin of
     ``BufferReadableBackend``).
 
     Lets large values (e.g. multi-GB Arrow IPC) reach storage without the whole serialized

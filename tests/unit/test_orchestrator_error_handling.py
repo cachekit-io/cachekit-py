@@ -304,7 +304,7 @@ class TestErrorHandlerEdgeCases:
 
 
 class TestCacheKeyRedaction:
-    """Raw cache keys must never reach logs on any error path (CWE-532, LAB-304).
+    """Raw cache keys must never reach logs on any error path (CWE-532).
 
     Keys embed caller-supplied tenant/user identifiers; the sink redacts once so
     every caller is covered by construction.
@@ -352,7 +352,7 @@ class TestCacheKeyRedaction:
 
     def test_cache_set_digest_unchanged_from_lab_109(self, caplog: pytest.LogCaptureFixture) -> None:
         """cache_set callers now pass the raw key; the sink must emit the SAME digest
-        the call-site redaction produced before (LAB-109 behaviour intact)."""
+        the call-site redaction produced before."""
         with caplog.at_level(logging.WARNING):
             self._orchestrator().handle_cache_error(
                 error=OSError("disk full"),

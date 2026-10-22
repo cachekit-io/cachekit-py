@@ -91,7 +91,7 @@ class TestRedisBackendConfigEnv:
         """protocol/spec/intent-presets.md rule 3: no process-wide TTL override.
 
         CACHEKIT_DEFAULT_TTL is reserved by the spec; setting it must neither
-        surface a field nor break construction (LAB-4641).
+        surface a field nor break construction.
         """
         monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
         config = CachekitConfig.from_env()

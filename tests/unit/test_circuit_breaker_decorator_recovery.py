@@ -1,4 +1,4 @@
-"""The circuit breaker recovers on the live ``@cache`` path (LAB-5326).
+"""The circuit breaker recovers on the live ``@cache`` path.
 
 The breaker's own state machine was always tested on a bare ``CircuitBreaker``,
 never through ``@cache`` / ``FeatureOrchestrator``. That hid defects that
@@ -463,7 +463,7 @@ class TestUnreportedProbesDoNotStrandTheBreaker:
     async def test_sync_interop_prefix_guard(self, resolver, backend, live_breakers, clock):
         """The fail-closed interop prefix guard raises unrecorded, and spends a probe slot only once.
 
-        Since LAB-5351 the guard runs before admission whenever the backend is already resolved,
+        The guard now runs before admission whenever the backend is already resolved,
         so only the call that resolves the backend (behind admission) can raise with a slot spent.
         That one unreported probe leaves the cycle short of ``success_threshold``; the cycle still
         starts over once its budget is spent and the timeout has passed.
@@ -495,7 +495,7 @@ class TestUnreportedProbesDoNotStrandTheBreaker:
 
 
 class TestL1HitsBypassTheBreaker:
-    """An L1 hit is served whatever the breaker state and records no breaker outcome (LAB-5351).
+    """An L1 hit is served whatever the breaker state and records no breaker outcome.
 
     The breaker tracks backend health, and an L1 hit never reaches the backend. When admission
     ran before the L1 lookup, an OPEN breaker recomputed keys L1 already held, and L1 hits
@@ -606,7 +606,7 @@ class TestL1HitsBypassTheBreaker:
 
 
 class TestFunctionExceptionsDoNotCount:
-    """An exception the decorated function raises is not a backend failure (LAB-5319).
+    """An exception the decorated function raises is not a backend failure.
 
     It reaches the caller unchanged and never counts toward the breaker, so a function
     that keeps raising against a healthy backend never turns caching off.
@@ -958,7 +958,7 @@ class TestLateProbesOfAnEarlierCycle:
 
 
 class TestInteropValueContractOnDegradedPaths:
-    """Interop refuses an out-of-model return value whatever the breaker state (LAB-5375).
+    """Interop refuses an out-of-model return value whatever the breaker state.
 
     A call the breaker rejects, and a call whose backend cannot be created, run the
     function uncached and never reach the store path, where the value check used to run.

@@ -1,4 +1,4 @@
-"""Freshness response headers against the protocol test vectors (LAB-8243).
+"""Freshness response headers against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/freshness-headers.json, vendored from
 cachekit-io/protocol @ f35635445a6a7461f93061aa51332e4f0d25c614 (vectors 1.0.0,

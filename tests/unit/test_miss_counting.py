@@ -1,4 +1,4 @@
-"""``cache_info().misses`` counts a backed miss once, sync and async (LAB-8298).
+"""``cache_info().misses`` counts a backed miss once, sync and async.
 
 A miss is a call that runs the wrapped function because no cached value was found.
 The async wrapper's backed miss path never counted one, on either the locked or the

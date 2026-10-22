@@ -200,7 +200,7 @@ class PerRequestRedisBackend:
     what RedisBackendProvider hands out — each operation is instead scoped to the tenant set in
     ``tenant_context`` for the calling context, and ``tenant_id`` is used only when that context
     has none. Such an instance can be held across requests (the decorator keeps its backend for
-    the life of the process) without serving one tenant's requests as another's (LAB-4773); a
+    the life of the process) without serving one tenant's requests as another's; a
     ContextVar read is per thread and per asyncio task, so sharing is race-free.
 
     Examples:

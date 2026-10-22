@@ -222,7 +222,7 @@ def _get_shared_metric(
     Module-level so ``circuit_breaker_gauge()`` shares the collectors' metric cache without
     creating a collector. ``buckets`` reach a ``Histogram`` only on first creation. It is a named
     parameter, not ``**kwargs``: every recorded cache operation calls this up to three times, and
-    forwarding ``**kwargs`` cost about 2,500 instructions per call (LAB-7801).
+    forwarding ``**kwargs`` cost about 2,500 instructions per call.
 
     Raises:
         ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client

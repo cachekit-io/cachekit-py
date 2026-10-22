@@ -823,7 +823,7 @@ class TestAsyncWrapperTTLRefreshEdgeCases:
 
     @pytest.mark.asyncio
     async def test_backend_without_ttl_support_warns_and_continues(self, backend_without_ttl):
-        """Backend without get_ttl/refresh_ttl warns once (LAB-446) and continues.
+        """Backend without get_ttl/refresh_ttl warns once and continues.
 
         The refresh_ttl_on_get flag is ignored when the backend can't inspect TTL; the
         cache hit must still be returned (graceful degradation, no crash).

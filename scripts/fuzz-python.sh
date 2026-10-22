@@ -10,7 +10,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 # cannot work there). Everywhere else the targets run unconditionally: if
 # atheris is missing, the target's own import fails loudly and reds the run —
 # probing for it first and skipping (the old behavior) was a silent green on
-# Linux, the exact lie this contract exists to kill (LAB-1140).
+# Linux, the exact lie this contract exists to kill.
 if [ "$(uname -s)" = "Darwin" ]; then
 	echo "${YELLOW}⚠️  Skipping Atheris fuzzing (macOS limitation - libFuzzer not in Apple Clang)${RESET}"
 	echo "${YELLOW}   Atheris fuzzing runs in CI on Linux${RESET}"
@@ -19,7 +19,7 @@ fi
 
 echo "${BLUE}Running Atheris fuzzing...${RESET}"
 # Same exit-code contract as the atheris-fuzzing job in security-deep.yml
-# (LAB-1140) — keep budgets/flags in sync with it: no `|| true`; a crash,
+# — keep budgets/flags in sync with it: no `|| true`; a crash,
 # import error, or hang fails the run (libFuzzer's -timeout=60 per-input
 # watchdog writes a timeout-* reproducer; `timeout -k 30s 15m` is the
 # backstop for native hangs, since libFuzzer traps SIGTERM; budget exhaustion

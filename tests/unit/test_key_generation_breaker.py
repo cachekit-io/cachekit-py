@@ -1,4 +1,4 @@
-"""A cache key that cannot be generated never changes circuit-breaker state (LAB-5376).
+"""A cache key that cannot be generated never changes circuit-breaker state.
 
 Key generation runs before admission and never touches the backend, so its
 failure says nothing about backend health. It used to count as a breaker

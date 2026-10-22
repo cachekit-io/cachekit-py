@@ -106,7 +106,7 @@ class TestCircuitBreakerConfig:
         assert config.half_open_requests == 6
 
     def test_excluded_exceptions_removed(self) -> None:
-        """excluded_exceptions was read by nothing (LAB-5340); passing it is now a TypeError."""
+        """excluded_exceptions was read by nothing; passing it is now a TypeError."""
         with pytest.raises(TypeError, match="excluded_exceptions"):
             CircuitBreakerConfig(excluded_exceptions=(ValueError,))  # type: ignore[call-arg]
 

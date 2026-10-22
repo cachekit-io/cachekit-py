@@ -206,7 +206,7 @@ class DefaultBackendProvider(BackendProviderInterface):
     for the life of the process. The Redis one is tenant-scoped per OPERATION: it reads
     the tenant_context ContextVar each time it touches Redis, so each Redis operation is
     scoped to the calling context's tenant, and a context with no tenant set
-    (single-tenant mode) is scoped to "default" (LAB-4773).
+    (single-tenant mode) is scoped to "default".
     """
 
     # Prefixed selectors. Tuple order is not precedence: two or more set raises, so

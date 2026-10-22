@@ -47,7 +47,7 @@ class TestSupportsMmapRead:
 
     def test_encrypted_arrow_not_eligible(self) -> None:
         """Encrypted values can never mmap — AES-GCM decrypt owns its buffer."""
-        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra
         sh = CacheSerializationHandler(serializer_name="arrow")
         sh.encryption = True
         assert sh.supports_mmap_read() is False
@@ -57,7 +57,7 @@ class TestSupportsMmapRead:
     def test_return_formats_that_keep_the_mapping_need_an_fd_free_mmap(self, return_format, releases_fd, monkeypatch) -> None:
         """An Arrow or polars result keeps its mapping alive, and before Python 3.13 a mapping also
         keeps a file descriptor: those formats map only where the mmap holds none. pandas always maps."""
-        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
         monkeypatch.setattr("cachekit.cache_handler.MMAP_RELEASES_FD", releases_fd)

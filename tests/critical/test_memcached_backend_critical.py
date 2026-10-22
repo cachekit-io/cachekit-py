@@ -351,7 +351,7 @@ def test_set_default_backend_with_memcached_backend(mock_store):
 @pytest.mark.critical
 def test_oversized_value_error_never_leaks_raw_key(backend, mock_hash_client):
     """The oversized-value message must not embed the raw key — str(e) reaches
-    log sinks verbatim (CWE-532, LAB-304); the key= digest segment carries correlation."""
+    log sinks verbatim (CWE-532); the key= digest segment carries correlation."""
     tenant_key = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
     big = b"\x00" * (1024 * 1024 + 1)
 

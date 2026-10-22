@@ -138,7 +138,7 @@ class TestDecoratorConfigValidation:
             DecoratorConfig(circuit_breaker=CircuitBreakerConfig(failure_threshold=0))
 
     def test_top_level_circuit_breaker_config_rejected_naming_the_nested_class(self) -> None:
-        """cachekit.CircuitBreakerConfig is the reliability class; circuit_breaker= takes the nested one (LAB-5340)."""
+        """cachekit.CircuitBreakerConfig is the reliability class; circuit_breaker= takes the nested one."""
         import cachekit
 
         with pytest.raises(TypeError, match=r"cachekit\.config\.nested\.CircuitBreakerConfig"):
@@ -315,7 +315,7 @@ class TestDecoratorConfigToDict:
 
 @pytest.mark.unit
 class TestIoPreset:
-    """DecoratorConfig.io / @cache.io credentials and argument rejection (LAB-4643).
+    """DecoratorConfig.io / @cache.io credentials and argument rejection.
 
     Contract (protocol spec, intent-presets.md § io Credentials / § Explicit Configuration):
     api_key argument OR CACHEKIT_API_KEY, argument wins, neither -> ConfigurationError at
@@ -506,7 +506,7 @@ _PRESET_KWARGS: dict[str, dict[str, str]] = {
 
 @pytest.mark.unit
 class TestL1EnabledFlag:
-    """``l1_enabled=`` flips only ``l1.enabled`` on the config each decorator form would use (LAB-4828).
+    """``l1_enabled=`` flips only ``l1.enabled`` on the config each decorator form would use.
 
     Disabling L1 is the tenant-safety escape hatch while L1 is tenant-blind, so every form must
     accept it — and must keep the rest of the preset's L1 tuning (minimal/test ``swr_enabled=False``).
@@ -561,7 +561,7 @@ def _field_values(config: DecoratorConfig) -> dict[str, object]:
 
 @pytest.mark.unit
 class TestPresetFieldOverrides:
-    """A preset accepts an override for every field it sets itself, and the caller's value wins (LAB-5361).
+    """A preset accepts an override for every field it sets itself, and the caller's value wins.
 
     protocol spec/intent-presets.md § Explicit Configuration rule 1: an explicit argument MUST override
     the preset default. Every other field keeps the preset's default.
@@ -667,7 +667,7 @@ _OTHER_KEY = "b" * 64  # pragma: allowlist secret
 
 @pytest.mark.unit
 class TestConfigFormGuards:
-    """A keyword beside config= cannot change what the config fixes, as the preset's own keywords cannot (LAB-8223).
+    """A keyword beside config= cannot change what the config fixes, as the preset's own keywords cannot.
 
     An encrypted config keeps its encryption: its key, its tenant mode and its being on. An io config keeps the
     CachekitIOBackend it built. Each override is a ConfigurationError when the decorator is applied (protocol
@@ -793,7 +793,7 @@ _COMPANION_KWARGS: dict[str, dict[str, object]] = {"interop": {"namespace": "use
 @pytest.mark.unit
 class TestUnsupportedKeywords:
     """A keyword the form does not accept is a ConfigurationError at construction: never the dataclass's TypeError,
-    never a silent drop (protocol intent-presets.md § Explicit Configuration rule 2, LAB-8223)."""
+    never a silent drop (protocol intent-presets.md § Explicit Configuration rule 2)."""
 
     @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
     def test_classmethod_rejects_unknown_keyword(self, preset: str) -> None:

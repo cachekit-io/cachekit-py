@@ -1,7 +1,7 @@
-"""Async lock double-check L2 hit-record parity (LAB-3769).
+"""Async lock double-check L2 hit-record parity.
 
-The uncontended async L2 hit site records get/serializer="rust" telemetry
-(LAB-3765); the two post-lock ``_l2_double_check`` hit returns did not — so a
+The uncontended async L2 hit site records get/serializer="rust" telemetry;
+the two post-lock ``_l2_double_check`` hit returns did not — so a
 thundering-herd hit, filled by another worker while this one waited on the
 distributed lock, was invisible to ``cache_operations_total`` and ``cache_info()``
 L2 stats. That is exactly the traffic the lock exists to absorb.

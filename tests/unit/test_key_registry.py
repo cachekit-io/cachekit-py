@@ -421,7 +421,7 @@ class TestDrain:
         assert backend.drain_calls[0][1] == set()  # it knew no keys itself
 
     def test_fresh_process_drains_custom_keys(self) -> None:
-        """The registry tracks the key the write path wrote, custom key= included (LAB-4387)."""
+        """The registry tracks the key the write path wrote, custom key= included."""
         backend = TrackingBackend()
 
         def f(x: int) -> int:
@@ -847,7 +847,7 @@ class _HidesCk(str):
 
 @pytest.mark.unit
 class TestNamespaceExactStr:
-    """A str-subclass namespace keys and names its registry set by its underlying str (LAB-6197)."""
+    """A str-subclass namespace keys and names its registry set by its underlying str."""
 
     def test_str_enum_registry_id_uses_value(self) -> None:
         backend = TrackingBackend()

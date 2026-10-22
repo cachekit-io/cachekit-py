@@ -24,7 +24,7 @@ import atheris
 # CPython 3.11 in _decorators.merge_seqs during pydantic_settings'
 # CLI-provider model construction (pulled in transitively via
 # cachekit.hiredis_compat). That SIGSEGV killed every nightly target during
-# startup, before a single fuzz iteration (LAB-1140/LAB-2528). Optional deps
+# startup, before a single fuzz iteration. Optional deps
 # use suppress: absent is fine, instrumented is the trap.
 for _mod in (
     "pydantic",

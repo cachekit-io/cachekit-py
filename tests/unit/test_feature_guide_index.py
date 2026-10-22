@@ -1,4 +1,4 @@
-"""Guard against feature-guide index drift (LAB-1013).
+"""Guard against feature-guide index drift.
 
 Every guide in docs/features/*.md must be reachable from the repo's index
 surfaces. Historically guides were "born orphaned": five of nine were listed
@@ -15,7 +15,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# All three surfaces index the full guide set (deliberate call on LAB-1013;
+# All three surfaces index the full guide set (deliberate call;
 # the top-level README is NOT a curated subset). Each maps to the exact link
 # prefix a guide path must carry ON THAT SURFACE to resolve for a reader —
 # docs/README.md links are relative to docs/, the other two to the repo root.

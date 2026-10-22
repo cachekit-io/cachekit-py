@@ -546,7 +546,7 @@ class TestL1OnlyModeNoRedisWarnings:
 
 
 class TestEncryptionRefusesL1Only:
-    """LAB-4665 / protocol spec/intent-presets.md § L1 Posture rule 3.
+    """Protocol spec/intent-presets.md § L1 Posture rule 3.
 
     Encryption is a serializer layer; the L1-only ObjectCache path never serializes.
     So `secure` (or any encrypting configuration) with backend=None used to report
@@ -604,7 +604,7 @@ class TestEncryptionRefusesL1Only:
                 return "pii"
 
     def test_message_names_full_resolution_order(self):
-        """LAB-6738: the hint lists every tier and all four selectors, never a subset."""
+        """The hint lists every tier and all four selectors, never a subset."""
         from cachekit.decorators import cache
 
         with pytest.raises(ConfigurationError) as exc_info:

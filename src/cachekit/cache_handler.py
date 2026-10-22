@@ -161,10 +161,10 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
     - ``suspicious_envelope``: SuspiciousCacheEntryError — the unauthenticated
       envelope is inconsistent with handler config (plaintext claim under
       encryption, missing tenant_id). Benign during lazy plaintext→encrypted
-      migration, so it ALWAYS fails open (miss + evict, LAB-241) — but spikes
+      migration, so it ALWAYS fails open (miss + evict) — but spikes
       outside a migration window warrant investigation.
     - ``envelope_shape``: EnvelopeShapeError — an entry nothing verified decoded to
-      the shape of a ByteStorage envelope and was refused (LAB-2736). Either a rotted
+      the shape of a ByteStorage envelope and was refused. Either a rotted
       integrity-on envelope or a legitimate top-level 4-element list; the read path
       cannot tell them apart, so this is NOT reliable corruption evidence and is kept
       out of ``corruption``. Always fails open. An integrity-off AutoSerializer never writes
@@ -259,7 +259,7 @@ def supports_locking(backend: object) -> TypeGuard[LockableBackend]:
 
 
 class FillLockBackend(Protocol):
-    """Backend whose miss-path lock reports contention and releases without blocking (LAB-7064).
+    """Backend whose miss-path lock reports contention and releases without blocking.
 
     Not part of LockableBackend: only the decorator's miss path uses it. Currently only
     CachekitIOBackend. ``acquire_fill_lock`` yields ``(acquired, uncontended)``.
@@ -290,7 +290,7 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
 
     Backends without TTLInspectableBackend (both get_ttl and refresh_ttl) cannot do
     threshold-based TTL refresh, so the flag is silently ignored. A silent no-op on a
-    feature the user explicitly opted into is a footgun — surface it once (LAB-446), while
+    feature the user explicitly opted into is a footgun — surface it once, while
     still degrading gracefully (the caller returns without failing the cache op).
     """
     name = type(backend).__name__
@@ -316,7 +316,7 @@ def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBacken
 
 
 def supports_streaming_write(backend: BaseBackend) -> TypeGuard[BufferWritableBackend]:
-    """Type guard: backend can accept an incrementally-streamed value via set_streaming (LAB-766, File only).
+    """Type guard: backend can accept an incrementally-streamed value via set_streaming (File only).
 
     Returns:
         True if backend implements BufferWritableBackend (used for the streaming Arrow write path).
@@ -325,10 +325,10 @@ def supports_streaming_write(backend: BaseBackend) -> TypeGuard[BufferWritableBa
 
 
 class SWRCapableBackend(Protocol):
-    """Backend with server-signaled stale-while-revalidate reads (LAB-381).
+    """Backend with server-signaled stale-while-revalidate reads.
 
     Reads report whether the entry is in its stale-grace window plus the
-    server's remaining freshness in seconds (LAB-557; None from a pre-signal
+    server's remaining freshness in seconds (None from a pre-signal
     server); writes accept the window length. Currently only CachekitIOBackend
     (the SaaS signals freshness on read — see protocol
     spec/saas-api.md#stale-while-revalidate and #remaining-freshness).
@@ -340,13 +340,13 @@ class SWRCapableBackend(Protocol):
 
 
 def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
-    """Type guard: backend supports server-signaled SWR stale-grace reads (LAB-381).
+    """Type guard: backend supports server-signaled SWR stale-grace reads.
 
     Checked on the backend's CLASS, not the instance: protocol methods live on
     classes, while instance-level hasattr reads dynamic-attribute objects
     (unittest.mock.Mock, __getattr__ proxies) as SWR-capable and silently
     reroutes their reads through the freshness path — reachable without any SWR
-    config since the LAB-557 gate widening (the freshness read now runs for
+    config since the gate widening (the freshness read now runs for
     every capable backend, not only when stale_ttl is set).
     """
     return callable(getattr(type(backend), "get_with_freshness", None))
@@ -413,7 +413,7 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
 
 
 class L2MissProbe:
-    """Whether the async L2 read in a ``probe_l2_miss`` scope found no entry, cleanly (LAB-7064).
+    """Whether the async L2 read in a ``probe_l2_miss`` scope found no entry, cleanly.
 
     ``clean_miss`` is set only where the backend's freshness read itself returned None: the read
     every backend with ``acquire_fill_lock`` takes. Any other read leaves it False, which costs
@@ -451,7 +451,7 @@ def _note_clean_l2_miss() -> None:
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
-    """Pad a released 2-tuple ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
+    """Pad a released 2-tuple ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)``.
 
     Third-party SWR backends (0.5.x) and custom CacheHandlerStrategy implementations
     (0.18.0) built against the 2-tuple signature still return it; None passes through.
@@ -731,7 +731,7 @@ class CacheSerializationHandler:
         # MessagePack document — no ByteStorage envelope and no CK v3 frame, so
         # there is no stored metadata header at all. Whether an entry is
         # encrypted is decided by THIS handler's configuration, never by
-        # sniffing stored bytes (fail closed by construction; the LAB-241
+        # sniffing stored bytes (fail closed by construction; the plaintext
         # downgrade cannot be reintroduced because there is no header to forge).
         if interop_mode:
             if tenant_extractor is not None:
@@ -1228,7 +1228,7 @@ class CacheSerializationHandler:
         return MMAP_RELEASES_FD or getattr(self._base_serializer, "return_format", None) == "pandas"
 
     def supports_streaming_write(self) -> bool:
-        """True iff writes can stream the envelope to a capable backend (LAB-766).
+        """True iff writes can stream the envelope to a capable backend.
 
         Eligible only for PLAINTEXT cachekit Arrow (``serializer="arrow"`` or an
         ``ArrowSerializer(...)`` instance):
@@ -1249,7 +1249,7 @@ class CacheSerializationHandler:
         )
 
     def write_serialized_to(self, sink: BinaryIO, data: Any) -> None:
-        """Streaming twin of :meth:`serialize_data` (LAB-766): write the SAME envelope bytes into
+        """Streaming twin of :meth:`serialize_data`: write the SAME envelope bytes into
         ``sink`` without ever materializing the payload in memory.
 
         Only valid when :meth:`supports_streaming_write` is True (plaintext Arrow — no
@@ -1366,7 +1366,7 @@ class CacheSerializationHandler:
             # unwrap/from_dict raise bare ValueError subclasses on frame faults. The
             # `except ValueError: raise` arm below exists only for the missing-cache_key
             # fail-closed check, so convert here or a corrupt header bypasses the L2
-            # `except SerializationError` eviction and survives to TTL (LAB-4075).
+            # `except SerializationError` eviction and survives to TTL.
             try:
                 # A custom SerializerProtocol may write to the metadata it is handed, so it gets its own
                 # copy rather than the header memo's shared, read-only instance.
@@ -1389,7 +1389,7 @@ class CacheSerializationHandler:
                     f"for gradual migrations: @cache(namespace='v2-{self._serializer_string_name}')"
                 )
 
-            # SECURITY (LAB-241 / CWE-757): the CK frame header is plaintext and NOT
+            # SECURITY (CWE-757): the CK frame header is plaintext and NOT
             # covered by the AES-GCM tag (AAD v0x03 binds tenant/cache_key/format/
             # compressed/original_type — not the header itself). A backend-write attacker
             # can plant a frame claiming `encrypted: false` with an arbitrary plaintext payload;
@@ -1402,7 +1402,7 @@ class CacheSerializationHandler:
             if self.encryption and not metadata.encrypted:
                 # SuspiciousCacheEntryError → telemetry reason "suspicious_envelope":
                 # legitimate during lazy plaintext→encrypted migration, an attack
-                # signature otherwise. Behavior stays miss+evict either way (LAB-241).
+                # signature otherwise. Behavior stays miss+evict either way.
                 raise SuspiciousCacheEntryError(
                     "Encryption is enabled but the cache entry's header claims plaintext. "
                     "Refusing the unauthenticated plaintext read path (fail closed): the "
@@ -1495,7 +1495,7 @@ class CacheSerializationHandler:
         Interop entries carry no metadata header, so there is nothing to sniff
         and nothing to forge: with encryption enabled the bytes are ALWAYS
         treated as nonce||ciphertext||tag and authenticated before any decode
-        (fail closed — same CWE-757 posture as the auto-mode LAB-241 fix);
+        (fail closed — same CWE-757 posture as the auto-mode fix);
         without encryption they are decoded as one plain MessagePack document.
         Decode/auth failures raise SerializationError, which callers treat as
         a miss and evict (self-healing overwrite).
@@ -1549,7 +1549,7 @@ class CacheHit(NamedTuple):
     over the mapping (see ``_MmapHandle``). size_bytes is the envelope's byte length on every hit, mmap
     included, so payload-size stats never depend on holding the bytes.
     A hit is distinguished from "no cache entry" by getting a CacheHit at
-    all vs. None — there is no boolean slot (LAB-3757).
+    all vs. None — there is no boolean slot.
     """
 
     value: Any
@@ -1686,7 +1686,7 @@ class CacheOperationHandler:
         )
 
     # Pre-0.20.0 releases never passed the serializer to generate_key, so every generated
-    # key ended in the default code `s` whatever the serializer was (LAB-4351). A
+    # key ended in the default code `s` whatever the serializer was. A
     # deployment upgraded from one still holds those entries — and old replicas keep
     # writing them during a rolling deploy — at a key the current code never computes.
     # Invalidating only the current key would let an erasure return normally while the
@@ -1733,7 +1733,7 @@ class CacheOperationHandler:
         )
 
     def _handle_l2_read_error(self, e: SerializationError, cache_key: str) -> None:
-        """Shared decrypt/integrity failure tail for sync L2 reads (LAB-108/#159).
+        """Shared decrypt/integrity failure tail for sync L2 reads.
 
         Routes through the single policy point (raises DecryptionAuthenticationError
         when fail-closed — poisoned entry retained as evidence), else best-effort
@@ -1818,12 +1818,12 @@ class CacheOperationHandler:
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
-            # LAB-241/LAB-683 failure class. Not routed through
+            # config-vs-crypto failure class. Not routed through
             # handle_decrypt_failure because there is no policy decision to make
             # here — a misconfigured keyring always raises.
             raise
         except SerializationError as e:
-            self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
+            self._handle_l2_read_error(e, cache_key)  # raises when fail-closed
             return None
         except TenantResolutionError:
             get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
@@ -1835,16 +1835,16 @@ class CacheOperationHandler:
     def get_cached_value_with_freshness(
         self, cache_key: str, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None
     ) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
-        """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
+        """SWR variant of :meth:`get_cached_value`: also reports
         staleness and the server's remaining freshness in seconds.
 
         Returns ``(CacheHit, is_stale, fresh_for)`` on a hit — the CacheHit
         matches the async variant so the sync decorator backfills L1 without
-        re-serializing (LAB-348) — None on miss/error. fresh_for is None when
+        re-serializing — None on miss/error. fresh_for is None when
         no signal exists (pre-signal server, non-SWR backend) — the caller
         applies legacy L1 TTL behavior. The mmap fast path is skipped — SWR is
         CachekitIO-only, which is not buffer-readable. Error semantics mirror
-        get_cached_value: the LAB-108 policy point raises
+        get_cached_value: the decrypt-failure policy point raises
         DecryptionAuthenticationError when fail-closed (poisoned entry retained as
         evidence); fail-open evicts and reads as a miss so the caller recomputes.
         """
@@ -1855,7 +1855,7 @@ class CacheOperationHandler:
             # Normalised here too: a custom CacheHandlerStrategy built against the
             # v0.18.0 2-tuple signature must degrade to fresh_for=None, not have a
             # strict 3-unpack ValueError swallowed below into a permanent
-            # every-hit-is-a-miss cache bypass (expert-panel finding, LAB-557).
+            # every-hit-is-a-miss cache bypass.
             hit = _normalize_freshness_hit(self._cache_handler.get_with_freshness(cache_key))
             if hit is None:
                 return None
@@ -1869,12 +1869,12 @@ class CacheOperationHandler:
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
-            # LAB-241/LAB-683 failure class. Not routed through
+            # config-vs-crypto failure class. Not routed through
             # handle_decrypt_failure because there is no policy decision to make
             # here — a misconfigured keyring always raises.
             raise
         except SerializationError as e:
-            self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
+            self._handle_l2_read_error(e, cache_key)  # raises when fail-closed
             return None
         except TenantResolutionError:
             get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
@@ -1886,14 +1886,14 @@ class CacheOperationHandler:
     async def get_cached_value_with_freshness_async(
         self, cache_key: str, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None
     ) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
-        """Async SWR variant (LAB-381/LAB-557): staleness + remaining freshness +
+        """Async SWR variant: staleness + remaining freshness +
         the raw envelope for L1 backfill.
 
         Returns ``(CacheHit, is_stale, fresh_for)`` on a hit — the CacheHit
-        matches :meth:`get_cached_value_async` (LAB-111 routing) so the async
+        matches :meth:`get_cached_value_async` so the async
         decorator backfills L1 without re-serializing; fresh_for (seconds,
         None = no signal) bounds that backfill to the server's remaining
-        freshness. None on miss/error; the LAB-108 fail-closed policy
+        freshness. None on miss/error; the fail-closed policy
         propagates DecryptionAuthenticationError.
         """
         try:
@@ -1913,12 +1913,12 @@ class CacheOperationHandler:
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
-            # LAB-241/LAB-683 failure class. Not routed through
+            # config-vs-crypto failure class. Not routed through
             # handle_decrypt_failure because there is no policy decision to make
             # here — a misconfigured keyring always raises.
             raise
         except SerializationError as e:
-            await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
+            await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed
             return None
         except TenantResolutionError:
             get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
@@ -1969,12 +1969,12 @@ class CacheOperationHandler:
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
-            # LAB-241/LAB-683 failure class. Not routed through
+            # config-vs-crypto failure class. Not routed through
             # handle_decrypt_failure because there is no policy decision to make
             # here — a misconfigured keyring always raises.
             raise
         except SerializationError as e:
-            await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
+            await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed
             return None
         except TenantResolutionError:
             get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
@@ -2016,7 +2016,7 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling store_result")
 
-            # Streaming write fast path (LAB-766): plaintext Arrow to a streaming-writable
+            # Streaming write fast path: plaintext Arrow to a streaming-writable
             # backend (File) writes the envelope without ever materializing it. SWR
             # (stale_ttl) stays buffered — no streaming backend signals freshness today.
             # getattr guards custom CacheHandlerStrategy impls that predate set_streaming.
@@ -2090,7 +2090,7 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling store_result_async")
 
-            # Streaming write fast path (LAB-766) — async twin of store_result's gate. The
+            # Streaming write fast path — async twin of store_result's gate. The
             # whole stream (pyarrow serialization included) runs in the handler's thread
             # pool, which also moves the blocking serialize OFF the event loop (the buffered
             # path below serializes on the loop thread).
@@ -2156,7 +2156,7 @@ class CacheHandlerStrategy(Protocol):
         ...
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
-        """Stream a value to a streaming-writable backend (LAB-766); None when unsupported."""
+        """Stream a value to a streaming-writable backend; None when unsupported."""
         ...
 
     async def set_streaming_async(
@@ -2182,7 +2182,7 @@ class CacheHandlerStrategy(Protocol):
         ...
 
     def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
-        """Get value plus SWR staleness and remaining freshness (LAB-381/LAB-557);
+        """Get value plus SWR staleness and remaining freshness;
         (bytes, is_stale, fresh_for) or None. fresh_for is None from a pre-signal
         server or a non-SWR backend."""
         ...
@@ -2293,7 +2293,7 @@ class StandardCacheHandler:
             when skipping due to lack of backend support.
         """
         # Check if backend supports TTL inspection (graceful degradation).
-        # Warn once (not silently no-op) so the ignored flag is discoverable — LAB-446.
+        # Warn once (not silently no-op) so the ignored flag is discoverable.
         if not supports_ttl_inspection(self.backend):
             warn_ttl_refresh_unsupported(self.backend)
             return
@@ -2354,7 +2354,7 @@ class StandardCacheHandler:
             return None
 
     def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
-        """Get value plus SWR staleness and remaining freshness (LAB-381/LAB-557).
+        """Get value plus SWR staleness and remaining freshness.
 
         Returns ``(bytes, is_stale, fresh_for)`` on a hit, or None on miss/error
         (same degradation contract as :meth:`get` — an error reads as a miss and
@@ -2399,8 +2399,8 @@ class StandardCacheHandler:
             key: Cache key
             value: Bytes value to store (encrypted or plaintext msgpack)
             ttl: Time-to-live in seconds
-            stale_ttl: SWR stale-grace window in seconds past the fresh TTL
-                (LAB-381); silently ignored on backends without SWR support.
+            stale_ttl: SWR stale-grace window in seconds past the fresh TTL;
+                silently ignored on backends without SWR support.
             **metadata: Additional metadata (ignored, for compatibility)
 
         Returns:
@@ -2424,7 +2424,7 @@ class StandardCacheHandler:
             return False
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
-        """Stream a value to a streaming-writable backend (LAB-766).
+        """Stream a value to a streaming-writable backend.
 
         Returns:
             None when the backend doesn't implement BufferWritableBackend — the caller falls
@@ -2525,7 +2525,7 @@ class StandardCacheHandler:
         """Set value in cache asynchronously using backend.
 
         Runs sync backend.set() in a thread pool to avoid blocking the event loop.
-        ``stale_ttl`` opens an SWR stale-grace window (LAB-381); silently ignored
+        ``stale_ttl`` opens an SWR stale-grace window; silently ignored
         on backends without SWR support.
         """
         # Ensure value is bytes

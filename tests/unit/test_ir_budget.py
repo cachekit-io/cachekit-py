@@ -348,7 +348,7 @@ def test_every_path_has_a_committed_budget() -> None:
 def test_performance_docs_state_the_committed_budgets() -> None:
     """docs/performance.md's Budgets table is ir_baselines.json, figure for figure.
 
-    A ratchet that rewrote the JSON and not the table once left seven rows stale, the worst by 60% (LAB-7801).
+    A ratchet that rewrote the JSON and not the table once left seven rows stale, the worst by 60%.
     """
     interpreters = json.loads(ir_budget.BASELINES.read_text())["interpreters"]
     columns = ("cpython-3.12-x86_64", "cpython-3.14-x86_64")  # the table's two figure columns, in order

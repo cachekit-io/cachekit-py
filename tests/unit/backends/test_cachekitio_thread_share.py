@@ -1,4 +1,4 @@
-"""Threads sharing one CachekitIOBackend never fail a request (LAB-7062).
+"""Threads sharing one CachekitIOBackend never fail a request.
 
 A backend keeps the one client it leased at construction and sends every request on it, from whichever
 thread calls: a thread pool calling a decorated function, every async-decorator L2 op, which

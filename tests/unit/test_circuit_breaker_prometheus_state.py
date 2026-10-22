@@ -1,4 +1,4 @@
-"""The breaker's state reaches Prometheus as ``circuit_breaker_state`` (LAB-6403).
+"""The breaker's state reaches Prometheus as ``circuit_breaker_state``.
 
 The breaker used to write only an in-process dict, so the documented alert
 ``circuit_breaker_state{state="OPEN"} > 0`` could never fire. The gauge now

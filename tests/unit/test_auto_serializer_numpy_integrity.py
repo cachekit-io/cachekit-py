@@ -21,7 +21,7 @@ from cachekit.serializers import AutoSerializer
 from cachekit.serializers.base import SerializationError
 
 # Requires the [data] extra — absent e.g. in the free-threaded CI lane until
-# numpy ships free-threaded wheels usable here (LAB-511).
+# numpy ships free-threaded wheels usable here.
 np = pytest.importorskip("numpy")
 
 
@@ -178,7 +178,7 @@ FORGED_NUMPY_RAW = {
 class TestAutoSerializerNumpyForgedEntries:
     """A NUMPY_RAW entry is routed to ``_deserialize_numpy`` structurally, with no outer
     ``PAYLOAD_DECODE_ERRORS`` normalisation, so its own except clause is the whole fail-closed
-    contract for a forged entry (LAB-2503). The checksum is unkeyed and does not help: whoever
+    contract for a forged entry. The checksum is unkeyed and does not help: whoever
     can write the backend can also write a matching xxHash3-64.
     """
 

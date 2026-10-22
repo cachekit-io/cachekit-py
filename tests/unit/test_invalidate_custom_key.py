@@ -1,4 +1,4 @@
-"""LAB-4387: invalidate_cache(*args) must delete the key the write path wrote.
+"""invalidate_cache(*args) must delete the key the write path wrote.
 
 Bug: the read/write paths derived the key four ways (interop / key= / fast_mode /
 auto) but invalidate_cache only two (interop / auto), so with a custom ``key=``

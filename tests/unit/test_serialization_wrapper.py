@@ -143,7 +143,7 @@ class TestUnwrapRejectsGarbage:
             SerializationWrapper.unwrap(frame)
 
     def test_frame_without_serializer_name_raises_valueerror(self):
-        # LAB-4432: the protocol treats a nameless value as a mismatch; never default a name.
+        # The protocol treats a nameless value as a mismatch; never default a name.
         header = b'{"m":{},"v":"2.0"}'
         frame = b"CK" + bytes((3,)) + len(header).to_bytes(4, "big") + header + b"payload"
         with pytest.raises(ValueError, match="records no serializer name"):
@@ -224,7 +224,7 @@ def _frame(header: bytes, payload: bytes = b"p") -> bytes:
 
 
 class TestHeaderMemo:
-    """unwrap_metadata parses each distinct header once (LAB-7069). The key is untrusted bytes from
+    """unwrap_metadata parses each distinct header once. The key is untrusted bytes from
     the backend, so only validated parses are kept, the memo is bounded, and every check the read
     path runs on the parsed metadata still runs on every read."""
 

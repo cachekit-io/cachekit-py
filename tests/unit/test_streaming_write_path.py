@@ -1,4 +1,4 @@
-"""LAB-766 streaming write-path wiring (write-side twin of test_mmap_read_path.py).
+"""Streaming write-path wiring (write-side twin of test_mmap_read_path.py).
 
 Four units compose the streaming Arrow write path:
 - ``CacheSerializationHandler.supports_streaming_write()`` — eligibility (plaintext Arrow).

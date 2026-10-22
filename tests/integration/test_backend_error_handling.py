@@ -115,7 +115,7 @@ class TestBackendErrorRepresentation:
 
     def test_error_key_redacted_not_leaked(self):
         """The raw key never appears in the exception text — only its fixed-length
-        digest (CWE-532, LAB-304). The attribute keeps the raw key for programmatic use."""
+        digest (CWE-532). The attribute keeps the raw key for programmatic use."""
         tenant_key = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
         error = BackendError(
             "Error",

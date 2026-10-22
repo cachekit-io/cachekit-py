@@ -330,7 +330,7 @@ def _tenant_prefixes(client) -> set[str]:
 
 @pytest.mark.integration
 class TestTenantScopedPerOperation:
-    """LAB-4773: the decorator resolves its backend once and keeps it, so the backend it
+    """The decorator resolves its backend once and keeps it, so the backend it
     holds must scope every operation to the tenant of the calling context — not to the
     tenant that happened to make the first call."""
 

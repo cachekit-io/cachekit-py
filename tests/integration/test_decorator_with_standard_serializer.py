@@ -130,7 +130,7 @@ class TestDecoratorWithStandardSerializer:
         assert result2["count"] == 1
         assert call_count == 1
 
-        # The key the decorator actually wrote must carry the AutoSerializer code (LAB-4351).
+        # The key the decorator actually wrote must carry the AutoSerializer code.
         # Asserting on a key we hand generate_key ourselves would pin nothing: the bug was
         # that the decorator never passed serializer_type at all.
         keys = redis_test_client.keys("t:default:ns:explicit_auto*")
@@ -145,7 +145,7 @@ class TestDecoratorWithStandardSerializer:
 
         # One shared namespace on purpose: with different namespaces the keys would differ
         # for a reason that has nothing to do with the serializer, and the test would pass
-        # against the LAB-4351 bug it is meant to catch.
+        # against the bug it is meant to catch.
         @cache(ttl=60, serializer="std", namespace="serializer_iso")
         def compute_std(x: int) -> dict:
             nonlocal std_count

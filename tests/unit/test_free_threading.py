@@ -1,4 +1,4 @@
-"""Free-threaded CPython guarantees (LAB-511).
+"""Free-threaded CPython guarantees.
 
 The CI lane `test-freethreaded` runs the core suites on a free-threaded 3.14
 build. These tests make the lane's central claim self-verifying from inside
@@ -351,7 +351,7 @@ def test_session_init_hammer_no_partial_publish_observed():
 
     On GIL builds this is a smoke test; on the free-threaded lane it races for
     real. get_session_start_ms() raising RuntimeError here is exactly the
-    mid-publish observation the LAB-511 guard in _ensure_session_initialized
+    mid-publish observation the guard in _ensure_session_initialized
     exists to prevent.
     """
     from cachekit.decorators import session as session_module
