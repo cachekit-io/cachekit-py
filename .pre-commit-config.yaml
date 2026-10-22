@@ -130,11 +130,10 @@ repos:
         # more digits, as in a test name or a namespace. A lookbehind, not \b, anchors the match, because
         # `_` is a word character.
         # CHANGELOG.md is generated from PR titles, which carry the one allowed id; the
-        # title-lint workflow shows the title format; protocol fixtures are vendored
-        # byte-for-byte (sha256-pinned), so they change only upstream.
+        # title-lint workflow shows the title format.
         language: pygrep
         entry: '(?i)(?<![a-z])lab(?:-[0-9]+|[_ ]?[0-9]{2,})'
-        exclude: ^(CHANGELOG\.md|\.github/workflows/pr-title-lint\.yml|tests/unit/protocol/fixtures/.*)$
+        exclude: ^(CHANGELOG\.md|\.github/workflows/pr-title-lint\.yml)$
         types: [text]
         stages: [pre-commit]
       - id: no-internal-references-commit-msg
