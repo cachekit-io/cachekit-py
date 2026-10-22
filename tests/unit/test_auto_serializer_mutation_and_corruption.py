@@ -211,6 +211,7 @@ class TestDeserializedArraysAreWritable:
         out = s.deserialize(data, meta)
         out.iloc[0] = -1.0  # must not raise
         assert out.iloc[0] == -1.0
+        assert out.values.flags.writeable
 
     @pytest.mark.parametrize(
         "serializer",
