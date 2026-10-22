@@ -219,7 +219,7 @@ class L1Cache:
             TypeError: if `value` is not exactly `bytes`. L1 stores raw bytes only; a memoryview
                 (e.g. an mmap-backed view from the File backend) or a mutable bytearray must never
                 be stored — the former would pin a mapped file's inode for the whole TTL, the
-                latter could mutate underneath the cache (#171 blocker C). Loud-fail a regression
+                latter could mutate underneath the cache (#171). Loud-fail a regression
                 rather than silently alias.
         """
         # Runtime guard: the annotation says bytes, but callers reach here across dynamic

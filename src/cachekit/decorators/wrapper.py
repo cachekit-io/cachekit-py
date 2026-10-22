@@ -1397,7 +1397,7 @@ def create_cache_wrapper(
     def _l2_swr_revalidate_sync(slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for sync functions (daemon thread).
 
-        ponytail: per-process single-flight only — the distributed lease API is
+        Per-process single-flight only — the distributed lease API is
         async-only; the lease is a spec SHOULD and duplicate revalidation is benign
         (last-write-wins between fresh values). Add a sync lease if cross-client
         duplicate recomputes ever measurably matter.

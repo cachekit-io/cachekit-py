@@ -162,7 +162,7 @@ class TestL1NonFiniteTtl:
 
 @pytest.mark.unit
 class TestNonBytesRejection:
-    """#171 blocker C belt-and-suspenders: L1 stores raw bytes ONLY.
+    """#171 belt-and-suspenders: L1 stores raw bytes ONLY.
 
     An mmap-backed memoryview must never reach L1 — it would pin the mapped file's inode for the
     whole L1 TTL (silent staleness on POSIX, write failures on Windows, RSS blowup under hot keys).

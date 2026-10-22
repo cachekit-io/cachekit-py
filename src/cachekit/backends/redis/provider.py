@@ -180,9 +180,8 @@ class PerRequestRedisBackend:
     - Accepts shared Redis client (not creating per operation)
     - URL-encodes tenant IDs to prevent ':' collision
     - Uses centralized classify_redis_error()
-    - No request_id parameter (YAGNI)
     - health_check() doesn't leak tenant_id
-    - Implements ALL optional protocols completely
+    - Implements the TTLInspectable, Lockable, KeyTrackable and TimeoutConfigurable protocols
     - Fail-fast validation - raises RuntimeError if tenant_id is None
 
     A failed operation raises its BackendError outside the ``except`` block, from the
@@ -483,7 +482,7 @@ class PerRequestRedisBackend:
                     },
                 )
 
-        # Implement ALL optional protocols completely
+        # Optional protocols
 
     async def get_ttl(self, key: str) -> Optional[int]:
         """Get remaining TTL on key (TTLInspectableBackend protocol).

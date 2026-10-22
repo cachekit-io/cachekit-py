@@ -146,7 +146,7 @@ class _MmapHandle:
     - ``close()`` releases the handle's own view, so touching ``handle.view`` afterwards raises
       ``ValueError`` (unless a consumer exported ``handle.view`` itself: then the release refuses
       and the view stays readable until that export dies). Either way the handle must never
-      escape the read call frame nor reach L1 (#171 blocker C).
+      escape the read call frame nor reach L1 (#171).
     - Anything deserialize built over the mapping (an Arrow table, a polars frame, or pandas
       columns that are views) holds buffer exports of it. ``mmap.close()`` refuses with
       ``BufferError`` while any export lives; ``close()`` swallows that, and the mapping is
@@ -888,7 +888,7 @@ class FileBackend:
                             fd_closed = True
                             return False
 
-                        # Overwrite ONLY the expiry field. ponytail: an 8-byte in-place write to
+                        # Overwrite ONLY the expiry field. An 8-byte in-place write to
                         # a fixed offset is atomic enough for a cache timestamp — a torn write on
                         # power loss yields a wrong expiry, never a corrupt payload (magic/version
                         # are untouched), so the entry just expires early/late. No rewrite-rename.

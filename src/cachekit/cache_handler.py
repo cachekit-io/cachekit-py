@@ -814,7 +814,7 @@ class CacheSerializationHandler:
 
         # Config-drift warn-once bookkeeping: first drift read per cache_key warns,
         # the rest only increment cachekit_config_drift_reads_total (log-flood guard).
-        # ponytail: bounded set — beyond 1024 distinct drifted keys, counter-only.
+        # Bounded set — beyond 1024 distinct drifted keys, counter-only.
         self._drift_warned_keys: set[str] = set()
 
         # Extract string name for metadata storage (for protocol instances, use class name)
@@ -1544,7 +1544,7 @@ class CacheHit(NamedTuple):
     envelope is the serialized bytes so the decorator can backfill L1 without
     re-serializing (re-encrypting) — None on the mmap fast path (sync reads
     only), whose handle is confined to its frame and whose bytes never reach
-    L1 (#171 blocker C); the value itself may be an Arrow or polars result
+    L1 (#171); the value itself may be an Arrow or polars result
     over the mapping (see ``_MmapHandle``). size_bytes is the envelope's byte length on every hit, mmap
     included, so payload-size stats never depend on holding the bytes.
     A hit is distinguished from "no cache entry" by getting a CacheHit at
@@ -1789,7 +1789,7 @@ class CacheOperationHandler:
 
             # mmap fast path (#171): plaintext cachekit Arrow on a buffer-readable backend (File,
             # POSIX) reads zero-copy. The handle is confined to this frame and closed in `finally`,
-            # so the mmap never becomes the returned value and never reaches L1 (blocker C). An
+            # so the mmap never becomes the returned value and never reaches L1. An
             # Arrow or polars result that aliases the mapping keeps it alive past that close (see
             # _MmapHandle). A None from get_buffer (ineligible file, or a non-buffer backend)
             # falls through to bytes.

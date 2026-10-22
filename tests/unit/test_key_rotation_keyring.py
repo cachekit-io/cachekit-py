@@ -803,9 +803,9 @@ class TestDecryptErrorTaxonomy:
         writer = EncryptionWrapper(master_key=K1, tenant_id=TENANT, previous_master_keys=[])
         enc, meta = writer.serialize({"v": 42}, cache_key="key:a")
 
-        # K1 is a decrypt-only entry here, so the read takes the fingerprint
-        # path (decrypt_at) — the other path, which shares
-        # the binding, and therefore the defect.
+        # K1 is a decrypt-only entry here, so the read takes the fingerprint path
+        # (decrypt_at), not the primary-key path; both share the binding, so both
+        # could relabel a config error as tamper.
         reader = EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[K1])
 
         class _ConfigFailKeyring:
