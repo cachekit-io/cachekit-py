@@ -14,7 +14,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  REDIS_DISABLE_HIREDIS: true
   DEFAULT_PYTHON_VERSION: "3.12"
 
 concurrency:
@@ -148,6 +147,12 @@ jobs:
           --junitxml=junit.xml \
           -o junit_family=legacy
 
+    # Push runs only: the full suite below includes tests/integration/test_memcached_integration.py,
+    # which skips its whole module when nothing answers on localhost:11211.
+    - name: Start Memcached
+      if: github.event_name == 'push'
+      run: bash .github/scripts/start-memcached.sh
+
     - name: Run full test suite (main)
       if: github.event_name == 'push'
       env:
@@ -168,6 +173,12 @@ jobs:
           --cov-report=term \
           --junitxml=junit.xml \
           -o junit_family=legacy
+
+    # The memcached module skips itself rather than failing when the server is unreachable, so a
+    # server that never started, died mid-run or was addressed wrong would pass green with nothing run.
+    - name: Check the memcached integration tests ran
+      if: github.event_name == 'push'
+      run: python3 .github/scripts/assert-junit-ran.py junit.xml tests.integration.test_memcached_integration
 
     # Executable docs are tests: docstring examples, tests/docs/ and the docs/
     # markdown blocks. None of them sit under tests/unit or tests/critical, so
