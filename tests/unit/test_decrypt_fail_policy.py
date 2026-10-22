@@ -641,7 +641,7 @@ class TestDecoratorFailClosed:
     def test_fail_closed_invalidates_poisoned_l1_before_raising(self):
         """A fail-closed raise from the L1 path must evict the poisoned L1 entry
         first — otherwise stale process-local L1 keeps raising after the operator
-        remediates the durable L2 copy (panel finding). L2 stays the evidence."""
+        remediates the durable L2 copy. L2 stays the evidence."""
         from cachekit import cache
         from cachekit.l1_cache import get_l1_cache
 
@@ -654,7 +654,7 @@ class TestDecoratorFailClosed:
             single_tenant_mode=True,
             master_key=_HEX_KEY,
             fail_closed=True,
-            namespace="lab108-l1",
+            namespace="decryptfail-l1",
         )
         def get_value(x: int) -> dict:
             return {"result": x}
@@ -664,7 +664,7 @@ class TestDecoratorFailClosed:
         k1, k2 = sorted(backend.store)
 
         # Plant ciphertext-substituted bytes directly in process-local L1
-        l1 = get_l1_cache("lab108-l1")
+        l1 = get_l1_cache("decryptfail-l1")
         l1.put(k1, backend.store[k2], redis_ttl=300)
 
         with pytest.raises(DecryptionAuthenticationError):
@@ -746,7 +746,7 @@ class TestDecoratorFailClosed:
             single_tenant_mode=True,
             master_key=_HEX_KEY,
             fail_closed=True,
-            namespace="lab108-l1-async",
+            namespace="decryptfail-l1-async",
         )
         async def get_value(x: int) -> dict:
             return {"result": x}
@@ -756,7 +756,7 @@ class TestDecoratorFailClosed:
         k1, k2 = sorted(backend.store)
 
         # Plant ciphertext-substituted bytes directly in process-local L1
-        l1 = get_l1_cache("lab108-l1-async")
+        l1 = get_l1_cache("decryptfail-l1-async")
         l1.put(k1, backend.store[k2], redis_ttl=300)
 
         with pytest.raises(DecryptionAuthenticationError):

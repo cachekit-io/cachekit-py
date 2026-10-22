@@ -249,7 +249,7 @@ The runner restores the source file after each mutant, runs only the killers' te
 
 ## Review Guidance
 
-This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository. The guidance below documents which paths benefit from security and maintainer review:
+`.github/CODEOWNERS` holds one rule: changes to `/.release-please-manifest.json` request the maintainer's review. That request does not block the merge. Every other path is routed by the guidance below, which documents which paths benefit from security and maintainer review:
 
 **Security-sensitive paths** — consider requesting review from maintainers:
 - `/rust/` — memory safety, FFI boundaries, cryptography

@@ -77,7 +77,7 @@ def _assert_contained(request: FakeRequest, key: str, *, suffix: str = "") -> No
 
     Asserts on the path the pool receives, after checking that urllib3 sends it as-is, so a
     traversal that a client or the SaaS router would act on shows up here as a failure, and
-    proves the key survives a single decode intact (AC-3: ``%3A`` -> ``:`` once, matching the
+    proves the key survives a single decode intact (``%3A`` -> ``:`` once, matching the
     SaaS validator's single ``decodeURIComponent``).
     """
     raw_path = request.path  # includes any query string
@@ -98,8 +98,8 @@ def _assert_contained(request: FakeRequest, key: str, *, suffix: str = "") -> No
     for bad in ("/", "?", "#"):
         assert bad not in encoded_key, f"unencoded {bad!r} survived in key segment: {encoded_key!r}"
 
-    # Round-trip: decode-once recovers the original key byte-for-byte. This is
-    # AC-3 — the client encodes with exactly the inverse of the SaaS validator's
+    # Round-trip: decode-once recovers the original key byte-for-byte. The
+    # client encodes with exactly the inverse of the SaaS validator's
     # single ``decodeURIComponent`` (cache-key-validator.ts), so no double-encoding
     # and no crafted key resolves to a *different* server-side key.
     assert unquote(encoded_key) == key, f"key not recoverable by single decode: {encoded_key!r} != {key!r}"

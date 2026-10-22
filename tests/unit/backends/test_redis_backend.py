@@ -753,7 +753,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
         fake = _FakeRedis()
         runs: list[int] = []
 
-        @cache(backend=PerRequestRedisBackend(fake, tenant_id="t"), ttl=60, l1_enabled=False, namespace="lab5346-redis")
+        @cache(backend=PerRequestRedisBackend(fake, tenant_id="t"), ttl=60, l1_enabled=False, namespace="lockrelease-redis")
         async def compute(x: int) -> int:
             runs.append(x)
             return x * 2

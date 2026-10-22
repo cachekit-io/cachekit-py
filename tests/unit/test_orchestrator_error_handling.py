@@ -350,7 +350,7 @@ class TestCacheKeyRedaction:
         digest = redact_cache_key(self.TENANT_KEY)
         assert any(digest in record.getMessage() for record in caplog.records)
 
-    def test_cache_set_digest_unchanged_from_lab_109(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_cache_set_digest_unchanged_matches_call_site_redaction(self, caplog: pytest.LogCaptureFixture) -> None:
         """cache_set callers now pass the raw key; the sink must emit the SAME digest
         the call-site redaction produced before."""
         with caplog.at_level(logging.WARNING):

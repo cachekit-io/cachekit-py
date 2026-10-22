@@ -840,7 +840,7 @@ class CacheSerializationHandler:
             else CacheKeyGenerator.CUSTOM_SERIALIZER_PREFIX + self._serializer_string_name
         )
 
-        # MEDIUM-02: Validate single-tenant mode configuration
+        # Validate single-tenant mode configuration
         if self.encryption:
             # Require explicit tenant mode (either extractor OR single_tenant_mode)
             if not self.tenant_extractor and not self.single_tenant_mode:
@@ -896,7 +896,7 @@ class CacheSerializationHandler:
             self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
         self._custom_serializer = not isinstance(serializer_name, str)
 
-        # CRITICAL-03 FIX: Cache EncryptionWrapper instances per tenant to prevent
+        # Cache EncryptionWrapper instances per tenant to prevent
         # 360K key copies/hour at 100 req/sec. Uses thread-safe LRU cache (maxsize=256)
         # with double-checked locking pattern (OrderedDict + RLock, NOT functools.lru_cache)
         from collections import OrderedDict
@@ -996,7 +996,7 @@ class CacheSerializationHandler:
     def _get_cached_encryption_wrapper(self, tenant_id: str) -> Any:
         """Get or create cached EncryptionWrapper for tenant_id.
 
-        CRITICAL-03 FIX: Thread-safe LRU cache with double-checked locking.
+        Thread-safe LRU cache with double-checked locking.
         Prevents 360K key copies/hour at 100 req/sec by reusing EncryptionWrapper
         instances (which internally cache derived keys).
 
@@ -1129,7 +1129,7 @@ class CacheSerializationHandler:
                         raise RuntimeError("single-tenant tenant_id should be set in __init__")
                     tenant_id = self._single_tenant_id
 
-                # CRITICAL-03 FIX: Use cached EncryptionWrapper to prevent 360K key copies/hour
+                # Use cached EncryptionWrapper to prevent 360K key copies/hour
                 # Gets cached instance (thread-safe LRU, maxsize=256) instead of creating new one
                 serializer = self._get_cached_encryption_wrapper(tenant_id)
 
@@ -1439,7 +1439,7 @@ class CacheSerializationHandler:
                         )
 
                 # Data is encrypted - use cached EncryptionWrapper for decryption
-                # CRITICAL-03 FIX: Use cached instance instead of creating new one
+                # Use cached instance instead of creating new one
                 if not metadata.tenant_id:
                     # Envelope claims encryption but lacks the tenant it was encrypted for —
                     # malformed or field-stripped. suspicious_envelope telemetry.

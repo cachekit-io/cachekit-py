@@ -792,7 +792,7 @@ class TestInvalidateNoArgsMultiDelete:
         assert not _supports_multi_delete(SlottedBatch())
 
     def test_slotted_prefixed_delete_sweeps_through_it(self) -> None:
-        """Kody's case end to end: a per-instance prefixing delete in a slot, beside a raw batch."""
+        """End to end: a per-instance prefixing delete in a slot, beside a raw batch."""
         from collections.abc import Callable
 
         class Slotted:

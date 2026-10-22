@@ -102,7 +102,7 @@ class TestFunctionBackendErrorRunsOnce:
     def test_sync_miss(self) -> None:
         raised: list[BackendError] = []
 
-        @cache(backend=_MemoryBackend(), ttl=60, l1_enabled=False, namespace="lab5360-sync")
+        @cache(backend=_MemoryBackend(), ttl=60, l1_enabled=False, namespace="runsonce-sync")
         def fn(x: int) -> int:
             raised.append(_function_error())
             raise raised[-1]
@@ -117,7 +117,7 @@ class TestFunctionBackendErrorRunsOnce:
     async def test_async_lockless(self) -> None:
         raised: list[BackendError] = []
 
-        @cache(backend=_MemoryBackend(), ttl=60, l1_enabled=False, namespace="lab5360-async-lockless")
+        @cache(backend=_MemoryBackend(), ttl=60, l1_enabled=False, namespace="runsonce-async-lockless")
         async def fn(x: int) -> int:
             raised.append(_function_error())
             raise raised[-1]
@@ -134,7 +134,7 @@ class TestFunctionBackendErrorRunsOnce:
         backend = _LockingBackend(redis_shaped=redis_shaped)
         raised: list[BackendError] = []
 
-        @cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"lab5360-async-lock-{int(redis_shaped)}")
+        @cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"runsonce-async-lock-{int(redis_shaped)}")
         async def fn(x: int) -> int:
             raised.append(_function_error())
             raise raised[-1]
@@ -162,7 +162,7 @@ class TestFunctionBackendErrorRunsOnce:
             backend=_FailingReleaseLockBackend(redis_shaped=redis_shaped),
             ttl=60,
             l1_enabled=False,
-            namespace=f"lab5360-async-lock-release-{int(redis_shaped)}",
+            namespace=f"runsonce-async-lock-release-{int(redis_shaped)}",
         )
         async def fn(x: int) -> int:
             try:
@@ -189,7 +189,7 @@ class TestFunctionBackendErrorRunsOnce:
             backend=_LockingBackend(redis_shaped=redis_shaped),
             ttl=60,
             l1_enabled=False,
-            namespace=f"lab5360-async-lock-value-{int(redis_shaped)}",
+            namespace=f"runsonce-async-lock-value-{int(redis_shaped)}",
         )
         async def fn(x: int) -> int:
             raised.append(ValueError("bad input"))
@@ -224,7 +224,7 @@ class TestLockReleaseFailureKeepsTheResult:
     async def test_after_the_store(self, redis_shaped: bool, caplog: pytest.LogCaptureFixture) -> None:
         backend = _FailingReleaseLockBackend(redis_shaped=redis_shaped)
         runs: list[int] = []
-        fn = self._fn(backend, runs, f"lab5346-release-store-{int(redis_shaped)}")
+        fn = self._fn(backend, runs, f"lockrelease-release-store-{int(redis_shaped)}")
 
         with caplog.at_level(logging.WARNING, logger="cachekit"):
             assert await fn(1) == 2
@@ -235,7 +235,7 @@ class TestLockReleaseFailureKeepsTheResult:
 
     @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)
     async def test_after_the_double_check_hit(self, redis_shaped: bool, caplog: pytest.LogCaptureFixture) -> None:
-        namespace = f"lab5346-release-double-check-{int(redis_shaped)}"
+        namespace = f"lockrelease-release-double-check-{int(redis_shaped)}"
         writer = _LockingBackend(redis_shaped=redis_shaped)
         assert await self._fn(writer, [], namespace)(1) == 2  # another worker's entry for fn(1)
         backend = _FailingReleaseLockBackend(redis_shaped=redis_shaped, fill=dict(writer.store))
@@ -261,7 +261,7 @@ class TestLockBodyCacheErrorsStillReachTheCaller:
             backend=_LockingBackend(redis_shaped=redis_shaped),
             ttl=60,
             l1_enabled=False,
-            namespace=f"lab5360-interop-{int(redis_shaped)}",
+            namespace=f"runsonce-interop-{int(redis_shaped)}",
             interop="op",
         )
         async def fn(x: int) -> Any:

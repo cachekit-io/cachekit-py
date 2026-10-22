@@ -82,7 +82,7 @@ class TestInvalidateCustomKey:
         backend = RecordingBackend()
         calls = 0
 
-        @_decorate(backend, "lab4387", **mode)
+        @_decorate(backend, "invkey", **mode)
         def get_user(user_id: int) -> int:
             nonlocal calls
             calls += 1
@@ -104,7 +104,7 @@ class TestInvalidateCustomKey:
         backend = RecordingBackend()
         calls = 0
 
-        @_decorate(backend, "lab4387", **mode)
+        @_decorate(backend, "invkey", **mode)
         async def get_user(user_id: int) -> int:
             nonlocal calls
             calls += 1
@@ -124,7 +124,7 @@ class TestInvalidateCustomKey:
         """L1-only mode (backend=None): the L1 delete must also use the custom key."""
         calls = 0
 
-        @cache(backend=None, key=_user_key, namespace="lab4387_l1_only")
+        @cache(backend=None, key=_user_key, namespace="invkey_l1_only")
         def get_user(user_id: int) -> int:
             nonlocal calls
             calls += 1
@@ -200,7 +200,7 @@ class TestFailedDeleteKeepsRetry:
     def test_sync_whole_function_retry_after_failed_delete(self, mode: dict[str, Any]):
         backend = FlakyDeleteBackend()
 
-        @_decorate(backend, "lab4387_retry", **mode)
+        @_decorate(backend, "invkey_retry", **mode)
         def get_user(user_id: int) -> int:
             return user_id
 
@@ -220,7 +220,7 @@ class TestFailedDeleteKeepsRetry:
     async def test_async_whole_function_retry_after_failed_delete(self, mode: dict[str, Any]):
         backend = FlakyDeleteBackend()
 
-        @_decorate(backend, "lab4387_retry", **mode)
+        @_decorate(backend, "invkey_retry", **mode)
         async def get_user(user_id: int) -> int:
             return user_id
 
@@ -240,7 +240,7 @@ class TestFailedDeleteKeepsRetry:
         """After a successful single-key delete the whole-function form has nothing left to delete."""
         backend = RecordingBackend()
 
-        @_decorate(backend, "lab4387_retry", **mode)
+        @_decorate(backend, "invkey_retry", **mode)
         def get_user(user_id: int) -> int:
             return user_id
 
@@ -264,7 +264,7 @@ class TestFailedDeleteKeepsRetry:
 
         backend = RacingBackend()
 
-        @_decorate(backend, "lab4387_race", **mode)
+        @_decorate(backend, "invkey_race", **mode)
         def get_user(user_id: int) -> int:
             return user_id
 

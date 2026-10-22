@@ -18,6 +18,7 @@ target/
 # Crash reports and triage output
 crash-*.txt
 deduplicated_crashes.txt
+triage_report.txt
 minimized/
 
 # AFL++ specific

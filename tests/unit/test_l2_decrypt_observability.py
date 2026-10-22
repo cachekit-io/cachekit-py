@@ -400,7 +400,7 @@ class TestCorruptFrameHeaderEvicts:
         """The inner catch lists only (AttributeError, KeyError, TypeError, ValueError).
 
         Anything else a parser raises must still reach SerializationError via the outer arm,
-        or narrowing that tuple would silently restore the no-eviction bug this ticket fixes.
+        or narrowing that tuple would silently restore the no-eviction bug this test guards.
         Raised through a patched parser rather than crafted bytes on purpose: no header the
         CPython JSON scanner accepts produces a non-ValueError on 3.12-3.14, so bytes cannot
         pin this invariant without depending on interpreter internals.

@@ -83,7 +83,7 @@ def _state(wrapper: Callable[..., Any]) -> dict[str, Any]:
 
 @pytest.mark.usefixtures("nothing_configured", "no_redis_built")
 class TestZeroConfigCaches:
-    """AC1 + AC2: twenty calls with one argument run the function once; nothing dials Redis or warns."""
+    """Twenty calls with one argument run the function once; nothing dials Redis or warns."""
 
     @pytest.mark.parametrize("preset", list(_PRESETS))
     def test_sync_preset_runs_once(self, preset: str, caplog: pytest.LogCaptureFixture) -> None:
@@ -126,7 +126,7 @@ class TestZeroConfigCaches:
 @pytest.mark.unit
 @pytest.mark.usefixtures("nothing_configured", "no_redis_built")
 class TestZeroConfigParity:
-    """AC3: a zero-config function behaves as the same function written with backend=None."""
+    """A zero-config function behaves as the same function written with backend=None."""
 
     @pytest.mark.parametrize("preset", list(_PRESETS))
     def test_mode_state_matches_backend_none(self, preset: str) -> None:
@@ -237,7 +237,7 @@ class TestZeroConfigParity:
 
 @pytest.mark.unit
 class TestConfiguredResolutionUnchanged:
-    """AC4: explicit backend=, set_default_backend(), a registered provider, one selector, REDIS_URL, then L1-only."""
+    """Resolution order: explicit backend=, set_default_backend(), a registered provider, one selector, REDIS_URL, then L1-only."""
 
     def test_explicit_backend_wins(self, nothing_configured: mock.MagicMock) -> None:
         backend = _MemoryBackend()
@@ -247,7 +247,7 @@ class TestConfiguredResolutionUnchanged:
         nothing_configured.assert_not_called()
 
     def test_default_backend_set_after_decoration_wins(self, nothing_configured: mock.MagicMock) -> None:
-        """AC5a: set_default_backend() between decoration and the first call is used (lazy resolution)."""
+        """set_default_backend() between decoration and the first call is used (lazy resolution)."""
         wrapped = cache(_named(lambda x: x, "default_late"))
         backend = _MemoryBackend()
         set_default_backend(backend)
@@ -284,7 +284,7 @@ class TestConfiguredResolutionUnchanged:
     def test_one_selector_resolves_a_backend(
         self, var: str, nothing_configured: mock.MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """AC4/AC5a: a selector set after decoration, before the first call, routes to get_backend()."""
+        """A selector set after decoration, before the first call, routes to get_backend()."""
         wrapped = cache(_named(lambda x: x, f"sel_{var}"))
         monkeypatch.setenv(var, "zc-cache-dir" if var == "CACHEKIT_FILE_CACHE_DIR" else "redis://example:6379")
         backend = _MemoryBackend()
@@ -330,7 +330,7 @@ _real_get_backend = DefaultBackendProvider.get_backend
 @pytest.mark.unit
 @pytest.mark.usefixtures("no_redis_built")
 class TestResolvedOnceAtFirstCall:
-    """AC5b: once a first call has resolved a function to zero-config L1-only, it stays L1-only."""
+    """Once a first call has resolved a function to zero-config L1-only, it stays L1-only."""
 
     def test_config_after_first_call_does_not_move_it(
         self, nothing_configured: mock.MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -395,7 +395,7 @@ class TestResolvedOnceAtFirstCall:
 
 @pytest.mark.unit
 class TestEncryptedAndInteropUnchanged:
-    """AC6: secure, encryption=True and interop= never run L1-only; they still resolve a backend."""
+    """secure, encryption=True and interop= never run L1-only; they still resolve a backend."""
 
     def _failing(self, spy: mock.MagicMock) -> None:
         spy.side_effect = BackendError("no backend", error_type=BackendErrorType.TRANSIENT)

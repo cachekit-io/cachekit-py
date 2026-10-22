@@ -25,7 +25,7 @@ def _arrow_serializer() -> SerializerProtocol:
 
 @pytest.mark.integration
 class TestSerializerEncryptionComposability:
-    """Test encryption composability with serializers (Requirement 3)."""
+    """Test encryption composability with serializers."""
 
     @pytest.fixture(autouse=True)
     def setup_encryption(self):

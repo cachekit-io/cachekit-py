@@ -225,7 +225,7 @@ def _column_trio(series: Any) -> dict[str, Any]:
     2-key ``{type: "object", data}`` otherwise (the ``dtype`` key is numeric-only) — "trio" names
     the maximal numeric form. One writer for both the DataFrame-column and the bare-Series paths, so
     the marker set and key order live in a single place and a third marker cannot be added to one
-    side only (the AC3 goal). Plain NumPy
+    side only. Plain NumPy
     numeric dtypes take the raw-buffer path; everything else (nullable/extension dtypes) takes the
     NA-safe object path so pd.NA/NaT do not crash msgpack (#160). Wire bytes and key order MUST
     stay byte-identical to the interop fixtures.

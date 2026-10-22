@@ -604,7 +604,7 @@ class TestInteropRejections:
                 return x
 
     def test_z_suffix_sentinel_revives(self):
-        """Panel MAJ regression: JS/Rust writers emit ISO-8601 with a Z designator;
+        """Regression: JS/Rust writers emit ISO-8601 with a Z designator;
         Python 3.10's fromisoformat cannot parse it — the decoder must normalize,
         or foreign datetime-bearing entries get evicted on read."""
         import msgpack
@@ -733,7 +733,7 @@ class TestInteropEncryption:
             reset_settings()
 
     def test_non_canonical_deployment_uuid_rejected(self, backend: DictBackend):
-        """Panel MAJ regression: Python normalizes UUIDs before key derivation;
+        """Regression: Python normalizes UUIDs before key derivation;
         other SDKs use the raw string — interop requires the canonical form."""
         pytest.importorskip("cachekit._rust_serializer")
         with pytest.raises(ConfigurationError, match="canonical"):

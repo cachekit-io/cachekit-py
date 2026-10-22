@@ -1219,8 +1219,8 @@ def create_cache_wrapper(
         legacy baseline is L1Cache's own default (DEFAULT_L1_TTL_SECONDS), so a
         long server remainder is clamped to it — returning raw fresh_for would
         EXTEND local service up to the 30-day cap and turn the bound into the
-        very freshness-extension it exists to prevent (expert-panel finding,
-        CWE-613: server-side DELETE-as-revocation relies on the ≤300s ageout).
+        very freshness-extension it exists to prevent (CWE-613: server-side
+        DELETE-as-revocation relies on the ≤300s ageout).
         """
         if fresh_for is None:
             return ttl

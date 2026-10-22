@@ -521,7 +521,7 @@ class TestSerializationSinksRedaction:
 
     def test_serializer_import_failure(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING), pytest.raises(ImportError) as exc_info:
-            _get_cached_serializer_class("lab304-bogus", "cachekit.no_such_module.Nope")
+            _get_cached_serializer_class("keyredact-bogus", "cachekit.no_such_module.Nope")
 
         _assert_error_text_redacted(caplog, exc_info.value)
 
@@ -570,7 +570,7 @@ class TestDecoratorWrapperRedaction:
     ) -> None:
         backend = _DictBackend()
 
-        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="lab304-l1-sync")
+        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="keyredact-l1-sync")
         def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -590,7 +590,7 @@ class TestDecoratorWrapperRedaction:
     ) -> None:
         backend = _DictBackend()
 
-        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="lab304-l1-async")
+        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="keyredact-l1-async")
         async def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -620,7 +620,7 @@ class TestDecoratorWrapperRedaction:
 
         monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", second_call_raises)
 
-        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lab304-dc")
+        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="keyredact-dc")
         async def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -638,7 +638,7 @@ class TestDecoratorWrapperRedaction:
         monkeypatch.setattr("cachekit.decorators.wrapper.get_backend_provider", lambda: provider)
 
     def test_sync_invalidate_provider_failure(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        @cache(ttl=300, namespace="lab304-inv-sync")
+        @cache(ttl=300, namespace="keyredact-inv-sync")
         def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -653,7 +653,7 @@ class TestDecoratorWrapperRedaction:
     async def test_async_invalidate_provider_failure(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        @cache(ttl=300, namespace="lab304-inv-async")
+        @cache(ttl=300, namespace="keyredact-inv-async")
         async def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
