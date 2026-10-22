@@ -373,6 +373,85 @@ jobs:
         REDIS_URL: redis://localhost:6379
       run: uv run --no-sync pytest tests/unit/ -m "not slow" -n auto
 
+  # Every other test job starts Redis first, so none of them sees cachekit the
+  # way a user first meets it: installed from the wheel, nothing configured,
+  # nothing on localhost:6379. This job starts no Redis and sets no REDIS_URL.
+  # It runs the user journeys against the built wheel (docs/CONTRIBUTING.md,
+  # "User Journeys"), then the docstring and markdown examples, which the
+  # `test` job runs with Redis up. tests/docs stays in `test`: its autouse
+  # fixture needs REDIS_URL. It builds the extension twice (the release wheel
+  # for the journeys' Python, then the `uv sync` build for the examples),
+  # hence the longer timeout.
+  no-services:
+    name: Journeys & Doc Examples (no Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: no-services
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Run user journeys (built wheel, fresh venv)
+      run: make journeys
+
+    # The examples run even when a journey fails, so one run reports every
+    # failure.
+    - name: Install dependencies
+      if: ${{ !cancelled() }}
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
+
+    - name: Run docstring examples
+      if: ${{ !cancelled() }}
+      run: uv run pytest --doctest-modules src/cachekit --ignore=src/cachekit/_rust_serializer.py
+
+    - name: Run markdown documentation examples
+      if: ${{ !cancelled() }}
+      run: uv run pytest --markdown-docs README.md docs/
+
+  # pandas 3 safety net. The lockfile resolves pandas 2.x, so every other job
+  # tests that, while a fresh install resolves the newest pandas, and pandas 3
+  # changes copy semantics (copy-on-write) in ways 2.x cannot show. This job
+  # overlays the newest pandas 3.x on the locked environment and runs the unit
+  # and critical suites. The bound floats within 3.x on purpose: the job tests
+  # what a user installing today gets, so a new 3.x release that breaks
+  # cachekit should go red here first. The version check runs inside the same
+  # `uv run --with` as the suites, so a missed overlay fails instead of
+  # quietly testing the locked pandas.
+  test-pandas3:
+    name: Tests (pandas 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Start Redis (no persistence)
+      run: bash .github/scripts/start-redis.sh
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: pandas3
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Install dependencies
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
+
+    - name: Run unit + critical suites on pandas 3
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        uv run --with "pandas>=3,<4" bash -euo pipefail -c '
+          python -c "import pandas; assert pandas.__version__.split(\".\")[0] == \"3\", pandas.__version__; print(\"pandas\", pandas.__version__)"
+          pytest tests/unit/ -m "not slow" -n auto
+          pytest tests/critical/ -m "not slow"
+        '
+
   # Version sync + dependency CVE scan (push to main only)
   post-merge:
     name: Post-Merge Checks
@@ -502,7 +581,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [quick-check, test, test-freethreaded, test-redis-floor, runner-drift-guard]
+    needs: [quick-check, test, test-freethreaded, test-redis-floor, no-services, test-pandas3, runner-drift-guard]
     if: always()
     steps:
     - name: Check all jobs succeeded
@@ -511,6 +590,8 @@ jobs:
            [[ "${{ needs.test.result }}" != "success" ]] || \
            [[ "${{ needs.test-freethreaded.result }}" != "success" ]] || \
            [[ "${{ needs.test-redis-floor.result }}" != "success" ]] || \
+           [[ "${{ needs.no-services.result }}" != "success" ]] || \
+           [[ "${{ needs.test-pandas3.result }}" != "success" ]] || \
            [[ "${{ needs.runner-drift-guard.result }}" != "success" ]]; then
           echo "One or more jobs failed"
           exit 1

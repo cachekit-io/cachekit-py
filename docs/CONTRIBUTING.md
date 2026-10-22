@@ -139,6 +139,8 @@ make journeys JOURNEY_PYTHON=3.12                      # another interpreter (de
 
 It builds the wheel, installs it with the `[data]` extra and polars into a fresh virtualenv, and runs `journeys/journeys.py` from outside the repository, with `REDIS_URL` and every `CACHEKIT_*` variable unset. It stops before building if anything listens on `localhost:6379`, because a user's machine has no Redis. Each journey runs in its own interpreter. The report lists every promise as `PASS` or `FAIL`, with what the failing journey saw, and the run exits non-zero if any fails.
 
+CI runs `make journeys` on every pull request, in the `Journeys & Doc Examples (no Redis)` job, which starts no Redis and sets no `REDIS_URL`. The same job then runs the docstring examples and the markdown examples, so they also pass on a machine with no Redis.
+
 **When to run it:** before you open a pull request that changes what a user sees by default (no configuration, presets, backend resolution), how a value comes back from a backend (serializers, return types, writability), or a documented fast path (mmap reads, streaming writes, zero-copy). Run it again before a release.
 
 **When you document a new promise,** add a journey for it in the same pull request. A journey is a function in `journeys/journeys.py`, registered with `@journey("<the promise, as the docs state it>")`, that does what a user would and asserts what the docs say:
