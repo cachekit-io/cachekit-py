@@ -229,7 +229,7 @@ All functions decorated with `@cache` automatically include health check methods
 
 #### `get_health_status()`
 
-Returns current health status including circuit breaker state and backpressure metrics.
+Returns current health status: overall health, plus circuit breaker, load-control (backpressure) and metrics stats per component.
 
 ```python
 @cache(ttl=300, namespace="api")
@@ -241,47 +241,90 @@ health_status = api_function.get_health_status()
 print(health_status)
 # {
 #     "namespace": "api",
-#     "features_enabled": {
-#         "circuit_breaker": True,
-#         "backpressure": True,
-#         "statistics": True,
-#         "structured_logging": True
+#     "overall_healthy": True,
+#     "healthy": True,
+#     "components": {
+#         "circuit_breaker": {
+#             "state": "closed",
+#             "failure_count": 0,
+#             "success_count": 0,
+#             "half_open_permits": 0,
+#             "last_failure_time": 0.0,
+#             "namespace": "api",
+#             "config": {
+#                 "failure_threshold": 5,
+#                 "success_threshold": 3,
+#                 "timeout_seconds": 30.0,
+#                 "half_open_requests": 3
+#             }
+#         },
+#         "load_control": {
+#             "queue_depth": 0,
+#             "rejected_count": 0,
+#             "max_concurrent": 100,
+#             "queue_size": 1000,
+#             "healthy": True
+#         },
+#         "metrics": {
+#             "mode": "sync",
+#             "total_operations": 0,
+#             "dropped_metrics": 0,
+#             "uptime_seconds": 0.0004,
+#             "ops_per_second": 0.0,
+#             "auto_detect_enabled": True,
+#             "pool_size": 0
+#         }
 #     },
-#     "circuit_breaker": {
-#         "state": "CLOSED",
-#         "failure_count": 0,
-#         "success_count": 15,
-#         "last_failure_time": null,
-#         "next_attempt": null
-#     },
-#     "backpressure": {
-#         "max_concurrent": 100,
-#         "current_requests": 2,
-#         "rejected_requests": 0
-#     }
+#     "circuit_breaker": { ... }  # Same dict as components["circuit_breaker"]
 # }
+
+assert set(health_status) == {"namespace", "overall_healthy", "healthy", "components", "circuit_breaker"}
+assert set(health_status["components"]) == {"circuit_breaker", "load_control", "metrics"}
+assert set(health_status["components"]["circuit_breaker"]) == {
+    "state", "failure_count", "success_count", "half_open_permits", "last_failure_time", "namespace", "config"
+}
+assert set(health_status["components"]["circuit_breaker"]["config"]) == {
+    "failure_threshold", "success_threshold", "timeout_seconds", "half_open_requests"
+}
+assert health_status["components"]["circuit_breaker"]["state"] == "closed"
+assert set(health_status["components"]["load_control"]) == {
+    "queue_depth", "rejected_count", "max_concurrent", "queue_size", "healthy"
+}
+assert set(health_status["components"]["metrics"]) == {
+    "mode", "total_operations", "dropped_metrics", "uptime_seconds", "ops_per_second", "auto_detect_enabled", "pool_size"
+}
+assert health_status["circuit_breaker"] is health_status["components"]["circuit_breaker"]
 ```
 
 #### `check_health()`
 
-Performs an active health check and returns comprehensive status including both decorator-specific and system-wide health information.
+Returns a simplified status: `"healthy"` or `"unhealthy"` (unhealthy while the circuit breaker is open), the namespace, and the same per-component stats as `get_health_status()`.
 
-```python notest
+```python continuation
 # Perform health check
-health_result = api_function.check_health()  # api_function = previously decorated function
+health_result = api_function.check_health()
 print(health_result)
 # {
-#     "decorator": { ... },  # Same as get_health_status()
-#     "system": {
-#         "status": "healthy",
-#         "redis_connection": "active",
-#         "connection_pool": {
-#             "created_connections": 2,
-#             "available_connections": 8,
-#             "in_use_connections": 2
-#         }
-#     }
+#     "status": "healthy",
+#     "namespace": "api",
+#     "components": { ... }  # Same as get_health_status()["components"]
 # }
+
+assert set(health_result) == {"status", "namespace", "components"}
+assert health_result["status"] == "healthy"
+components = health_result["components"]
+assert set(components) == {"circuit_breaker", "load_control", "metrics"}
+assert set(components["circuit_breaker"]) == {
+    "state", "failure_count", "success_count", "half_open_permits", "last_failure_time", "namespace", "config"
+}
+assert set(components["circuit_breaker"]["config"]) == {
+    "failure_threshold", "success_threshold", "timeout_seconds", "half_open_requests"
+}
+assert components["circuit_breaker"]["state"] == "closed"
+assert set(components["load_control"]) == {"queue_depth", "rejected_count", "max_concurrent", "queue_size", "healthy"}
+assert set(components["metrics"]) == {
+    "mode", "total_operations", "dropped_metrics", "uptime_seconds", "ops_per_second", "auto_detect_enabled", "pool_size"
+}
 ```
 
 ## Modular Architecture
