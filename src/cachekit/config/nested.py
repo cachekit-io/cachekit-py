@@ -25,12 +25,16 @@ def _is_count(value: object) -> bool:
 
 
 def _is_permit_wait(value: object) -> bool:
-    """Whether value is an int or float (not a bool) from 0 to threading.TIMEOUT_MAX.
+    """Whether value is an int, a float or a NumPy integer (not a bool) from 0 to threading.TIMEOUT_MAX.
 
     threading.Semaphore.acquire takes only those: None or a str fail the range check with a bare TypeError,
-    and a Decimal or Fraction passes it but raises TypeError inside the wait.
+    and a Decimal, a Fraction or a np.float32 passes it but raises TypeError inside the wait.
     """
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= threading.TIMEOUT_MAX
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, SupportsIndex):  # an int, or a NumPy integer
+        value = operator.index(value)
+    return isinstance(value, (int, float)) and 0 <= value <= threading.TIMEOUT_MAX
 
 
 @dataclass(frozen=True)

@@ -208,10 +208,14 @@ class TestBackpressureConfig:
         assert DecoratorConfig(backpressure=config).backpressure is config
 
     def test_validate_numpy_values(self) -> None:
-        """A NumPy integer is a whole number (it has __index__), and np.float64 subclasses float, so both pass."""
+        """NumPy integers (they have __index__) and np.float64 (a float subclass) pass, as threading.Semaphore takes
+        them. np.float32 is refused: Semaphore.acquire raises TypeError for it."""
         np = pytest.importorskip("numpy")
-        config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16), timeout=np.float64(0.5))
-        assert DecoratorConfig(backpressure=config).backpressure is config
+        for timeout in (np.float64(0.5), np.int64(1)):
+            config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16), timeout=timeout)
+            assert DecoratorConfig(backpressure=config).backpressure is config
+        with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
+            BackpressureConfig(timeout=np.float32(0.5)).validate()
 
     @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
     def test_validate_queue_size_invalid(self, queue_size: float) -> None:
