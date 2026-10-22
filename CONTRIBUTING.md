@@ -208,7 +208,13 @@ The spawned server listens on a unix socket under pytest's base temp directory, 
 
 **Testing the nothing-configured path.** Every test gets a Redis-backed provider from an autouse fixture in `tests/conftest.py`, so a decorator under test never sees what a user with nothing configured sees. Request the `nothing_configured` fixture to opt out: it installs the real default provider, clears `REDIS_URL` and every `CACHEKIT_*` variable in any casing, needs no Redis, and fails the test if the provider builds a backend. Add `no_redis_built` to fail on any Redis client construction. A promise about default behaviour also needs a fresh-interpreter test, as in `tests/critical/test_zero_config_fresh_interpreter.py`: its child process refuses every outbound connection, because CI serves Redis at `localhost:6379`, the address an unconfigured client would dial, and a test that only checks for a cache hit passes there either way.
 
-**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
+**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. The docstring and `docs/` examples run twice: once beside a Redis server and once with none. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
+
+**Which pandas the tests use.** The lockfile pins pandas 2.x, but a fresh install resolves the newest pandas. Every PR also runs the unit and critical suites with the newest pandas 3.x installed over the lockfile (the `Tests (pandas 3)` job), because pandas 3's copy-on-write changes what a returned frame allows. To reproduce it locally:
+
+```bash
+uv run --with "pandas>=3,<4" pytest tests/unit/ -m "not slow" -n auto
+```
 
 ### Test Coverage
 
