@@ -1,0 +1,105 @@
+name: Mutation Smoke
+
+# Re-applies each hand-written mutant in scripts/mutation_smoke.py and fails when the unmutated
+# baseline fails, when a mutant's anchor no longer matches exactly once, or when a mutant is no
+# longer killed by any of its recorded tests. A deleted or renamed killer turns the baseline red.
+#
+# pull_request is permanent and path-filtered to the smoke's own files: GitHub runs schedule and
+# workflow_dispatch only for a workflow already on the default branch, so this is how a change
+# to the smoke gets a run before it merges. It never files the tracking issue.
+on:
+  schedule:
+    - cron: '40 19 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/mutation-smoke.yml
+      - scripts/mutation_smoke.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # One leg per mutant, plus the baseline. Keep the list in step with MUTANTS in
+  # scripts/mutation_smoke.py; tests/unit/test_mutation_smoke.py fails when they differ.
+  smoke:
+    name: ${{ matrix.mutant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant:
+        - baseline
+        - checksum-skipped
+        - polars-returns-pandas
+        - arrow-returns-pandas
+        - ipc-single-unbounded-batch
+        - numpy-result-aliases-cache
+        - mmap-read-disabled
+        - streaming-write-disabled
+        - mmap-read-when-encrypted
+        - get-buffer-serves-expired
+        - get-buffer-follows-symlinks
+        - zero-config-l1-off
+        - serializer-name-mismatch-accepted
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    # The runner runs pytest serially, so one Redis serves the whole leg: no xdist worker can
+    # flush another's keys mid-test.
+    - name: Start Redis (no persistence)
+      run: bash .github/scripts/start-redis.sh
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    # Every leg builds the same Rust extension on the same interpreter, so one cache serves all.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Install dependencies
+      run: uv sync --python 3.12 --group dev --locked
+
+    - name: Run ${{ matrix.mutant }}
+      env:
+        MUTANT: ${{ matrix.mutant }}
+        REDIS_URL: redis://localhost:6379
+      run: uv run --no-sync python scripts/mutation_smoke.py run "$MUTANT"
+
+  # Surface nightly failures: a schedule-only job that fails silently is worse than no job.
+  # De-duplicate by title so a red streak comments on one issue instead of opening one a night.
+  # Not failure(): a leg that hits its timeout ends cancelled, which failure() skips. !cancelled()
+  # keeps a cancelled run (concurrency, manual) from filing.
+  report:
+    name: File / update tracking issue on failure
+    needs: smoke
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.smoke.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+    - name: File / update tracking issue
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TITLE: "Mutation Smoke nightly is failing"
+      run: |
+        body=$(printf '%s\n' \
+          "Mutation Smoke failed on run ${{ github.run_id }}." \
+          "" \
+          "Each failed leg names its mutant and the reason: SURVIVED, NOT APPLIED or BASELINE RED." \
+          "" \
+          "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+        existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+          --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --repo "${{ github.repository }}" --body "$body"
+        else
+          gh issue create --repo "${{ github.repository }}" --title "$TITLE" --label bug --body "$body"
+        fi

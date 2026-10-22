@@ -219,6 +219,16 @@ uv run --with "pandas>=3,<4" pytest tests/unit/ -m "not slow" -n auto
 
 **The nightly run.** `.github/workflows/nightly.yml` runs the suites no PR job selects, every night at 19:17 UTC. It has three independent jobs. The first runs `tests/competitive`. The second runs `tests/performance -m "performance and not slow"`, whose wall-clock numbers are reported, not asserted, and then the serializer micro-benchmarks once, untimed. The third builds the wheel on Python 3.10 and resolves it with `--resolution lowest`, so numpy, pandas and pyarrow sit at the `data` extra's floors. It then runs `tests/unit` against that wheel, not the source tree. A failed run opens or updates the "Nightly is failing" issue. To run it on demand, use **Run workflow** on the Actions page, or `gh workflow run nightly.yml`. A PR that edits the workflow file runs it too.
 
+**Mutation smoke.** `scripts/mutation_smoke.py` holds hand-written mutants: each is one exact string edit to a guard in `src/`, plus the tests recorded as its killers. The nightly `Mutation Smoke` workflow runs the baseline and every mutant as parallel jobs, and opens or updates a tracking issue when one fails. A mutant counts as killed only when pytest exits 1 and at least one of its recorded killers fails; a collection error, a setup or teardown error, a timeout or an unrelated failure never counts. The baseline checks that every anchor matches exactly once and that every killer passes unmutated, so a deleted or renamed killer turns the baseline red. A mutant reports `SURVIVED` only once none of its killers catch it: with two killers, weakening one leaves the other to kill it. A refactored guard reports `NOT APPLIED`. Run it locally:
+
+```bash
+uv run python scripts/mutation_smoke.py list                     # mutant names
+uv run python scripts/mutation_smoke.py run baseline             # anchors apply, killers pass
+uv run python scripts/mutation_smoke.py run checksum-skipped     # one mutant: exit 0 killed, 1 survived, 2 not applied
+```
+
+The runner restores the source file after each mutant, runs only the killers' test files, and runs them serially, so one Redis serves the run. To add a mutant, append a `Mutant(...)` to `MUTANTS`: a behaviour name, the file, an anchor that matches exactly once, its replacement and the killer node ids. Find the killers by running the wide suite with the mutant applied, then record the tests that check that guard itself, not ones that fail by accident. Add the name to the matrix in `.github/workflows/mutation-smoke.yml`; `tests/unit/test_mutation_smoke.py` fails until the two lists agree. When a refactor breaks an anchor, `tests/unit/test_mutation_smoke.py` fails on that PR: re-anchor the mutant on the new code so it makes the same behaviour change.
+
 ### Test Coverage
 
 - Aim for >85% coverage for new code
