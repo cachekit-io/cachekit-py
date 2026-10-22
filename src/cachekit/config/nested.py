@@ -209,7 +209,7 @@ class BackpressureConfig:
         >>> BackpressureConfig(max_concurrent_requests=0).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        cachekit.config.validation.ConfigurationError: max_concurrent_requests must be >= 1, got 0
+        cachekit.config.validation.ConfigurationError: max_concurrent_requests must be a finite number >= 1, got 0
     """
 
     enabled: bool = True
@@ -223,8 +223,11 @@ class BackpressureConfig:
         Raises:
             ConfigurationError: If capacity limits are invalid
         """
-        if self.max_concurrent_requests < 1:
-            raise ConfigurationError(f"max_concurrent_requests must be >= 1, got {self.max_concurrent_requests}")
+        # threading.Semaphore never blocks at NaN or inf, which would silently remove the concurrency limit.
+        if not 1 <= self.max_concurrent_requests < math.inf:
+            raise ConfigurationError(
+                f"max_concurrent_requests must be a finite number >= 1, got {self.max_concurrent_requests!r}"
+            )
         # Every backend operation joins the queue before it waits for a permit, even one that gets a
         # permit at once, so at 0 every operation is rejected. NaN or inf would silently remove the cap.
         if not 1 <= self.queue_size < math.inf:

@@ -191,16 +191,13 @@ class TestBackpressureConfig:
         config = BackpressureConfig(max_concurrent_requests=1)
         assert DecoratorConfig(backpressure=config).backpressure is config
 
-    def test_validate_max_concurrent_requests_too_small(self) -> None:
-        """Test validation fails when max_concurrent_requests < 1."""
-        config = BackpressureConfig(max_concurrent_requests=0)
-        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be >= 1, got 0"):
-            config.validate()
-
-    def test_validate_max_concurrent_requests_negative(self) -> None:
-        """Test validation fails for negative max_concurrent_requests."""
-        config = BackpressureConfig(max_concurrent_requests=-10)
-        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be >= 1, got -10"):
+    @pytest.mark.parametrize("max_concurrent", [0, -10, float("nan"), float("inf")])
+    def test_validate_max_concurrent_requests_invalid(self, max_concurrent: float) -> None:
+        """Below 1 nothing runs; at NaN or inf threading.Semaphore never blocks, so there is no limit."""
+        config = BackpressureConfig(max_concurrent_requests=max_concurrent)  # pyright: ignore[reportArgumentType]
+        with pytest.raises(
+            ConfigurationError, match=f"max_concurrent_requests must be a finite number >= 1, got {max_concurrent!r}"
+        ):
             config.validate()
 
     def test_validate_limit_minimums(self) -> None:
