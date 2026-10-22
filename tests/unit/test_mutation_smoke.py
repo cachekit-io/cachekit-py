@@ -77,7 +77,8 @@ def test_a_killer_erroring_in_setup_is_not_a_kill():
 @pytest.mark.parametrize("mutant", smoke.MUTANTS, ids=lambda m: m.name)
 def test_every_anchor_still_applies(mutant):
     """A refactor that breaks an anchor fails here, on its own PR, not at the next nightly. Re-anchor the mutant."""
-    smoke.mutated_source(mutant, (ROOT / mutant.path).read_text())
+    source = (ROOT / mutant.path).read_text()
+    assert smoke.mutated_source(mutant, source) != source
 
 
 def test_every_mutant_records_killers_and_has_a_unique_name():
