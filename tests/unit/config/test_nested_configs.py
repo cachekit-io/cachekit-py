@@ -208,11 +208,11 @@ class TestBackpressureConfig:
         config = BackpressureConfig(queue_size=1, timeout=0.0)
         assert DecoratorConfig(backpressure=config).backpressure is config
 
-    @pytest.mark.parametrize("queue_size", [0, -5])
-    def test_validate_queue_size_too_small(self, queue_size: int) -> None:
-        """Every operation joins the queue, so a queue_size below 1 would reject them all."""
-        with pytest.raises(ConfigurationError, match=f"queue_size must be >= 1, got {queue_size}"):
-            BackpressureConfig(queue_size=queue_size).validate()
+    @pytest.mark.parametrize("queue_size", [0, -5, float("nan"), float("inf")])
+    def test_validate_queue_size_invalid(self, queue_size: float) -> None:
+        """Below 1 every operation is rejected (each joins the queue); NaN or inf would remove the cap."""
+        with pytest.raises(ConfigurationError, match=f"queue_size must be a finite number >= 1, got {queue_size!r}"):
+            BackpressureConfig(queue_size=queue_size).validate()  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize("timeout", [-0.1, 1e10, float("inf"), float("nan")])
     def test_validate_timeout_invalid(self, timeout: float) -> None:

@@ -226,9 +226,9 @@ class BackpressureConfig:
         if self.max_concurrent_requests < 1:
             raise ConfigurationError(f"max_concurrent_requests must be >= 1, got {self.max_concurrent_requests}")
         # Every backend operation joins the queue before it waits for a permit, even one that gets a
-        # permit at once, so at 0 every operation is rejected.
-        if self.queue_size < 1:
-            raise ConfigurationError(f"queue_size must be >= 1, got {self.queue_size}")
+        # permit at once, so at 0 every operation is rejected. NaN or inf would silently remove the cap.
+        if not 1 <= self.queue_size < math.inf:
+            raise ConfigurationError(f"queue_size must be a finite number >= 1, got {self.queue_size!r}")
         # The permit wait hands timeout to threading.Semaphore.acquire. While every permit is held, NaN never
         # returns, and inf or a value past the platform limit raises OverflowError instead of waiting.
         # threading.TIMEOUT_MAX is the documented maximum.
