@@ -6,7 +6,7 @@ Designed for seamless data exchange between Python, PHP, JavaScript, and other l
 Supports ONLY language-universal primitives:
 - None, bool, int, float, str, bytes
 - list, tuple, dict
-- datetime, date, time (MessagePack extension 0xC0)
+- datetime, date, time (ISO-8601 sentinel maps, e.g. {"__datetime__": true, "value": "<ISO-8601>"})
 
 Explicitly rejects Python-specific types for safety and interoperability:
 - NumPy arrays → Use AutoSerializer (Python-only) or ArrowSerializer (Python/JS/Java/R, NOT PHP)
@@ -89,10 +89,11 @@ CUSTOM_CLASS_ERROR_MESSAGE = (
 
 
 def _standard_default(obj: Any) -> Any:
-    """Custom encoder for datetime types (MessagePack extension 0xC0).
+    """Custom encoder for datetime types (ISO-8601 sentinel maps).
 
     Handles ONLY datetime/date/time using ISO-8601 string format.
-    Extension code 0xC0 chosen for language-agnostic datetime representation.
+    Encodes each as a plain map, {"__datetime__": True, "value": "<ISO-8601>"} (or __date__ / __time__),
+    per the protocol spec's datetime format (spec/wire-format.md#datetime-extension-format).
 
     Explicitly rejects Python-specific types with actionable error messages.
 
@@ -105,7 +106,7 @@ def _standard_default(obj: Any) -> Any:
     Raises:
         TypeError: For unsupported types with actionable guidance
     """
-    # Language-universal datetime support (MessagePack extension 0xC0)
+    # Datetime support as protocol sentinel maps (plain MessagePack maps, no ext type)
     if isinstance(obj, datetime):
         return {"__datetime__": True, "value": obj.isoformat()}
     if isinstance(obj, date):
@@ -147,7 +148,7 @@ def _standard_default(obj: Any) -> Any:
 
 
 def _standard_object_hook(obj: Any) -> Any:
-    """Custom decoder for datetime types (MessagePack extension 0xC0).
+    """Custom decoder for datetime types (ISO-8601 sentinel maps).
 
     Restores datetime/date/time from ISO-8601 strings.
 
@@ -194,7 +195,7 @@ class StandardSerializer:
     Supported Types (Language-Universal):
     - Primitives: None, bool, int, float, str, bytes
     - Collections: list, tuple, dict
-    - Temporal: datetime, date, time (ISO-8601 via MessagePack extension 0xC0)
+    - Temporal: datetime, date, time (ISO-8601 string in a __datetime__ / __date__ / __time__ sentinel map)
 
     NOT Supported (Use AutoSerializer or ArrowSerializer):
     - NumPy arrays (Python-specific)

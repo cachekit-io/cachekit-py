@@ -95,7 +95,7 @@ class TestStandardSerializerCrossLanguage:
                 "mixed array",
                 "mixed_array",
             ),
-            # Datetime types (MessagePack extension 0xC0 → dict with __datetime__ marker)
+            # Datetime types (sentinel map with __datetime__ marker, not a MessagePack ext type)
             (
                 datetime(2025, 11, 14, 10, 30, 0),
                 "datetime",
@@ -211,7 +211,7 @@ class TestStandardSerializerCrossLanguage:
         print("=" * 80 + "\n")
 
     def test_datetime_encoding_format(self):
-        """Verify datetime encoding uses __datetime__ marker dict (MessagePack extension 0xC0 replacement).
+        """Verify datetime encoding uses the __datetime__ sentinel map.
 
         Protocol-v1.0.md specifies datetime encoding as:
             {"__datetime__": true, "value": "2025-11-14T10:30:00"}

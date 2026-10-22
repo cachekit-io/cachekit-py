@@ -67,7 +67,7 @@ StandardSerializer can be referenced by alias when configuring serializers:
 | `bool` | ✅ | |
 | `None` | ✅ | |
 | `bytes` | ✅ | Binary data — only serializer that handles raw bytes |
-| `datetime` | ✅ | Via MessagePack extension |
+| `datetime`, `date`, `time` | ✅ | ISO-8601 string in a sentinel map, e.g. `{"__datetime__": true, "value": "<ISO-8601>"}` ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/wire-format.md#datetime-extension-format)); revival of these maps varies across SDKs |
 | `numpy.ndarray` | ❌ | Use [AutoSerializer](./auto.md) (`serializer="auto"`) |
 | `pandas.DataFrame` | ❌ | Use [ArrowSerializer](./arrow.md) or [AutoSerializer](./auto.md) |
 | `pandas.Series` | ❌ | Use [AutoSerializer](./auto.md) |
