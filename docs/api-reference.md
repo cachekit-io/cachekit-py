@@ -103,8 +103,8 @@ def your_function(args):
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
-  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests
-  - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up
+  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests; must be `>= 1`
+  - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up; must be finite and `>= 0`
 
 #### Monitoring Parameters
 

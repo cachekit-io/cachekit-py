@@ -201,6 +201,23 @@ class TestBackpressureConfig:
         with pytest.raises(ConfigurationError, match="max_concurrent_requests must be >= 1, got -10"):
             config.validate()
 
+    def test_validate_limit_minimums(self) -> None:
+        """queue_size=1 and timeout=0 (no wait for a permit), the minimums, pass."""
+        config = BackpressureConfig(queue_size=1, timeout=0.0)
+        assert DecoratorConfig(backpressure=config).backpressure is config
+
+    @pytest.mark.parametrize("queue_size", [0, -5])
+    def test_validate_queue_size_too_small(self, queue_size: int) -> None:
+        """Every operation joins the queue, so a queue_size below 1 would reject them all."""
+        with pytest.raises(ConfigurationError, match=f"queue_size must be >= 1, got {queue_size}"):
+            BackpressureConfig(queue_size=queue_size).validate()
+
+    @pytest.mark.parametrize("timeout", [-0.1, float("inf"), float("nan")])
+    def test_validate_timeout_invalid(self, timeout: float) -> None:
+        """A negative timeout is meaningless, and inf or NaN never return from a permit wait while every permit is held."""
+        with pytest.raises(ConfigurationError, match="timeout must be a finite number >= 0"):
+            BackpressureConfig(timeout=timeout).validate()
+
 
 @pytest.mark.unit
 class TestMonitoringConfig:

@@ -186,8 +186,8 @@ class BackpressureConfig:
     Attributes:
         enabled: Enable backpressure protection (default: True)
         max_concurrent_requests: Maximum concurrent cache requests (default: 100)
-        queue_size: Queue size for waiting requests (default: 1000)
-        timeout: Seconds to wait in queue before giving up (default: 0.1)
+        queue_size: Queue size for waiting requests (default: 1000, must be >= 1)
+        timeout: Seconds to wait in queue before giving up (default: 0.1, finite and >= 0)
 
     Examples:
         Create with defaults:
@@ -224,6 +224,14 @@ class BackpressureConfig:
         """
         if self.max_concurrent_requests < 1:
             raise ConfigurationError(f"max_concurrent_requests must be >= 1, got {self.max_concurrent_requests}")
+        # Every backend operation joins the queue before it waits for a permit, even one that gets a
+        # permit at once, so at 0 every operation is rejected.
+        if self.queue_size < 1:
+            raise ConfigurationError(f"queue_size must be >= 1, got {self.queue_size}")
+        # The permit wait hands timeout to threading.Semaphore.acquire, which never returns on inf or NaN
+        # while every permit is held.
+        if not math.isfinite(self.timeout) or self.timeout < 0:
+            raise ConfigurationError(f"timeout must be a finite number >= 0, got {self.timeout!r}")
 
 
 @dataclass(frozen=True)
