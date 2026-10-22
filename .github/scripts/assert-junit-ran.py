@@ -14,8 +14,13 @@ import xml.etree.ElementTree as ET
 
 
 def main(report: str, module: str) -> int:
-    # The report is this job's own pytest output, not untrusted input.
-    cases = [c for c in ET.parse(report).iter("testcase") if f"{c.get('classname', '')}.".startswith(f"{module}.")]  # noqa: S314
+    try:
+        # The report is this job's own pytest output, not untrusted input.
+        tree = ET.parse(report)  # noqa: S314
+    except (OSError, ET.ParseError) as e:
+        print(f"::error::cannot read junit report {report}: {e}")
+        return 1
+    cases = [c for c in tree.iter("testcase") if f"{c.get('classname', '')}.".startswith(f"{module}.")]
     skipped = [f"{c.get('classname')}::{c.get('name')}" for c in cases if c.find("skipped") is not None]
     if not cases:
         print(f"::error::{report} has no tests from {module}: the module was not collected")
