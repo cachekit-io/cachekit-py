@@ -216,7 +216,7 @@ class TestBackpressureConfig:
 
     @pytest.mark.parametrize("timeout", [-0.1, 1e10, float("inf"), float("nan")])
     def test_validate_timeout_invalid(self, timeout: float) -> None:
-        """While every permit is held, NaN never returns from the wait, and inf or above TIMEOUT_MAX raises OverflowError."""
+        """Outside 0 to TIMEOUT_MAX: NaN never returns from a wait, and inf or 1e10 raises OverflowError."""
         with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
             BackpressureConfig(timeout=timeout).validate()
 

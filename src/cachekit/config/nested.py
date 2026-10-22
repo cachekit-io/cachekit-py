@@ -230,7 +230,8 @@ class BackpressureConfig:
         if self.queue_size < 1:
             raise ConfigurationError(f"queue_size must be >= 1, got {self.queue_size}")
         # The permit wait hands timeout to threading.Semaphore.acquire. While every permit is held, NaN never
-        # returns, and inf or anything above threading.TIMEOUT_MAX raises OverflowError instead of waiting.
+        # returns, and inf or a value past the platform limit raises OverflowError instead of waiting.
+        # threading.TIMEOUT_MAX is the documented maximum.
         if not 0 <= self.timeout <= threading.TIMEOUT_MAX:
             raise ConfigurationError(
                 f"timeout must be a number from 0 to {threading.TIMEOUT_MAX} (threading.TIMEOUT_MAX), got {self.timeout!r}"
