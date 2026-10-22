@@ -203,7 +203,7 @@ class TestWrapperLockTimeoutFallback:
 
         # The warning must reference the redacted digest of the BARE cache_key —
         # a ``:lock``-suffixed key would digest differently, so the bare-key
-        # contract is still pinned. Raw keys never reach logs (CWE-532, LAB-304).
+        # contract is still pinned. Raw keys never reach logs (CWE-532).
         timeout_warnings = [r for r in caplog.records if "Failed to acquire lock" in r.message]
         assert len(timeout_warnings) == 1, (
             f"expected exactly one lock-timeout warning; got {[r.message for r in caplog.records]!r}"
@@ -247,7 +247,7 @@ class TestWrapperLockOperationFailureFallback:
 
         # The lock-operation-failed warning must reference the redacted digest of
         # the bare cache_key — a ``:lock``-suffixed key would digest differently.
-        # Raw keys never reach logs (CWE-532, LAB-304).
+        # Raw keys never reach logs (CWE-532).
         lock_failed_warnings = [r for r in caplog.records if "Lock operation failed" in r.message]
         assert len(lock_failed_warnings) == 1, (
             f"expected one lock-operation-failed warning; got {[r.message for r in caplog.records]!r}"
@@ -340,7 +340,7 @@ class _LockFailingBackend(_RecordingLockableBackend):
 @pytest.mark.asyncio
 class TestLockFailureWarningRedactsKey:
     """The 'Lock operation failed' warning interpolates ``{e}`` — a BackendError
-    carrying the cache key must not leak it into the log (CodeRabbit PR #264)."""
+    carrying the cache key must not leak it into the log (#264)."""
 
     async def test_lock_failure_warning_never_logs_raw_key(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = _LockFailingBackend()
@@ -439,7 +439,7 @@ class TestNonCallableLockAttributeFallsBackToLockless:
     ``TypeError`` escaped: the wrapper's handler degrades to lockless execution
     only for a ``BackendError`` and re-raises everything else. So a backend that
     merely declared the attribute broke every decorated call it was supposed to
-    protect (CodeRabbit PR #313).
+    protect (#313).
     """
 
     async def test_non_callable_acquire_lock_does_not_break_the_call(self) -> None:

@@ -1,0 +1,213 @@
+name: Nightly
+
+# Suites no per-commit job selects: the competitive comparison suite, the
+# wall-clock performance tests (`performance and not slow`), and the unit suite
+# with every dependency at its declared floor. The path-filtered pull_request
+# trigger runs the workflow on any PR that edits it, because schedule and
+# workflow_dispatch only run a workflow file that is already on main.
+on:
+  schedule:
+    - cron: '17 19 * * *'  # 19:17 UTC, an hour before Security Deep
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REDIS_DISABLE_HIREDIS: true
+  DEFAULT_PYTHON_VERSION: "3.12"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  competitive:
+    name: Competitive suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Start Redis (no persistence)
+      run: bash .github/scripts/start-redis.sh
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    # The dev group carries cachetools and aiocache; without them the comparison
+    # modules skip whole and the job passes having compared nothing.
+    - name: Install dependencies
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
+
+    - name: Run competitive suite
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: uv run pytest tests/competitive/ -rs
+
+  performance:
+    name: Performance tests (not slow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Start Redis (no persistence)
+      run: bash .github/scripts/start-redis.sh
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Install dependencies
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
+
+    # Wall-clock thresholds here are reported through record_property, not
+    # asserted, so this job fails on correctness and memory assertions only.
+    - name: Run performance tests
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: uv run pytest tests/performance/ -m "performance and not slow" -rs
+
+    # The --benchmark-skip addopt skips the serializer micro-benchmarks above.
+    # Run each body once, untimed, so their assertions still execute.
+    - name: Run serializer micro-benchmarks once, untimed
+      if: ${{ !cancelled() }}
+      run: |
+        uv run pytest tests/performance/test_serializer_microbench.py -m "performance and not slow" \
+          -o addopts="--strict-markers" --benchmark-disable -rs
+
+  # The lockfile resolves the newest release of every dependency, so no other
+  # job proves the floors in pyproject.toml install and work. This job resolves
+  # the built wheel at the lowest versions its metadata allows, on the oldest
+  # supported Python, and runs the unit suite against that wheel.
+  dependency-floors:
+    name: Unit suite (Python 3.10, dependency floors)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Start Redis (no persistence)
+      run: bash .github/scripts/start-redis.sh
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: floors
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: py3.10
+
+    - name: Build the wheel
+      run: uv build --wheel --python 3.10 --out-dir dist
+
+    - name: Resolve the wheel at its floors
+      run: |
+        wheel=$(ls dist/cachekit-*.whl)
+        echo "cachekit[data,json,memcached] @ file://$PWD/$wheel" > "$RUNNER_TEMP/floors.in"
+        # python-dateutil 2.8.2 pulls six 1.5.0, whose lazy _gdbm import breaks Hypothesis's module scan.
+        echo "six>=1.16.0" > "$RUNNER_TEMP/overrides.txt"
+        uv pip compile "$RUNNER_TEMP/floors.in" --python-version 3.10 --resolution lowest \
+          --override "$RUNNER_TEMP/overrides.txt" --no-header --output-file "$RUNNER_TEMP/floors.txt"
+        cat "$RUNNER_TEMP/floors.txt"
+
+    # Test tools come from the lock; the project itself is not installed, so the
+    # only cachekit on the path is the wheel in the floors overlay below.
+    - name: Install test tools from the lock
+      run: uv sync --python 3.10 --group dev --no-install-project
+
+    # The floors are read from the installed wheel's own metadata, so a floor
+    # raised in pyproject.toml is checked here without editing this file.
+    - name: Assert the data extra resolved at its floors
+      run: |
+        uv run --python 3.10 --no-sync --with-requirements "$RUNNER_TEMP/floors.txt" python - <<'PY'
+        import importlib.metadata as md
+        import cachekit
+        from packaging.requirements import Requirement
+
+        print(f"cachekit {md.version('cachekit')} from {cachekit.__file__}")
+        assert "site-packages" in cachekit.__file__, f"cachekit imported from {cachekit.__file__}, not the wheel"
+        floors = {}
+        for raw in md.requires("cachekit"):
+            req = Requirement(raw)
+            if req.marker and req.marker.evaluate({"extra": "data"}) and not req.marker.evaluate({"extra": ""}):
+                (spec,) = [s for s in req.specifier if s.operator == ">="]
+                floors[req.name] = spec.version
+        assert set(floors) == {"numpy", "pandas", "pyarrow"}, floors
+        bad = []
+        for name, floor in sorted(floors.items()):
+            got = md.version(name)
+            print(f"{name}: resolved {got}, floor {floor}")
+            if got != floor:
+                bad.append(name)
+        assert not bad, f"not at the declared floor: {bad}"
+        PY
+
+    # `-o pythonpath=` drops pyproject's `pythonpath = ["src"]`, so the tests
+    # import the wheel, not the source tree.
+    - name: Run unit suite on the floors
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        uv run --python 3.10 --no-sync --with-requirements "$RUNNER_TEMP/floors.txt" \
+          pytest tests/unit/ -m "not slow" -n auto -o pythonpath= -rs
+
+  # A scheduled job that fails silently is worse than none: open or update one
+  # tracking issue. Only this job may write issues, and it skips that step on
+  # pull requests.
+  nightly-success:
+    name: Nightly Success
+    runs-on: ubuntu-latest
+    needs: [competitive, performance, dependency-floors]
+    if: always()
+    permissions:
+      contents: read
+      issues: write
+    steps:
+    - name: Check all nightly jobs succeeded
+      run: |
+        if [[ "${{ needs.competitive.result }}" != "success" ]] || \
+           [[ "${{ needs.performance.result }}" != "success" ]] || \
+           [[ "${{ needs.dependency-floors.result }}" != "success" ]]; then
+          echo "One or more nightly jobs failed"
+          echo "Competitive: ${{ needs.competitive.result }}"
+          echo "Performance: ${{ needs.performance.result }}"
+          echo "Dependency floors: ${{ needs.dependency-floors.result }}"
+          exit 1
+        fi
+        echo "All nightly jobs passed"
+
+    - name: File / update tracking issue on failure
+      if: failure() && github.event_name != 'pull_request'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TITLE: "Nightly is failing"
+      run: |
+        body=$(printf '%s\n' \
+          "Nightly failed on run ${{ github.run_id }}." \
+          "" \
+          "- Competitive: ${{ needs.competitive.result }}" \
+          "- Performance: ${{ needs.performance.result }}" \
+          "- Dependency floors: ${{ needs.dependency-floors.result }}" \
+          "" \
+          "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+        # The search is word-based and also matches "Security Deep nightly is failing": keep exact titles only.
+        existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+          --search "$TITLE in:title" --json number,title \
+          --jq 'map(select(.title == env.TITLE)) | .[0].number // empty')
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --repo "${{ github.repository }}" --body "$body"
+        else
+          gh issue create --repo "${{ github.repository }}" --title "$TITLE" --label bug --body "$body"
+        fi

@@ -485,7 +485,7 @@ class TestEventEncoding:
     def test_publish_with_an_unencodable_registry_id_never_raises(
         self, registry_id: str, key: str | None, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """LAB-7624: the failure log redacts the registry id, so it must not raise on a surrogate."""
+        """The failure log redacts the registry id, so it must not raise on a surrogate."""
         backend = TrackingBackend()
         with caplog.at_level(logging.WARNING, logger=invalidation.__name__):
             invalidation.publish(backend, registry_id, key)

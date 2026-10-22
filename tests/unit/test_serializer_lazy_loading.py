@@ -14,7 +14,7 @@ import pytest
 
 # Lazy loading can only be exercised when the lazily-loaded serializers are
 # actually installed — requires the [data] + [json] extras, absent e.g. in the
-# free-threaded CI lane (LAB-511).
+# free-threaded CI lane.
 pytest.importorskip("pyarrow")
 pytest.importorskip("orjson")
 

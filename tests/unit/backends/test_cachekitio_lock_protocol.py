@@ -640,7 +640,7 @@ class TestDecoratorDegradesOnLockError:
         backend, pool = _lock_failing_backend(status, body)
         runs: list[int] = []
 
-        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lab5346")
+        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lockerror")
         async def compute(x: int) -> int:
             runs.append(x)
             return x * 2
@@ -669,7 +669,7 @@ async def _drain_background_releases() -> None:
 
 @pytest.mark.unit
 class TestFillLock:
-    """acquire_fill_lock (LAB-7064): reports a first-attempt grant and releases without blocking the caller."""
+    """acquire_fill_lock: reports a first-attempt grant and releases without blocking the caller."""
 
     @pytest.mark.parametrize(
         ("posts", "expected"),

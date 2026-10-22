@@ -1,4 +1,4 @@
-"""Architecture test: no logging call may receive a raw cache key or raw exception text (CWE-532, LAB-304).
+"""Architecture test: no logging call may receive a raw cache key or raw exception text (CWE-532).
 
 The redaction sweep on PR #264 hand-edited ~30 log lines. Nothing stopped the
 next ``logger.debug(f"... {key}")`` from landing with CI green — this does.

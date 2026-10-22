@@ -1,4 +1,4 @@
-"""Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time (LAB-7070).
+"""Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time.
 
 The SaaS has no bulk delete, so ``_delete_many`` sends one DELETE per key on a bounded pool.
 Requests go through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py) whose
@@ -165,7 +165,7 @@ async def test_ainvalidate_cache_takes_the_fan_out() -> None:
 
     await f.ainvalidate_cache()
 
-    # Fan-out shape from the server, not the clock (LAB-7889): the held first wave puts 16 DELETEs
+    # Fan-out shape from the server, not the clock: the held first wave puts 16 DELETEs
     # in flight on 16 pool threads. A key deleted outside the pool (per-key loop, serial tail)
     # brings a 17th thread; a pool of fewer than 16 never fills the hold and peaks below 16.
     assert len(server.threads) == _DELETE_FANOUT, len(server.threads)
@@ -362,7 +362,7 @@ def clock() -> Any:
         yield fake
 
 
-def test_cobels_case_waits_out_the_rate_limit_and_deletes_every_key(clock: _Clock) -> None:
+def test_free_tier_near_limit_waits_out_the_rate_limit_and_deletes_every_key(clock: _Clock) -> None:
     """Free tier, 90 tokens left, 100/min: the unpaced fan-out left about 9 of 100 keys live."""
     server = _Limited(clock, tokens=90, per_minute=100, burst=200)
     backend = _backend(server)
@@ -375,7 +375,7 @@ def test_cobels_case_waits_out_the_rate_limit_and_deletes_every_key(clock: _Cloc
     assert server.late_peak <= 1  # no concurrent DELETE after the first rate-limited answer
 
 
-def test_cobels_case_through_the_decorator_leaves_nothing_tracked(clock: _Clock) -> None:
+def test_free_tier_near_limit_through_the_decorator_leaves_nothing_tracked(clock: _Clock) -> None:
     server = _Limited(clock, tokens=90, per_minute=100, burst=200)
 
     @cache(backend=_backend(server), ttl=60, namespace="fanout_paced", l1_enabled=False)

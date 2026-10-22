@@ -135,7 +135,7 @@ def test_full_roundtrip_through_cache_handler_is_correct_and_compact():
 @pytest.mark.slow
 @pytest.mark.performance
 def test_streaming_write_path_peak_rss_bounded():
-    """LAB-766: the File-backend streaming write path never materializes the envelope.
+    """The File-backend streaming write path never materializes the envelope.
 
     Peak RSS in a dedicated subprocess (tracemalloc cannot see pyarrow's C++ pools,
     which is exactly where the buffered path's residual lives). A 400MB incompressible
@@ -317,7 +317,7 @@ def test_file_backend_bytes_read_python_allocations_bounded(tmp_path: Path) -> N
 
     This is the path most cached functions take (anything that isn't a plaintext
     Arrow DataFrame). Measured cost today: ~3x payload on the Python heap —
-    FileBackend.get's single payload os.read (header read separately, LAB-770),
+    FileBackend.get's single payload os.read (header read separately),
     the decompressed msgpack document, and the unpacked output. The two avoidable
     copies #169 called out are gone: the file_data[14:] slice (header-first read)
     and deserialize's ``bytes(data)`` coercion (Rust retrieve takes the buffer
@@ -340,8 +340,8 @@ def test_file_backend_bytes_read_python_allocations_bounded(tmp_path: Path) -> N
     assert hit.value == payload
     assert peak / len(payload) < 3.5, (
         f"File-backend bytes read peak {peak / len(payload):.2f}x payload — a full-payload read-side "
-        f"copy crept back in (known cost ~3x: payload os.read + decode + output; LAB-770 removed "
-        f"the header slice and the bytes() coercion)"
+        f"copy crept back in (known cost ~3x: payload os.read + decode + output; the header-first read and "
+        f"buffer-protocol retrieve removed the header slice and the bytes() coercion)"
     )
 
 

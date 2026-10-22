@@ -1,4 +1,4 @@
-"""One cache operation, one metrics record (LAB-3761).
+"""One cache operation, one metrics record.
 
 Every success site used to call ``features.record_success()``, which forwarded an
 unlabelled record to the collector, and then its own labelled

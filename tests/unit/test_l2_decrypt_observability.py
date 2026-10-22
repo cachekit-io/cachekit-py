@@ -72,7 +72,7 @@ class TestL2DecryptFailureWarning:
 
         assert result is None
         assert any("decrypt/integrity failure" in r.message for r in caplog.records)
-        # The exception is rendered by redact_error_for_log (CWE-532, LAB-304): the log
+        # The exception is rendered by redact_error_for_log (CWE-532): the log
         # names the type, never the provider's free-form message text.
         assert any("EncryptionError" in r.message for r in caplog.records)
         assert not any("GCM tag mismatch" in r.message for r in caplog.records)
@@ -327,7 +327,7 @@ class TestDecoratorPoisonEviction:
 
 @pytest.mark.unit
 class TestCorruptFrameHeaderEvicts:
-    """A corrupt CK frame *header* must evict like a corrupt payload (LAB-4075).
+    """A corrupt CK frame *header* must evict like a corrupt payload.
 
     Drives a REAL CacheSerializationHandler (no deserialize mock) so the exception class
     under test is the one the code actually raises, not one a mock was told to raise.
@@ -400,7 +400,7 @@ class TestCorruptFrameHeaderEvicts:
         """The inner catch lists only (AttributeError, KeyError, TypeError, ValueError).
 
         Anything else a parser raises must still reach SerializationError via the outer arm,
-        or narrowing that tuple would silently restore the no-eviction bug this ticket fixes.
+        or narrowing that tuple would silently restore the no-eviction bug this test guards.
         Raised through a patched parser rather than crafted bytes on purpose: no header the
         CPython JSON scanner accepts produces a non-ValueError on 3.12-3.14, so bytes cannot
         pin this invariant without depending on interpreter internals.

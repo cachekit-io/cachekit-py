@@ -1,4 +1,4 @@
-"""Error-path log redaction for backend operations (CWE-532, LAB-304).
+"""Error-path log redaction for backend operations (CWE-532).
 
 Companion to ``tests/unit/test_orchestrator_error_handling.py``'s
 ``TestCacheKeyRedaction``: that file pins ``FeatureOrchestrator.handle_cache_error``;
@@ -249,7 +249,7 @@ class TestInvalidationRedaction:
         _assert_redacted(caplog, backend.received_keys[0])
 
     async def test_legacy_key_failure_logs_redacted_at_error(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A non-default serializer also deletes the pre-0.20.0 key (LAB-5288); both failures log redacted at ERROR."""
+        """A non-default serializer also deletes the pre-0.20.0 key; both failures log redacted at ERROR."""
         error = ValueError(f"illegal input: {TENANT_KEY}")
 
         for invoke in ("sync", "async"):
@@ -283,7 +283,7 @@ class TestKeyCarryingBackendErrorRedaction:
 
     ``BackendError.__str__`` includes a ``key=`` segment; the get() sinks
     interpolate the exception verbatim, so the exception text itself must be
-    redacted (CodeRabbit PR #264).
+    redacted (#264).
     """
 
     def _key_carrying_error(self) -> BackendError:
@@ -318,7 +318,7 @@ class TestStructuredLoggerCacheOperationRedaction:
     as the orchestrator sink: a value that arrives already redacted, or is a known
     sentinel, is emitted verbatim. Hashing it a second time would mint a different
     digest for the same key and break correlation between the two sinks
-    (CodeRabbit PR #264).
+    (#264).
     """
 
     def _emit(self, caplog: pytest.LogCaptureFixture, cache_key: str) -> str:
@@ -521,7 +521,7 @@ class TestSerializationSinksRedaction:
 
     def test_serializer_import_failure(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING), pytest.raises(ImportError) as exc_info:
-            _get_cached_serializer_class("lab304-bogus", "cachekit.no_such_module.Nope")
+            _get_cached_serializer_class("keyredact-bogus", "cachekit.no_such_module.Nope")
 
         _assert_error_text_redacted(caplog, exc_info.value)
 
@@ -570,7 +570,7 @@ class TestDecoratorWrapperRedaction:
     ) -> None:
         backend = _DictBackend()
 
-        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="lab304-l1-sync")
+        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="keyredact-l1-sync")
         def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -590,7 +590,7 @@ class TestDecoratorWrapperRedaction:
     ) -> None:
         backend = _DictBackend()
 
-        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="lab304-l1-async")
+        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="keyredact-l1-async")
         async def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -620,7 +620,7 @@ class TestDecoratorWrapperRedaction:
 
         monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", second_call_raises)
 
-        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lab304-dc")
+        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="keyredact-dc")
         async def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -638,7 +638,7 @@ class TestDecoratorWrapperRedaction:
         monkeypatch.setattr("cachekit.decorators.wrapper.get_backend_provider", lambda: provider)
 
     def test_sync_invalidate_provider_failure(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        @cache(ttl=300, namespace="lab304-inv-sync")
+        @cache(ttl=300, namespace="keyredact-inv-sync")
         def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -653,7 +653,7 @@ class TestDecoratorWrapperRedaction:
     async def test_async_invalidate_provider_failure(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        @cache(ttl=300, namespace="lab304-inv-async")
+        @cache(ttl=300, namespace="keyredact-inv-async")
         async def get_user(user_id: int) -> dict[str, int]:
             return {"id": user_id}
 
@@ -706,7 +706,7 @@ class TestDecoratorWrapperRedaction:
 
 
 class TestUnpairedSurrogateKeys:
-    """A key holding an unpaired surrogate degrades like any other key (LAB-7624).
+    """A key holding an unpaired surrogate degrades like any other key.
 
     Such a key cannot be strictly UTF-8 encoded. The redaction digest must still be minted, or
     an L2 failure raises UnicodeEncodeError from the error handler instead of degrading.

@@ -23,8 +23,8 @@ class TestSerializerProtocolCompliance:
 
     def test_arrow_serializer_implements_protocol(self):
         """ArrowSerializer must implement SerializerProtocol."""
-        # Requires the [data] extra — absent e.g. in the free-threaded CI lane
-        # (LAB-511). Skipped here, not module-level: the rest of this module
+        # Requires the [data] extra — absent e.g. in the free-threaded CI lane.
+        # Skipped here, not module-level: the rest of this module
         # is pyarrow-free and must keep running without the extra.
         pytest.importorskip("pyarrow")
         from cachekit.serializers.arrow_serializer import ArrowSerializer

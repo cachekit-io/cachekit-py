@@ -924,7 +924,7 @@ _API_KEY_FORMS: dict[str, Callable[[str], Any]] = {
 # (env, call, raised, secret) per public entry point that takes a secret or reads one from the environment.
 _ENTRY_POINT_ROWS: dict[str, _EntryPointRow] = {
     **{name + suffix: row for suffix, form in _API_KEY_FORMS.items() for name, row in _api_key_rows(form).items()},
-    # A key passed where no form takes one is still a key (LAB-8223).
+    # A key passed where no form takes one is still a key.
     "minimal-config-misplaced-key": ({}, lambda: DecoratorConfig.minimal(master_key=_KEY_HEX), ConfigurationError, _KEY_HEX),
     "io-config-misplaced-key": (
         {},

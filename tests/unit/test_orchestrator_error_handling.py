@@ -304,7 +304,7 @@ class TestErrorHandlerEdgeCases:
 
 
 class TestCacheKeyRedaction:
-    """Raw cache keys must never reach logs on any error path (CWE-532, LAB-304).
+    """Raw cache keys must never reach logs on any error path (CWE-532).
 
     Keys embed caller-supplied tenant/user identifiers; the sink redacts once so
     every caller is covered by construction.
@@ -350,9 +350,8 @@ class TestCacheKeyRedaction:
         digest = redact_cache_key(self.TENANT_KEY)
         assert any(digest in record.getMessage() for record in caplog.records)
 
-    def test_cache_set_digest_unchanged_from_lab_109(self, caplog: pytest.LogCaptureFixture) -> None:
-        """cache_set callers now pass the raw key; the sink must emit the SAME digest
-        the call-site redaction produced before (LAB-109 behaviour intact)."""
+    def test_cache_set_logs_digest_not_raw_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        """cache_set callers pass the raw key; the sink logs its redact_cache_key digest, never the key."""
         with caplog.at_level(logging.WARNING):
             self._orchestrator().handle_cache_error(
                 error=OSError("disk full"),
@@ -405,7 +404,7 @@ class TestCacheKeyRedaction:
         """BackendError text must not leak its key attribute through {error} interpolation.
 
         BackendError.__str__ appends a key= segment; redacting the separate
-        cache_key argument does not touch that value (CodeRabbit PR #264).
+        cache_key argument does not touch that value (#264).
         """
         error = BackendError(
             "backend down",

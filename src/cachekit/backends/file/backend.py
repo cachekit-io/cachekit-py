@@ -97,7 +97,7 @@ def _read_fully(fd: int, n: int) -> bytes:
     failure. A file shorter than ``n`` still yields a short result, so callers' header/integrity
     validation sees truncation exactly as before. CPython's single-chunk ``join`` returns the chunk
     itself, so the one-read case (every payload the kernel serves whole) adds no copy and the
-    LAB-770 read-peak bound holds; only a genuinely short-read payload pays a join copy.
+    read-peak bound holds; only a genuinely short-read payload pays a join copy.
     """
     chunks: list[bytes] = []
     while n > 0:
@@ -146,7 +146,7 @@ class _MmapHandle:
     - ``close()`` releases the handle's own view, so touching ``handle.view`` afterwards raises
       ``ValueError`` (unless a consumer exported ``handle.view`` itself: then the release refuses
       and the view stays readable until that export dies). Either way the handle must never
-      escape the read call frame nor reach L1 (#171 blocker C).
+      escape the read call frame nor reach L1 (#171).
     - Anything deserialize built over the mapping (an Arrow table, a polars frame, or pandas
       columns that are views) holds buffer exports of it. ``mmap.close()`` refuses with
       ``BufferError`` while any export lives; ``close()`` swallows that, and the mapping is
@@ -274,7 +274,7 @@ class FileBackend:
                     self._acquire_file_lock(fd, exclusive=False)
 
                     try:
-                        # Header-first read (LAB-770): reading the 14-byte header separately,
+                        # Header-first read: reading the 14-byte header separately,
                         # then the payload via _read_fully, avoids the full-payload
                         # file_data[HEADER_SIZE:] slice copy (~1x payload off the read peak).
                         st_size = os.fstat(fd).st_size
@@ -516,7 +516,7 @@ class FileBackend:
                 self._safe_unlink(temp_path)
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: int | None = None) -> None:
-        """Store a streamed value with the same atomicity, locking, and limits as ``set`` (LAB-766).
+        """Store a streamed value with the same atomicity, locking, and limits as ``set``.
 
         ``write_payload`` receives a writable, seekable buffered binary file positioned at the
         start of the payload region (just past this backend's 14-byte header) and must write the
@@ -888,7 +888,7 @@ class FileBackend:
                             fd_closed = True
                             return False
 
-                        # Overwrite ONLY the expiry field. ponytail: an 8-byte in-place write to
+                        # Overwrite ONLY the expiry field. An 8-byte in-place write to
                         # a fixed offset is atomic enough for a cache timestamp — a torn write on
                         # power loss yields a wrong expiry, never a corrupt payload (magic/version
                         # are untouched), so the entry just expires early/late. No rewrite-rename.

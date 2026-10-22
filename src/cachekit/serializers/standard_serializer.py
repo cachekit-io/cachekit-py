@@ -366,7 +366,7 @@ class StandardSerializer:
             >>> result == {"test": 123}
             True
         """
-        # No bytes() coercion: Rust retrieve accepts the buffer protocol (LAB-770), so
+        # No bytes() coercion: Rust retrieve accepts the buffer protocol, so
         # unwrap's zero-copy memoryview flows through without a full-payload copy.
         try:
             if self.enable_integrity_checking:

@@ -323,7 +323,7 @@ class TestEnvironmentVariables:
         Asserts live fields so the test can't pass vacuously: with extra="forbid",
         pydantic-settings silently ignores unknown env vars, so naming a removed knob
         here would assert nothing (issue #163 review). CACHEKIT_DEFAULT_TTL was removed
-        in LAB-4641 (protocol/spec/intent-presets.md rule 3) and must not reappear here.
+        (protocol/spec/intent-presets.md rule 3) and must not reappear here.
         """
         reset_settings()  # Clear singleton cache
         _env_vars = ("CACHEKIT_ARROW_COMPRESSION", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB")

@@ -465,7 +465,7 @@ class TestInteropRejections:
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
 
     def test_key_prefix_appearing_later_fails_closed_per_call_sync_l1_hit(self):
-        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission (LAB-5351),
+        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission,
         and the per-call re-check must still run before it."""
         mutable = DictBackend(key_prefix="")
 
@@ -497,7 +497,7 @@ class TestInteropRejections:
         assert calls == [], "function must NOT run against an incompatible backend"
 
     def test_sync_lazy_provider_prefixing_backend_fails_closed(self):
-        """Sync twin (LAB-5351): the guard still runs on the first sync call, when the backend is
+        """Sync twin: the guard still runs on the first sync call, when the backend is
         resolved lazily behind admission. Checking before resolution alone would be a no-op
         (``ensure_interop_backend_compatible(None)`` returns) and run the function."""
         from cachekit.decorators.wrapper import create_cache_wrapper
@@ -582,7 +582,7 @@ class TestInteropRejections:
             assert await wrapped(3) == 6
 
     def test_tenant_scoped_redis_wrapper_fails_closed(self):
-        """Panel CRIT regression (CWE-636): the default provider's Redis path is a
+        """Regression (CWE-636): the default provider's Redis path is a
         tenant-scoping wrapper (t:{tenant}:{key} on the wire) — it must expose
         key_prefix so the interop guard rejects it instead of silently diverging
         from the bare keys other SDKs use."""
@@ -604,7 +604,7 @@ class TestInteropRejections:
                 return x
 
     def test_z_suffix_sentinel_revives(self):
-        """Panel MAJ regression: JS/Rust writers emit ISO-8601 with a Z designator;
+        """Regression: JS/Rust writers emit ISO-8601 with a Z designator;
         Python 3.10's fromisoformat cannot parse it — the decoder must normalize,
         or foreign datetime-bearing entries get evicted on read."""
         import msgpack
@@ -668,7 +668,7 @@ class TestInteropEncryption:
         assert get_user.cache_info().hits == 1
 
     def test_plaintext_entry_under_encryption_is_never_returned(self, backend: DictBackend):
-        """Fail closed (LAB-241 posture): with encryption on, a planted plaintext
+        """Fail closed: with encryption on, a planted plaintext
         msgpack value must not be served — it fails auth, gets evicted, and the
         recomputed value is stored encrypted."""
         import msgpack
@@ -686,7 +686,7 @@ class TestInteropEncryption:
         assert backend.store[key] != forged, "forged entry must be overwritten with ciphertext"
 
     def test_encrypted_out_of_model_value_raises_at_store(self, backend: DictBackend):
-        """Panel CRIT regression: EncryptionWrapper must not launder InteropError
+        """Regression: EncryptionWrapper must not launder InteropError
         into SerializationError — the encrypted store path fails loud too."""
         pytest.importorskip("cachekit._rust_serializer")
 
@@ -698,8 +698,8 @@ class TestInteropEncryption:
             get_user(42)
         assert not backend.store
 
-    # protocol test-vectors/encryption.json → default_tenant.vectors[default_tenant_interop]
-    # (LAB-4666): HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
+    # protocol test-vectors/encryption.json → default_tenant.vectors[default_tenant_interop]:
+    # HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
     # canonical plain-MessagePack value at the `single_int` interop key, sealed by the
     # protocol's stdlib+cryptography reference — NOT by this SDK. Pinned inline so a
     # fixture drift is a conscious change.
@@ -733,7 +733,7 @@ class TestInteropEncryption:
             reset_settings()
 
     def test_non_canonical_deployment_uuid_rejected(self, backend: DictBackend):
-        """Panel MAJ regression: Python normalizes UUIDs before key derivation;
+        """Regression: Python normalizes UUIDs before key derivation;
         other SDKs use the raw string — interop requires the canonical form."""
         pytest.importorskip("cachekit._rust_serializer")
         with pytest.raises(ConfigurationError, match="canonical"):

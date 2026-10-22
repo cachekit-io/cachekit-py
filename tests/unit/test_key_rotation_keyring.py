@@ -1,4 +1,4 @@
-"""Key rotation via the master-key keyring (LAB-684).
+"""Key rotation via the master-key keyring.
 
 Spec: protocol spec/encryption.md → "Key Rotation (Keyring)" and
 decisions/key-rotation.md. cachekit-py stores a per-entry key_fingerprint in CK
@@ -27,7 +27,7 @@ Covers:
 - End-to-end rotation round-trip through CacheSerializationHandler with the env
   configuration: write under k1, rotate to k2 with k1 decrypt-only, read without
   re-encryption; drop k1, read follows the fail policy.
-- The dead KeyRotationState PyO3 binding (LAB-275) is gone; master-key and
+- The dead KeyRotationState PyO3 binding is gone; master-key and
   derived-key material never crosses the FFI boundary into Python.
 """
 
@@ -730,7 +730,7 @@ class TestWrapperKeyringConfig:
     EncryptionError (a SerializationError) would be classified as corruption by
     handle_decrypt_failure and fail OPEN even under fail_closed=True, turning a
     misconfigured keyring into silent 100% misses plus entry-by-entry eviction
-    (the LAB-241/LAB-683 config-vs-crypto error class).
+    (the config-vs-crypto error class).
     """
 
     def test_cap_exceeded_raises_value_error(self):
@@ -803,9 +803,9 @@ class TestDecryptErrorTaxonomy:
         writer = EncryptionWrapper(master_key=K1, tenant_id=TENANT, previous_master_keys=[])
         enc, meta = writer.serialize({"v": 42}, cache_key="key:a")
 
-        # K1 is a decrypt-only entry here, so the read takes the fingerprint
-        # path (decrypt_at) — the path CodeRabbit did not flag but which shares
-        # the binding, and therefore the defect.
+        # K1 is a decrypt-only entry here, so the read takes the fingerprint path
+        # (decrypt_at), not the primary-key path; both share the binding, so both
+        # could relabel a config error as tamper.
         reader = EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[K1])
 
         class _ConfigFailKeyring:
@@ -1120,7 +1120,7 @@ def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryptio
         backend=backend,
         ttl=300,
         l1_enabled=l1_enabled,
-        namespace="lab4841",
+        namespace="keyring-rotation",
         encryption=encryption,
         single_tenant_mode=encryption,
         master_key=K2.hex(),
@@ -1129,7 +1129,7 @@ def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryptio
 
 @pytest.mark.usefixtures("_read_site_env")
 class TestDecoratorL2ReadsFailLoud:
-    """LAB-4841: behind @cache, a keyring config fault on an L2 read reaches the
+    """Behind @cache, a keyring config fault on an L2 read reaches the
     caller as it does from the L1 guards — never logged as a cache error and run
     uncached, recounted on the circuit breaker, on every call."""
 
@@ -1235,7 +1235,7 @@ class TestL2WritesFailLoud:
     async def test_cold_key_write_raises_on_every_call(self, monkeypatch, live_breakers, is_async, make_backend, l1_enabled):
         _settings_previous_keys(monkeypatch, [K2])
         backend = make_backend()
-        l1 = get_l1_cache("lab4841")
+        l1 = get_l1_cache("keyring-rotation")
         l1.clear()
         runs: list[int] = []
         fn = _decorate(backend, runs, is_async=is_async, l1_enabled=l1_enabled)
@@ -1265,7 +1265,7 @@ class TestL2WritesFailLoud:
             def compute(x: int) -> None:
                 raise KeyringConfigurationError("Keyring configuration invalid: nested")
 
-        fn = cache(backend=_ByteStore(), ttl=300, l1_enabled=False, namespace="lab4841")(compute)
+        fn = cache(backend=_ByteStore(), ttl=300, l1_enabled=False, namespace="keyring-rotation")(compute)
         (breaker,) = live_breakers
 
         for _ in range(7):
@@ -1309,8 +1309,8 @@ class TestEndToEndRotation:
     def _pin_deployment_uuid(self, monkeypatch):
         """Pin the tenant identity these tests derive their keys from.
 
-        Unset, single-tenant mode resolves to the protocol literal "default"
-        (LAB-4666); these tests pin an explicit UUID so the rotation assertions
+        Unset, single-tenant mode resolves to the protocol literal "default";
+        these tests pin an explicit UUID so the rotation assertions
         exercise the explicit-tenant path too. `TestInteropRotation._handler`
         already pins it.
         """
@@ -1488,7 +1488,7 @@ class TestInteropRotation:
 
 
 class TestDeadBindingRemoved:
-    """LAB-275: the KeyRotationState PyO3 binding had zero Python callers."""
+    """The KeyRotationState PyO3 binding had zero Python callers."""
 
     def test_key_rotation_state_no_longer_importable(self):
         with pytest.raises(ImportError):

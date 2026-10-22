@@ -320,7 +320,7 @@ class EncryptionWrapper:
         # EncryptionError: EncryptionError is a SerializationError, which the
         # read-path policy (handle_decrypt_failure) classifies as corruption →
         # fail-open miss + evict — a misconfigured keyring would silently erode
-        # the cache and mask itself as misses (the LAB-241/LAB-683
+        # the cache and mask itself as misses (the
         # config-vs-crypto error class). Nor plain ValueError: the handler
         # re-raises it, but the read sites (CacheOperationHandler.get_cached_value*
         # and the decorator L1 guards) re-raise only KeyringConfigurationError
@@ -367,7 +367,7 @@ class EncryptionWrapper:
         # SerializationError, which handle_decrypt_failure classifies as
         # corruption and fails open. A keyring that cannot derive fingerprints
         # would then present as silent misses plus entry-by-entry eviction (the
-        # LAB-241/LAB-683 failure class). Let it propagate (taxonomy note above).
+        # config-vs-crypto failure class). Let it propagate (taxonomy note above).
         #
         # On a read by a handler without a tenant_extractor, tenant_id comes from
         # the unauthenticated frame header (with one, from the caller), so a
@@ -557,8 +557,8 @@ class EncryptionWrapper:
             cachekit.serializers.encryption_wrapper.TenantMismatchError: Tenant mismatch: entry encrypted for a different tenant
 
             An entry claiming plaintext is refused outright — the wrapper is
-            encryption-mandatory and fails closed on its own (LAB-271,
-            defense-in-depth behind the handler-level LAB-241 guard):
+            encryption-mandatory and fails closed on its own (defense-in-depth
+            behind the handler-level guard):
 
             >>> from cachekit.serializers.base import SerializationFormat
             >>> plain_meta = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK)
@@ -569,7 +569,7 @@ class EncryptionWrapper:
                 ...
             DecryptionAuthenticationError: EncryptionWrapper.deserialize received an entry claiming plaintext ...
         """
-        # SECURITY (LAB-271, defense-in-depth behind the LAB-241 handler guard):
+        # SECURITY (defense-in-depth behind the handler guard):
         # this wrapper is encryption-mandatory, so an entry claiming plaintext can
         # never be legitimate input here. The frame header carrying this flag is
         # NOT covered by the AES-GCM tag and may be forged; benign migration reads

@@ -1,4 +1,4 @@
-"""Tests for single-tenant mode tenant_id resolution (MEDIUM-02, LAB-4666).
+"""Tests for single-tenant mode tenant_id resolution.
 
 Single-tenant mode derives keys and builds AAD from ONE tenant_id, resolved once
 in ``__init__``: explicit ``deployment_uuid`` → ``CACHEKIT_DEPLOYMENT_UUID`` → the
@@ -20,7 +20,7 @@ from cachekit.serializers.encryption_wrapper import KeyringConfigurationError
 
 
 class TestSingleTenantModeValidation:
-    """Test single-tenant mode configuration validation (MEDIUM-02, Criterion 1)."""
+    """Test single-tenant mode configuration validation."""
 
     def test_encryption_requires_explicit_mode(self):
         """Encryption must specify either tenant_extractor OR single_tenant_mode."""
@@ -296,7 +296,7 @@ class TestMissingTenantIdFailsClosed:
 
 
 class TestErrorMessages:
-    """Test error message clarity (MEDIUM-02, Criterion 4)."""
+    """Test error message clarity."""
 
     def test_missing_mode_error_message(self):
         """Error message should explain both options clearly."""
@@ -325,7 +325,7 @@ class TestErrorMessages:
 
 
 class TestBackwardCompatibility:
-    """Test backward compatibility with existing code (MEDIUM-02, Criterion 5)."""
+    """Test backward compatibility with existing code."""
 
     def test_existing_tenant_extractor_still_works(self):
         """Existing code using tenant_extractor should continue working."""

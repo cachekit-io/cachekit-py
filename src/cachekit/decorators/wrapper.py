@@ -78,10 +78,10 @@ def _resolve_lazy_backend() -> BaseBackend:
 
     Consulted at FIRST CALL, not at decoration, so ``set_default_backend()``
     takes effect regardless of whether it ran before or after the module holding
-    the decorated function was imported (LAB-4457). The result is kept for the
+    the decorated function was imported. The result is kept for the
     life of the wrapper and shared by every later call, so it must not capture
     anything request-scoped — the env-resolved Redis backend reads the tenant per
-    operation for exactly this reason (LAB-4773).
+    operation for exactly this reason.
     """
     from ..config.decorator import get_default_backend
 
@@ -108,10 +108,10 @@ _NOT_DEEP_COPYABLE = ": arguments not deep-copyable, so refresh-ahead cannot run
 _DELETE_BATCH = 10_000
 
 # Backed-mode (L2) SWR revalidation pool — deliberately separate from the L1
-# constant above so the two features can be tuned independently (LAB-381 panel).
+# constant above so the two features can be tuned independently.
 _L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
-# Background refresh_ttl_on_get pool (LAB-7074), same bound as the L2 SWR pool.
+# Background refresh_ttl_on_get pool, same bound as the L2 SWR pool.
 _TTL_REFRESH_MAX_CONCURRENT = 32
 # Lease on the slot and key of a refresh whose event loop has stopped, from admission; the same
 # lease length as L2 SWR. A stopped loop runs no timers, so its client timeout never fires and
@@ -243,7 +243,7 @@ async def _fill_lock(
     """The miss path's lock: ``(acquired, uncontended)``.
 
     A backend with ``acquire_fill_lock`` reports whether its first lock attempt won, and releases
-    without blocking the caller (LAB-7064). Any other lockable backend reports every grant as
+    without blocking the caller. Any other lockable backend reports every grant as
     contended, so the caller keeps the post-lock double-check read.
     """
     if supports_fill_lock(backend):
@@ -795,7 +795,7 @@ def create_cache_wrapper(
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
 
-    # Rebind a str namespace to its exact str value before any use (LAB-6197). A str
+    # Rebind a str namespace to its exact str value before any use. A str
     # subclass renders through its own __format__/__eq__/startswith: a (str, Enum) member
     # formats as "NS.USERS" on Python 3.11+ but "users" on 3.10, which split registry ids and
     # key= keys across versions and could slip a crafted value past the "ck" check below.
@@ -843,7 +843,7 @@ def create_cache_wrapper(
     _registry_id = f"ck:reg:{namespace if namespace is not None else ''}:{_registry_hash}"
     # Pre-fix releases named the set with the namespace's f-string rendering. Auto-mode keys
     # did not move, so entries tracked under the old name are still served; the no-args drain
-    # empties that set too, or they would outlive invalidate_cache() (LAB-5288 precedent).
+    # empties that set too, or they would outlive invalidate_cache().
     # Interop is skipped: 0.20.0 shipped the registry with interop's exact-str rebind, so no
     # release wrote a non-exact interop set. This drains the set name 0.20.x wrote: remove
     # it only in a major release whose notes declare upgrades from 0.20.x unsupported (the
@@ -854,7 +854,7 @@ def create_cache_wrapper(
         else None
     )
 
-    # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
+    # ENCRYPTION + L1-ONLY (protocol spec/intent-presets.md § L1 Posture rule 3:
     # "secure MUST hold only ciphertext" in L1). Encryption is a serializer layer, and the
     # L1-only ObjectCache path below never serializes — so @cache.secure(backend=None)
     # reported encryption.enabled=True while holding plaintext. Refuse at decoration; a
@@ -905,7 +905,7 @@ def create_cache_wrapper(
             )
             _handler_backend = resolved
 
-    # ---- Backed-mode stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate) ----
+    # ---- Backed-mode stale-while-revalidate (spec/saas-api.md#stale-while-revalidate) ----
     # Past-TTL SWR: the backend keeps serving an entry for a stale-grace window past
     # its fresh TTL and labels the read stale; we return the stale value immediately
     # and re-run the wrapped function in the background. Requires an SWR-capable
@@ -916,7 +916,7 @@ def create_cache_wrapper(
         """Freshness capability of the backend as RESOLVED so far. The read paths
         call this at call time because provider-backed decorators (no backend=
         argument, e.g. @cache.production with CACHEKIT_API_KEY set) resolve
-        _backend on first call (LAB-557). Class-level check: an instance-level
+        _backend on first call. Class-level check: an instance-level
         hasattr reads Mock/proxy objects as capable."""
         return _backend is not None and supports_swr(_backend)
 
@@ -1065,7 +1065,7 @@ def create_cache_wrapper(
     # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
     # keys can't spawn unbounded work. Cross-client single-flight rides the
     # backend's async lock as a non-blocking lease (contested = serve stale, no
-    # wait, no retry — only 200 with a null lock_id is contested, LAB-240; any lock
+    # wait, no retry — only 200 with a null lock_id is contested; any lock
     # error abandons the attempt). The lease is best-effort per spec.
     _l2_swr_pool = _RefreshPool(_L2_SWR_MAX_CONCURRENT_REFRESHES)  # keyed by cache key: the in-flight dedup
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
@@ -1207,7 +1207,7 @@ def create_cache_wrapper(
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
-        freshness (LAB-557, spec/saas-api.md#remaining-freshness).
+        freshness (spec/saas-api.md#remaining-freshness).
 
         Unbounded, a read near the end of the server's freshness window restarts
         the clock and serves from L1 as fresh past the server's fresh_until.
@@ -1219,8 +1219,8 @@ def create_cache_wrapper(
         legacy baseline is L1Cache's own default (DEFAULT_L1_TTL_SECONDS), so a
         long server remainder is clamped to it — returning raw fresh_for would
         EXTEND local service up to the 30-day cap and turn the bound into the
-        very freshness-extension it exists to prevent (expert-panel finding,
-        CWE-613: server-side DELETE-as-revocation relies on the ≤300s ageout).
+        very freshness-extension it exists to prevent (CWE-613: server-side
+        DELETE-as-revocation relies on the ≤300s ageout).
         """
         if fresh_for is None:
             return ttl
@@ -1229,8 +1229,8 @@ def create_cache_wrapper(
     async def _l2_double_check(
         cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[CacheHit | None, bool, int | None]:
-        """Post-lock L2 double-check read, freshness-aware on a capable backend
-        (LAB-557): a hit found after a lock wait gets the same stale-exclusion
+        """Post-lock L2 double-check read, freshness-aware on a capable backend:
+        a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
         (the entry another client just wrote is usually full-window fresh, but
         an L2 read error on the primary path can land here with the OLD entry
@@ -1249,7 +1249,7 @@ def create_cache_wrapper(
     def _l1_backfill_from_l2(
         cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None, *, twin: str | None
     ) -> None:
-        """Backfill L1 from an L2 hit's raw envelope, holding both LAB-557
+        """Backfill L1 from an L2 hit's raw envelope, holding both freshness
         invariants at every call site in lockstep: a stale-labelled hit is never
         recorded (spec: local caches MUST NOT record stale as fresh), and a
         fresh hit's local lifetime is bounded by _l1_backfill_ttl.
@@ -1258,7 +1258,7 @@ def create_cache_wrapper(
         documents — TypeError on a non-bytes envelope from an out-of-contract
         backend — is logged and skipped; every caller sits inside an `except
         Exception` that would otherwise demote the served hit into a recompute on
-        each call (LAB-348). Anything else is an L1 bug and propagates.
+        each call. Anything else is an L1 bug and propagates.
 
         A hit that is not backfilled still records its key and twin, in one step as _put_l1
         does: no registry holds a twin, and on a backend without one the key's writer recorded
@@ -1276,19 +1276,19 @@ def create_cache_wrapper(
 
     def _record_l2_hit_async(size_bytes: int, get_duration_ms: float, cycle: int) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
-        both post-lock double-check hits (LAB-3769) share this so a
+        both post-lock double-check hits share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
 
         cycle is what features.admit() returned for the call, so a probe of an
         ended HALF_OPEN cycle counts toward no later one.
 
-        size_bytes is the length CacheHit already measured (LAB-3757), not a
+        size_bytes is the length CacheHit already measured, not a
         recompute from the envelope. CacheHit.size_bytes is set on every hit
         including the mmap fast path, where envelope is None and there are no
         bytes to measure -- so this label never depends on holding the bytes.
 
-        Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
+        Best-effort, for the same reason _l1_backfill_from_l2 is:
         every call site sits inside an `except Exception` that falls through to
         a recompute, so a throwing metrics collector would silently turn a hit
         already in hand into a full recompute — under exactly the stampede the
@@ -1397,7 +1397,7 @@ def create_cache_wrapper(
     def _l2_swr_revalidate_sync(slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for sync functions (daemon thread).
 
-        ponytail: per-process single-flight only — the distributed lease API is
+        Per-process single-flight only — the distributed lease API is
         async-only; the lease is a spec SHOULD and duplicate revalidation is benign
         (last-write-wins between fresh values). Add a sync lease if cross-client
         duplicate recomputes ever measurably matter.
@@ -1447,7 +1447,7 @@ def create_cache_wrapper(
                 # ContextVarExtractor's tenant var is set) so the daemon thread sees
                 # the same contextvars the async path inherits via create_task —
                 # without this, encryption tenant extraction fails off-request and
-                # the refresh silently no-ops (LAB-381 panel, MAJ).
+                # the refresh silently no-ops.
                 ctx = contextvars.copy_context()
                 threading.Thread(
                     target=ctx.run,
@@ -1486,7 +1486,7 @@ def create_cache_wrapper(
         A call the breaker rejects, whose backend cannot be created, or whose sync L2 read
         raises past the handler never reaches the store path, where interop raises InteropError
         on an out-of-model value. Without this, that value contract would depend on breaker
-        state (LAB-5375). Any other encode failure degrades here as it does on the store path,
+        state. Any other encode failure degrades here as it does on the store path,
         where it never reaches the caller.
         """
         if interop is None:
@@ -1505,7 +1505,7 @@ def create_cache_wrapper(
     _generated_key_mode = interop is None and custom_key_func is None and not fast_mode
 
     def _resolve_cache_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str:
-        """Single key derivation shared by the read/write and invalidate paths (LAB-4387)."""
+        """Single key derivation shared by the read/write and invalidate paths."""
         # Standard key generation with type-aware handling
         if _generated_key_mode:
             return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
@@ -1547,7 +1547,7 @@ def create_cache_wrapper(
     # The set is not bounded: an entry is dropped only by invalidation, never on TTL expiry.
     # Each entry is (L2 key prefix, cache key): a tenant-scoped backend holds one L2 entry
     # per tenant under the same cache key, and an invalidation may delete — and stop
-    # tracking — only the calling tenant's (LAB-4773).
+    # tracking — only the calling tenant's.
     _cached_keys: set[tuple[str, str]] = set()
 
     def _foreign_l1_entry(error: SerializationError) -> bool:
@@ -1905,7 +1905,7 @@ def create_cache_wrapper(
 
             # L1+L2 MODE: Original behavior with backend initialization
 
-            # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
+            # Tenant scope, before the breaker check and outside every degrade try: an
             # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
             # caller before the function runs, whatever the breaker state, and never counts a failure
             # on the breaker every tenant of this function shares. "" until the backend is resolved;
@@ -1918,7 +1918,7 @@ def create_cache_wrapper(
             # this SDK read/write a key other SDKs cannot see. Re-checked on every call
             # because the backend is lazily resolved and a prefix could appear
             # dynamically. It runs before the L1 lookup, because an L1 hit returns early
-            # and must not skip it (LAB-5351). ensure_interop_backend_compatible(None)
+            # and must not skip it. ensure_interop_backend_compatible(None)
             # is a no-op, so until the backend is resolved an interop call skips L1 and
             # is checked right after resolution, below.
             interop_checked = False
@@ -1929,7 +1929,7 @@ def create_cache_wrapper(
             # Guard clause: L1 cache check first - early return eliminates network latency.
             # It runs before the breaker's admission check and records no breaker outcome:
             # the breaker tracks backend health, and an L1 hit never reaches the backend,
-            # so it is served whatever the breaker state (LAB-5351). It waits for the backend:
+            # so it is served whatever the breaker state. It waits for the backend:
             # an encrypted entry's AAD binds the backend's key prefix, which is unknown until
             # then, so an entry another wrapper wrote here would read as tampered.
             if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
@@ -2022,7 +2022,7 @@ def create_cache_wrapper(
             except UnsupportedTenantError:
                 # From the first-call check above, or from a provider that checks the tenant while
                 # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
-                # client failure, so never degraded or counted (LAB-5713).
+                # client failure, so never degraded or counted.
                 raise
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
@@ -2054,7 +2054,7 @@ def create_cache_wrapper(
                 # Use operation handler for all cache access (uses backend internally).
                 # A freshness-capable backend (CachekitIO) always takes the freshness
                 # read — not just when SWR is configured — so every hit carries the
-                # server's staleness label (LAB-381/LAB-557); a stale hit is served
+                # server's staleness label; a stale hit is served
                 # immediately and (with SWR active) revalidated on a background daemon
                 # thread below. The freshness path drops refresh_ttl, which is a
                 # documented no-op on the sync path anyway (StandardCacheHandler.get),
@@ -2099,7 +2099,7 @@ def create_cache_wrapper(
                         )
 
                     # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
-                    # + remaining-freshness bound (LAB-557), as on the async path (LAB-348).
+                    # + remaining-freshness bound, as on the async path.
                     _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
 
                     # Record L2 hit with latency for cache_info()
@@ -2121,7 +2121,7 @@ def create_cache_wrapper(
                 # the metric and error log were recorded there), and a LOCAL keyring config
                 # fault (same contract as the L1 guard above). The generic clause below
                 # would log either as a cache error, count it on the breaker, and recompute
-                # uncached on every call (LAB-4841).
+                # uncached on every call.
                 raise
             except Exception as e:
                 # Cache GET failed - execute function without caching
@@ -2283,7 +2283,7 @@ def create_cache_wrapper(
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
-            # Tenant scope, before the breaker check (LAB-5713): see sync_wrapper. "" until the
+            # Tenant scope, before the breaker check: see sync_wrapper. "" until the
             # backend is resolved; the first call checks right after resolving it, below. The
             # outer finally resets the stats context.
             _l2_scope()
@@ -2293,7 +2293,7 @@ def create_cache_wrapper(
             # Interop fail-closed guard (CWE-636): see sync_wrapper. Checked before
             # the L1 lookup once the backend is resolved; until then an interop call
             # skips L1 and is checked right after resolution, below, so backend
-            # resolution stays behind admission (LAB-5351). The raise propagates;
+            # resolution stays behind admission. The raise propagates;
             # the outer finally resets the stats context.
             interop_checked = False
             if interop is not None and _backend is not None:
@@ -2302,7 +2302,7 @@ def create_cache_wrapper(
 
             # Guard clause: L1 cache check first - early return eliminates network latency.
             # Before admission and recording no breaker outcome, and only once the backend is
-            # resolved, as in sync_wrapper (LAB-5351).
+            # resolved, as in sync_wrapper.
             if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
                 l1_start = time.perf_counter()
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
@@ -2340,7 +2340,7 @@ def create_cache_wrapper(
                         # Explicit local re-raise mirrors the sync L1/L2 fail-closed
                         # guards and the async lock-path guard: a fail-closed tamper raise
                         # must reach the caller, never be demoted to a fail-open recompute
-                        # (defense-in-depth, LAB-108). The clause keeps it ahead of any
+                        # (defense-in-depth). The clause keeps it ahead of any
                         # `except Exception` later added to this inner try; it cannot stop a
                         # broad handler wrapped around this read path from outside, which
                         # test_async_fail_closed_invalidates_poisoned_l1_before_raising catches.
@@ -2502,15 +2502,15 @@ def create_cache_wrapper(
         start_time = time.perf_counter()
 
         # The read paths report a failed read as a miss; the probe tells the two apart, so
-        # the post-lock double-check is skipped only after a clean miss (LAB-7064).
+        # the post-lock double-check is skipped only after a clean miss.
         _l2_read = L2MissProbe()
         try:
             # Route through the operation handler so corrupt/tampered entries inherit
             # eviction + the cache_get_deserialize metric instead of persisting (#159),
-            # and fail-closed tamper errors propagate (LAB-108). A freshness-capable
+            # and fail-closed tamper errors propagate. A freshness-capable
             # backend (CachekitIO) always takes the freshness read — not just when SWR
             # is configured — so every hit carries the server's staleness label and
-            # remaining-freshness bound (LAB-381/LAB-557): a stale hit is never
+            # remaining-freshness bound: a stale hit is never
             # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
             _l2_is_stale = False
             _l2_fresh_for: int | None = None
@@ -2532,10 +2532,10 @@ def create_cache_wrapper(
                 _record_l2_hit_async(cached_result.size_bytes, get_duration_ms, probe_cycle)
 
                 # Update L1 cache with the L2 value (serialized bytes) for subsequent
-                # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
+                # fast access — stale-exclusion + remaining-freshness bound.
                 _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for, twin=twin_key)
 
-                # TTL refresh, never on the caller's path (LAB-7074). Decide from the
+                # TTL refresh, never on the caller's path. Decide from the
                 # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
                 # it only drops below the threshold after fresh_until, when the PATCH
                 # 409s. A stale hit can't be renewed. A fresh-labelled 0 is an unhinted
@@ -2546,7 +2546,7 @@ def create_cache_wrapper(
                         _schedule_ttl_refresh(_backend, cache_key, ttl, _fresh_for)
                 elif refresh_ttl_on_get and ttl:
                     # Backend can't inspect TTL: warn once instead of silently ignoring
-                    # the opted-in flag (LAB-446). Still degrades gracefully.
+                    # the opted-in flag. Still degrades gracefully.
                     warn_ttl_refresh_unsupported(_backend)
 
                 # SWR: stale hit — value already in hand; revalidate in the
@@ -2562,7 +2562,7 @@ def create_cache_wrapper(
         except (DecryptionAuthenticationError, KeyringConfigurationError):
             # Fail-closed tamper failure propagated from get_cached_value_async —
             # the tamper metric, error log, evidence retention, and fail policy all
-            # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108) — or a
+            # fired inside handle_decrypt_failure (cachekit-py#170) — or a
             # LOCAL keyring config fault (see the sync L2 read). Either must reach
             # the caller: the generic clause below would demote it to a fail-open
             # "record and recompute".
@@ -2606,7 +2606,7 @@ def create_cache_wrapper(
                         )
                         try:
                             # Routed through the operation handler: corrupt entries evict (#159),
-                            # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                            # stale hits skip L1, fresh backfill bounded by fresh_for.
                             _dc_start = time.perf_counter()
                             cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
                             if cached_result is not None:
@@ -2630,12 +2630,12 @@ def create_cache_wrapper(
                         # Lock acquired after a wait, or after a failed primary read - double-check
                         # cache: another request may have populated it while we waited, or the
                         # entry may still be live. Skipped after a clean miss and an uncontended
-                        # grant (LAB-7064): this caller never waited behind another holder, so
+                        # grant: this caller never waited behind another holder, so
                         # the read would almost always miss again, and be billed as one. A fill
                         # that completed between our read and our lock request is recomputed;
                         # last write wins.
                         # Routed through the operation handler: corrupt entries evict (#159),
-                        # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                        # stale hits skip L1, fresh backfill bounded by fresh_for.
                         try:
                             _dc_start = time.perf_counter()
                             cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
@@ -2667,9 +2667,9 @@ def create_cache_wrapper(
                     # is held here, outside the lock's error handling, and re-raised once
                     # the lock is released: a Redis lock wraps whatever leaves its body in
                     # a BackendError, and the clause below would take a function's own
-                    # BackendError for a lock failure and run the function again (LAB-5360).
+                    # BackendError for a lock failure and run the function again.
                     # A miss is a call that runs the function: a double-check hit above returned
-                    # before here, so it is never counted as one (LAB-8298).
+                    # before here, so it is never counted as one.
                     _stats.record_miss()
                     try:
                         result = await func(*args, **kwargs)
@@ -3084,7 +3084,7 @@ def create_cache_wrapper(
             return _delete_then_forget(None)
 
         # Single-key invalidation (specific args provided, or zero-param function).
-        # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288).
+        # Same derivation as the write path, plus the pre-0.20.0 twin.
         cache_keys = _resolve_invalidation_keys(args, kwargs)
         return _delete_then_forget(cache_keys)
 
@@ -3116,7 +3116,7 @@ def create_cache_wrapper(
             return await asyncio.to_thread(_delete_then_forget, None)
 
         # Single-key invalidation (specific args provided, or zero-param function).
-        # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288). The
+        # Same derivation as the write path, plus the pre-0.20.0 twin. The
         # sync deletes run off the loop; never a backend's delete_async. The Redis provider caches one
         # async client per provider, whose pool stays bound to the first event loop that used it
         # (asyncio.run per job).

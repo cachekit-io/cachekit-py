@@ -1,4 +1,4 @@
-"""Security hardening for the decrypt fail path (cachekit-py#170 / LAB-108).
+"""Security hardening for the decrypt fail path (cachekit-py#170).
 
 Covers:
 - Exception taxonomy: AES-GCM auth failure and tenant mismatch raise
@@ -13,7 +13,7 @@ Covers:
   and a poisoned L1 entry is invalidated before the raise.
 - Regressions that must NOT change: nonce uniqueness, HKDF per-tenant isolation and
   determinism, and the CWE-757 downgrade guard staying miss+evict under fail-closed
-  (lazy migration, LAB-241).
+  (lazy migration).
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class TestExceptionTaxonomy:
             wrapper.deserialize(bytes(tampered), meta, cache_key="key:a")
 
     def test_non_string_original_type_is_corruption_not_tamper(self):
-        """LAB-4350: a non-string ``original_type`` cannot be built into the AAD,
+        """A non-string ``original_type`` cannot be built into the AAD,
         so no tag check runs — it is corruption, not tamper."""
         wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
         enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
@@ -145,7 +145,7 @@ class TestFingerprintMismatch:
 
 class TestTenantMismatchRegression:
     """Tenant mismatch always raises at the wrapper, and is tamper-class
-    (auth_tamper telemetry + honored by fail-closed) per panel review — a
+    (auth_tamper telemetry + honored by fail-closed) — a
     foreign-tenant entry at this cache key is a cross-tenant substitution
     signature, not corruption."""
 
@@ -201,7 +201,7 @@ class TestHandleDecryptFailure:
 
     def test_classifies_envelope_shape(self):
         # Kept out of "corruption": the read path cannot prove it is corrupt, and for a legitimate
-        # envelope-shaped value it fires on every read forever (LAB-2736).
+        # envelope-shaped value it fires on every read forever.
         err = EnvelopeShapeError("x")
         assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "envelope_shape"
 
@@ -353,7 +353,7 @@ class TestGetCachedValueFailPolicy:
         encryption-enabled handler trips the CWE-757 downgrade guard —
         SuspiciousCacheEntryError (suspicious_envelope, NOT auth_tamper) — and
         must stay a miss+evict even with fail_closed=True, or lazy
-        plaintext→encrypted migration (LAB-241) would break."""
+        plaintext→encrypted migration would break."""
         handler, strategy, _ = _make_operation_handler(fail_closed=True)
         plaintext_writer = CacheSerializationHandler()  # no encryption
         strategy.store["key:c"] = plaintext_writer.serialize_data({"v": 1}, cache_key="key:c")
@@ -362,7 +362,7 @@ class TestGetCachedValueFailPolicy:
 
     @pytest.mark.parametrize("rotted", [["json"], {"t": "json"}, 7, True, 0, False, [], {}, "\ud800"])
     def test_fail_closed_rotted_original_type_header_is_miss_and_evicted(self, rotted):
-        """LAB-4350: a non-string or non-encodable ``original_type`` in the stored
+        """A non-string or non-encodable ``original_type`` in the stored
         plaintext header is corruption-class — evicted and recomputed even under
         fail_closed=True, unlike the tamper-class substitution case above which
         retains evidence. Falsy values and a lone surrogate must not slip past."""
@@ -641,7 +641,7 @@ class TestDecoratorFailClosed:
     def test_fail_closed_invalidates_poisoned_l1_before_raising(self):
         """A fail-closed raise from the L1 path must evict the poisoned L1 entry
         first — otherwise stale process-local L1 keeps raising after the operator
-        remediates the durable L2 copy (panel finding). L2 stays the evidence."""
+        remediates the durable L2 copy. L2 stays the evidence."""
         from cachekit import cache
         from cachekit.l1_cache import get_l1_cache
 
@@ -654,7 +654,7 @@ class TestDecoratorFailClosed:
             single_tenant_mode=True,
             master_key=_HEX_KEY,
             fail_closed=True,
-            namespace="lab108-l1",
+            namespace="decryptfail-l1",
         )
         def get_value(x: int) -> dict:
             return {"result": x}
@@ -664,7 +664,7 @@ class TestDecoratorFailClosed:
         k1, k2 = sorted(backend.store)
 
         # Plant ciphertext-substituted bytes directly in process-local L1
-        l1 = get_l1_cache("lab108-l1")
+        l1 = get_l1_cache("decryptfail-l1")
         l1.put(k1, backend.store[k2], redis_ttl=300)
 
         with pytest.raises(DecryptionAuthenticationError):
@@ -746,7 +746,7 @@ class TestDecoratorFailClosed:
             single_tenant_mode=True,
             master_key=_HEX_KEY,
             fail_closed=True,
-            namespace="lab108-l1-async",
+            namespace="decryptfail-l1-async",
         )
         async def get_value(x: int) -> dict:
             return {"result": x}
@@ -756,7 +756,7 @@ class TestDecoratorFailClosed:
         k1, k2 = sorted(backend.store)
 
         # Plant ciphertext-substituted bytes directly in process-local L1
-        l1 = get_l1_cache("lab108-l1-async")
+        l1 = get_l1_cache("decryptfail-l1-async")
         l1.put(k1, backend.store[k2], redis_ttl=300)
 
         with pytest.raises(DecryptionAuthenticationError):

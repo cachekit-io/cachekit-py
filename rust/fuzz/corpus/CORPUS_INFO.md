@@ -12,7 +12,7 @@ corpus/<target-name>/
 directory `cargo fuzz run <target>` loads (and grows) by default — no corpus
 argument needed, locally or in CI. Any other layout is invisible to the
 fuzzer: an earlier category tree (`byte_storage/`, `encryption/`, …) sat here
-for months without a single target ever reading it (LAB-1149).
+for months without a single target ever reading it.
 
 No file counts or sizes are recorded here — a written-down count is stale the
 day someone adds a seed. For live numbers run, from the repository root (the

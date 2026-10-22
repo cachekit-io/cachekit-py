@@ -1,4 +1,4 @@
-"""A cached value that records no serializer name is a serializer mismatch (LAB-4432).
+"""A cached value that records no serializer name is a serializer mismatch.
 
 The protocol cache-key spec requires a reader that records serializer names to compare the
 recorded name with its own before decoding, and states that "an entry that records no

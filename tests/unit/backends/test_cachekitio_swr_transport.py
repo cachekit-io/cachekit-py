@@ -1,4 +1,4 @@
-"""SWR transport layer (LAB-381, protocol spec/saas-api.md#stale-while-revalidate).
+"""SWR transport layer (protocol spec/saas-api.md#stale-while-revalidate).
 
 Covers the freshness-aware read (X-CacheKit-Freshness mapping), the stale-grace
 write headers (X-CacheKit-Stale-TTL + the canonical TTL), and the
@@ -71,7 +71,7 @@ class TestFreshnessRead:
 
 
 class TestFreshForRead:
-    """X-CacheKit-Fresh-For mapping (LAB-557, spec/saas-api.md#remaining-freshness):
+    """X-CacheKit-Fresh-For mapping (spec/saas-api.md#remaining-freshness):
     absent = None (pre-signal server, legacy); anything but 1-7 ASCII digits at most
     2,592,000 = 0 (never extend local service on drift — mirrors unrecognized-freshness → stale)."""
 
@@ -113,7 +113,7 @@ class TestFreshForRead:
         ],
     )
     def test_parse_fresh_for_grammar(self, value: str | None, expected: int | None) -> None:
-        """LAB-7838: 1-7 ASCII digits at most 2,592,000, else 0 — the header string alone, no response."""
+        """1-7 ASCII digits at most 2,592,000, else 0 — the header string alone, no response."""
         assert _parse_fresh_for(value) == expected
 
     def test_fresh_for_rides_alongside_staleness(self, backend: CachekitIOBackend) -> None:
@@ -288,7 +288,7 @@ class _LegacyTupleBackend(_SWRBackend):
 
 
 class TestHandlerNormalisesLegacyTuple:
-    """LAB-557: StandardCacheHandler owns the 3-tuple shape it promises. A legacy
+    """StandardCacheHandler owns the 3-tuple shape it promises. A legacy
     2-tuple backend passes supports_swr, so the handler pads it to
     (bytes, is_stale, None) — callers never see a 2-tuple."""
 

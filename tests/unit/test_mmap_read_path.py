@@ -5,8 +5,8 @@ Three units compose the zero-copy Arrow read fast path:
 - ``StandardCacheHandler.get_buffer()`` — delegates to a backend that exposes ``get_buffer``.
 - ``CacheOperationHandler.get_cached_value`` (sync only; the async read never maps) — when
   eligible, reads via the mmap handle, deserializes over the view, and closes the handle in a
-  ``finally``. The handle never leaves the frame and its bytes never reach ``_l1_cache.put``
-  (blocker C); an Arrow or polars result may keep the mapping alive (see ``_MmapHandle``).
+  ``finally``. The handle never leaves the frame and its bytes never reach ``_l1_cache.put``;
+  an Arrow or polars result may keep the mapping alive (see ``_MmapHandle``).
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class TestSupportsMmapRead:
 
     def test_encrypted_arrow_not_eligible(self) -> None:
         """Encrypted values can never mmap — AES-GCM decrypt owns its buffer."""
-        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra
         sh = CacheSerializationHandler(serializer_name="arrow")
         sh.encryption = True
         assert sh.supports_mmap_read() is False
@@ -57,7 +57,7 @@ class TestSupportsMmapRead:
     def test_return_formats_that_keep_the_mapping_need_an_fd_free_mmap(self, return_format, releases_fd, monkeypatch) -> None:
         """An Arrow or polars result keeps its mapping alive, and before Python 3.13 a mapping also
         keeps a file descriptor: those formats map only where the mmap holds none. pandas always maps."""
-        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
         monkeypatch.setattr("cachekit.cache_handler.MMAP_RELEASES_FD", releases_fd)
@@ -138,7 +138,7 @@ class TestGetCachedValueMmapBranch:
 
         result = self._handler(sh, ch).get_cached_value("k")
 
-        # No envelope (the mmap view never reaches L1, blocker C), but the payload size still rides along
+        # No envelope (the mmap view never reaches L1), but the payload size still rides along
         assert result == CacheHit(sentinel, None, 4096)
         ch.get_buffer.assert_called_once_with("k")
         ch.get.assert_not_called()  # normal read path NOT used on the mmap hit

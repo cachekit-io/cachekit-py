@@ -1,7 +1,7 @@
 """Per-request Redis backend with tenant isolation.
 
 This module implements the hybrid singleton pool + per-request wrapper pattern
-for multi-tenant caching. All Code-Craftsman fixes (#1-#10) are applied.
+for multi-tenant caching.
 
 Architecture:
 - Singleton: Connection pool (expensive, created once in __init__)
@@ -138,7 +138,7 @@ if hasattr(os, "register_at_fork"):
 
 
 def _encode_tenant(tenant_id: object) -> str:
-    """URL-encode a tenant id for the key prefix (Fix #2: no ':' collision).
+    """URL-encode a tenant id for the key prefix (no ':' collision).
 
     Apps set int / UUID tenant ids, so both are accepted in canonical form (and typed so on
     ``tenant_context`` and the constructor). int by exact type: no driver returns an int subclass, and a
@@ -176,14 +176,13 @@ class PerRequestRedisBackend:
     ``RedisBackendProvider.get_shared_backend()`` returns one object shared for the life of the
     process, scoped per operation (``follow_context``, below).
 
-    Implements all Code-Craftsman fixes:
-    - Fix #1: Accepts shared Redis client (not creating per operation)
-    - Fix #2: URL-encodes tenant IDs to prevent ':' collision
-    - Fix #3: Uses centralized classify_redis_error()
-    - Fix #4: No request_id parameter (YAGNI)
-    - Fix #5: health_check() doesn't leak tenant_id
-    - Fix #6: Implements ALL optional protocols completely
-    - Fix #9: Fail-fast validation - raises RuntimeError if tenant_id is None
+    Guarantees:
+    - Accepts shared Redis client (not creating per operation)
+    - URL-encodes tenant IDs to prevent ':' collision
+    - Uses centralized classify_redis_error()
+    - health_check() doesn't leak tenant_id
+    - Implements the TTLInspectable, Lockable, KeyTrackable and TimeoutConfigurable protocols
+    - Fail-fast validation - raises RuntimeError if tenant_id is None
 
     A failed operation raises its BackendError outside the ``except`` block, from the
     cause ``classify_redis_error`` keeps, and from a frame that holds neither the client
@@ -200,7 +199,7 @@ class PerRequestRedisBackend:
     what RedisBackendProvider hands out — each operation is instead scoped to the tenant set in
     ``tenant_context`` for the calling context, and ``tenant_id`` is used only when that context
     has none. Such an instance can be held across requests (the decorator keeps its backend for
-    the life of the process) without serving one tenant's requests as another's (LAB-4773); a
+    the life of the process) without serving one tenant's requests as another's; a
     ContextVar read is per thread and per asyncio task, so sharing is race-free.
 
     Examples:
@@ -253,20 +252,20 @@ class PerRequestRedisBackend:
             follow_context: Scope each operation to tenant_context's tenant when one is set
 
         Raises:
-            RuntimeError: If tenant_id is None (fail-fast validation - Fix #9)
+            RuntimeError: If tenant_id is None (fail-fast validation)
             TypeError: If tenant_id is not str, bytes, int or UUID (see _encode_tenant)
         """
-        # Fix #9: Fail-fast validation
+        # Fail-fast validation
         if tenant_id is None:
             raise RuntimeError(
                 "tenant_id cannot be None. Set tenant context via tenant_context.set() "
                 "or ensure tenant_extractor returns non-None value."
             )
 
-        # Fix #1: Accept shared client (not creating per operation)
+        # Accept shared client (not creating per operation)
         self._client = client
 
-        # Fix #2: URL-encode tenant ID to prevent ':' collision
+        # URL-encode tenant ID to prevent ':' collision
         self._tenant_id = _encode_tenant(tenant_id)
         self._follow_context = follow_context
 
@@ -325,7 +324,7 @@ class PerRequestRedisBackend:
             Bytes value if found, None if key doesn't exist
 
         Raises:
-            BackendError: If Redis operation fails (classified via Fix #3)
+            BackendError: If Redis operation fails (classified via classify_redis_error())
         """
         scoped_key = self._scoped_key(key)
         with _ClearedOnInterrupt():
@@ -339,7 +338,7 @@ class PerRequestRedisBackend:
                         return value
                 return None
             except Exception as exc:
-                # Fix #3: Use centralized error classification
+                # Use centralized error classification
                 error = classify_redis_error(exc, operation="get", key=key)
         try:
             raise error from error.original_exception
@@ -355,7 +354,7 @@ class PerRequestRedisBackend:
             ttl: Time-to-live in seconds (None = no expiry)
 
         Raises:
-            BackendError: If Redis operation fails (classified via Fix #3)
+            BackendError: If Redis operation fails (classified via classify_redis_error())
         """
         scoped_key = self._scoped_key(key)
         with _ClearedOnInterrupt():
@@ -366,7 +365,7 @@ class PerRequestRedisBackend:
                     self._client.set(scoped_key, value)
                 return
             except Exception as exc:
-                # Fix #3: Use centralized error classification
+                # Use centralized error classification
                 error = classify_redis_error(exc, operation="set", key=key)
         try:
             raise error from error.original_exception
@@ -383,7 +382,7 @@ class PerRequestRedisBackend:
             True if key was deleted, False if key didn't exist
 
         Raises:
-            BackendError: If Redis operation fails (classified via Fix #3)
+            BackendError: If Redis operation fails (classified via classify_redis_error())
         """
         scoped_key = self._scoped_key(key)
         with _ClearedOnInterrupt():
@@ -397,7 +396,7 @@ class PerRequestRedisBackend:
                     )
                 return result > 0
             except Exception as exc:
-                # Fix #3: Use centralized error classification
+                # Use centralized error classification
                 error = classify_redis_error(exc, operation="delete", key=key)
         try:
             raise error from error.original_exception
@@ -414,7 +413,7 @@ class PerRequestRedisBackend:
             True if key exists, False otherwise
 
         Raises:
-            BackendError: If Redis operation fails (classified via Fix #3)
+            BackendError: If Redis operation fails (classified via classify_redis_error())
         """
         scoped_key = self._scoped_key(key)
         with _ClearedOnInterrupt():
@@ -428,7 +427,7 @@ class PerRequestRedisBackend:
                     )
                 return result > 0
             except Exception as exc:
-                # Fix #3: Use centralized error classification
+                # Use centralized error classification
                 error = classify_redis_error(exc, operation="exists", key=key)
         try:
             raise error from error.original_exception
@@ -438,7 +437,7 @@ class PerRequestRedisBackend:
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check Redis backend health status.
 
-        Fix #5: Does NOT leak tenant_id in health check response.
+        Does NOT leak tenant_id in health check response.
         Returns generic Redis health without tenant-specific info.
 
         Returns:
@@ -471,7 +470,7 @@ class PerRequestRedisBackend:
                     },
                 )
             except Exception as exc:
-                # Fix #3: Use centralized error classification
+                # Use centralized error classification
                 error = classify_redis_error(exc, operation="health_check")
                 return (
                     False,
@@ -483,7 +482,7 @@ class PerRequestRedisBackend:
                     },
                 )
 
-        # Fix #6: Implement ALL optional protocols completely
+        # Optional protocols
 
     async def get_ttl(self, key: str) -> Optional[int]:
         """Get remaining TTL on key (TTLInspectableBackend protocol).
@@ -916,7 +915,7 @@ class PerRequestRedisBackend:
 class RedisBackendProvider:
     """Provider for Redis backend with singleton pool + tenant-scoped wrappers.
 
-    Fix #1: Creates connection pool ONCE in __init__ (expensive).
+    Creates connection pool ONCE in __init__ (expensive).
     Creates singleton Redis client from pool.
 
     Both methods return a PerRequestRedisBackend that reads tenant_context per operation;
@@ -941,7 +940,7 @@ class RedisBackendProvider:
     ) -> None:
         """Initialize provider with singleton connection pool.
 
-        Fix #1: Creates pool ONCE (expensive operation).
+        Creates pool ONCE (expensive operation).
 
         Args:
             redis_url: Redis connection URL, as a string or a SecretStr
@@ -955,7 +954,7 @@ class RedisBackendProvider:
         redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inside the pool builder (CWE-532)
         with _ClearedOnInterrupt():
             try:
-                # Fix #1: Create connection pool ONCE. Shared builder wires the
+                # Create connection pool ONCE. Shared builder wires the
                 # finite socket timeouts, so the ping below fails fast on an
                 # unreachable Redis instead of blocking on the OS TCP timeout.
                 from cachekit.backends.redis.client import create_connection_pool
@@ -984,14 +983,14 @@ class RedisBackendProvider:
             PerRequestRedisBackend with tenant isolation
 
         Raises:
-            RuntimeError: If tenant_context is not set (fail-fast - Fix #9)
+            RuntimeError: If tenant_context is not set (fail-fast)
             TypeError: If tenant_context holds a type other than str, bytes, int or UUID
         """
         # Extract tenant from ContextVar
         tenant_id = tenant_context.get()
 
         # Create per-request wrapper (cheap: ~50ns)
-        # Fix #9: Fail-fast validation happens in PerRequestRedisBackend.__init__
+        # Fail-fast validation happens in PerRequestRedisBackend.__init__
         return PerRequestRedisBackend(self._client, tenant_id, follow_context=True)
 
     def get_shared_backend(self) -> BaseBackend:

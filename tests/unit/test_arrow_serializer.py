@@ -12,7 +12,7 @@ from collections.abc import Mapping
 import pytest
 
 # ArrowSerializer requires the [data] extra — absent e.g. in the free-threaded
-# CI lane until pandas/pyarrow ship free-threaded wheels (LAB-511).
+# CI lane until pandas/pyarrow ship free-threaded wheels.
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
 np = pytest.importorskip("numpy")

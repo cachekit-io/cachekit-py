@@ -225,7 +225,7 @@ def _column_trio(series: Any) -> dict[str, Any]:
     2-key ``{type: "object", data}`` otherwise (the ``dtype`` key is numeric-only) — "trio" names
     the maximal numeric form. One writer for both the DataFrame-column and the bare-Series paths, so
     the marker set and key order live in a single place and a third marker cannot be added to one
-    side only (the AC3 goal). Plain NumPy
+    side only. Plain NumPy
     numeric dtypes take the raw-buffer path; everything else (nullable/extension dtypes) takes the
     NA-safe object path so pd.NA/NaT do not crash msgpack (#160). Wire bytes and key order MUST
     stay byte-identical to the interop fixtures.
@@ -742,7 +742,7 @@ class AutoSerializer:
                 then fails the checksum, byte-indistinguishable from a rotted one. Map-encoded
                 envelopes (``to_vec_named`` or a foreign writer, never this one and never rot)
                 score 0/4 and are returned — this corner's other residual. Closing every cell
-                needs the writer to mark an envelope AS one: a wire change (LAB-4304), not a
+                needs the writer to mark an envelope AS one: a wire change, not a
                 read-path rule.
 
                 **Metadata-free reads assume the writer's configuration.** A read with no metadata
@@ -754,7 +754,7 @@ class AutoSerializer:
                 has no parse to appeal to — when ``retrieve()`` already failed, a re-parse fails the
                 same way, so shape DECIDES and a value shaped >=3/4 like an envelope is refused.
                 That residual is the price of not adding a wire discriminator to tell an envelope
-                from a list, which would be a format change (LAB-4304), not a read-path fix.
+                from a list, which would be a format change, not a read-path fix.
 
                 **Format.** The stored format is recorded twice — in the envelope's ``format``
                 field and in the header's ``original_type`` — and the xxHash3-64 covers the
@@ -885,7 +885,7 @@ class AutoSerializer:
                 # Integrity off: data is direct msgpack (no envelope)
                 return self._decode_columnar(data, header_format)
             # Integrity on, every format: the single verified-envelope decode below. The columnar
-            # pre-branch that used to sit here decoded on the header alone (LAB-2736 AC6).
+            # pre-branch that used to sit here decoded on the header alone.
 
         # For Rust-envelope formats, use the Rust layer
         envelope_error: Exception | None = None
@@ -911,7 +911,7 @@ class AutoSerializer:
             else:
                 # The envelope verified (checksum matched), so its payload is exactly what was
                 # stored; a payload that then fails to decode is corruption or a forged entry
-                # (LAB-2503 decode bomb) and MUST fail closed. Falling through here used to
+                # (e.g. a decode bomb) and MUST fail closed. Falling through here used to
                 # re-decode the ENVELOPE bytes as plain MessagePack and return its positional
                 # fields as the cached value — wrong data, silently.
                 # Format by agreement, never by a winner — see Raises:.
@@ -1219,7 +1219,7 @@ class AutoSerializer:
         four let a single rotted slot through by construction, not by bad luck. Accepting any ONE
         instead false-rejects values a caller legitimately cached: an integrity-off writer's
         ``[1, 2, 3, "msgpack"]`` matched on the format slot alone, a miss recompute reproduces
-        forever (LAB-4312).
+        forever.
 
         Every slot is TYPE-checked before its value is read, so ``in _ENVELOPE_FORMATS`` never
         sees an unhashable slot — there it RAISES ``TypeError`` rather than returning False, and
@@ -1235,8 +1235,8 @@ class AutoSerializer:
         damages two slots, the score drops to 2, and ``>= 3`` says "not an envelope". Every
         escape is a ``list``; 12 of the 13 carry the healthy compressed payload byte-identical
         at slot 0. Metadata-present reads: 0 of 12,495, the cross-config gate raises first.
-        ``>= 2`` would close all 13 and re-refuse LAB-4312's ``[1, 2, 3, "msgpack"]``, which also
-        scores 2 — byte-indistinguishable, so no threshold fixes it (LAB-2736, LAB-4304). A
+        ``>= 2`` would close all 13 and re-refuse the plain list ``[1, 2, 3, "msgpack"]``, which also
+        scores 2 — byte-indistinguishable, so no threshold fixes it. A
         crafted entry is out of scope by the same argument: backend write access returns
         arbitrary values through the plain path with no gate involved.
         """
@@ -1272,7 +1272,7 @@ class AutoSerializer:
         The metadata routes in ``deserialize`` reach here outside the verified-envelope
         normaliser, and the read handler treats only ``SerializationError`` as a read error
         (evict + tamper hook) — a bare ``ValueError`` from the decode bound would be logged as
-        a backend fault and the poisoned entry kept (LAB-2503).
+        a backend fault and the poisoned entry kept.
         """
         build = self._deserialize_dataframe if kind == "dataframe" else self._deserialize_series
         try:

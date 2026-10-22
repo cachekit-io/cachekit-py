@@ -1,4 +1,4 @@
-//! Structural bound for untrusted MessagePack (LAB-2503; protocol spec/interop-mode.md →
+//! Structural bound for untrusted MessagePack (protocol spec/interop-mode.md →
 //! Decode bounds). The one algorithm this crate owns rather than delegates to cachekit-core;
 //! a core-shared walk usable from py/rs/wasm is the follow-up. Mirrors the opcode table of
 //! cachekit-rs `check_structure` so the two SDKs reject the same documents.

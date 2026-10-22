@@ -1,4 +1,4 @@
-"""AutoSerializer packs with strict_types=True instead of rebuilding the value tree (LAB-7069).
+"""AutoSerializer packs with strict_types=True instead of rebuilding the value tree.
 
 The old write path copied every list and dict in ``_wrap_tuples`` just to find tuples, then packed
 with ``strict_types=False``. Now msgpack hands every tuple and builtin subclass to ``_auto_default``,

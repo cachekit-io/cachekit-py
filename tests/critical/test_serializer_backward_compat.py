@@ -15,7 +15,7 @@ from cachekit.serializers.standard_serializer import StandardSerializer
 
 @pytest.mark.critical
 class TestSerializerBackwardCompatibility:
-    """Test 100% backward compatibility (Requirement 4)."""
+    """Test 100% backward compatibility."""
 
     def test_cache_without_serializer_uses_default(self, redis_isolated):
         """@cache without serializer parameter uses StandardSerializer."""

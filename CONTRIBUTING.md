@@ -76,7 +76,9 @@ This project follows a standard code of conduct. Please be respectful and profes
 User-facing docs (the README and `docs/`) follow CacheKit's shared rule on what belongs in them:
 [What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
 `prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
-files, `docs/` and commit messages.
+files, `docs/` and commit messages, and internal ticket ids, with or without the hyphen, in every
+tracked file except `CHANGELOG.md`, `.github/workflows/pr-title-lint.yml` and the vendored protocol
+fixtures.
 
 ## Code Style Guidelines
 
@@ -208,7 +210,25 @@ The spawned server listens on a unix socket under pytest's base temp directory, 
 
 **Testing the nothing-configured path.** Every test gets a Redis-backed provider from an autouse fixture in `tests/conftest.py`, so a decorator under test never sees what a user with nothing configured sees. Request the `nothing_configured` fixture to opt out: it installs the real default provider, clears `REDIS_URL` and every `CACHEKIT_*` variable in any casing, needs no Redis, and fails the test if the provider builds a backend. Add `no_redis_built` to fail on any Redis client construction. A promise about default behaviour also needs a fresh-interpreter test, as in `tests/critical/test_zero_config_fresh_interpreter.py`: its child process refuses every outbound connection, because CI serves Redis at `localhost:6379`, the address an unconfigured client would dial, and a test that only checks for a cache hit passes there either way.
 
-**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
+**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. The docstring and `docs/` examples run twice: once beside a Redis server and once with none. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
+
+**Which pandas the tests use.** The lockfile pins pandas 2.x, but a fresh install resolves the newest pandas. Every PR also runs the unit and critical suites with the newest pandas 3.x installed over the lockfile (the `Tests (pandas 3)` job), because pandas 3's copy-on-write changes what a returned frame allows. To reproduce it locally:
+
+```bash
+uv run --with "pandas>=3,<4" pytest tests/unit/ -m "not slow" -n auto
+```
+
+**The nightly run.** `.github/workflows/nightly.yml` runs the suites no PR job selects, every night at 19:17 UTC. It has three independent jobs. The first runs `tests/competitive`. The second runs `tests/performance -m "performance and not slow"`, whose wall-clock numbers are reported, not asserted, and then the serializer micro-benchmarks once, untimed. The third builds the wheel on Python 3.10 and resolves it with `--resolution lowest`, so numpy, pandas and pyarrow sit at the `data` extra's floors. It then runs `tests/unit` against that wheel, not the source tree. A failed run opens or updates the "Nightly is failing" issue. To run it on demand, use **Run workflow** on the Actions page, or `gh workflow run nightly.yml`. A PR that edits the workflow file runs it too.
+
+**Mutation smoke.** `scripts/mutation_smoke.py` holds hand-written mutants: each is one exact string edit to a guard in `src/`, plus the tests recorded as its killers. The nightly `Mutation Smoke` workflow runs the baseline and every mutant as parallel jobs, and opens or updates a tracking issue when one fails. A mutant counts as killed only when pytest exits 1 and at least one of its recorded killers fails; a collection error, a setup or teardown error, a timeout or an unrelated failure never counts. The baseline checks that every anchor matches exactly once and that every killer passes unmutated, so a deleted or renamed killer turns the baseline red. A mutant reports `SURVIVED` only once none of its killers catch it: with two killers, weakening one leaves the other to kill it. A refactored guard reports `NOT APPLIED`. Run it locally:
+
+```bash
+uv run python scripts/mutation_smoke.py list                     # mutant names
+uv run python scripts/mutation_smoke.py run baseline             # anchors apply, killers pass
+uv run python scripts/mutation_smoke.py run checksum-skipped     # one mutant: exit 0 killed, 1 survived, 2 not applied
+```
+
+The runner restores the source file after each mutant, runs only the killers' test files, and runs them serially, so one Redis serves the run. To add a mutant, append a `Mutant(...)` to `MUTANTS`: a behaviour name, the file, an anchor that matches exactly once, its replacement and the killer node ids. Find the killers by running the wide suite with the mutant applied, then record the tests that check that guard itself, not ones that fail by accident. Add the name to the matrix in `.github/workflows/mutation-smoke.yml`; `tests/unit/test_mutation_smoke.py` fails until the two lists agree. When a refactor breaks an anchor, `tests/unit/test_mutation_smoke.py` fails on that PR: re-anchor the mutant on the new code so it makes the same behaviour change.
 
 ### Test Coverage
 
@@ -230,7 +250,7 @@ The spawned server listens on a unix socket under pytest's base temp directory, 
 
 ## Review Guidance
 
-This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository (tracked internally as LAB-1151). The guidance below documents which paths benefit from security and maintainer review:
+`.github/CODEOWNERS` holds one rule: changes to `/.release-please-manifest.json` request the maintainer's review. That request does not block the merge. No other path has a code owner; the guidance below lists the paths that benefit from security and maintainer review:
 
 **Security-sensitive paths** — consider requesting review from maintainers:
 - `/rust/` — memory safety, FFI boundaries, cryptography

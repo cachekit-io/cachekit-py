@@ -238,7 +238,7 @@ class TestDefaultCacheClientProvider:
 
 @pytest.mark.unit
 class TestPooledClientProvider:
-    """PooledClientProvider builds its clients once, not per operation (LAB-7075)."""
+    """PooledClientProvider builds its clients once, not per operation."""
 
     def test_get_sync_client_is_cached_over_own_pool(self) -> None:
         provider = PooledClientProvider("redis://127.0.0.1:1/0")
@@ -328,7 +328,7 @@ class TestDefaultBackendProvider:
                 mock_ckio.assert_called_once()
 
     def test_redis_backend_is_cached_and_tenant_context_left_alone(self) -> None:
-        """Redis path caches ONE shared backend and never writes tenant_context (LAB-4773).
+        """Redis path caches ONE shared backend and never writes tenant_context.
 
         The backend resolves the tenant per operation, so caching it cannot pin a tenant;
         writing "default" into the first caller's context was the old per-context workaround.

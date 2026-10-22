@@ -84,7 +84,7 @@ def _write_bounded_batches(writer: pa.ipc.RecordBatchFileWriter, table: pa.Table
 
 
 class _HashingSink:
-    """Forward-only adapter pyarrow's IPC writer streams into (LAB-766): forwards each write to
+    """Forward-only adapter pyarrow's IPC writer streams into: forwards each write to
     the underlying sink while hashing it (xxHash3-64) and enforcing an optional byte budget, so
     the checksum over the streamed IPC bytes is known the moment streaming completes — without
     ever holding those bytes together in memory.
@@ -167,7 +167,7 @@ class ArrowSerializer:
     - Serialize: builds the compressed IPC once and prepends the checksum; the source Arrow
       table is freed before the IPC bytes are materialized. On a streaming-writable backend
       (File), ``serialize_to_sink`` skips even that: record batches stream straight into the
-      cache file and the full payload never exists in memory (LAB-766).
+      cache file and the full payload never exists in memory.
     - Deserialize: the envelope is sliced with a memoryview (no full-body copy), wrapped via
       pa.py_buffer (zero-copy), and Arrow->pandas conversion uses self_destruct + split_blocks
       to free Arrow buffers during conversion. zstd is decompressed transparently by the reader.
@@ -316,7 +316,7 @@ class ArrowSerializer:
     def serialization_metadata(self) -> SerializationMetadata:
         """Metadata a serialize() call will produce, computable BEFORE any payload byte exists.
 
-        The streaming write path (LAB-766) needs this upfront: the cache envelope's metadata
+        The streaming write path needs this upfront: the cache envelope's metadata
         header is written before the payload streams. Deterministic per serializer config —
         never payload-dependent. ``serialize`` returns exactly this object.
         """
@@ -376,7 +376,7 @@ class ArrowSerializer:
             raise SerializationError(f"Failed to serialize DataFrame to Arrow IPC format: {e}") from e
 
     def serialize_to_sink(self, obj: Any, sink: BinaryIO, max_bytes: int | None = None) -> SerializationMetadata:
-        """Stream-serialize a DataFrame into ``sink``, never materializing the full payload (LAB-766).
+        """Stream-serialize a DataFrame into ``sink``, never materializing the full payload.
 
         Writes the exact bytes ``serialize`` returns — [8-byte xxHash3-64 checksum][Arrow IPC] —
         but the IPC record batches (~8 MiB actual bytes each, see ``_write_bounded_batches``) go

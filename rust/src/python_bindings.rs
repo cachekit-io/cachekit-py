@@ -178,7 +178,7 @@ impl PyByteStorage {
     /// Args:
     ///     envelope_bytes: Serialized StorageEnvelope — any buffer-protocol object
     ///         (`bytes`, `memoryview`, `bytearray`), so callers holding a zero-copy
-    ///         `memoryview` (SerializationWrapper.unwrap) never re-coerce to `bytes` (LAB-770)
+    ///         `memoryview` (SerializationWrapper.unwrap) never re-coerce to `bytes`
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)

@@ -1,4 +1,4 @@
-"""Cache success paths leave the operation context unset (LAB-6357).
+"""Cache success paths leave the operation context unset.
 
 The operation context is read only by ``record_failure()``, and its one caller,
 ``handle_cache_error()``, sets its own context first. A write on a success path is

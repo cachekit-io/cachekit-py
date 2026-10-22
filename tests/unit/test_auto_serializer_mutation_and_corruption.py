@@ -14,7 +14,7 @@ DataFrames route through ArrowSerializer when pyarrow is installed, so the colum
 serializer; the #157 DataFrame test runs both paths. Series never use arrow, so they hit the
 columnar path unconditionally.
 
-LAB-2503: ``TestDataFrameSeriesReadRoutes`` pins every DataFrame/Series read route (metadata x
+``TestDataFrameSeriesReadRoutes`` pins every DataFrame/Series read route (metadata x
 integrity, and metadata-less via the envelope's format_id); it lives here because this file
 already forces the columnar path.
 """
@@ -49,7 +49,7 @@ from cachekit.serializers.base import (
 )
 
 # Requires the [data] extra — absent e.g. in the free-threaded CI lane until
-# numpy/pandas ship free-threaded wheels (LAB-511).
+# numpy/pandas ship free-threaded wheels.
 np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 
@@ -106,7 +106,7 @@ ENVELOPE_SHAPED = [
 class TestDataFrameSeriesReadRoutes:
     """Every route a DataFrame/Series read can take must reconstruct the value: with metadata
     on both integrity settings, and — the decorator read path may carry none — from the
-    envelope's own format_id (LAB-2503 moved that route under the fail-closed guard).
+    envelope's own format_id (that route now sits under the fail-closed guard).
     """
 
     @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
@@ -124,7 +124,7 @@ class TestDataFrameSeriesReadRoutes:
 
     @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
     def test_cross_config_written_off_read_on_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
-        """LAB-2736 follow-up: an entry written with integrity off (no ByteStorage envelope,
+        """An entry written with integrity off (no ByteStorage envelope,
         no checksum ever computed) must raise, not reconstruct, when read by a reader with
         integrity on — a same-shaped DataFrame/Series with silently wrong values is far more
         dangerous than a raw-dict/TypeError, so this path never falls through like the
@@ -255,7 +255,7 @@ class TestDataFrameSeriesCorruptionDiagnostic:
 
 @pytest.mark.unit
 class TestEnvelopeVerificationVsNotAnEnvelope:
-    """LAB-2736: ``retrieve()`` raises a distinct type for a verified-but-corrupt envelope
+    """``retrieve()`` raises a distinct type for a verified-but-corrupt envelope
     (checksum/decompression/size failure) vs. bytes that were never a ByteStorage envelope
     at all (e.g. written with integrity checking off). ``deserialize`` must fail closed on
     the former and keep falling through to the plain-msgpack path only on the latter.
@@ -283,7 +283,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         assert on.deserialize(data) == payload
 
     def test_structurally_corrupt_envelope_on_generic_path_fails_closed(self) -> None:
-        """LAB-2736 follow-up: metadata.compressed=True (the writer's own record that this
+        """metadata.compressed=True (the writer's own record that this
         entry should be a verified envelope) plus a structural parse failure — not just a
         checksum mismatch — must still raise, not fall through to unpackb_bounded on the
         still-enveloped bytes. Truncation forces DeserializationFailed (structural), the
@@ -709,9 +709,9 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         float64/uint64/int64 markers) at offsets 33-36, and ``0x2b`` at offset 2: a marker byte
         re-partitions every slot after it, two slots rot at once, the score drops to 2, and the
         ``>= 3`` guard passes it. That residual is documented in ``_looks_like_envelope`` and is
-        not closable by threshold (``>= 2`` re-refuses LAB-4312's value). So this test pins the
+        not closable by threshold (``>= 2`` re-refuses the plain list ``[1, 2, 3, "msgpack"]``). So this test pins the
         residual as RECORDED: the guard neutered fails it with hundreds of escapes; a threshold
-        change fails it with zero; and the wire-format fix (LAB-4304) that legitimately empties
+        change fails it with zero; and the wire-format fix that legitimately empties
         the set must update this record on its way through.
 
         The sweep also pins the *refusals*, not just the escapes: every one of the ~12.4k mutants
@@ -779,7 +779,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
     def test_numpy_bytes_are_refused_when_the_header_names_another_format(
         self, claim: str, writer_integrity: bool, reader_integrity: bool
     ) -> None:
-        """LAB-4312: the structural NumPy route returned an ndarray whatever the header said, so
+        """The structural NumPy route returned an ndarray whatever the header said, so
         the format-agreement rule this file exists to establish never fired on it — ``"msgpack"``
         over NUMPY_RAW bytes still produced an array, on both readers and both prefix forms.
 
@@ -822,7 +822,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         ids=["ints-msgpack", "ints-dataframe", "strs-series", "nones-series", "unhashable-list", "unhashable-dict"],
     )
     def test_a_legitimate_four_element_list_is_not_mistaken_for_an_envelope(self, value: list) -> None:
-        """LAB-4312: the shape test accepted the format slot ALONE as proof, so an integrity-off
+        """The shape test accepted the format slot ALONE as proof, so an integrity-off
         writer's plain-msgpack ``[1, 2, 3, "msgpack"]``, read back by an integrity-on serializer
         with no metadata, decoded fine and was then rejected as a corrupt envelope. Recompute is
         deterministic, so that miss never self-heals — the offset-8 magic collision's class,
@@ -900,7 +900,7 @@ def _columnar_entry(kind: str, column: dict) -> bytes:
 
 @pytest.mark.unit
 class TestForgedColumnarPayloadIsRefused:
-    """Forged DataFrame/Series documents are refused before pandas sees them (LAB-2503): a numeric
+    """Forged DataFrame/Series documents are refused before pandas sees them: a numeric
     column dtype the writer never emits (``M8[0ns]`` passes ``np.frombuffer`` and then kills the
     process with SIGFPE inside pandas — uncatchable), a column type marker other than the two the
     writer emits, and an ndarray smuggled via the ``__ndarray__`` hook into a field the writer only
@@ -966,7 +966,7 @@ def _numpy_raw(dtype: bytes, shape: bytes) -> bytes:
 class TestForgedNumpyMetadataIsRefused:
     """NUMPY_RAW dtype/shape metadata is untrusted: slicing past the end silently shortens and a
     partial 4-byte chunk used to parse as a dimension, so a forged 1-byte zero shape chunk built
-    an EMPTY array instead of raising (CodeRabbit on cachekit-py#276)."""
+    an EMPTY array instead of raising (#276)."""
 
     @pytest.mark.parametrize(
         ("payload", "why"),
@@ -996,7 +996,7 @@ def _oversized_forged_error() -> SerializationError:
     """The SerializationError raised by decoding a poisoned columnar entry that carries a 1 MiB
     column name and a 4 KB forged dtype — the real error object the read-path log sites echo."""
     big_name = "n" * (1024 * 1024)  # 1 MiB column name (already capped in the field echo, #276)
-    big_dtype = "z" * 4096  # 4 KB forged dtype — numpy echoes the whole string, uncapped (LAB-3131)
+    big_dtype = "z" * 4096  # 4 KB forged dtype — numpy echoes the whole string, uncapped
     body = {
         "columns": [big_name],
         "index": None,
@@ -1009,7 +1009,7 @@ def _oversized_forged_error() -> SerializationError:
 
 @pytest.mark.unit
 class TestForgedEntryErrorEchoIsBounded:
-    """LAB-3131 AC1: a poisoned columnar entry of any size logs O(1)-bounded text at every wrap
+    """A poisoned columnar entry of any size logs O(1)-bounded text at every wrap
     site. #276 capped the per-field marker/column echoes, but ``_dtype_from_untrusted`` still
     echoed the full forged dtype, so the SerializationError message — and every log line built
     from it — grew with the payload. The bound is applied once, at each read-path wrap site, via

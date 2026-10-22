@@ -1,4 +1,4 @@
-"""TTLInspectableBackend support for the File and Memcached backends (LAB-446).
+"""TTLInspectableBackend support for the File and Memcached backends.
 
 Covers:
 - File: full ``get_ttl`` / ``refresh_ttl`` off its on-disk expiry header (no format change).
@@ -108,7 +108,7 @@ class TestFileBackendTTLInspection:
         assert supports_ttl_inspection(file_backend) is True
         assert isinstance(file_backend, TTLInspectableBackend)
 
-    # --- error / corruption / security branches (LAB-446 review-gate hardening) ---
+    # --- error / corruption / security branches ---
 
     async def test_get_ttl_corrupt_header_unlinks_and_returns_none(self, file_backend: FileBackend) -> None:
         """A file whose magic no longer matches is treated as absent AND evicted on read."""
@@ -316,7 +316,7 @@ class TestFileRefreshEndToEnd:
 
     async def test_refresh_concurrency_is_capped(self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         """While every refresh is still in flight, a second hit on a key starts no second refresh, and
-        hits on more distinct keys than the pool holds start one refresh per slot (LAB-7074)."""
+        hits on more distinct keys than the pool holds start one refresh per slot."""
         from cachekit import cache
 
         monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
@@ -347,7 +347,7 @@ class TestFileRefreshEndToEnd:
 
     def test_refresh_single_flight_spans_event_loops(self, file_backend: FileBackend) -> None:
         """A refresh still running on one thread's event loop is not pruned by a hit on another
-        loop: the second loop sends no duplicate refresh for the same key (LAB-7074)."""
+        loop: the second loop sends no duplicate refresh for the same key."""
         import threading
 
         from cachekit import cache
@@ -393,7 +393,7 @@ class TestFileRefreshEndToEnd:
         """A refresh left pending on a loop that stopped without closing (sync code calling
         run_until_complete) keeps its key and pool slot for the hold, as a request it sent may
         still be in flight; after the hold a hit on another loop refreshes another key, then the
-        same key (LAB-7074)."""
+        same key."""
         from cachekit import cache
 
         monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 1)
@@ -441,7 +441,7 @@ class TestFileRefreshEndToEnd:
     ) -> None:
         """A refresh that gave up its slot because its loop stopped is cancelled, so loops that
         resume after pausing between run_until_complete calls do not run more refreshes than the
-        pool holds (LAB-7074)."""
+        pool holds."""
         from cachekit import cache
 
         monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)

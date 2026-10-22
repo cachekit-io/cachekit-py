@@ -360,7 +360,6 @@ Reports are archived in `reports/security/` for compliance and audit trails.
 > body to `pa.ipc.open_file(...).read_all()`, which decompresses with no size or
 > ratio limit. Measured: a 2,570-byte envelope expands to 64 MiB (26,112:1), and
 > 8,714 bytes to 256 MiB (30,805:1) — ratios cachekit-core rejects at 1000:1.
-> Tracked in LAB-2730.
 
 Neither existing control covers it:
 
@@ -385,8 +384,7 @@ or every read of our own entries fails — which is a wire-size and L1-footprint
 decision, not a drive-by fix. Keeping compression instead means summing each
 buffer's uncompressed-length prefix before decompressing; `pa.ipc.read_message`
 exposes the first buffer's prefix but not the rest, so that needs a
-bounds-checked walk of the record-batch Flatbuffers metadata. LAB-2730 carries
-both options.
+bounds-checked walk of the record-batch Flatbuffers metadata.
 
 Approaches that do **not** work, so nobody re-derives them: pyarrow exposes no
 read-side size limit and no allocation-limiting memory pool; accumulating

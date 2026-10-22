@@ -27,7 +27,7 @@ from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 # OrjsonSerializer requires the [json] extra — absent e.g. in the free-threaded
-# CI lane (LAB-511). Skipped per-test, NOT module-level: the rest of this
+# CI lane. Skipped per-test, NOT module-level: the rest of this
 # module pins encryption invariants that must keep running without orjson.
 
 
@@ -79,7 +79,7 @@ _WRONG_LENGTH_RAW_KEYS = {"31-bytes": b"\x01" * 31, "33-bytes": b"\x01" * 33, "h
 
 
 class TestEncryptionWrapperRawKeyLength:
-    """master_key= and previous_master_keys= take raw bytes, exactly 32 of them (LAB-8223)."""
+    """master_key= and previous_master_keys= take raw bytes, exactly 32 of them."""
 
     @pytest.mark.parametrize("key", _WRONG_LENGTH_RAW_KEYS.values(), ids=list(_WRONG_LENGTH_RAW_KEYS))
     def test_master_key_must_be_exactly_32_bytes(self, key: bytes) -> None:
@@ -429,7 +429,7 @@ class TestDeserializeDataMissingTenantId:
 
 
 class TestEncryptionDowngradeFailClosed:
-    """LAB-241 / CWE-757: an encryption-enabled handler must never trust the plaintext
+    """CWE-757: an encryption-enabled handler must never trust the plaintext
     frame header's `encrypted` flag to route onto the unauthenticated plaintext path.
 
     The CK frame header is NOT covered by the AES-GCM tag (AAD binds tenant/cache_key/
@@ -499,7 +499,7 @@ class TestEncryptionDowngradeFailClosed:
 
 
 class TestEncryptionWrapperSelfGuard:
-    """LAB-271 (defense-in-depth behind LAB-241): EncryptionWrapper.deserialize must
+    """Defense-in-depth behind the handler guard: EncryptionWrapper.deserialize must
     fail closed on its own, independent of the handler-level downgrade guard.
 
     The handler guard (TestEncryptionDowngradeFailClosed above) is the reachable
@@ -516,7 +516,7 @@ class TestEncryptionWrapperSelfGuard:
         """Forged `encrypted: false` metadata driven straight at the wrapper MUST raise.
 
         The wrapper is encryption-mandatory: the old passthrough to the base
-        serializer was the exact downgrade LAB-241 closed one layer up.
+        serializer was the exact downgrade the handler closes one layer up.
         """
         attacker_bytes, plain_meta = StandardSerializer().serialize({"attacker": "controlled"})
         assert plain_meta.encrypted is False

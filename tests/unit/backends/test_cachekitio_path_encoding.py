@@ -1,5 +1,5 @@
 """Path-injection regression: the cache key MUST be percent-encoded into the
-CachekitIO request path (LAB-2846, CWE-22 / CWE-20).
+CachekitIO request path (CWE-22 / CWE-20).
 
 Before the fix, the raw key was interpolated unquoted into
 ``/v1/cache/{key}``. The HTTP client then (httpx, at the time) normalised
@@ -15,8 +15,7 @@ arbitrary ``api.cachekit.io`` endpoints with the application's bearer token:
 
 A bare ``.`` / ``..`` key has no safe wire form (percent-encoded dots are collapsed
 server-side), and neither do the route tokens ``health`` / ``ttl`` / ``lock`` or the
-empty key: those six are rejected before any request (protocol rule 2, LAB-2880,
-LAB-6550). See ``SECURITY.md``.
+empty key: those six are rejected before any request (protocol rule 2). See ``SECURITY.md``.
 
 These tests drive the real backend methods through the backend's real client on a
 fake pool (tests/utils/cachekitio_fakes.py) and assert on the path the client hands
@@ -78,7 +77,7 @@ def _assert_contained(request: FakeRequest, key: str, *, suffix: str = "") -> No
 
     Asserts on the path the pool receives, after checking that urllib3 sends it as-is, so a
     traversal that a client or the SaaS router would act on shows up here as a failure, and
-    proves the key survives a single decode intact (AC-3: ``%3A`` -> ``:`` once, matching the
+    proves the key survives a single decode intact (``%3A`` -> ``:`` once, matching the
     SaaS validator's single ``decodeURIComponent``).
     """
     raw_path = request.path  # includes any query string
@@ -99,8 +98,8 @@ def _assert_contained(request: FakeRequest, key: str, *, suffix: str = "") -> No
     for bad in ("/", "?", "#"):
         assert bad not in encoded_key, f"unencoded {bad!r} survived in key segment: {encoded_key!r}"
 
-    # Round-trip: decode-once recovers the original key byte-for-byte. This is
-    # AC-3 — the client encodes with exactly the inverse of the SaaS validator's
+    # Round-trip: decode-once recovers the original key byte-for-byte. The
+    # client encodes with exactly the inverse of the SaaS validator's
     # single ``decodeURIComponent`` (cache-key-validator.ts), so no double-encoding
     # and no crafted key resolves to a *different* server-side key.
     assert unquote(encoded_key) == key, f"key not recoverable by single decode: {encoded_key!r} != {key!r}"
@@ -188,7 +187,7 @@ def test_health_endpoint_untouched() -> None:
     assert pool.requests[0].path == "/v1/cache/health"
 
 
-# ---- reserved segments: rejected before any request is made (LAB-2880) -----
+# ---- reserved segments: rejected before any request is made -----
 
 
 def _assert_rejected(exc: BackendError, pool: FakePool) -> None:
