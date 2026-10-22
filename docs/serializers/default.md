@@ -47,10 +47,10 @@ StandardSerializer can be referenced by alias when configuring serializers:
 |-------|-------------|
 | `"default"` | StandardSerializer — language-agnostic MessagePack |
 | `"std"` | StandardSerializer — explicit alias |
-| `"auto"` | AutoSerializer — Python-specific types (NumPy, pandas, datetime) |
+| `"auto"` | AutoSerializer — Python-specific types (NumPy, pandas, set, UUID) |
 
 > [!NOTE]
-> `"auto"` resolves to `AutoSerializer`, which adds Python-specific type detection (NumPy arrays, pandas DataFrames, datetime). `"default"` / `"std"` resolves to `StandardSerializer`, a language-agnostic MessagePack variant designed for cross-language interoperability. Both are based on MessagePack + Rust ByteStorage.
+> `"auto"` resolves to `AutoSerializer`, which adds Python-specific type detection (NumPy arrays, pandas DataFrames, sets, UUID). `"default"` / `"std"` resolves to `StandardSerializer`, a language-agnostic MessagePack variant designed for cross-language interoperability. Both are based on MessagePack + Rust ByteStorage.
 
 ## Type Support Matrix
 

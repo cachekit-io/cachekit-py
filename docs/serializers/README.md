@@ -13,7 +13,7 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 | Serializer | Speed | Best For |
 |-----------|-------|----------|
 | [StandardSerializer](default.md) | Fast | General Python objects, cross-language SDK interop |
-| [AutoSerializer](auto.md) | Fast | Python-only — preserves sets, frozensets, datetime, UUID, NumPy, pandas |
+| [AutoSerializer](auto.md) | Fast | Python-only — preserves tuples, sets, frozensets, UUID, NumPy, top-level DataFrame/Series |
 | [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
 | [ArrowSerializer](arrow.md) | — | pandas/polars DataFrames, any size |
 | [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer, which picks its decoder by inspecting the bytes) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
@@ -28,7 +28,7 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 | Use Case | Recommended Serializer | Reason |
 |----------|----------------------|--------|
 | General Python objects | StandardSerializer | Broad type support, cross-language safe |
-| Python-only with type preservation | AutoSerializer | Preserves sets, frozensets, datetime, UUID, NumPy |
+| Python-only with type preservation | AutoSerializer | Preserves tuples, sets, frozensets, UUID, NumPy |
 | JSON-heavy data | OrjsonSerializer | 2-5x faster than stdlib json |
 | API response caching | OrjsonSerializer | JSON-native, human-readable |
 | Web session data | OrjsonSerializer | Fast JSON, cross-language |

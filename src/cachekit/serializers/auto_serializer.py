@@ -83,7 +83,8 @@ ORM_ERROR_MESSAGE = (
 CUSTOM_CLASS_ERROR_MESSAGE = (
     "AutoSerializer does not support custom classes. "
     "Supported types: dict, list, tuple, str, int, float, bool, None, bytes, "
-    "datetime, date, time, UUID, set, frozenset, NumPy arrays, pandas DataFrames.\n"
+    "datetime, date, time, UUID, set, frozenset, NumPy arrays, and pandas DataFrames and Series "
+    "as the top-level value only (not inside a dict, list or other container).\n"
     "Options:\n"
     "  1. Convert to dict manually\n"
     "  2. Use dataclasses.asdict() for dataclasses\n"

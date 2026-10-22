@@ -2,10 +2,10 @@
 
 # AutoSerializer
 
-The AutoSerializer (`serializer='auto'`) extends the default MessagePack serialization with **Python-specific type detection and preservation**. Use it when your cache is Python-only and you want types like sets, frozensets, datetime, UUID, and NumPy arrays to survive cache roundtrips intact.
+The AutoSerializer (`serializer='auto'`) extends the default MessagePack serialization with **Python-specific type detection and preservation**. Use it when your cache is Python-only and you want types like tuples, sets, frozensets, UUID, and NumPy arrays to survive cache roundtrips intact.
 
 > [!TIP]
-> If you're hitting tuple→list or set→list issues with the default serializer, `serializer='auto'` is the fix.
+> If you're hitting tuple→list conversion, or a `TypeError` on a set or UUID, with the default serializer, `serializer='auto'` is the fix.
 
 ## Quick Start
 
@@ -23,19 +23,23 @@ result = get_data()
 
 ## What It Preserves
 
-Types that the default `StandardSerializer` (MessagePack) loses, but `AutoSerializer` preserves:
+How the default `StandardSerializer` (MessagePack) and `AutoSerializer` handle Python-specific types:
 
 | Type | Default (`"default"`) | Auto (`"auto"`) |
 |------|:---------------------:|:---------------:|
 | `tuple` | → `list` | Preserved |
-| `set` | → `list` | Preserved |
-| `frozenset` | → `list` | Preserved |
-| `datetime` | → string | Preserved (ISO-8601 roundtrip) |
-| `date` / `time` | → string | Preserved |
-| `UUID` | → string | Preserved |
+| `set` | Raises `TypeError` | Preserved |
+| `frozenset` | Raises `TypeError` | Preserved |
+| `datetime` | Preserved | Preserved (ISO-8601 roundtrip) |
+| `date` / `time` | Preserved | Preserved |
+| `UUID` | Raises `TypeError` | Preserved |
 | `numpy.ndarray` | Not supported | Preserved (zero-copy binary) |
-| `pandas.DataFrame` | Not supported | Preserved (columnar format) |
-| `pandas.Series` | Not supported | Preserved |
+| `pandas.DataFrame` | Not supported | Preserved (columnar format), top-level value only |
+| `pandas.Series` | Not supported | Preserved, top-level value only |
+
+A DataFrame or Series is encoded only as the whole cached value. Nested inside a dict, list or other container it raises `TypeError`; return it on its own, or convert it first (for example with `df.to_dict("list")`). A NumPy array has no such limit and can sit at any depth.
+
+`TypeError` is what the serializer raises when you call it directly. Under `@cache` with a backend, the decorated function's result is returned but not cached, and the failure is logged: see [Serialization unsupported type](../error-codes.md#serialization-unsupported-type).
 
 ## How It Works
 
@@ -67,7 +71,7 @@ Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is i
 
 **Use `serializer='auto'` when:**
 - Your cache is Python-only (no cross-language SDK sharing)
-- You need set, frozenset, or datetime type preservation
+- You need set, frozenset, tuple or UUID type preservation
 - You're caching NumPy arrays or pandas DataFrames
 - Type fidelity matters more than cross-language compatibility
 

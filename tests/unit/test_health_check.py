@@ -4,10 +4,12 @@ This module tests the health check system that monitors Redis connectivity,
 connection pool status, circuit breaker state, and metrics collection.
 """
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import time_machine
 
 from cachekit.health import (
     ComponentHealth,
@@ -18,6 +20,7 @@ from cachekit.health import (
     get_health_checker,
     health_check_handler,
 )
+from cachekit.reliability import CircuitBreaker, CircuitBreakerConfig
 
 
 class TestHealthChecker:
@@ -221,54 +224,56 @@ class TestHealthChecker:
         assert component.status == HealthStatus.DEGRADED
         assert "not initialized" in component.message
 
-    def test_circuit_breaker_health_check_closed(self, health_checker):
-        """Test circuit breaker health check when closed."""
-        mock_circuit_breaker = Mock()
-        mock_circuit_breaker.state = "CLOSED"
-        mock_circuit_breaker.failure_count = 0
-        mock_circuit_breaker.success_count = 100
-        mock_circuit_breaker.last_failure_time = None
-        health_checker._circuit_breaker = mock_circuit_breaker
+    def test_circuit_breaker_health_tracks_real_breaker(self):
+        """A real CircuitBreaker, not a Mock: CLOSED, OPEN and HALF_OPEN read as HEALTHY, UNHEALTHY and DEGRADED."""
+        breaker = CircuitBreaker(
+            CircuitBreakerConfig(failure_threshold=2, success_threshold=1, timeout_seconds=30.0, half_open_requests=1),
+            namespace="health_check_real_breaker",
+        )
+        health_checker = HealthChecker(timeout_seconds=2.0, circuit_breaker=breaker)
+        failed_at = 1_700_000_000
 
-        component = health_checker._check_circuit_breaker()
+        with time_machine.travel(failed_at, tick=False) as traveller:
+            component = health_checker._check_circuit_breaker()
+            assert component.name == "circuit_breaker"
+            assert component.status == HealthStatus.HEALTHY
+            assert "CLOSED" in component.message
+            assert component.details == {"state": "CLOSED", "failure_count": 0, "success_count": 0, "last_failure_time": None}
 
-        assert component.name == "circuit_breaker"
-        assert component.status == HealthStatus.HEALTHY
-        assert "CLOSED" in component.message
-        assert component.details["state"] == "CLOSED"
-        assert component.details["failure_count"] == 0
-        assert component.details["success_count"] == 100
+            breaker.record_failure()
+            breaker.record_failure()
+            component = health_checker._check_circuit_breaker()
+            assert component.status == HealthStatus.UNHEALTHY
+            assert "OPEN" in component.message
+            assert component.details["state"] == "OPEN"
+            assert component.details["failure_count"] == 2
+            assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, timezone.utc).isoformat()
+            json.dumps(component.to_dict())  # the health endpoint returns this dict as JSON
 
-    def test_circuit_breaker_health_check_open(self, health_checker):
-        """Test circuit breaker health check when open."""
-        mock_circuit_breaker = Mock()
-        mock_circuit_breaker.state = "OPEN"
-        mock_circuit_breaker.failure_count = 5
-        mock_circuit_breaker.success_count = 0
-        mock_circuit_breaker.last_failure_time = datetime.now(timezone.utc)
-        health_checker._circuit_breaker = mock_circuit_breaker
+            traveller.shift(31)
+            assert breaker.should_attempt_call()  # cooldown over: OPEN -> HALF_OPEN, and this call is the probe
+            component = health_checker._check_circuit_breaker()
+            assert component.status == HealthStatus.DEGRADED
+            assert "HALF_OPEN" in component.message
+            assert component.details["state"] == "HALF_OPEN"
 
-        component = health_checker._check_circuit_breaker()
+            breaker.record_success()
+            component = health_checker._check_circuit_breaker()
+            assert component.status == HealthStatus.HEALTHY
+            assert component.details["state"] == "CLOSED"
+            assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, timezone.utc).isoformat()
 
-        assert component.name == "circuit_breaker"
+    def test_circuit_breaker_unknown_state_is_unhealthy(self):
+        """A state outside CLOSED, OPEN and HALF_OPEN (here lowercase) is never read as HEALTHY."""
+
+        class LowercaseBreaker:
+            def get_stats(self):
+                return {"state": "open", "failure_count": 5, "success_count": 0, "last_failure_time": 0.0}
+
+        component = HealthChecker(circuit_breaker=LowercaseBreaker())._check_circuit_breaker()
+
         assert component.status == HealthStatus.UNHEALTHY
-        assert "OPEN" in component.message
-        assert component.details["state"] == "OPEN"
-
-    def test_circuit_breaker_health_check_half_open(self, health_checker):
-        """Test circuit breaker health check when half-open."""
-        mock_circuit_breaker = Mock()
-        mock_circuit_breaker.state = "HALF_OPEN"
-        mock_circuit_breaker.failure_count = 3
-        mock_circuit_breaker.success_count = 1
-        mock_circuit_breaker.last_failure_time = None
-        health_checker._circuit_breaker = mock_circuit_breaker
-
-        component = health_checker._check_circuit_breaker()
-
-        assert component.name == "circuit_breaker"
-        assert component.status == HealthStatus.DEGRADED
-        assert "HALF_OPEN" in component.message
+        assert "'open'" in component.message
 
     def test_circuit_breaker_not_in_use(self, health_checker):
         """Test circuit breaker check when not in use."""
