@@ -127,11 +127,10 @@ repos:
         name: No internal ticket ids in tracked files
         # Ticket ids only, but in every file: code comments and docstrings are public too.
         # CHANGELOG.md is generated from PR titles, which carry the one allowed id; the
-        # title-lint workflow shows the title format; protocol fixtures are vendored
-        # byte-for-byte (sha256-pinned), so they change only upstream.
+        # title-lint workflow shows the title format.
         language: pygrep
         entry: '\b(?i:LAB)-[0-9]+'
-        exclude: ^(CHANGELOG\.md|\.github/workflows/pr-title-lint\.yml|tests/unit/protocol/fixtures/.*)$
+        exclude: ^(CHANGELOG\.md|\.github/workflows/pr-title-lint\.yml)$
         types: [text]
         stages: [pre-commit]
       - id: no-internal-references-commit-msg

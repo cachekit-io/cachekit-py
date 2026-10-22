@@ -1,8 +1,8 @@
 """SDK-level byte-verification of the ByteStorage envelope against the protocol wire-format vectors.
 
 Fixture: tests/unit/protocol/fixtures/wire-format.json, vendored from
-cachekit-io/protocol @ 4b8fddb2120b9e3355d7fc9d593130dba8a345ac
-(fixture 1.4.0, sha256 2f6818903a552a7c09414c1e5c02caf21fa92dcd56ccff5634c8257038e7575c).
+cachekit-io/protocol @ 4f8665f46c0f0eae5a83166bf14859ad34cc8192
+(fixture 1.4.0, sha256 806de79dca2e0e6b221b8ec191526207d32f9fe5d88597098dd2549427b4993c).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 The fixture is append-only (protocol 1.1, decisions/envelope-bin-encoding.md):
@@ -71,7 +71,7 @@ from cachekit.serializers.wrapper import SerializationWrapper
 pytestmark = pytest.mark.unit
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "wire-format.json"
-FIXTURE_SHA256 = "2f6818903a552a7c09414c1e5c02caf21fa92dcd56ccff5634c8257038e7575c"  # pragma: allowlist secret
+FIXTURE_SHA256 = "806de79dca2e0e6b221b8ec191526207d32f9fe5d88597098dd2549427b4993c"  # pragma: allowlist secret
 
 _FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 VECTORS = _FIXTURE["vectors"]

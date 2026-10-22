@@ -77,7 +77,7 @@ User-facing docs (the README and `docs/`) follow CacheKit's shared rule on what 
 [What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
 `prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
 files, `docs/` and commit messages, and internal ticket ids in every tracked file except
-`CHANGELOG.md`, `.github/workflows/pr-title-lint.yml` and the vendored protocol fixtures.
+`CHANGELOG.md` and `.github/workflows/pr-title-lint.yml`.
 
 ## Code Style Guidelines
 
