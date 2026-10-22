@@ -149,10 +149,6 @@ jobs:
 
     # Push runs only: the full suite below includes tests/integration/test_memcached_integration.py,
     # which skips its whole module when nothing answers on localhost:11211.
-    - name: Start Memcached
-      if: true
-      run: bash .github/scripts/start-memcached.sh
-
     - name: Run full test suite (main)
       if: true
       env:
