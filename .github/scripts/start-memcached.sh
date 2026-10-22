@@ -26,9 +26,11 @@ done
 
 docker run -d --name memcached -p 11211:11211 "$image" -m 64 || exit 1
 
-# Ready when the server answers `version` on the published port. Capped, so a
-# server that never comes up fails this step instead of hanging the job.
-for _ in $(seq 30); do
+# Ready when the server answers `version` on the published port. The 30s deadline
+# covers the probes too, so a server that never comes up, or accepts but never
+# answers, fails this step instead of hanging the job.
+deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$deadline" ]; do
   if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/11211 && printf "version\r\n" >&3 && head -c 7 <&3' 2>/dev/null | grep -q VERSION; then
     exit 0
   fi
