@@ -11,6 +11,8 @@ Tests all 5 nested config classes:
 from __future__ import annotations
 
 import threading
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
@@ -205,10 +207,10 @@ class TestBackpressureConfig:
         config = BackpressureConfig(queue_size=1, timeout=0.0)
         assert DecoratorConfig(backpressure=config).backpressure is config
 
-    def test_validate_numpy_integer_counts(self) -> None:
-        """A NumPy integer is a whole number too (numbers.Integral), so it passes."""
+    def test_validate_numpy_values(self) -> None:
+        """A NumPy integer is a whole number (it has __index__), and np.float64 subclasses float, so both pass."""
         np = pytest.importorskip("numpy")
-        config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16))
+        config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16), timeout=np.float64(0.5))
         assert DecoratorConfig(backpressure=config).backpressure is config
 
     @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
@@ -217,11 +219,15 @@ class TestBackpressureConfig:
         with pytest.raises(ConfigurationError, match=f"queue_size must be a whole number >= 1, got {queue_size!r}"):
             BackpressureConfig(queue_size=queue_size).validate()  # pyright: ignore[reportArgumentType]
 
-    @pytest.mark.parametrize("timeout", [-0.1, 1e10, float("inf"), float("nan")])
-    def test_validate_timeout_invalid(self, timeout: float) -> None:
-        """Outside 0 to TIMEOUT_MAX: NaN never returns from a wait, and inf or 1e10 raises OverflowError."""
+    @pytest.mark.parametrize(
+        "timeout",
+        [-0.1, 1e10, float("inf"), float("nan"), True, None, "0.1", Decimal("0.1"), Fraction(1, 10)],
+    )
+    def test_validate_timeout_invalid(self, timeout: object) -> None:
+        """Outside 0 to TIMEOUT_MAX NaN never returns from a wait and inf or 1e10 raises OverflowError; a value
+        that is not an int or float (None, a str, a Decimal, a Fraction) is refused before it reaches the wait."""
         with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
-            BackpressureConfig(timeout=timeout).validate()
+            BackpressureConfig(timeout=timeout).validate()  # pyright: ignore[reportArgumentType]
 
     def test_validate_timeout_max_accepted(self) -> None:
         """threading.TIMEOUT_MAX itself is a valid permit wait."""

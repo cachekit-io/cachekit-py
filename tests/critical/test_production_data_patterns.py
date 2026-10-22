@@ -451,22 +451,10 @@ class TestProductionDataPatterns:
         # test_auto_serializer_mutation_and_corruption.py). Nested in a dict it is refused, and the error names
         # that limit, as docs/serializers/auto.md does.
         pd = pytest.importorskip("pandas")
-        df = pd.DataFrame(
-            {
-                "user_id": [1, 2, 3, 4, 5],
-                "name": ["Alice", "Bob", "Carol", "Dave", "Eve"],
-                "department": ["Engineering", "Sales", "Marketing", "Engineering", "Sales"],
-                "salary": [75000.0, 65000.0, 70000.0, 80000.0, 72000.0],
-                "active": [True, True, False, True, True],
-            }
-        )
+        df = pd.DataFrame({"salary": [75000.0, 65000.0]})
         value = df if kind == "DataFrame" else df["salary"]
-        enterprise_with_pandas = {
-            "employee_data": value,
-            "report_metadata": {"generated_by": "hr_system", "report_date": "2024-08-03", "total_employees": len(df)},
-        }
         with pytest.raises(TypeError, match="pandas DataFrames and Series as the top-level value only"):
-            self.serializer.serialize(enterprise_with_pandas)
+            self.serializer.serialize({"employee_data": value, "report_metadata": {"generated_by": "hr_system"}})
 
     def test_datetime_objects_enterprise_patterns(self):
         # timedelta is not in AutoSerializer's supported set (datetime, date, time), so it is not part of this payload

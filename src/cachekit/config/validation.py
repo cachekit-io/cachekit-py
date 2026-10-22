@@ -352,7 +352,7 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
             "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
         )
 
-    # Production environment warning when key came from env var (not inline)
+    # Warn whenever the key came from the env var (not inline), unless dev_mode is on
     if not master_key:
         from cachekit.config.singleton import get_settings
 

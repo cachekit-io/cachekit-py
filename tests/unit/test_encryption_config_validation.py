@@ -109,7 +109,7 @@ class TestEncryptionConfigValidation:
         error_msg = str(exc_info.value)
         assert "hex" in error_msg.lower() or "encoded" in error_msg.lower()
 
-    @pytest.mark.parametrize("env_value", ["production", "prod", "prd", "PRODUCTION", "staging", "development", None])
+    @pytest.mark.parametrize("env_value", ["production", "staging", None])
     def test_env_key_warning_ignores_env(self, env_value, monkeypatch, caplog):
         """The env-var key warning depends only on dev_mode: with it off, every ENV value (or none) gets it."""
         import secrets

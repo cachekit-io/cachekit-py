@@ -24,6 +24,15 @@ def _is_count(value: object) -> bool:
     return isinstance(value, SupportsIndex) and not isinstance(value, bool) and operator.index(value) >= 1
 
 
+def _is_permit_wait(value: object) -> bool:
+    """Whether value is an int or float (not a bool) from 0 to threading.TIMEOUT_MAX.
+
+    threading.Semaphore.acquire takes only those: None or a str fail the range check with a bare TypeError,
+    and a Decimal or Fraction passes it but raises TypeError inside the wait.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= threading.TIMEOUT_MAX
+
+
 @dataclass(frozen=True)
 class L1CacheConfig:
     """L1 (in-memory) cache configuration.
@@ -242,7 +251,7 @@ class BackpressureConfig:
         # The permit wait hands timeout to threading.Semaphore.acquire. While every permit is held, NaN never
         # returns, and inf or a value past the platform limit raises OverflowError instead of waiting.
         # threading.TIMEOUT_MAX is the documented maximum.
-        if not 0 <= self.timeout <= threading.TIMEOUT_MAX:
+        if not _is_permit_wait(self.timeout):
             raise ConfigurationError(
                 f"timeout must be a number from 0 to {threading.TIMEOUT_MAX} (threading.TIMEOUT_MAX), got {self.timeout!r}"
             )
