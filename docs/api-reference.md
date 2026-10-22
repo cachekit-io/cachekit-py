@@ -312,7 +312,19 @@ print(health_result)
 
 assert set(health_result) == {"status", "namespace", "components"}
 assert health_result["status"] == "healthy"
-assert set(health_result["components"]) == {"circuit_breaker", "load_control", "metrics"}
+components = health_result["components"]
+assert set(components) == {"circuit_breaker", "load_control", "metrics"}
+assert set(components["circuit_breaker"]) == {
+    "state", "failure_count", "success_count", "half_open_permits", "last_failure_time", "namespace", "config"
+}
+assert set(components["circuit_breaker"]["config"]) == {
+    "failure_threshold", "success_threshold", "timeout_seconds", "half_open_requests"
+}
+assert components["circuit_breaker"]["state"] == "closed"
+assert set(components["load_control"]) == {"queue_depth", "rejected_count", "max_concurrent", "queue_size", "healthy"}
+assert set(components["metrics"]) == {
+    "mode", "total_operations", "dropped_metrics", "uptime_seconds", "ops_per_second", "auto_detect_enabled", "pool_size"
+}
 ```
 
 ## Modular Architecture
