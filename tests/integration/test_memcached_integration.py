@@ -1,10 +1,11 @@
 """Integration tests for MemcachedBackend against a real Memcached instance.
 
 Requires a running Memcached server. Start one with:
-    docker run -d --name cachekit-memcached -p 11211:11211 docker.io/library/memcached:alpine -m 64
+    bash .github/scripts/start-memcached.sh
 
 Set MEMCACHED_TEST_HOST / MEMCACHED_TEST_PORT to override defaults.
-Tests are skipped when Memcached is unreachable.
+Tests are skipped when Memcached is unreachable. CI push runs start Memcached and fail the job if
+any test here skips.
 
 Covers:
 - CRUD round-trip (set/get/delete/exists)
