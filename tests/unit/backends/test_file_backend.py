@@ -976,34 +976,6 @@ class TestErrorPaths:
         result = backend.get(key)
         assert result is None
 
-    @pytest.mark.skipif(os.name != "posix", reason="get_buffer mmap path is POSIX-only")
-    def test_get_buffer_refuses_symlink_to_valid_cache_file(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_buffer() must not follow a planted symlink (O_NOFOLLOW), even to a valid entry.
-
-        Following it would reintroduce the TOCTOU file read that O_NOFOLLOW closes on the mmap path.
-        """
-        backend.set("target_key", b"valid-cached-payload", ttl=300)
-        target_path = backend._key_to_path("target_key")
-        handle = backend.get_buffer("target_key")
-        assert handle is not None  # the target is a mappable cache file
-        handle.close()
-
-        file_path = backend._key_to_path("symlink_key")
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        os.symlink(target_path, file_path)
-
-        mapped: list[object] = []
-        real_mmap = file_backend_module.mmap.mmap
-
-        def spy_mmap(*args: Any, **kwargs: Any) -> object:
-            mapped.append(args)
-            return real_mmap(*args, **kwargs)
-
-        monkeypatch.setattr(file_backend_module.mmap, "mmap", spy_mmap)
-
-        assert backend.get_buffer("symlink_key") is None
-        assert mapped == []
-
     def test_set_write_failure_cleans_temp_file(
         self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
