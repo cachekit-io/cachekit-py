@@ -445,13 +445,10 @@ class TestProductionDataPatterns:
         }
         validate_roundtrip_integrity(self.serializer, enterprise_with_numpy)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=TypeError,
-        reason="AutoSerializer encodes a DataFrame only as the top-level value; nested in a dict it is refused as a "
-        "custom class, while the docs list DataFrames as preserved without that limit",
-    )
-    def test_pandas_dataframe_enterprise_scenarios(self):
+    @pytest.mark.parametrize("kind", ["DataFrame", "Series"])
+    def test_pandas_enterprise_scenarios_top_level_only(self, kind):
+        # A DataFrame or Series is encoded only as the whole cached value. Nested in a dict it is refused,
+        # and the error names that limit, as docs/serializers/auto.md does.
         pd = pytest.importorskip("pandas")
         df = pd.DataFrame(
             {
@@ -462,14 +459,21 @@ class TestProductionDataPatterns:
                 "active": [True, True, False, True, True],
             }
         )
-        enterprise_with_dataframe = {
-            "employee_data": df,
+        value = df if kind == "DataFrame" else df["salary"]
+
+        serialized, metadata = self.serializer.serialize(value)
+        result = self.serializer.deserialize(serialized, metadata)
+        if kind == "DataFrame":
+            pd.testing.assert_frame_equal(result, value)
+        else:
+            pd.testing.assert_series_equal(result, value)
+
+        enterprise_with_pandas = {
+            "employee_data": value,
             "report_metadata": {"generated_by": "hr_system", "report_date": "2024-08-03", "total_employees": len(df)},
         }
-        serialized, metadata = self.serializer.serialize(enterprise_with_dataframe)
-        result = self.serializer.deserialize(serialized, metadata)
-        pd.testing.assert_frame_equal(result["employee_data"], df)
-        assert result["report_metadata"] == enterprise_with_dataframe["report_metadata"]
+        with pytest.raises(TypeError, match="pandas DataFrames and Series as the top-level value only"):
+            self.serializer.serialize(enterprise_with_pandas)
 
     def test_datetime_objects_enterprise_patterns(self):
         # timedelta is not in AutoSerializer's supported set (datetime, date, time), so it is not part of this payload
