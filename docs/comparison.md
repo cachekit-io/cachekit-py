@@ -44,14 +44,14 @@ Are you caching in Python?
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
-> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CachekitIO), the default `StandardSerializer` converts tuples to lists and raises `TypeError` on sets and frozensets, for cross-language SDK compatibility.
+> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CachekitIO), the default `StandardSerializer` converts tuples to lists and cannot encode sets or frozensets (the result is returned uncached; see [Serialization unsupported type](error-codes.md#serialization-unsupported-type)), for cross-language SDK compatibility.
 >
 > **If you need type preservation with a distributed backend**, use `serializer='auto'`:
 > ```python
 > @cache(serializer='auto', ttl=300)
 > def fn(): return (1, 2, 3)  # tuple preserved on cache hit
 > ```
-> `AutoSerializer` preserves tuples, sets, frozensets, datetime and UUID through serialization via type markers (`Decimal` raises `TypeError`). The tradeoff: Python-only (other language SDKs won't understand the type markers). See [Serializer Guide](serializers/README.md) for details.
+> `AutoSerializer` preserves tuples, sets, frozensets, datetime and UUID through serialization via type markers. It cannot encode `Decimal`. The tradeoff: Python-only (other language SDKs won't understand the type markers). See [Serializer Guide](serializers/README.md) for details.
 >
 > ¹ `lru_cache` on async functions caches the coroutine object, not the result. The second `await` raises `RuntimeError`. See [#77](https://github.com/cachekit-io/cachekit-py/issues/77).
 

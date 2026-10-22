@@ -1,7 +1,8 @@
-"""Ground truth validation for serializer documentation (Arrow and Orjson).
+"""Ground truth validation for serializer documentation (Arrow, Orjson and the AutoSerializer table).
 
 This module validates every testable claim about ArrowSerializer and OrjsonSerializer
-in README.md and docs/guides/serializer-guide.md. Tests execute what documentation
+in README.md and docs/guides/serializer-guide.md, and the StandardSerializer column of
+docs/serializers/auto.md. Tests execute what documentation
 claims - when docs lie, tests fail loudly.
 
 **Coverage**:

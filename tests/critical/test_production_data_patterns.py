@@ -446,9 +446,10 @@ class TestProductionDataPatterns:
         validate_roundtrip_integrity(self.serializer, enterprise_with_numpy)
 
     @pytest.mark.parametrize("kind", ["DataFrame", "Series"])
-    def test_pandas_enterprise_scenarios_top_level_only(self, kind):
-        # A DataFrame or Series is encoded only as the whole cached value. Nested in a dict it is refused,
-        # and the error names that limit, as docs/serializers/auto.md does.
+    def test_pandas_nested_in_dict_is_refused(self, kind):
+        # A DataFrame or Series is encoded only as the whole cached value (top-level round trips are pinned in
+        # test_auto_serializer_mutation_and_corruption.py). Nested in a dict it is refused, and the error names
+        # that limit, as docs/serializers/auto.md does.
         pd = pytest.importorskip("pandas")
         df = pd.DataFrame(
             {
@@ -460,14 +461,6 @@ class TestProductionDataPatterns:
             }
         )
         value = df if kind == "DataFrame" else df["salary"]
-
-        serialized, metadata = self.serializer.serialize(value)
-        result = self.serializer.deserialize(serialized, metadata)
-        if kind == "DataFrame":
-            pd.testing.assert_frame_equal(result, value)
-        else:
-            pd.testing.assert_series_equal(result, value)
-
         enterprise_with_pandas = {
             "employee_data": value,
             "report_metadata": {"generated_by": "hr_system", "report_date": "2024-08-03", "total_employees": len(df)},

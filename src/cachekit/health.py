@@ -506,9 +506,12 @@ class HealthChecker:
             elif state == "HALF_OPEN":
                 status = HealthStatus.DEGRADED
                 message = "Circuit breaker is HALF_OPEN - testing recovery"
-            else:  # CLOSED
+            elif state == "CLOSED":
                 status = HealthStatus.HEALTHY
                 message = "Circuit breaker is CLOSED - normal operation"
+            else:  # Never read an unrecognised state as healthy
+                status = HealthStatus.UNHEALTHY
+                message = f"Circuit breaker reported an unknown state {state!r}"
 
             return ComponentHealth(
                 name="circuit_breaker",

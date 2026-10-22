@@ -10,6 +10,8 @@ Tests all 5 nested config classes:
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from cachekit.config.decorator import DecoratorConfig
@@ -212,11 +214,16 @@ class TestBackpressureConfig:
         with pytest.raises(ConfigurationError, match=f"queue_size must be >= 1, got {queue_size}"):
             BackpressureConfig(queue_size=queue_size).validate()
 
-    @pytest.mark.parametrize("timeout", [-0.1, float("inf"), float("nan")])
+    @pytest.mark.parametrize("timeout", [-0.1, 1e10, float("inf"), float("nan")])
     def test_validate_timeout_invalid(self, timeout: float) -> None:
-        """A negative timeout is meaningless, and inf or NaN never return from a permit wait while every permit is held."""
-        with pytest.raises(ConfigurationError, match="timeout must be a finite number >= 0"):
+        """While every permit is held, NaN never returns from the wait, and inf or above TIMEOUT_MAX raises OverflowError."""
+        with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
             BackpressureConfig(timeout=timeout).validate()
+
+    def test_validate_timeout_max_accepted(self) -> None:
+        """threading.TIMEOUT_MAX itself is a valid permit wait."""
+        config = BackpressureConfig(timeout=threading.TIMEOUT_MAX)
+        assert DecoratorConfig(backpressure=config).backpressure is config
 
 
 @pytest.mark.unit

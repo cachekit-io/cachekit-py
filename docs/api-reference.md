@@ -104,7 +104,7 @@ def your_function(args):
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
   - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests; must be `>= 1`
-  - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up; must be finite and `>= 0`
+  - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up; must be from `0` to `threading.TIMEOUT_MAX`
 
 #### Monitoring Parameters
 

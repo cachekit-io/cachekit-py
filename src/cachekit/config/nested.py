@@ -8,6 +8,7 @@ timeout, backpressure, monitoring, encryption).
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -187,7 +188,7 @@ class BackpressureConfig:
         enabled: Enable backpressure protection (default: True)
         max_concurrent_requests: Maximum concurrent cache requests (default: 100)
         queue_size: Queue size for waiting requests (default: 1000, must be >= 1)
-        timeout: Seconds to wait in queue before giving up (default: 0.1, finite and >= 0)
+        timeout: Seconds to wait in queue before giving up (default: 0.1, from 0 to threading.TIMEOUT_MAX)
 
     Examples:
         Create with defaults:
@@ -228,10 +229,12 @@ class BackpressureConfig:
         # permit at once, so at 0 every operation is rejected.
         if self.queue_size < 1:
             raise ConfigurationError(f"queue_size must be >= 1, got {self.queue_size}")
-        # The permit wait hands timeout to threading.Semaphore.acquire, which never returns on inf or NaN
-        # while every permit is held.
-        if not math.isfinite(self.timeout) or self.timeout < 0:
-            raise ConfigurationError(f"timeout must be a finite number >= 0, got {self.timeout!r}")
+        # The permit wait hands timeout to threading.Semaphore.acquire. While every permit is held, NaN never
+        # returns, and inf or anything above threading.TIMEOUT_MAX raises OverflowError instead of waiting.
+        if not 0 <= self.timeout <= threading.TIMEOUT_MAX:
+            raise ConfigurationError(
+                f"timeout must be a number from 0 to {threading.TIMEOUT_MAX} (threading.TIMEOUT_MAX), got {self.timeout!r}"
+            )
 
 
 @dataclass(frozen=True)

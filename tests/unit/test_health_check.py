@@ -20,8 +20,7 @@ from cachekit.health import (
     get_health_checker,
     health_check_handler,
 )
-from cachekit.reliability import CircuitBreaker
-from cachekit.reliability.circuit_breaker import CircuitBreakerConfig
+from cachekit.reliability import CircuitBreaker, CircuitBreakerConfig
 
 
 class TestHealthChecker:
@@ -263,6 +262,18 @@ class TestHealthChecker:
             assert component.status == HealthStatus.HEALTHY
             assert component.details["state"] == "CLOSED"
             assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, timezone.utc).isoformat()
+
+    def test_circuit_breaker_unknown_state_is_unhealthy(self):
+        """A state outside CLOSED, OPEN and HALF_OPEN (here lowercase) is never read as HEALTHY."""
+
+        class LowercaseBreaker:
+            def get_stats(self):
+                return {"state": "open", "failure_count": 5, "success_count": 0, "last_failure_time": 0.0}
+
+        component = HealthChecker(circuit_breaker=LowercaseBreaker())._check_circuit_breaker()
+
+        assert component.status == HealthStatus.UNHEALTHY
+        assert "'open'" in component.message
 
     def test_circuit_breaker_not_in_use(self, health_checker):
         """Test circuit breaker check when not in use."""
