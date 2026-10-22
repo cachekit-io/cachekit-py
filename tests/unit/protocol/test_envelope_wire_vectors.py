@@ -36,9 +36,6 @@ paths that:
    ``reject_ratio_bomb`` stay below ``original_size`` in allocation; that bound
    is not asserted here, because an SDK over cachekit-core may rely on it only
    once core's allocation probe runs in CI on the core version this package pins.
-   ``reject_envelope_slots_overclaim`` is an expected failure: the pinned
-   cachekit-core rejects it in the typed decode, not with the pre-scan error the
-   spec requires.
 7. **Payload decode bounds**: every ``payload_reject_vectors`` envelope passes the
    envelope read, and ``StandardSerializer`` then refuses its payload with the
    structural guard's own error, before the decode allocates.
@@ -238,15 +235,6 @@ REJECT_EXPECTATIONS: dict[str, tuple[type[Exception], str]] = {
     ),
 }
 
-# Vectors the pinned cachekit-core fails, each recorded as a strict expected failure so it fails loudly
-# the day it starts passing. Every other reject vector must pass outright.
-REJECT_XFAIL: dict[str, str] = {
-    "reject_envelope_slots_overclaim": (
-        "WIRE-9: the pinned cachekit-core has no envelope pre-scan, so its typed decode rejects this "
-        "vector (invalid type at element 1) instead of the pre-scan"
-    ),
-}
-
 
 class TestRejectVectors:
     """Every reject vector is refused by the real FFI retrieve path with the error its row names."""
@@ -255,20 +243,7 @@ class TestRejectVectors:
         """An emptied or renamed group fails here instead of passing on zero parametrized cases."""
         assert {v["name"] for v in _FIXTURE.get("reject_vectors", [])} == set(REJECT_EXPECTATIONS)
 
-    @pytest.mark.parametrize(
-        ("name", "expected"),
-        [
-            pytest.param(
-                name,
-                expected,
-                id=name,
-                marks=[pytest.mark.xfail(strict=True, raises=AssertionError, reason=REJECT_XFAIL[name])]
-                if name in REJECT_XFAIL
-                else [],
-            )
-            for name, expected in REJECT_EXPECTATIONS.items()
-        ],
-    )
+    @pytest.mark.parametrize(("name", "expected"), REJECT_EXPECTATIONS.items(), ids=list(REJECT_EXPECTATIONS))
     def test_retrieve_rejects_with_named_error(self, name, expected):
         error_type, message = expected
         envelope = bytes.fromhex(_named_vector("reject_vectors", name)["envelope_hex"])
@@ -278,7 +253,7 @@ class TestRejectVectors:
             assert not isinstance(excinfo.value, EnvelopeIntegrityError)
 
 
-# The structural guard's own error for each reject reason (rust/src/msgpack_bounds.rs).
+# The structural guard's own error for each reject reason (cachekit-core check_msgpack_structure).
 PAYLOAD_REJECT_ERRORS = {"overclaim": "declares more elements than the input can back"}
 
 

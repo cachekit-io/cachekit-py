@@ -1,14 +1,11 @@
 //! `PyO3` bindings for `cachekit-core`
 //!
 //! This crate provides thin Python wrappers around the cachekit-core library.
-//! Business logic lives in cachekit-core, with one SDK-owned exception: the untrusted
-//! msgpack decode bound in `msgpack_bounds`, pending a core-shared walk.
+//! Business logic lives in cachekit-core, including the untrusted msgpack decode bound
+//! (`cachekit_core::check_msgpack_structure`).
 
 // Re-export core types for use in Python bindings
 pub use cachekit_core::{ByteStorage, StorageEnvelope};
-
-/// Untrusted msgpack structural bound — pure Rust, not gated on `python`
-pub mod msgpack_bounds;
 
 #[cfg(feature = "encryption")]
 pub use cachekit_core::{

@@ -364,11 +364,12 @@ class EnvelopeShapeError(SerializationError):
 # Owned untrusted-decode bounds (protocol spec/interop-mode.md → Decode bounds)
 # ---------------------------------------------------------------------------
 
-#: cachekit's own nesting ceiling, enforced by the Rust ``check_msgpack_structure``
-#: walk before msgpack-python ever sees the document. Two constraints pin it: the
-#: protocol requires every SDK's bound to sit in 32..=1024, and it must not exceed
-#: msgpack-python's C unpacker stack (a document at the ceiling has to decode after
-#: passing the walk; tests/unit/protocol/test_decode_bounds.py checks exactly that).
+#: cachekit's own nesting ceiling, enforced by cachekit-core's ``check_msgpack_structure``
+#: walk (through the Rust extension) before msgpack-python ever sees the document. Every
+#: array or map header on the path counts as a level, an empty one included. Two
+#: constraints pin it: the protocol requires every SDK's bound to sit in 32..=1024, and
+#: it must not exceed msgpack-python's C unpacker stack (a document at the ceiling has to
+#: decode after passing the walk; tests/unit/protocol/test_decode_bounds.py checks exactly that).
 MSGPACK_MAX_NESTING = 1024
 
 #: Everything a corrupted or forged payload can make a decode raise, for serializers
@@ -460,10 +461,11 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
     (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
     transient heap — measured 10 KB -> 67 MB.
 
-    The bound is the Rust extension's zero-copy, header-only walk
-    (``check_msgpack_structure``, documented there) run before the decode. It
-    rejects a document that nests deeper than :data:`MSGPACK_MAX_NESTING` or whose
-    open headers declare more elements or bytes than the remaining input can back.
+    The bound is cachekit-core's header-only walk (``check_msgpack_structure``,
+    documented there), which the Rust extension runs zero-copy before the decode. It
+    rejects a document that nests deeper than :data:`MSGPACK_MAX_NESTING` (every
+    array or map header counts, an empty one included) or whose open headers
+    declare more elements or bytes than the remaining input can back.
     Every element that survives is backed by >= 1 input byte, so the real decode's
     total container pre-allocation is bounded by len(data) rather than by
     depth x declared length. The explicit ``max_*_len=len(data)`` caps on

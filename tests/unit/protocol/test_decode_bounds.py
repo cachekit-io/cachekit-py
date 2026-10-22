@@ -208,6 +208,18 @@ class TestOwnedBounds:
         with pytest.raises(ValueError, match=f"nests deeper than {MSGPACK_MAX_NESTING} levels"):
             unpackb_bounded(b"\x91" * (MSGPACK_MAX_NESTING + 1) + b"\xc0")
 
+    def test_an_empty_innermost_collection_counts_toward_the_ceiling(self) -> None:
+        # Every array header is a level, an empty one included, so one level past the ceiling is the
+        # guard's rejection, not msgpack-python's StackError (also a ValueError) after the walk let it by.
+        check_msgpack_structure(b"\x91" * (MSGPACK_MAX_NESTING - 1) + b"\x90", MSGPACK_MAX_NESTING)
+        too_deep = b"\x91" * MSGPACK_MAX_NESTING + b"\x90"
+        with pytest.raises(ValueError, match=f"nests deeper than {MSGPACK_MAX_NESTING} levels") as excinfo:
+            check_msgpack_structure(too_deep, MSGPACK_MAX_NESTING)
+        assert str(excinfo.value).startswith(GUARD_ERROR_PREFIX)
+        with pytest.raises(ValueError) as excinfo:
+            unpackb_bounded(too_deep)
+        _assert_guard_rejected(excinfo.value)
+
     def test_trailing_bytes_still_rejected(self) -> None:
         with pytest.raises(msgpack.exceptions.ExtraData):
             unpackb_bounded(b"\xc0\xc0")
