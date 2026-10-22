@@ -712,7 +712,7 @@ def create_cache_wrapper(
         function so it is part of the args hash. See docs/features/zero-knowledge-encryption.md.
     """
     circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
-    backpressure_limits: dict[str, Any] = {}  # empty = BackpressureController's queue_size / timeout defaults
+    backpressure_limits: dict[str, int | float] = {}  # empty = BackpressureController's queue_size / timeout defaults
     # L1-only (in-process, no backend) is chosen only by config.backend None, below: one switch for every caller.
     _l1_only_mode = False
 
