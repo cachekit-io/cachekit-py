@@ -2,7 +2,7 @@
 
 Each mutant is one exact string edit to one source file, plus the tests that must catch it. A mutant
 is killed only when pytest exits 1 and at least one of its killers is among the failures, so a
-collection error, a timeout or an unrelated failure never counts as a kill. The ``baseline`` run
+collection error, a setup or teardown error, a timeout or an unrelated failure never counts as a kill. The ``baseline`` run
 checks that every anchor matches exactly once and that every killer passes on the unmutated tree.
 
     uv run python scripts/mutation_smoke.py list
@@ -181,11 +181,16 @@ def junit_key(node_id: str) -> tuple[str, str]:
 
 
 def junit_outcomes(xml_path: Path) -> dict[tuple[str, str], str]:
-    """Outcome per test case: "failed" (failure or error), "skipped" or "passed"."""
+    """Outcome per test case: "failed", "error" (setup or teardown, never a kill), "skipped" or "passed"."""
     outcomes = {}
     for case in ET.parse(xml_path).iter("testcase"):  # noqa: S314 (trusted: junit this script just had pytest write)
         tags = {child.tag for child in case}
-        outcome = "failed" if tags & {"failure", "error"} else "skipped" if "skipped" in tags else "passed"
+        if "failure" in tags:
+            outcome = "failed"
+        elif "error" in tags:
+            outcome = "error"
+        else:
+            outcome = "skipped" if "skipped" in tags else "passed"
         outcomes[(case.get("classname", ""), case.get("name", ""))] = outcome
     return outcomes
 
@@ -218,8 +223,6 @@ def verdict(mutant: Mutant, rc: int | None, outcomes: dict[tuple[str, str], str]
 
 
 def run_mutant(mutant: Mutant) -> int:
-    if not mutant.killers:  # no files would run the whole suite, and nothing could count as a kill
-        raise NotAppliedError(f"{mutant.name}: records no killer tests")
     path = ROOT / mutant.path
     original = path.read_text()
     path.write_text(mutated_source(mutant, original))
@@ -236,8 +239,6 @@ def run_baseline() -> int:
     """Every anchor applies once, and every killer passes on the unmutated tree."""
     problems = []
     for mutant in MUTANTS:
-        if not mutant.killers:
-            problems.append(f"{mutant.name}: records no killer tests")
         try:
             mutated_source(mutant, (ROOT / mutant.path).read_text())
         except NotAppliedError as exc:
@@ -246,7 +247,10 @@ def run_baseline() -> int:
     rc, outcomes = run_pytest(killer_files(tuple(killers)))
     if rc != 0:
         problems.append("baseline timed out" if rc is None else f"baseline pytest exited {rc}")
-    problems += [f"killer {k} did not pass on the baseline" for k in killers if outcomes.get(junit_key(k)) != "passed"]
+    for k in killers:
+        outcome = outcomes.get(junit_key(k), "not run")
+        if outcome != "passed":
+            problems.append(f"killer {k} did not pass on the baseline: {outcome}")
     for problem in problems:
         print(f"BASELINE: {problem}")
     print("BASELINE RED" if problems else f"BASELINE GREEN: {len(killers)} killers pass, {len(MUTANTS)} anchors apply")

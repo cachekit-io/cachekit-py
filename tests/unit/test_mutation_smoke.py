@@ -45,12 +45,6 @@ def test_anchor_is_replaced():
     assert smoke.mutated_source(MUTANT, "a old b") == "a new b"
 
 
-def test_run_refuses_a_mutant_without_killers():
-    """No killer files would make pytest run the whole suite, where nothing could count as a kill."""
-    with pytest.raises(smoke.NotAppliedError, match="no killer tests"):
-        smoke.run_mutant(smoke.Mutant("bare", "f.py", "old", "new", ()))
-
-
 def test_junit_key_matches_pytest_junit_naming():
     assert smoke.junit_key("tests/unit/backends/test_f.py::TestE::test_s") == ("tests.unit.backends.test_f.TestE", "test_s")
     assert smoke.junit_key("tests/unit/test_f.py::test_m[get_buffer-None]") == ("tests.unit.test_f", "test_m[get_buffer-None]")
@@ -69,9 +63,21 @@ def test_junit_outcomes(tmp_path):
     assert smoke.junit_outcomes(xml) == {
         ("c", "passed"): "passed",
         ("c", "failed"): "failed",
-        ("c", "errored"): "failed",
+        ("c", "errored"): "error",
         ("c", "skipped"): "skipped",
     }
+
+
+def test_a_killer_erroring_in_setup_is_not_a_kill():
+    """A setup or teardown error is an infrastructure failure, not the mutant being caught."""
+    killed, _ = smoke.verdict(MUTANT, 1, {KILLER: "error"})
+    assert not killed
+
+
+@pytest.mark.parametrize("mutant", smoke.MUTANTS, ids=lambda m: m.name)
+def test_every_anchor_still_applies(mutant):
+    """A refactor that breaks an anchor fails here, on its own PR, not at the next nightly. Re-anchor the mutant."""
+    smoke.mutated_source(mutant, (ROOT / mutant.path).read_text())
 
 
 def test_every_mutant_records_killers_and_has_a_unique_name():

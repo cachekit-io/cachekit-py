@@ -2,8 +2,7 @@ name: Mutation Smoke
 
 # Re-applies each hand-written mutant in scripts/mutation_smoke.py and fails when the unmutated
 # baseline fails, when a mutant's anchor no longer matches exactly once, or when a mutant is no
-# longer killed by its recorded tests. A deleted or weakened test then shows up the next night
-# instead of never.
+# longer killed by any of its recorded tests. A deleted or renamed killer turns the baseline red.
 #
 # pull_request is permanent and path-filtered to the smoke's own files: GitHub runs schedule and
 # workflow_dispatch only for a workflow already on the default branch, so this is how a change
@@ -16,13 +15,9 @@ on:
     paths:
       - .github/workflows/mutation-smoke.yml
       - scripts/mutation_smoke.py
-      - tests/unit/test_mutation_smoke.py
 
 permissions:
   contents: read
-
-env:
-  REDIS_DISABLE_HIREDIS: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -63,7 +58,6 @@ jobs:
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
-        cache-suffix: mutation-smoke
 
     # Every leg builds the same Rust extension on the same interpreter, so one cache serves all.
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -79,10 +73,12 @@ jobs:
 
   # Surface nightly failures: a schedule-only job that fails silently is worse than no job.
   # De-duplicate by title so a red streak comments on one issue instead of opening one a night.
+  # Not failure(): a leg that hits its timeout ends cancelled, which failure() skips. !cancelled()
+  # keeps a cancelled run (concurrency, manual) from filing.
   report:
     name: File / update tracking issue on failure
     needs: smoke
-    if: failure() && github.event_name != 'pull_request'
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.smoke.result != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
