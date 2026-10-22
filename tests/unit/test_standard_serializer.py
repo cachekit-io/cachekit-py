@@ -327,7 +327,7 @@ class TestStandardSerializerDatetimeTypes:
     def test_serialize_datetime(self) -> None:
         """Test roundtrip serialization of datetime objects.
 
-        Validates ISO-8601 encoding via MessagePack extension 0xC0.
+        Validates ISO-8601 encoding in a __datetime__ sentinel map.
         """
         serializer = StandardSerializer()
         dt = datetime(2024, 1, 15, 12, 30, 45, 123456)

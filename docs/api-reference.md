@@ -465,7 +465,7 @@ result = compute_results(123)  # Multi-language compatible
 **Supported Types**:
 - Primitives: `None`, `bool`, `int`, `float`, `str`, `bytes`
 - Collections: `list`, `tuple`, `dict`
-- Dates: `datetime`, `date`, `time` (ISO-8601 format via MessagePack extension)
+- Dates: `datetime`, `date`, `time` (ISO-8601 string in a sentinel map: `{"__datetime__": true, "value": "<ISO-8601>"}`, or `__date__` / `__time__`; see the [protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/wire-format.md#datetime-extension-format))
 
 **Explicitly NOT supported**:
 - NumPy arrays → Use `serializer="auto"`
