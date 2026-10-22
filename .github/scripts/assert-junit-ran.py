@@ -1,4 +1,4 @@
-"""Fail unless a pytest junit report ran every test of one module, none skipped.
+"""Fail unless every test the report holds from one module ran, none skipped or xfailed.
 
 A module that skips itself when its service is unreachable stays green with zero
 coverage. CI reads the report afterwards, so a service that never started, died
@@ -23,11 +23,11 @@ def main(report: str, module: str) -> int:
     cases = [c for c in tree.iter("testcase") if f"{c.get('classname', '')}.".startswith(f"{module}.")]
     skipped = [f"{c.get('classname')}::{c.get('name')}" for c in cases if c.find("skipped") is not None]
     if not cases:
-        print(f"::error::{report} has no tests from {module}: the module was not collected")
+        print(f"::error::{report} has no tests from {module}: the module was not collected, or all deselected")
         return 1
     if skipped:
         reasons = {s.get("message", "") for c in cases for s in c.findall("skipped")}
-        print(f"::error::{len(skipped)} of {len(cases)} tests in {module} skipped: {'; '.join(sorted(reasons))}")
+        print(f"::error::{len(skipped)} of {len(cases)} tests in {module} skipped or xfailed: {'; '.join(sorted(reasons))}")
         print("\n".join(skipped))
         return 1
     print(f"{len(cases)} tests in {module} ran, none skipped")

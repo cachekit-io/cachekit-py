@@ -36,6 +36,6 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   fi
   sleep 1
 done
-echo "::error::memcached did not answer on localhost:11211 within 30s"
-docker logs memcached || true
+echo "::error::memcached did not answer on 127.0.0.1:11211 within 30s"
+docker logs memcached
 exit 1
