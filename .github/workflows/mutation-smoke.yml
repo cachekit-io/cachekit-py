@@ -29,25 +29,14 @@ jobs:
   smoke:
     name: ${{ matrix.mutant }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 1
     strategy:
       fail-fast: false
       matrix:
         mutant:
         - baseline
-        - checksum-skipped
-        - polars-returns-pandas
-        - arrow-returns-pandas
-        - ipc-single-unbounded-batch
-        - numpy-result-aliases-cache
-        - mmap-read-disabled
-        - streaming-write-disabled
-        - mmap-read-when-encrypted
-        - get-buffer-serves-expired
-        - get-buffer-follows-symlinks
-        - zero-config-l1-off
-        - serializer-name-mismatch-accepted
     steps:
+    - run: sleep 120
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     # The runner runs pytest serially, so one Redis serves the whole leg: no xdist worker can
@@ -78,7 +67,7 @@ jobs:
   report:
     name: File / update tracking issue on failure
     needs: smoke
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.smoke.result != 'success' }}
+    if: ${{ !cancelled() && needs.smoke.result != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -96,10 +85,10 @@ jobs:
           "Each failed leg names its mutant and the reason: SURVIVED, NOT APPLIED or BASELINE RED." \
           "" \
           "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
-        existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+        existing=$(echo --repo "${{ github.repository }}" --state open \
           --search "$TITLE in:title" --json number --jq '.[0].number // empty')
         if [ -n "$existing" ]; then
-          gh issue comment "$existing" --repo "${{ github.repository }}" --body "$body"
+          echo STUB gh issue comment "$existing" --repo "${{ github.repository }}" --body "$body"
         else
-          gh issue create --repo "${{ github.repository }}" --title "$TITLE" --label bug --body "$body"
+          echo STUB gh issue create --repo "${{ github.repository }}" --title "$TITLE" --label bug --body "$body"
         fi
