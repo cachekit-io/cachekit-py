@@ -102,8 +102,8 @@ def your_function(args):
   - `half_open_requests` (`int`, default: `3`) - Probe slots per half-open cycle (not a concurrency limit). Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
-  - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
-  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests; must be `>= 1`
+  - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests; must be a whole number `>= 1`
+  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests; must be a whole number `>= 1`
   - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up; must be from `0` to `threading.TIMEOUT_MAX`
 
 #### Monitoring Parameters

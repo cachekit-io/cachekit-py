@@ -191,12 +191,12 @@ class TestBackpressureConfig:
         config = BackpressureConfig(max_concurrent_requests=1)
         assert DecoratorConfig(backpressure=config).backpressure is config
 
-    @pytest.mark.parametrize("max_concurrent", [0, -10, float("nan"), float("inf")])
+    @pytest.mark.parametrize("max_concurrent", [0, -10, 1.5, float("nan"), float("inf"), True])
     def test_validate_max_concurrent_requests_invalid(self, max_concurrent: float) -> None:
-        """Below 1 nothing runs; at NaN or inf threading.Semaphore never blocks, so there is no limit."""
+        """Below 1 nothing runs; from NaN, inf or a fraction threading.Semaphore never reaches 0, so nothing is limited."""
         config = BackpressureConfig(max_concurrent_requests=max_concurrent)  # pyright: ignore[reportArgumentType]
         with pytest.raises(
-            ConfigurationError, match=f"max_concurrent_requests must be a finite number >= 1, got {max_concurrent!r}"
+            ConfigurationError, match=f"max_concurrent_requests must be a whole number >= 1, got {max_concurrent!r}"
         ):
             config.validate()
 
@@ -205,10 +205,16 @@ class TestBackpressureConfig:
         config = BackpressureConfig(queue_size=1, timeout=0.0)
         assert DecoratorConfig(backpressure=config).backpressure is config
 
-    @pytest.mark.parametrize("queue_size", [0, -5, float("nan"), float("inf")])
+    def test_validate_numpy_integer_counts(self) -> None:
+        """A NumPy integer is a whole number too (numbers.Integral), so it passes."""
+        np = pytest.importorskip("numpy")
+        config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16))
+        assert DecoratorConfig(backpressure=config).backpressure is config
+
+    @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
     def test_validate_queue_size_invalid(self, queue_size: float) -> None:
         """Below 1 every operation is rejected (each joins the queue); NaN or inf would remove the cap."""
-        with pytest.raises(ConfigurationError, match=f"queue_size must be a finite number >= 1, got {queue_size!r}"):
+        with pytest.raises(ConfigurationError, match=f"queue_size must be a whole number >= 1, got {queue_size!r}"):
             BackpressureConfig(queue_size=queue_size).validate()  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize("timeout", [-0.1, 1e10, float("inf"), float("nan")])

@@ -146,7 +146,7 @@ class TestDecoratorConfigValidation:
 
     def test_validate_delegates_to_backpressure_config(self) -> None:
         """Test validation delegates to BackpressureConfig."""
-        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be a finite number >= 1, got 0"):
+        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be a whole number >= 1, got 0"):
             DecoratorConfig(backpressure=BackpressureConfig(max_concurrent_requests=0))
 
     def test_validate_delegates_to_monitoring_config(self) -> None:

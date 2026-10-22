@@ -8,14 +8,20 @@ timeout, backpressure, monitoring, encryption).
 from __future__ import annotations
 
 import math
+import operator
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, SupportsIndex
 
 from .validation import ConfigurationError, hide_any_secret, refuse_bytes_key
 
 if TYPE_CHECKING:
     from cachekit.decorators.tenant_context import TenantContextExtractor
+
+
+def _is_count(value: object) -> bool:
+    """Whether value is a whole number >= 1 (an int or a NumPy integer). A bool is refused: it is an int, but never a count."""
+    return isinstance(value, SupportsIndex) and not isinstance(value, bool) and operator.index(value) >= 1
 
 
 @dataclass(frozen=True)
@@ -186,8 +192,8 @@ class BackpressureConfig:
 
     Attributes:
         enabled: Enable backpressure protection (default: True)
-        max_concurrent_requests: Maximum concurrent cache requests (default: 100)
-        queue_size: Queue size for waiting requests (default: 1000, must be >= 1)
+        max_concurrent_requests: Maximum concurrent cache requests (default: 100, a whole number >= 1)
+        queue_size: Queue size for waiting requests (default: 1000, a whole number >= 1)
         timeout: Seconds to wait in queue before giving up (default: 0.1, from 0 to threading.TIMEOUT_MAX)
 
     Examples:
@@ -209,7 +215,7 @@ class BackpressureConfig:
         >>> BackpressureConfig(max_concurrent_requests=0).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        cachekit.config.validation.ConfigurationError: max_concurrent_requests must be a finite number >= 1, got 0
+        cachekit.config.validation.ConfigurationError: max_concurrent_requests must be a whole number >= 1, got 0
     """
 
     enabled: bool = True
@@ -223,15 +229,16 @@ class BackpressureConfig:
         Raises:
             ConfigurationError: If capacity limits are invalid
         """
-        # threading.Semaphore never blocks at NaN or inf, which would silently remove the concurrency limit.
-        if not 1 <= self.max_concurrent_requests < math.inf:
+        # threading.Semaphore blocks only while its counter is exactly 0. From NaN, inf or a fraction it never
+        # reaches 0, which would silently remove the concurrency limit.
+        if not _is_count(self.max_concurrent_requests):
             raise ConfigurationError(
-                f"max_concurrent_requests must be a finite number >= 1, got {self.max_concurrent_requests!r}"
+                f"max_concurrent_requests must be a whole number >= 1, got {self.max_concurrent_requests!r}"
             )
         # Every backend operation joins the queue before it waits for a permit, even one that gets a
         # permit at once, so at 0 every operation is rejected. NaN or inf would silently remove the cap.
-        if not 1 <= self.queue_size < math.inf:
-            raise ConfigurationError(f"queue_size must be a finite number >= 1, got {self.queue_size!r}")
+        if not _is_count(self.queue_size):
+            raise ConfigurationError(f"queue_size must be a whole number >= 1, got {self.queue_size!r}")
         # The permit wait hands timeout to threading.Semaphore.acquire. While every permit is held, NaN never
         # returns, and inf or a value past the platform limit raises OverflowError instead of waiting.
         # threading.TIMEOUT_MAX is the documented maximum.
