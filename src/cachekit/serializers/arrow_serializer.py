@@ -482,14 +482,6 @@ class ArrowSerializer:
 
             # Convert to requested format
             if self.return_format == "pandas":
-                if reader.num_record_batches == 1:
-                    # pyarrow converts a single-chunk column (and categorical codes) zero-copy, as a
-                    # READ-ONLY numpy view of the IPC buffers, which alias the backend's bytes or the
-                    # File backend's mmap. A second, empty chunk makes it concatenate into fresh
-                    # arrays instead, as it already does for a multi-batch frame, so the caller gets
-                    # a frame it can edit in place and that owns its memory, like an uncached call's
-                    # (cachekit-py#157). One batch is at most _TARGET_BATCH_BYTES, so the copy is small.
-                    table = pa.concat_tables([table.slice(0, 0), table])
                 # self_destruct frees each Arrow column as it is converted (the table is a
                 # throwaway local here, so the experimental-invalidation caveat does not apply);
                 # split_blocks avoids the transient 2x of consolidated-block construction.
