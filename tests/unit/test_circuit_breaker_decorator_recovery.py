@@ -207,7 +207,7 @@ class TestOrchestratorAdmission:
         return breaker
 
     def test_half_open_admits_exactly_the_probe_budget_per_cycle(self, clock):
-        orch = FeatureOrchestrator(namespace="lab5326-admit-budget", backpressure_enabled=False)
+        orch = FeatureOrchestrator(namespace="cbrecover-admit-budget", backpressure_enabled=False)
         breaker = self._open(orch)
         budget = breaker.config.half_open_requests
 
@@ -221,7 +221,7 @@ class TestOrchestratorAdmission:
 
     def test_spent_cycle_with_no_outcome_starts_over_after_timeout(self, clock):
         """Probes that never report back do not hold the breaker HALF_OPEN for good."""
-        orch = FeatureOrchestrator(namespace="lab5326-admit-expiry", backpressure_enabled=False)
+        orch = FeatureOrchestrator(namespace="cbrecover-admit-expiry", backpressure_enabled=False)
         breaker = self._open(orch)
         budget = breaker.config.half_open_requests
 
@@ -237,7 +237,7 @@ class TestOrchestratorAdmission:
 
     def test_old_cycle_with_probe_slots_left_is_not_restarted(self, clock):
         """Only a spent cycle starts over: an old cycle with slots left keeps its successes."""
-        orch = FeatureOrchestrator(namespace="lab5326-admit-expiry-unspent", backpressure_enabled=False)
+        orch = FeatureOrchestrator(namespace="cbrecover-admit-expiry-unspent", backpressure_enabled=False)
         breaker = self._open(orch)
 
         clock.shift(_PAST_TIMEOUT)
@@ -259,7 +259,7 @@ class TestRejectionIsNotAFailure:
 
     async def test_rejected_while_open(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
-        fn = _decorate(f"lab5326-reject-open-{is_async}", is_async=is_async, executions=executions)
+        fn = _decorate(f"cbrecover-reject-open-{is_async}", is_async=is_async, executions=executions)
         (breaker,) = live_breakers
         await _open(fn, resolver, breaker)
         failures = breaker.failure_count
@@ -273,7 +273,7 @@ class TestRejectionIsNotAFailure:
         assert breaker.state == CircuitState.OPEN
 
     async def test_rejected_in_half_open_leaves_breaker_half_open(self, is_async, resolver, backend, live_breakers, clock):
-        fn = _decorate(f"lab5326-reject-half-open-{is_async}", is_async=is_async)
+        fn = _decorate(f"cbrecover-reject-half-open-{is_async}", is_async=is_async)
         (breaker,) = live_breakers
         await _open(fn, resolver, breaker)
         failures = breaker.failure_count
@@ -298,7 +298,7 @@ class TestSlidingWindow:
     """
 
     async def test_steady_traffic_does_not_hold_the_breaker_open(self, is_async, resolver, backend, live_breakers, clock):
-        fn = _decorate(f"lab5326-sliding-{is_async}", is_async=is_async)
+        fn = _decorate(f"cbrecover-sliding-{is_async}", is_async=is_async)
         (breaker,) = live_breakers
         await _open(fn, resolver, breaker)
         half = timedelta(seconds=_TIMEOUT / 2)
@@ -325,7 +325,7 @@ class TestSlidingWindow:
                 raise TypeError("cannot build a key")
             return x
 
-        fn = _decorate(f"lab5326-sliding-keygen-{is_async}", is_async=is_async, key=key)
+        fn = _decorate(f"cbrecover-sliding-keygen-{is_async}", is_async=is_async, key=key)
         (breaker,) = live_breakers
         await _open(fn, resolver, breaker)
 
@@ -346,7 +346,7 @@ class TestRecovery:
 
     async def test_recovers_to_closed(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
-        fn = _decorate(f"lab5326-recover-{is_async}", is_async=is_async, executions=executions)
+        fn = _decorate(f"cbrecover-recover-{is_async}", is_async=is_async, executions=executions)
         (breaker,) = live_breakers
         await _open(fn, resolver, breaker)
 
@@ -371,7 +371,7 @@ class TestKnobPathRecovery:
 
     async def test_recovers_after_configured_recovery_timeout(self, is_async, resolver, backend, clock):
         executions: list[str] = []
-        fn = _decorate(f"lab5326-knob-{is_async}", is_async=is_async, executions=executions, circuit_breaker=self._KNOBS)
+        fn = _decorate(f"cbrecover-knob-{is_async}", is_async=is_async, executions=executions, circuit_breaker=self._KNOBS)
 
         def breaker_state() -> str:
             return fn.get_health_status()["circuit_breaker"]["state"]
@@ -426,7 +426,7 @@ class TestUnreportedProbesDoNotStrandTheBreaker:
         """``CancelledError`` is a ``BaseException``: no ``except Exception`` records it."""
         never = asyncio.Event()
 
-        @cache(ttl=300, l1_enabled=False, namespace="lab5326-strand-cancel")
+        @cache(ttl=300, l1_enabled=False, namespace="cbrecover-strand-cancel")
         async def fn(x: str) -> str:
             if x.startswith("stranded"):
                 await never.wait()
@@ -445,7 +445,7 @@ class TestUnreportedProbesDoNotStrandTheBreaker:
         """Interop refuses an out-of-model return value; the lock path re-raises it unrecorded."""
         locking = resolver.backend = _LockingBackend()
 
-        @cache(ttl=300, l1_enabled=False, namespace="lab5326-strand-interop-out", interop="op")
+        @cache(ttl=300, l1_enabled=False, namespace="cbrecover-strand-interop-out", interop="op")
         async def fn(x: str) -> Any:
             if x.startswith("stranded"):
                 return {x}  # a set is outside the interop data model
@@ -469,7 +469,7 @@ class TestUnreportedProbesDoNotStrandTheBreaker:
         starts over once its budget is spent and the timeout has passed.
         """
 
-        @cache(ttl=300, l1_enabled=False, namespace="lab5326-strand-prefix", interop="op")
+        @cache(ttl=300, l1_enabled=False, namespace="cbrecover-strand-prefix", interop="op")
         def fn(x: str) -> str:
             return f"v:{x}"
 
@@ -511,7 +511,7 @@ class TestL1HitsBypassTheBreaker:
         self, is_async, resolver, live_breakers, clock, monkeypatch: pytest.MonkeyPatch
     ):
         executions: list[str] = []
-        fn = _decorate(f"lab5351-spy-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
+        fn = _decorate(f"cbl1-spy-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
 
@@ -534,7 +534,7 @@ class TestL1HitsBypassTheBreaker:
 
     async def test_open_breaker_serves_l1_hit(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
-        fn = _decorate(f"lab5351-open-hit-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
+        fn = _decorate(f"cbl1-open-hit-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
         _trip(breaker)
@@ -549,7 +549,7 @@ class TestL1HitsBypassTheBreaker:
 
     async def test_open_breaker_l1_miss_runs_uncached(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
-        fn = _decorate(f"lab5351-open-miss-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
+        fn = _decorate(f"cbl1-open-miss-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
         _trip(breaker)
@@ -564,7 +564,7 @@ class TestL1HitsBypassTheBreaker:
 
     async def test_half_open_l1_hits_spend_no_probe_and_do_not_close(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
-        fn = _decorate(f"lab5351-half-open-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
+        fn = _decorate(f"cbl1-half-open-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
         _trip(breaker)
@@ -592,7 +592,7 @@ class TestL1HitsBypassTheBreaker:
         """Serving L1 before admission does not pull backend resolution ahead of it for interop."""
         executions: list[str] = []
         fn = _decorate(
-            f"lab5351-interop-open-{int(is_async)}", is_async=is_async, executions=executions, l1_enabled=True, interop="op"
+            f"cbl1-interop-open-{int(is_async)}", is_async=is_async, executions=executions, l1_enabled=True, interop="op"
         )
         (breaker,) = live_breakers
         await _open(fn, resolver, breaker)  # leaves no backend resolved
@@ -641,7 +641,7 @@ class TestFunctionExceptionsDoNotCount:
         ids=["application-error", "function-raised-backend-error"],
     )
     async def test_breaker_stays_closed_and_caching_continues(self, is_async, backend, live_breakers, make_error):
-        fn, executions, raised = self._decorate_raising(f"lab5319-{is_async}", is_async, backend, make_error)
+        fn, executions, raised = self._decorate_raising(f"cberr-{is_async}", is_async, backend, make_error)
         (breaker,) = live_breakers
 
         for i in range(self._RAISES):
@@ -670,7 +670,7 @@ class TestFunctionExceptionsDoNotCount:
         then would run uncached: a raising function would still switch off its own caching.
         """
         backend = backend_cls()
-        fn, _, raised = self._decorate_raising(f"lab5319-probe-{is_async}-{backend_cls.__name__}", is_async, backend, ValueError)
+        fn, _, raised = self._decorate_raising(f"cberr-probe-{is_async}-{backend_cls.__name__}", is_async, backend, ValueError)
         (breaker,) = live_breakers
         _trip(breaker)
 
@@ -716,7 +716,7 @@ class TestFunctionExceptionsDoNotCount:
                 await asyncio.sleep(0)
             raise ValueError(x)
 
-        namespace = f"lab5319-stale-{is_async}-{backend_cls.__name__}"
+        namespace = f"cberr-stale-{is_async}-{backend_cls.__name__}"
         fn = cache(ttl=300, l1_enabled=False, namespace=namespace, backend=backend)(async_body if is_async else body)
         (breaker,) = live_breakers
 
@@ -752,7 +752,7 @@ class TestFunctionExceptionsDoNotCount:
             raise BackendError("backend unreachable", error_type=BackendErrorType.TRANSIENT)
 
         monkeypatch.setattr(wrapper_module, "_resolve_lazy_backend", unreachable)
-        fn = _decorate(f"lab5319-backend-{is_async}", is_async=is_async)
+        fn = _decorate(f"cberr-backend-{is_async}", is_async=is_async)
         (breaker,) = live_breakers
 
         for i in range(_DEFAULTS.failure_threshold):
@@ -877,7 +877,7 @@ class TestLateProbesOfAnEarlierCycle:
                 await asyncio.to_thread(hold)
             return f"v:{x}"
 
-        namespace = f"lab5374-{slow_at}-{outcome}-{is_async}-{backend_cls.__name__}"
+        namespace = f"cbslow-{slow_at}-{outcome}-{is_async}-{backend_cls.__name__}"
         fn = cache(ttl=300, l1_enabled=False, namespace=namespace, backend=backend)(async_body if is_async else body)
         (breaker,) = live_breakers
         slow = [f"slow-{i}" for i in range(self._SLOW)]
@@ -939,7 +939,7 @@ class TestLateProbesOfAnEarlierCycle:
             return backend
 
         monkeypatch.setattr(wrapper_module, "_resolve_lazy_backend", resolve)
-        fn = _decorate(f"lab5374-client-creation-{is_async}", is_async=is_async)  # lazy: resolved on a call
+        fn = _decorate(f"cbslow-client-creation-{is_async}", is_async=is_async)  # lazy: resolved on a call
         (breaker,) = live_breakers
         _trip(breaker)
 
@@ -985,7 +985,7 @@ class TestInteropValueContractOnDegradedPaths:
         kwargs: dict[str, Any] = {"interop": "op"}
         if scenario in ("open", "half-open-spent"):
             kwargs["backend"] = resolver.backend  # resolved before the breaker rejects anything
-        fn = cache(ttl=300, l1_enabled=False, namespace=f"lab5375-{scenario}-{int(is_async)}", **kwargs)(
+        fn = cache(ttl=300, l1_enabled=False, namespace=f"cbscenario-{scenario}-{int(is_async)}", **kwargs)(
             async_body if is_async else body
         )
         (breaker,) = live_breakers
@@ -1074,7 +1074,7 @@ class TestInteropValueContractOnDegradedPaths:
         async def async_body(x: str) -> Any:
             return body(x)
 
-        fn = cache(ttl=300, l1_enabled=False, namespace=f"lab5375-read-{int(is_async)}", interop="op", backend=backend)(
+        fn = cache(ttl=300, l1_enabled=False, namespace=f"cbscenario-read-{int(is_async)}", interop="op", backend=backend)(
             async_body if is_async else body
         )
         return fn, executions

@@ -231,9 +231,8 @@ jobs:
     # GitHub-hosted runner with no secrets and no OIDC token. The one credential
     # an unverified binary there can reach is the job's GITHUB_TOKEN, read-only
     # on fork PRs and expired when the job ends, and the runner is discarded
-    # afterwards, so nothing persists. Fork runs also need maintainer approval,
-    # and same-repo runs, which verify the binary and fail closed, far outnumber
-    # them.
+    # afterwards, so nothing persists. Same-repo runs, which verify the binary
+    # and fail closed, far outnumber fork runs.
     #
     # Do not re-pin below v7.0.0 (fb8b3582): releases published before Codecov's
     # June 2026 keybase migration fetch the CLI signing key from a deleted account,
@@ -495,8 +494,8 @@ jobs:
   # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
   # The program is the heredoc below; its regression fixtures are
   # .github/scripts/runner-drift-guard-selftest.sh, run first so a broken
-  # guard cannot pass anything. This is drift protection for maintainers, NOT
-  # a fork-PR control; that lives in repository and org runner settings.
+  # guard cannot pass anything. This is protection against MAINTAINER drift
+  # on trusted branches only.
   runner-drift-guard:
     name: Runner Drift Guard
     runs-on: ubuntu-latest

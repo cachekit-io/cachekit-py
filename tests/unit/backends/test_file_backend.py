@@ -2394,7 +2394,7 @@ class TestShortIO:
         assert not os.path.exists(file_path)
 
     def test_get_modified_payload_is_served_not_evicted(self, backend: FileBackend) -> None:
-        """AC4 at the backend layer: a same-length modification is not the backend's call.
+        """At the backend layer, a same-length modification is not the backend's call.
 
         Content integrity belongs to the envelope (xxHash3 checksum / AES-GCM tag), so the
         bytes are handed back unchanged and the file stays for the fail policy to judge.
@@ -2416,7 +2416,7 @@ class TestShortIO:
 
 @pytest.mark.unit
 class TestShortIOFailClosed:
-    """End-to-end on a real FileBackend: truncation and tampering stay distinguishable under fail-closed (AC4)."""
+    """End-to-end on a real FileBackend: truncation and tampering stay distinguishable under fail-closed."""
 
     _HEX_KEY = "a" * 64
 

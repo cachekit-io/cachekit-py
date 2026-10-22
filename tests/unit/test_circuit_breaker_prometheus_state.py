@@ -51,7 +51,7 @@ def _counts(namespace: str) -> dict[str, float]:
 
 
 def _namespace() -> str:
-    return f"lab6403-{uuid.uuid4().hex}"
+    return f"cbprom-{uuid.uuid4().hex}"
 
 
 def _breaker(namespace: str, **config: Any) -> CircuitBreaker:

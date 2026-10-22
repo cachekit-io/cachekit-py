@@ -182,7 +182,7 @@ class TestCompetitiveEvidenceAiocache:
 
     def test_evidence_json_tuple_problem(self):
         """
-        EVIDENCE for Requirement 0 AC-2:
+        EVIDENCE:
 
         Type Preservation: aiocache converts tuples to lists via JSON.
         cachekit preserves tuple types via MessagePack.
@@ -202,7 +202,7 @@ class TestCompetitiveEvidenceAiocache:
 
     def test_evidence_l1_l2_advantage(self):
         """
-        EVIDENCE for Requirement 0 AC-3:
+        EVIDENCE:
 
         Multi-pod apps - cachekit's L1+L2 beats aiocache's L2-only.
 
@@ -224,7 +224,7 @@ class TestCompetitiveEvidenceAiocache:
 
     def test_evidence_multi_feature_advantage(self):
         """
-        EVIDENCE for Requirement 0 AC-3:
+        EVIDENCE:
 
         Multi-pod apps:
         - Circuit breaker (aiocache: ❌)

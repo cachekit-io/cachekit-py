@@ -298,7 +298,7 @@ class TestEncryptedAtRestArchitecture(RedisIsolationMixin):
 
         @cache(
             ttl=300,
-            namespace="medium01",
+            namespace="l1pii",
             l1=L1CacheConfig(enabled=True),
             encryption=EncryptionConfig(
                 enabled=True,
@@ -330,7 +330,7 @@ class TestEncryptedAtRestArchitecture(RedisIsolationMixin):
         # Verify encrypted in L2 (Redis)
         redis_client = self.redis_client
         key_gen = CacheKeyGenerator()
-        cache_key = key_gen.generate_key(get_pii, (100,), {}, "medium01")
+        cache_key = key_gen.generate_key(get_pii, (100,), {}, "l1pii")
         l2_data = redis_client.get(self.get_scoped_key(cache_key))
         assert l2_data is not None
         l2_str = l2_data.decode("latin-1", errors="ignore")
@@ -342,7 +342,7 @@ class TestEncryptedAtRestArchitecture(RedisIsolationMixin):
         # L2-only mode also works (user can choose to disable L1 for extra security)
         @cache(
             ttl=300,
-            namespace="medium01_l2only",
+            namespace="l1pii_l2only",
             l1=L1CacheConfig(enabled=False),
             encryption=EncryptionConfig(
                 enabled=True,

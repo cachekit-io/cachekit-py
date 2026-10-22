@@ -72,7 +72,7 @@ class CacheKeyGenerator:
     # different frame tags, each evicting the other on every read at a 0% hit rate. An
     # instance is the only way to configure a built-in (ArrowSerializer(return_format=...)),
     # so that path is common, not exotic.
-    # ponytail: 16 bits, so distinct identities collide at ~1/65536 — a hit-rate risk only,
+    # 16 bits, so distinct identities collide at ~1/65536 — a hit-rate risk only,
     # since a collision still leaves the frame tags different and the mismatch guard fires.
     # Two instances of the SAME class with different constructor arguments share a code AND
     # a frame tag, so the guard does NOT separate them; use distinct namespaces.

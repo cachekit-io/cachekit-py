@@ -129,13 +129,13 @@ class TestRedisBackendInitialization:
 
         backend = RedisBackend(redis_url=url)
         try:
-            backend.set("lab352:roundtrip", b"\x00binary\xff", ttl=30)
-            assert backend.get("lab352:roundtrip") == b"\x00binary\xff"
+            backend.set("rawbytes:roundtrip", b"\x00binary\xff", ttl=30)
+            assert backend.get("rawbytes:roundtrip") == b"\x00binary\xff"
             # Prove the write landed in the instance the URL names
-            assert redis_isolated.get("lab352:roundtrip") == b"\x00binary\xff"
-            assert backend.delete("lab352:roundtrip") is True
+            assert redis_isolated.get("rawbytes:roundtrip") == b"\x00binary\xff"
+            assert backend.delete("rawbytes:roundtrip") is True
         finally:
-            redis_isolated.delete("lab352:roundtrip")
+            redis_isolated.delete("rawbytes:roundtrip")
 
 
 @pytest.mark.unit

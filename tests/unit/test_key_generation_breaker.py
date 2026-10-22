@@ -121,7 +121,7 @@ def _open(breaker: CircuitBreaker) -> None:
 class TestKeyGenerationFailureLeavesBreakerAlone:
     async def test_closed_stays_closed(self, is_async, backend, live_breakers, clock):
         executions: list[Any] = []
-        fn = _decorate(f"lab5376-closed-{is_async}", is_async=is_async, executions=executions)
+        fn = _decorate(f"keygenbreaker-closed-{is_async}", is_async=is_async, executions=executions)
         (breaker,) = live_breakers
 
         for _ in range(_DEFAULTS.failure_threshold * 3):
@@ -136,7 +136,7 @@ class TestKeyGenerationFailureLeavesBreakerAlone:
 
     async def test_half_open_stays_half_open_and_still_closes(self, is_async, backend, live_breakers, clock):
         executions: list[Any] = []
-        fn = _decorate(f"lab5376-half-open-{is_async}", is_async=is_async, executions=executions)
+        fn = _decorate(f"keygenbreaker-half-open-{is_async}", is_async=is_async, executions=executions)
         (breaker,) = live_breakers
         _open(breaker)
         clock.shift(_PAST_TIMEOUT)
@@ -155,7 +155,7 @@ class TestKeyGenerationFailureLeavesBreakerAlone:
 
     async def test_open_state_and_window_unchanged(self, is_async, backend, live_breakers, clock):
         executions: list[Any] = []
-        fn = _decorate(f"lab5376-open-{is_async}", is_async=is_async, executions=executions)
+        fn = _decorate(f"keygenbreaker-open-{is_async}", is_async=is_async, executions=executions)
         (breaker,) = live_breakers
         _open(breaker)
         opened_at = breaker._last_failure_time
@@ -180,7 +180,7 @@ class TestKeyGenerationFailureStillReported:
 
         monkeypatch.setattr(orchestrator_module.AsyncMetricsCollector, "record_cache_operation", spy)
         executions: list[Any] = []
-        fn = _decorate(f"lab5376-report-{is_async}", is_async=is_async, executions=executions)
+        fn = _decorate(f"keygenbreaker-report-{is_async}", is_async=is_async, executions=executions)
 
         with caplog.at_level(logging.INFO):
             await _unkeyable(fn, executions)

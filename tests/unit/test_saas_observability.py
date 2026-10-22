@@ -750,7 +750,7 @@ class TestMidPublishMemoryOrdering:
         """The end-to-end regression: backend.py catches session errors and sends
         NO session headers — the silent telemetry loss."""
         with self._mid_publish_state():
-            stats = _FunctionStats("lab511.mid_publish_probe")
+            stats = _FunctionStats("stats.mid_publish_probe")
             stats.record_miss()
             headers = _inject_metrics_headers(stats)
 
@@ -800,7 +800,7 @@ class TestForkResetHandlers:
     def test_reset_stats_after_fork_resets_registry_entries(self):
         from cachekit.decorators import wrapper as wrapper_module
 
-        stats = wrapper_module._get_function_stats("lab506.registry_reset_probe", l1_enabled=True)
+        stats = wrapper_module._get_function_stats("stats.registry_reset_probe", l1_enabled=True)
         stats.record_miss()
         old_registry_lock = wrapper_module._function_stats_registry_lock
 
@@ -810,7 +810,7 @@ class TestForkResetHandlers:
         info = stats.get_info()
         assert info.hits + info.misses == 0
         # Same instance stays registered — identity survives, state resets
-        assert wrapper_module._function_stats_registry["lab506.registry_reset_probe"] is stats
+        assert wrapper_module._function_stats_registry["stats.registry_reset_probe"] is stats
 
     def test_session_reset_state_mints_new_identity(self):
         from cachekit.decorators import session as session_module

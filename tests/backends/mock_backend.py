@@ -3,7 +3,7 @@
 Provides in-memory backend implementation matching production PerRequestRedisBackend
 architecture. Implements singleton store + per-request wrapper with tenant isolation.
 
-Fix #7: Matches production pattern exactly with URL-encoded tenant IDs and fail-fast validation.
+Matches production pattern exactly with URL-encoded tenant IDs and fail-fast validation.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ mock_tenant_context: ContextVar[str | None] = ContextVar("mock_tenant_context", 
 class PerRequestMockBackend:
     """Per-request mock backend wrapper with tenant isolation.
 
-    Fix #7: Matches production PerRequestRedisBackend pattern:
+    Matches production PerRequestRedisBackend pattern:
     - Accepts shared store dict (not creating per operation)
     - URL-encodes tenant IDs (matching Redis pattern)
     - Fail-fast validation for missing tenant_id
@@ -49,20 +49,20 @@ class PerRequestMockBackend:
             tenant_id: Tenant identifier for key scoping (None = fail-fast)
 
         Raises:
-            RuntimeError: If tenant_id is None (fail-fast validation - Fix #9)
+            RuntimeError: If tenant_id is None (fail-fast validation)
         """
-        # Fix #9: Fail-fast validation (matches production)
+        # Fail-fast validation (matches production)
         if tenant_id is None:
             raise RuntimeError(
                 "tenant_id cannot be None. Set tenant context via mock_tenant_context.set() "
                 "or ensure tenant_extractor returns non-None value."
             )
 
-        # Fix #7: Accept shared store (not creating per operation)
+        # Accept shared store (not creating per operation)
         self._store = store
         self._locks: dict[str, asyncio.Lock] = {}
 
-        # Fix #7: URL-encode tenant ID to prevent ':' collision (matches production)
+        # URL-encode tenant ID to prevent ':' collision (matches production)
         self._tenant_id = url_encode(tenant_id, safe="")
 
     @property
@@ -150,7 +150,7 @@ class PerRequestMockBackend:
     async def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check backend health status.
 
-        Fix #5: Does NOT leak tenant_id in health check response (matches production).
+        Does NOT leak tenant_id in health check response (matches production).
 
         Returns:
             Tuple of (is_healthy=True, details_dict)
@@ -279,7 +279,7 @@ class PerRequestMockBackend:
 class MockBackendProvider:
     """Test provider with singleton store + per-request wrapper pattern.
 
-    Fix #7: Matches RedisBackendProvider pattern exactly.
+    Matches RedisBackendProvider pattern exactly.
     - Singleton shared store (expensive to setup, shared across requests)
     - Per-request wrapper (cheap ~50ns, tenant-scoped)
 
@@ -297,7 +297,7 @@ class MockBackendProvider:
     def __init__(self):
         """Initialize provider with singleton shared store.
 
-        Fix #7: Creates shared store ONCE (matches production pattern).
+        Creates shared store ONCE (matches production pattern).
         """
         # Singleton shared store
         self._store: dict[str, tuple[bytes, int | None]] = {}
@@ -311,13 +311,13 @@ class MockBackendProvider:
             PerRequestMockBackend with tenant isolation
 
         Raises:
-            RuntimeError: If mock_tenant_context is not set (fail-fast - Fix #9)
+            RuntimeError: If mock_tenant_context is not set (fail-fast)
         """
         # Extract tenant from ContextVar (matches production)
         tenant_id = mock_tenant_context.get()
 
         # Create per-request wrapper (cheap: ~50ns)
-        # Fix #9: Fail-fast validation happens in PerRequestMockBackend.__init__
+        # Fail-fast validation happens in PerRequestMockBackend.__init__
         return PerRequestMockBackend(self._store, tenant_id)
 
     def clear(self):

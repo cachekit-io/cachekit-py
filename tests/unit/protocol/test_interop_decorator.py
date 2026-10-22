@@ -582,7 +582,7 @@ class TestInteropRejections:
             assert await wrapped(3) == 6
 
     def test_tenant_scoped_redis_wrapper_fails_closed(self):
-        """Panel CRIT regression (CWE-636): the default provider's Redis path is a
+        """Regression (CWE-636): the default provider's Redis path is a
         tenant-scoping wrapper (t:{tenant}:{key} on the wire) — it must expose
         key_prefix so the interop guard rejects it instead of silently diverging
         from the bare keys other SDKs use."""
@@ -604,7 +604,7 @@ class TestInteropRejections:
                 return x
 
     def test_z_suffix_sentinel_revives(self):
-        """Panel MAJ regression: JS/Rust writers emit ISO-8601 with a Z designator;
+        """Regression: JS/Rust writers emit ISO-8601 with a Z designator;
         Python 3.10's fromisoformat cannot parse it — the decoder must normalize,
         or foreign datetime-bearing entries get evicted on read."""
         import msgpack
@@ -686,7 +686,7 @@ class TestInteropEncryption:
         assert backend.store[key] != forged, "forged entry must be overwritten with ciphertext"
 
     def test_encrypted_out_of_model_value_raises_at_store(self, backend: DictBackend):
-        """Panel CRIT regression: EncryptionWrapper must not launder InteropError
+        """Regression: EncryptionWrapper must not launder InteropError
         into SerializationError — the encrypted store path fails loud too."""
         pytest.importorskip("cachekit._rust_serializer")
 
@@ -733,7 +733,7 @@ class TestInteropEncryption:
             reset_settings()
 
     def test_non_canonical_deployment_uuid_rejected(self, backend: DictBackend):
-        """Panel MAJ regression: Python normalizes UUIDs before key derivation;
+        """Regression: Python normalizes UUIDs before key derivation;
         other SDKs use the raw string — interop requires the canonical form."""
         pytest.importorskip("cachekit._rust_serializer")
         with pytest.raises(ConfigurationError, match="canonical"):

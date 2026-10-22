@@ -641,8 +641,8 @@ class TestOperationHandlerFreshnessDegradation:
         """A custom CacheHandlerStrategy built against the v0.18.0
         2-tuple (bytes, is_stale) signature must read as fresh_for=None (legacy L1
         lifetime), NOT raise a strict-unpack ValueError that the broad except
-        swallows into a permanent every-hit-is-a-miss cache bypass (expert-panel
-        finding). Third-party 2-tuple BACKENDS are padded upstream by
+        swallows into a permanent every-hit-is-a-miss cache bypass.
+        Third-party 2-tuple BACKENDS are padded upstream by
         StandardCacheHandler (tests/unit/backends/test_cachekitio_swr_transport.py)."""
         from unittest import mock
 
@@ -738,7 +738,7 @@ class TestOperationHandlerFreshnessDegradation:
 
 
 class TestSWRSchedulingHardening:
-    """CodeRabbit round-2 regressions: negative default window, arg snapshots,
+    """Regressions: negative default window, arg snapshots,
     slot release when scheduling fails."""
 
     def test_default_window_off_when_ttl_at_or_above_cap(self) -> None:
@@ -1215,11 +1215,11 @@ class TestRevalidationFailureWarnings:
         assert claimed == 1, "a forked child must open its own window with its own count"
 
 
-class TestPanelFollowUps:
+class TestSwrFollowUpRegressions:
     """Fast-follow regressions (fixes on top of the merged #228)."""
 
     def test_sync_revalidation_preserves_contextvars_for_encryption(self) -> None:
-        """Panel MAJ: the daemon thread must see the caller's contextvars. With
+        """The daemon thread must see the caller's contextvars. With
         encryption + ContextVarExtractor (fail-closed on unset var), background
         revalidation must ACTUALLY execute and store — not silently no-op."""
         from cachekit.decorators.tenant_context import ContextVarExtractor
@@ -1251,7 +1251,7 @@ class TestPanelFollowUps:
         assert _wait_for(lambda: len(backend.set_calls) == 2), "revalidated value must be stored (encrypt succeeded)"
 
     def test_no_raw_cache_key_in_thread_name_or_debug_logs(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Panel MIN (CWE-532): thread names and SWR debug logs carry no raw key.
+        """CWE-532: thread names and SWR debug logs carry no raw key.
 
         The namespace segment of a cache key can carry tenant/user IDs; the
         revalidation thread name must be static and the SWR debug lines must
@@ -1298,7 +1298,7 @@ class TestPanelFollowUps:
 
 
 class TestFreshnessFailClosedPropagation:
-    """Panel should-fix 5: a future except-reorder must not demote the freshness
+    """A future except-reorder must not demote the freshness
     getters to fail-open with green tests — mirror the get_cached_value_async
     fail-closed contract on both new getters."""
 
@@ -1517,7 +1517,7 @@ class TestFreshForBoundedL1Backfill:
         assert len(backend.set_calls) == 1  # only the seeding write — no revalidation PUT
 
     async def test_no_ttl_backfill_clamps_to_l1_default_never_extends(self) -> None:
-        """Panel finding (CWE-613): with ttl=None the legacy L1 lifetime is
+        """CWE-613: with ttl=None the legacy L1 lifetime is
         DEFAULT_L1_TTL_SECONDS — a long server remainder must clamp to it, never
         extend local service toward the 30-day cap (DELETE-as-revocation relies
         on that ageout). A short remainder still shortens."""
