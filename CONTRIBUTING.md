@@ -210,6 +210,8 @@ The spawned server listens on a unix socket under pytest's base temp directory, 
 
 **Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
 
+**The nightly run.** `.github/workflows/nightly.yml` runs the suites no PR job selects, every night at 19:17 UTC. It has three independent jobs. The first runs `tests/competitive`. The second runs `tests/performance -m "performance and not slow"`, whose wall-clock numbers are reported, not asserted, and then the serializer micro-benchmarks once, untimed. The third builds the wheel on Python 3.10 and resolves it with `--resolution lowest`, so numpy, pandas and pyarrow sit at the `data` extra's floors. It then runs `tests/unit` against that wheel, not the source tree. A failed run opens or updates the "Nightly is failing" issue. To run it on demand, use **Run workflow** on the Actions page, or `gh workflow run nightly.yml`. A PR that edits the workflow file runs it too.
+
 ### Test Coverage
 
 - Aim for >85% coverage for new code
