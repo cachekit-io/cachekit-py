@@ -388,11 +388,11 @@ class TestLruCacheComparison:
 
 
 class TestCompetitiveClaimsEvidence:
-    """Document evidence for competitive claims from requirements.md."""
+    """Document evidence for competitive claims."""
 
     def test_evidence_type_preservation_tuples(self):
         """
-        EVIDENCE (type preservation):
+        EVIDENCE:
 
         "Type Preservation (tuples)" - cachekit preserves tuples through
         serialization (MessagePack), while JSON-based competitors (aiocache,
@@ -411,7 +411,7 @@ class TestCompetitiveClaimsEvidence:
 
     def test_evidence_single_process_upgrade_path(self):
         """
-        EVIDENCE (deployment fit):
+        EVIDENCE:
 
         Single-process apps:
         - Same ~50ns performance (in-memory L1 cache)
@@ -440,7 +440,7 @@ class TestCompetitiveClaimsEvidence:
 
     def test_evidence_multi_pod_advantages(self):
         """
-        EVIDENCE (deployment fit):
+        EVIDENCE:
 
         Multi-pod apps - @cache beats aiocache/redis-cache:
         - Circuit breaker (aiocache has none)

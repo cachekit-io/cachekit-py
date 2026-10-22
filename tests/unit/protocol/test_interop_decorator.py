@@ -582,7 +582,7 @@ class TestInteropRejections:
             assert await wrapped(3) == 6
 
     def test_tenant_scoped_redis_wrapper_fails_closed(self):
-        """Panel CRIT regression (CWE-636): the default provider's Redis path is a
+        """Regression (CWE-636): the default provider's Redis path is a
         tenant-scoping wrapper (t:{tenant}:{key} on the wire) — it must expose
         key_prefix so the interop guard rejects it instead of silently diverging
         from the bare keys other SDKs use."""
@@ -686,7 +686,7 @@ class TestInteropEncryption:
         assert backend.store[key] != forged, "forged entry must be overwritten with ciphertext"
 
     def test_encrypted_out_of_model_value_raises_at_store(self, backend: DictBackend):
-        """Panel CRIT regression: EncryptionWrapper must not launder InteropError
+        """Regression: EncryptionWrapper must not launder InteropError
         into SerializationError — the encrypted store path fails loud too."""
         pytest.importorskip("cachekit._rust_serializer")
 

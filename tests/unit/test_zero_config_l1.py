@@ -237,7 +237,7 @@ class TestZeroConfigParity:
 
 @pytest.mark.unit
 class TestConfiguredResolutionUnchanged:
-    """Resolution order: explicit backend=, set_default_backend(), a registered provider, one selector, REDIS_URL, then L1-only."""
+    """Explicit backend=, set_default_backend(), a registered provider, one selector, REDIS_URL, then L1-only."""
 
     def test_explicit_backend_wins(self, nothing_configured: mock.MagicMock) -> None:
         backend = _MemoryBackend()

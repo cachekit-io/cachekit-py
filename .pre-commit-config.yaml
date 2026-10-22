@@ -126,8 +126,8 @@ repos:
       - id: no-ticket-ids
         name: No internal ticket ids in tracked files
         # Ticket ids only, but in every file: code comments and docstrings are public too.
-        # Hyphenless spellings count too: an underscore, a space or nothing before the digits,
-        # as in a test name or a namespace. A lookbehind, not \b, anchors the match, because
+        # Hyphenless spellings count too: an underscore, a space or nothing before two or
+        # more digits, as in a test name or a namespace. A lookbehind, not \b, anchors the match, because
         # `_` is a word character.
         # CHANGELOG.md is generated from PR titles, which carry the one allowed id; the
         # title-lint workflow shows the title format; protocol fixtures are vendored

@@ -193,7 +193,7 @@ class TestCompetitiveEvidenceCachetools:
 
     def test_evidence_single_vs_multi_pod(self):
         """
-        EVIDENCE (deployment fit):
+        EVIDENCE:
 
         cachetools: Single-process (dict) by default, requires separate
                     backend config for Memcached multi-pod

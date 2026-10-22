@@ -804,7 +804,7 @@ class TestDecryptErrorTaxonomy:
         enc, meta = writer.serialize({"v": 42}, cache_key="key:a")
 
         # K1 is a decrypt-only entry here, so the read takes the fingerprint
-        # path (decrypt_at) — the path CodeRabbit did not flag but which shares
+        # path (decrypt_at) — the other path, which shares
         # the binding, and therefore the defect.
         reader = EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[K1])
 

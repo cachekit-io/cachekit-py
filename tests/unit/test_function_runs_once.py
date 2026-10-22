@@ -224,7 +224,7 @@ class TestLockReleaseFailureKeepsTheResult:
     async def test_after_the_store(self, redis_shaped: bool, caplog: pytest.LogCaptureFixture) -> None:
         backend = _FailingReleaseLockBackend(redis_shaped=redis_shaped)
         runs: list[int] = []
-        fn = self._fn(backend, runs, f"lockrelease-release-store-{int(redis_shaped)}")
+        fn = self._fn(backend, runs, f"lockerror-release-store-{int(redis_shaped)}")
 
         with caplog.at_level(logging.WARNING, logger="cachekit"):
             assert await fn(1) == 2
@@ -235,7 +235,7 @@ class TestLockReleaseFailureKeepsTheResult:
 
     @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)
     async def test_after_the_double_check_hit(self, redis_shaped: bool, caplog: pytest.LogCaptureFixture) -> None:
-        namespace = f"lockrelease-release-double-check-{int(redis_shaped)}"
+        namespace = f"lockerror-release-double-check-{int(redis_shaped)}"
         writer = _LockingBackend(redis_shaped=redis_shaped)
         assert await self._fn(writer, [], namespace)(1) == 2  # another worker's entry for fn(1)
         backend = _FailingReleaseLockBackend(redis_shaped=redis_shaped, fill=dict(writer.store))

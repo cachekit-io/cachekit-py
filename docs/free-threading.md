@@ -43,8 +43,8 @@ Rule of thumb applied throughout the audit:
 
 ## Concurrency audit
 
-Every lock-free fast path and shared mutable module/instance state, including what the free-threaded CI lane surfaced
-and sites added since the audit:
+The lock-free fast paths and shared mutable module/instance state the audit
+covered, plus what the free-threaded CI lane surfaced and sites added since:
 
 | Site | Mechanism | Verdict |
 |:-----|:----------|:--------|

@@ -1439,7 +1439,6 @@ class CacheSerializationHandler:
                         )
 
                 # Data is encrypted - use cached EncryptionWrapper for decryption
-                # Use cached instance instead of creating new one
                 if not metadata.tenant_id:
                     # Envelope claims encryption but lacks the tenant it was encrypted for —
                     # malformed or field-stripped. suspicious_envelope telemetry.

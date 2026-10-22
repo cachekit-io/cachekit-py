@@ -145,7 +145,7 @@ class TestFingerprintMismatch:
 
 class TestTenantMismatchRegression:
     """Tenant mismatch always raises at the wrapper, and is tamper-class
-    (auth_tamper telemetry + honored by fail-closed) per panel review — a
+    (auth_tamper telemetry + honored by fail-closed) — a
     foreign-tenant entry at this cache key is a cross-tenant substitution
     signature, not corruption."""
 

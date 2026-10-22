@@ -283,7 +283,7 @@ class TestKeyCarryingBackendErrorRedaction:
 
     ``BackendError.__str__`` includes a ``key=`` segment; the get() sinks
     interpolate the exception verbatim, so the exception text itself must be
-    redacted (CodeRabbit PR #264).
+    redacted (#264).
     """
 
     def _key_carrying_error(self) -> BackendError:
@@ -318,7 +318,7 @@ class TestStructuredLoggerCacheOperationRedaction:
     as the orchestrator sink: a value that arrives already redacted, or is a known
     sentinel, is emitted verbatim. Hashing it a second time would mint a different
     digest for the same key and break correlation between the two sinks
-    (CodeRabbit PR #264).
+    (#264).
     """
 
     def _emit(self, caplog: pytest.LogCaptureFixture, cache_key: str) -> str:

@@ -738,7 +738,7 @@ class TestOperationHandlerFreshnessDegradation:
 
 
 class TestSWRSchedulingHardening:
-    """CodeRabbit round-2 regressions: negative default window, arg snapshots,
+    """Regressions: negative default window, arg snapshots,
     slot release when scheduling fails."""
 
     def test_default_window_off_when_ttl_at_or_above_cap(self) -> None:
@@ -1251,7 +1251,7 @@ class TestSwrFollowUpRegressions:
         assert _wait_for(lambda: len(backend.set_calls) == 2), "revalidated value must be stored (encrypt succeeded)"
 
     def test_no_raw_cache_key_in_thread_name_or_debug_logs(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Panel MIN (CWE-532): thread names and SWR debug logs carry no raw key.
+        """CWE-532: thread names and SWR debug logs carry no raw key.
 
         The namespace segment of a cache key can carry tenant/user IDs; the
         revalidation thread name must be static and the SWR debug lines must
@@ -1298,7 +1298,7 @@ class TestSwrFollowUpRegressions:
 
 
 class TestFreshnessFailClosedPropagation:
-    """Panel should-fix 5: a future except-reorder must not demote the freshness
+    """A future except-reorder must not demote the freshness
     getters to fail-open with green tests — mirror the get_cached_value_async
     fail-closed contract on both new getters."""
 

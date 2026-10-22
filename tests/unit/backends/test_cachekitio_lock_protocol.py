@@ -640,7 +640,7 @@ class TestDecoratorDegradesOnLockError:
         backend, pool = _lock_failing_backend(status, body)
         runs: list[int] = []
 
-        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lockrelease")
+        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lockerror")
         async def compute(x: int) -> int:
             runs.append(x)
             return x * 2
