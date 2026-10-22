@@ -494,9 +494,10 @@ class HealthChecker:
                     last_check=datetime.now(timezone.utc),
                 )
 
-            state = self._circuit_breaker.state
-            failure_count = self._circuit_breaker.failure_count
-            success_count = self._circuit_breaker.success_count
+            # One locked snapshot, so the state and the counters agree
+            stats = self._circuit_breaker.get_stats()
+            state = stats["state"]
+            last_failure_time = stats["last_failure_time"]  # epoch seconds, 0.0 before the first failure
 
             # Map circuit breaker state to health status
             if state == "OPEN":
@@ -515,10 +516,10 @@ class HealthChecker:
                 message=message,
                 details={
                     "state": state,
-                    "failure_count": failure_count,
-                    "success_count": success_count,
+                    "failure_count": stats["failure_count"],
+                    "success_count": stats["success_count"],
                     "last_failure_time": (
-                        self._circuit_breaker.last_failure_time.isoformat() if self._circuit_breaker.last_failure_time else None
+                        datetime.fromtimestamp(last_failure_time, timezone.utc).isoformat() if last_failure_time else None
                     ),
                 },
                 last_check=datetime.now(timezone.utc),
