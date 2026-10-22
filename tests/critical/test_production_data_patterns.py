@@ -445,31 +445,16 @@ class TestProductionDataPatterns:
         }
         validate_roundtrip_integrity(self.serializer, enterprise_with_numpy)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=TypeError,
-        reason="AutoSerializer encodes a DataFrame only as the top-level value; nested in a dict it is refused as a "
-        "custom class, while the docs list DataFrames as preserved without that limit",
-    )
-    def test_pandas_dataframe_enterprise_scenarios(self):
+    @pytest.mark.parametrize("kind", ["DataFrame", "Series"])
+    def test_pandas_nested_in_dict_is_refused(self, kind):
+        # A DataFrame or Series is encoded only as the whole cached value (top-level round trips are pinned in
+        # test_auto_serializer_mutation_and_corruption.py). Nested in a dict it is refused, and the error names
+        # that limit, as docs/serializers/auto.md does.
         pd = pytest.importorskip("pandas")
-        df = pd.DataFrame(
-            {
-                "user_id": [1, 2, 3, 4, 5],
-                "name": ["Alice", "Bob", "Carol", "Dave", "Eve"],
-                "department": ["Engineering", "Sales", "Marketing", "Engineering", "Sales"],
-                "salary": [75000.0, 65000.0, 70000.0, 80000.0, 72000.0],
-                "active": [True, True, False, True, True],
-            }
-        )
-        enterprise_with_dataframe = {
-            "employee_data": df,
-            "report_metadata": {"generated_by": "hr_system", "report_date": "2024-08-03", "total_employees": len(df)},
-        }
-        serialized, metadata = self.serializer.serialize(enterprise_with_dataframe)
-        result = self.serializer.deserialize(serialized, metadata)
-        pd.testing.assert_frame_equal(result["employee_data"], df)
-        assert result["report_metadata"] == enterprise_with_dataframe["report_metadata"]
+        df = pd.DataFrame({"salary": [75000.0, 65000.0]})
+        value = df if kind == "DataFrame" else df["salary"]
+        with pytest.raises(TypeError, match="pandas DataFrames and Series as the top-level value only"):
+            self.serializer.serialize({"employee_data": value, "report_metadata": {"generated_by": "hr_system"}})
 
     def test_datetime_objects_enterprise_patterns(self):
         # timedelta is not in AutoSerializer's supported set (datetime, date, time), so it is not part of this payload

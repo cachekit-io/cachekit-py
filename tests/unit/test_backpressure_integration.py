@@ -33,8 +33,10 @@ class TestBackpressureIntegration:
         FeatureOrchestrator.__init__ = patched_init
 
         try:
+            # Non-default queue_size and timeout: the controller's defaults (1000, 0.1) would hide a dropped field
+            backpressure = BackpressureConfig(enabled=True, max_concurrent_requests=50, queue_size=7, timeout=0.25)
 
-            @cache(config=DecoratorConfig(ttl=60, backpressure=BackpressureConfig(enabled=True, max_concurrent_requests=50)))
+            @cache(config=DecoratorConfig(ttl=60, backpressure=backpressure))
             def test_function(x):
                 return x * 2
 
@@ -49,6 +51,8 @@ class TestBackpressureIntegration:
             assert features_instance.backpressure is not None
             assert isinstance(features_instance.backpressure, BackpressureController)
             assert features_instance.backpressure.max_concurrent == 50
+            assert features_instance.backpressure.queue_size == 7
+            assert features_instance.backpressure.timeout == 0.25
 
         finally:
             FeatureOrchestrator.__init__ = original_init

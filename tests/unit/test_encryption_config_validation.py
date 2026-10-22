@@ -109,50 +109,23 @@ class TestEncryptionConfigValidation:
         error_msg = str(exc_info.value)
         assert "hex" in error_msg.lower() or "encoded" in error_msg.lower()
 
-    @pytest.mark.parametrize(
-        "env_value,expected_env",
-        [
-            ("production", "production"),
-            ("prod", "prod"),
-            ("prd", "prd"),
-            ("PRODUCTION", "production"),  # Case insensitive
-            ("staging", None),  # Not production
-            ("development", None),  # Not production
-        ],
-    )
-    def test_validate_production_environment_warning(self, env_value, expected_env, monkeypatch, caplog):
-        """Production environment should log security warning."""
+    @pytest.mark.parametrize("env_value", ["production", "staging", None])
+    def test_env_key_warning_ignores_env(self, env_value, monkeypatch, caplog):
+        """The env-var key warning depends only on dev_mode: with it off, every ENV value (or none) gets it."""
         import secrets
 
-        # Set valid master key
-        master_key = secrets.token_hex(32)
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_key)
-
-        # Set environment
-        if env_value:
-            monkeypatch.setenv("ENV", env_value)
-        else:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", secrets.token_hex(32))
+        monkeypatch.delenv("CACHEKIT_DEV_MODE", raising=False)
+        if env_value is None:
             monkeypatch.delenv("ENV", raising=False)
-
+        else:
+            monkeypatch.setenv("ENV", env_value)
         caplog.set_level(logging.WARNING)
 
-        # Validate
         validate_encryption_config(encryption=True)
 
-        # Check for production warning
-        warning_messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
-
-        if expected_env:
-            # Should have production warning
-            has_prod_warning = any(
-                "PRODUCTION" in msg.upper()
-                and ("environment variable" in msg.lower() or "secure" in msg.lower() or "vault" in msg.lower())
-                for msg in warning_messages
-            )
-            assert has_prod_warning, f"Expected production warning for ENV={env_value}"
-        else:
-            # Should NOT have production warning (or it's optional)
-            pass
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(ENV_KEY_WARNING in msg for msg in warnings), f"no env-var key warning for ENV={env_value!r}: {warnings}"
 
     def test_validate_error_message_includes_remediation(self, monkeypatch):
         """ConfigurationError messages should include remediation guidance."""

@@ -712,6 +712,7 @@ def create_cache_wrapper(
         function so it is part of the args hash. See docs/features/zero-knowledge-encryption.md.
     """
     circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
+    backpressure_limits: dict[str, int | float] = {}  # empty = BackpressureController's queue_size / timeout defaults
     # L1-only (in-process, no backend) is chosen only by config.backend None, below: one switch for every caller.
     _l1_only_mode = False
 
@@ -757,6 +758,7 @@ def create_cache_wrapper(
         # Backpressure settings
         backpressure = config.backpressure.enabled
         max_concurrent_requests = config.backpressure.max_concurrent_requests
+        backpressure_limits = {"queue_size": config.backpressure.queue_size, "timeout": config.backpressure.timeout}
 
         # Monitoring settings
         collect_stats = config.monitoring.collect_stats
@@ -1006,7 +1008,7 @@ def create_cache_wrapper(
         circuit_breaker_enabled=use_circuit_breaker,
         circuit_breaker_config=circuit_breaker_config,
         backpressure_enabled=use_backpressure,
-        backpressure_config={"max_concurrent": max_concurrent_requests} if use_backpressure else None,
+        backpressure_config={"max_concurrent": max_concurrent_requests, **backpressure_limits} if use_backpressure else None,
         collect_stats=use_collect_stats,
         enable_structured_logging=use_enable_structured_logging,
     )

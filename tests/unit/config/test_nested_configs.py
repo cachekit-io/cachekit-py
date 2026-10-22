@@ -10,6 +10,10 @@ Tests all 5 nested config classes:
 
 from __future__ import annotations
 
+import threading
+from decimal import Decimal
+from fractions import Fraction
+
 import pytest
 
 from cachekit.config.decorator import DecoratorConfig
@@ -189,17 +193,50 @@ class TestBackpressureConfig:
         config = BackpressureConfig(max_concurrent_requests=1)
         assert DecoratorConfig(backpressure=config).backpressure is config
 
-    def test_validate_max_concurrent_requests_too_small(self) -> None:
-        """Test validation fails when max_concurrent_requests < 1."""
-        config = BackpressureConfig(max_concurrent_requests=0)
-        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be >= 1, got 0"):
+    @pytest.mark.parametrize("max_concurrent", [0, -10, 1.5, float("nan"), float("inf"), True])
+    def test_validate_max_concurrent_requests_invalid(self, max_concurrent: float) -> None:
+        """Below 1 nothing runs; from NaN, inf or a fraction threading.Semaphore never reaches 0, so nothing is limited."""
+        config = BackpressureConfig(max_concurrent_requests=max_concurrent)  # pyright: ignore[reportArgumentType]
+        with pytest.raises(
+            ConfigurationError, match=f"max_concurrent_requests must be a whole number >= 1, got {max_concurrent!r}"
+        ):
             config.validate()
 
-    def test_validate_max_concurrent_requests_negative(self) -> None:
-        """Test validation fails for negative max_concurrent_requests."""
-        config = BackpressureConfig(max_concurrent_requests=-10)
-        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be >= 1, got -10"):
-            config.validate()
+    def test_validate_limit_minimums(self) -> None:
+        """queue_size=1 and timeout=0 (no wait for a permit), the minimums, pass."""
+        config = BackpressureConfig(queue_size=1, timeout=0.0)
+        assert DecoratorConfig(backpressure=config).backpressure is config
+
+    def test_validate_numpy_values(self) -> None:
+        """NumPy integers (they have __index__) and np.float64 (a float subclass) pass, as threading.Semaphore takes
+        them. np.float32 is refused: Semaphore.acquire raises TypeError for it."""
+        np = pytest.importorskip("numpy")
+        for timeout in (np.float64(0.5), np.int64(1)):
+            config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16), timeout=timeout)
+            assert DecoratorConfig(backpressure=config).backpressure is config
+        with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
+            BackpressureConfig(timeout=np.float32(0.5)).validate()
+
+    @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
+    def test_validate_queue_size_invalid(self, queue_size: float) -> None:
+        """Below 1 every operation is rejected (each joins the queue); NaN or inf would remove the cap."""
+        with pytest.raises(ConfigurationError, match=f"queue_size must be a whole number >= 1, got {queue_size!r}"):
+            BackpressureConfig(queue_size=queue_size).validate()  # pyright: ignore[reportArgumentType]
+
+    @pytest.mark.parametrize(
+        "timeout",
+        [-0.1, 1e10, float("inf"), float("nan"), True, None, "0.1", Decimal("0.1"), Fraction(1, 10)],
+    )
+    def test_validate_timeout_invalid(self, timeout: object) -> None:
+        """Outside 0 to TIMEOUT_MAX NaN never returns from a wait and inf or 1e10 raises OverflowError; a value
+        that is not an int or float (None, a str, a Decimal, a Fraction) is refused before it reaches the wait."""
+        with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
+            BackpressureConfig(timeout=timeout).validate()  # pyright: ignore[reportArgumentType]
+
+    def test_validate_timeout_max_accepted(self) -> None:
+        """threading.TIMEOUT_MAX itself is a valid permit wait."""
+        config = BackpressureConfig(timeout=threading.TIMEOUT_MAX)
+        assert DecoratorConfig(backpressure=config).backpressure is config
 
 
 @pytest.mark.unit

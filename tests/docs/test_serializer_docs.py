@@ -1,13 +1,15 @@
-"""Ground truth validation for serializer documentation (Arrow and Orjson).
+"""Ground truth validation for serializer documentation (Arrow, Orjson and the AutoSerializer table).
 
 This module validates every testable claim about ArrowSerializer and OrjsonSerializer
-in README.md and docs/guides/serializer-guide.md. Tests execute what documentation
+in README.md and docs/guides/serializer-guide.md, and the StandardSerializer column of
+docs/serializers/auto.md. Tests execute what documentation
 claims - when docs lie, tests fail loudly.
 
 **Coverage**:
 - README.md lines 148-165 (Smart Serialization section)
 - docs/guides/serializer-guide.md lines 40-253 (OrjsonSerializer section)
 - docs/guides/serializer-guide.md lines 93-334 (ArrowSerializer section)
+- docs/serializers/auto.md "What It Preserves" table (StandardSerializer column)
 
 **Expected Test Count**: ~25 tests validating serializer claims
 
@@ -17,7 +19,7 @@ claims - when docs lie, tests fail loudly.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time
 from uuid import UUID
 
 import pytest
@@ -31,6 +33,7 @@ pd = pytest.importorskip("pandas")
 pytest.importorskip("pyarrow")
 
 from cachekit.serializers import ArrowSerializer, AutoSerializer, OrjsonSerializer  # noqa: E402  (needs orjson)
+from cachekit.serializers.standard_serializer import StandardSerializer  # noqa: E402
 
 
 @pytest.mark.critical
@@ -309,6 +312,39 @@ class TestArrowSerializerDocClaims:
         # Metadata format should be ARROW (dedicated format enum)
         assert metadata.format == SerializationFormat.ARROW, "ArrowSerializer uses ARROW format"
         assert SerializationFormat.ARROW.value == "arrow"
+
+
+@pytest.mark.critical
+class TestAutoSerializerTableClaims:
+    """docs/serializers/auto.md "What It Preserves": the Default (StandardSerializer) column, row by row."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param((1, 2), [1, 2], id="tuple-to-list"),
+            pytest.param(datetime(2026, 3, 28, 12, 0), datetime(2026, 3, 28, 12, 0), id="datetime-preserved"),
+            pytest.param(date(2026, 3, 28), date(2026, 3, 28), id="date-preserved"),
+            pytest.param(time(12, 30), time(12, 30), id="time-preserved"),
+        ],
+    )
+    def test_default_round_trip(self, value, expected):
+        serializer = StandardSerializer()
+        data, metadata = serializer.serialize(value)
+        result = serializer.deserialize(data, metadata)
+        assert result == expected
+        assert type(result) is type(expected)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param({1, 2}, id="set"),
+            pytest.param(frozenset({1, 2}), id="frozenset"),
+            pytest.param(UUID("12345678-1234-5678-1234-567812345678"), id="uuid"),
+        ],
+    )
+    def test_default_raises_type_error(self, value):
+        with pytest.raises(TypeError):
+            StandardSerializer().serialize(value)
 
 
 @pytest.mark.critical

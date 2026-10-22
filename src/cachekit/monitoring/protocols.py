@@ -4,8 +4,7 @@ Defines the interfaces that health-checkable components must implement.
 These enable health.py to check components without coupling to their concrete implementations.
 """
 
-from datetime import datetime
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 
 class PoolManagerProtocol(Protocol):
@@ -21,26 +20,19 @@ class PoolManagerProtocol(Protocol):
 
 
 class CircuitBreakerProtocol(Protocol):
-    """Protocol for circuit breakers that can be health checked."""
+    """Protocol for circuit breakers that can be health checked.
 
-    @property
-    def state(self) -> str:
-        """Get circuit breaker state (OPEN, HALF_OPEN, CLOSED)."""
-        ...
+    ``cachekit.reliability.CircuitBreaker`` implements it.
+    """
 
-    @property
-    def failure_count(self) -> int:
-        """Get failure count."""
-        ...
+    def get_stats(self) -> dict[str, Any]:
+        """Get a consistent snapshot of the breaker.
 
-    @property
-    def success_count(self) -> int:
-        """Get success count."""
-        ...
-
-    @property
-    def last_failure_time(self) -> Optional[datetime]:
-        """Get last failure time."""
+        Returns:
+            Dictionary with at least ``state`` (the state name: ``"CLOSED"``, ``"OPEN"`` or
+            ``"HALF_OPEN"``), ``failure_count``, ``success_count`` and ``last_failure_time``
+            (epoch seconds of the last counted failure, ``0.0`` before the first).
+        """
         ...
 
 
