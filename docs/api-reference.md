@@ -217,7 +217,7 @@ def get_exchange_rates():
 #### Notes
 
 - Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
-- L1 in-memory cache is enabled — hot data is served at ~50ns without an HTTP round-trip
+- L1 in-memory cache is enabled — hot data is served from process memory without an HTTP round-trip (each L1 hit deserializes the stored bytes)
 - Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` disables both expiry and SWR.
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 

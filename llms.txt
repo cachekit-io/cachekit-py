@@ -146,7 +146,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 
 ## L1+L2 Dual-Layer Cache
 
-- L1: In-memory — per-process, no network; a hit takes microseconds (README, Performance)
+- L1: In-memory — per-process, no network; a `backend=None` hit takes under a microsecond on a hosted runner, and with a backend each hit also deserializes (README, Performance)
 - L2: Backend — one round trip per read, shared across processes
 - L1 backfill on L2 hit, automatic invalidation
 

@@ -15,6 +15,8 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from cachekit import cache
 from cachekit.decorators.stats_context import get_current_function_stats
@@ -143,6 +145,29 @@ class TestKeyBytesUnchanged:
             fn(*args, **kwargs)
         expected = _key_now(fn, args, kwargs, "memo")
         assert backend.reads == [expected] * 3
+
+    # Values that compare equal across types (1, 1.0, True; 0, 0.0, -0.0, False), values just past
+    # the length cap, and a few the memo never takes, so equal-but-different calls interleave.
+    _ARGS = st.sampled_from(
+        [0, 1, 1.0, True, False, 0.0, -0.0, None, "", "1", b"1", "x" * _MEMO_MAX_LEN, "x" * (_MEMO_MAX_LEN + 1), _Color.RED, [1]]
+    )
+
+    @settings(max_examples=200, deadline=None)
+    @given(
+        calls=st.lists(
+            st.tuples(st.lists(_ARGS, max_size=3), st.dictionaries(st.sampled_from("ab"), _ARGS, max_size=2)), max_size=12
+        )
+    )
+    def test_any_call_sequence_reads_the_generated_keys(self, calls: list[tuple[list[Any], dict[str, Any]]]) -> None:
+        backend = _RecordingBackend()
+
+        @cache(backend=backend, l1_enabled=False, ttl=60, namespace="memo", encryption=False)
+        def fn(*a: Any, **k: Any) -> int:
+            return 1
+
+        for args, kwargs in calls:
+            fn(*args, **kwargs)
+            assert backend.reads[-1] == _key_now(fn, tuple(args), kwargs, "memo")
 
     def test_keyword_order_does_not_change_the_key(self) -> None:
         backend = _RecordingBackend()

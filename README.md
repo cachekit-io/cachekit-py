@@ -266,16 +266,16 @@ What a call costs inside your process, from the wall-clock guards in `tests/perf
 
 | Path | Time per call |
 |:-----|--------------:|
-| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 6.70 ± 0.09 µs |
-| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 6.69 ± 0.04 µs |
-| L1 hit with an L2 backend configured, same dict | 302 ± 19 µs |
-| Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 562 ± 25 µs |
+| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.861 ± 0.001 µs |
+| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.87 ± 0.01 µs |
+| L1 hit with an L2 backend configured, same dict | 286 ± 19 µs |
+| Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 540 ± 27 µs |
 
-- With no backend, L1 keeps the returned object itself, so a hit costs key generation and a lookup, whatever the payload's size.
-- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 45 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 11 ± 16 µs, inside the noise.
+- With no backend, L1 keeps the returned object itself, whatever the payload's size. A repeat call also finds its cache key in a per-function memo instead of building it again, when every argument is an `int`, `float`, `bool`, `None`, a `str` of up to 256 characters or `bytes` of up to 256 bytes. Other arguments, such as a list, a dict, a `datetime` or a longer string, build the key on every call.
+- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 330 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 12 ± 20 µs, inside the noise.
 - An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
 
-Hosted runners come with other CPU models too: a run on an EPYC 9V45 runner took 46-61% as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
+Hosted runners come with other CPU models too: a run of the same commit on an EPYC 9V74 runner took 66-75% as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
 
 ---
 

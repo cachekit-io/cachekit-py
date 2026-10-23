@@ -280,7 +280,7 @@ if it supplies the key.
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
-    # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
+    # L1 cache enabled: stores encrypted bytes; each hit decrypts, with no network round trip
     # Encryption is orthogonal: wraps any allowed serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined

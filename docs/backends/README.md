@@ -94,7 +94,7 @@ class BaseBackend(Protocol):
 
 | Backend | Latency | Persistence | Cross-Process | TTL | Locking |
 |---------|---------|-------------|---------------|-----|---------|
-| **L1 (In-Memory)** | ~50ns | No | No | No | No |
+| **L1 (In-Memory)** | 0.86μs per `backend=None` hit ([measured](../performance.md#github-hosted-runner)); with a backend, a hit also deserializes | No | No | No | No |
 | **[File](file.md)** | set = fsync + a scan of every entry, so slow on a large cache; get waits on a concurrent set ([cost model](file.md#performance-characteristics)) | Yes (disk) | Format shared; one writer process | Yes | File locks |
 | **[Redis](redis.md)** | 1–7ms | Yes (RDB/AOF) | Yes | Yes | Yes |
 | **[Memcached](memcached.md)** | 1–5ms | No | Yes | Yes (max 30d) | No |
@@ -401,7 +401,7 @@ these still resolve a backend with nothing configured, and get Redis at
 
 | Backend | Latency | Use Case | Notes |
 |---------|---------|----------|-------|
-| **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
+| **L1 (In-Memory)** | 0.86μs per `backend=None` hit ([measured](../performance.md#github-hosted-runner)) | Repeated calls in same process | Process-local only |
 | **File** | set = fsync, flat in cache size, except eviction, rejection and the 30 s rescan, which scan the directory; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | 1-7ms | Shared cache across pods | Recommended production backend |
 | **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |

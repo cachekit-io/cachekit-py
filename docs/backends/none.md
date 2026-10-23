@@ -16,7 +16,7 @@ def expensive_computation(x: int) -> dict:
 # First call: computes
 result = expensive_computation(42)
 
-# Second call: served from L1 in-memory cache (~50ns)
+# Second call: served from L1 in-memory cache, no serialization or network
 result = expensive_computation(42)
 ```
 
@@ -47,7 +47,7 @@ With `backend=None`, cachekit skips L2 entirely. The data flow is:
 
 ```
 @cache(backend=None)
-  └─ L1 In-Memory Cache (~50ns)
+  └─ L1 In-Memory Cache
      ├─ Hit → return cached value
      └─ Miss → call function → store in L1 → return
 ```
@@ -204,7 +204,7 @@ assert len(calls) == 2  # ran on both calls: nothing was stored
 
 ## Characteristics
 
-- Latency: ~50ns (in-memory, no network)
+- Latency: 0.86μs per hit on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)); in-memory, no network
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
