@@ -1,0 +1,67 @@
+name: Bench
+
+# Runs the wall-clock guards behind the GitHub-hosted runner figures in
+# docs/performance.md and the README, on a GitHub-hosted runner, and writes
+# their run medians into the job summary. Run it from the Actions tab to
+# refresh those figures. A PR that changes this file runs it as well.
+# Informational only: nothing here gates a merge.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - .github/workflows/bench.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guards:
+    name: Performance guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        persist-credentials: false
+
+    - name: Start Redis (no persistence)
+      run: bash .github/scripts/start-redis.sh
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    - name: Install dependencies
+      run: uv sync --python 3.14 --group dev
+
+    - name: Record the machine
+      run: |
+        {
+          echo '```text'
+          uv run python --version
+          lscpu | grep -E '^(Model name|CPU\(s\)):'
+          echo '```'
+          echo
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Run the guards
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        uv run pytest tests/performance/test_production_realism.py -s -q -p no:cacheprovider \
+          -k "complex_dict or dataframe or with_backend or encryption_overhead or redis_l2" | tee guards.log
+        {
+          echo '```text'
+          grep -E '^[A-Z][A-Z0-9 +()=-]+$|^[A-Z].*:$|Run median|Absolute' guards.log
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
