@@ -10,7 +10,8 @@ msgpack-python bump cannot silently move it:
 - ``validate_data`` (which returns a bool) proves the same through a spy on the guard;
 - every accept vector decodes on every path at its declared depth (the bound cannot over-tighten);
 - fed to ``ByteStorage.retrieve`` as envelope bytes, every reject vector is refused by cachekit-core's
-  envelope pre-scan (Retrieve Flow step 2) and every accept vector gets past it, as a plain ValueError;
+  envelope pre-scan (Retrieve Flow step 2) for its own reason, as a plain ValueError, so a metadata-less
+  integrity-on read still falls through to the plain decode; every accept vector gets past the pre-scan;
 - the nesting ceiling is exactly MSGPACK_MAX_NESTING;
 - the read path turns a bomb into SerializationError (a controlled miss), not a crash.
 
@@ -192,13 +193,17 @@ class TestProtocolVectors:
 
 
 # cachekit-core's envelope pre-scan rejects as DeserializationFailed("decode pre-scan: <reason>"), which the
-# binding raises as a plain ValueError: the not-an-envelope signal AutoSerializer falls through on.
-ENVELOPE_PRE_SCAN_PREFIX = "Retrieval failed: deserialization failed: decode pre-scan: "
+# binding raises as a plain ValueError, not EnvelopeIntegrityError: the not-an-envelope signal on which
+# AutoSerializer.deserialize, called without metadata, falls through to the plain decode.
+PRE_SCAN_MARKER = "decode pre-scan: "
+ENVELOPE_PRE_SCAN_PREFIX = f"Retrieval failed: deserialization failed: {PRE_SCAN_MARKER}"
 # Core's nesting bound for the envelope decode (a real envelope nests 2 deep), not MSGPACK_MAX_NESTING.
 ENVELOPE_MAX_DEPTH = 100
-# The pre-scan's end-of-input rejection carries the prefix too, so the prefix alone would pass with the
-# depth or slot check deleted. A vector with one reason must be rejected for that reason.
-ENVELOPE_REJECT_REASONS = {"depth": f"nests deeper than {ENVELOPE_MAX_DEPTH} levels", "overclaim": "declares more "}
+# The reason a depth-only or overclaim-only vector must carry. The prefix alone survives deleting the slot
+# check, because the pre-scan's end-of-input rejection carries it too; the depth message pins core's bound.
+# "declares more " covers both the elements and the bytes overclaim. The incomplete vectors pin only the
+# prefix: core's slot budget rejects them as overclaims before they run out of input.
+PRE_SCAN_REJECT_ERRORS = {"depth": f"nests deeper than {ENVELOPE_MAX_DEPTH} levels", "overclaim": "declares more "}
 
 
 class TestEnvelopeEntryPoint:
@@ -210,31 +215,25 @@ class TestEnvelopeEntryPoint:
             ByteStorage("msgpack").retrieve(bytes.fromhex(vector["input_hex"]))
         assert type(excinfo.value) is ValueError, repr(excinfo.value)  # not EnvelopeIntegrityError
         message = str(excinfo.value)
-        assert message.startswith(ENVELOPE_PRE_SCAN_PREFIX), f"{vector['name']}: {message}"
-        if len(vector["reject_reasons"]) == 1 and vector["reject_reasons"][0] in ENVELOPE_REJECT_REASONS:
-            expected = ENVELOPE_REJECT_REASONS[vector["reject_reasons"][0]]
-            assert message.removeprefix(ENVELOPE_PRE_SCAN_PREFIX).startswith(expected), f"{vector['name']}: {message}"
+        reasons = vector["reject_reasons"]
+        expected = PRE_SCAN_REJECT_ERRORS.get(reasons[0], "") if len(reasons) == 1 else ""
+        assert message.startswith(ENVELOPE_PRE_SCAN_PREFIX + expected), f"{vector['name']}: {message}"
 
     @pytest.mark.parametrize("vector", VECTORS["accept_vectors"], ids=_vector_ids("accept_vectors"))
     def test_accept_vector_gets_past_the_pre_scan(self, vector: dict[str, Any]) -> None:
         # Not envelopes, so the typed decode still rejects them; the pre-scan must not.
         with pytest.raises(ValueError) as excinfo:
             ByteStorage("msgpack").retrieve(bytes.fromhex(vector["input_hex"]))
-        assert "decode pre-scan: " not in str(excinfo.value), f"{vector['name']}: {excinfo.value}"
+        assert PRE_SCAN_MARKER not in str(excinfo.value), f"{vector['name']}: {excinfo.value}"
 
     def test_value_deeper_than_the_envelope_bound_still_falls_through(self) -> None:
-        # A plain value nested past core's envelope bound but within MSGPACK_MAX_NESTING: the pre-scan
-        # refuses it as an envelope, and that plain ValueError is what lets an integrity-on reader decode it.
-        depth = ENVELOPE_MAX_DEPTH + 1
-        doc = b"\x91" * depth + b"\xc0"
+        # A plain value nested past core's envelope bound but within MSGPACK_MAX_NESTING: the pre-scan refuses
+        # it as an envelope, and that plain ValueError lets a metadata-less integrity-on deserialize decode it.
+        doc = b"\x91" * (ENVELOPE_MAX_DEPTH + 1) + b"\xc0"
         with pytest.raises(ValueError) as excinfo:
             ByteStorage("msgpack").retrieve(doc)
-        assert str(excinfo.value) == ENVELOPE_PRE_SCAN_PREFIX + ENVELOPE_REJECT_REASONS["depth"]
-        value: object = AutoSerializer().deserialize(doc)
-        for _ in range(depth):
-            assert isinstance(value, list) and len(value) == 1
-            value = value[0]
-        assert value is None
+        assert str(excinfo.value) == ENVELOPE_PRE_SCAN_PREFIX + PRE_SCAN_REJECT_ERRORS["depth"]
+        assert AutoSerializer().deserialize(doc) == msgpack.unpackb(doc)
 
 
 class TestOwnedBounds:

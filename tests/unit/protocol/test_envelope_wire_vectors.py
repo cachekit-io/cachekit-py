@@ -34,8 +34,9 @@ paths that:
    ``ByteStorage.retrieve`` with the error class and message its row names. The
    spec also asks that the reads of ``reject_original_size_over_cap`` and
    ``reject_ratio_bomb`` stay below ``original_size`` in allocation. That bound
-   is relied on through cachekit-core's allocation probe, which runs in core's CI
-   on the 0.7.0 this package pins: the spec lets an SDK over core do so when it
+   is relied on through cachekit-core's allocation probe, which ran in core's CI
+   on the exact version this package pins (``PROBE_VERIFIED_CORE_VERSION``,
+   checked against ``Cargo.lock``): the spec lets an SDK over core do so when it
    passes the envelope bytes through, and ``ByteStorage.retrieve`` hands them to
    core with no allocation of its own sized from an envelope field.
 7. **Payload decode bounds**: every ``payload_reject_vectors`` envelope passes the
@@ -54,6 +55,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import msgpack
@@ -68,6 +70,10 @@ from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 pytestmark = pytest.mark.unit
+
+CARGO_LOCK = Path(__file__).parents[3] / "Cargo.lock"
+# The cachekit-core release whose publish job ran core's allocation probe (docstring item 6).
+PROBE_VERIFIED_CORE_VERSION = "0.7.0"
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "wire-format.json"
 FIXTURE_SHA256 = "806de79dca2e0e6b221b8ec191526207d32f9fe5d88597098dd2549427b4993c"  # pragma: allowlist secret
@@ -240,6 +246,13 @@ REJECT_EXPECTATIONS: dict[str, tuple[type[Exception], str]] = {
 
 class TestRejectVectors:
     """Every reject vector is refused by the real FFI retrieve path with the error its row names."""
+
+    def test_core_pin_is_the_probe_verified_release(self):
+        """Item 6 relies on core's allocation probe, which counts only on the core release it ran on."""
+        pinned = re.search(r'name = "cachekit-core"\nversion = "([^"]+)"', CARGO_LOCK.read_text(encoding="utf-8"))
+        assert pinned, "Cargo.lock has no cachekit-core entry"
+        # A new core release needs its own probe run: check that its publish job ran it, then update the constant.
+        assert pinned[1] == PROBE_VERIFIED_CORE_VERSION
 
     def test_reject_vector_names_are_pinned(self):
         """An emptied or renamed group fails here instead of passing on zero parametrized cases."""
