@@ -1,17 +1,19 @@
 """The generated-key memo and the L1-only fast path.
 
-A decorated function remembers the key of each argument tuple it has generated one for, and an
-L1-only hit on a remembered key returns without setting the stats context. These pin what must not
-change: the key bytes, the counters, and which arguments may never share a memo entry.
+An L1-only function remembers the key of each argument tuple it has generated one for, and a hit on
+a remembered key returns without setting the stats context. These pin what must not change: the key
+bytes, the counters, which arguments may never share a memo entry, and which functions keep none.
 """
 
 from __future__ import annotations
 
 import asyncio
 import enum
+import sys
 import threading
 import types
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,8 +21,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cachekit import cache
+from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _FunctionStats, _memo_key
+from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _memo_key
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
@@ -94,6 +97,75 @@ class _RecordingBackend:
         return True, {}
 
 
+class _RecordingObjectCache(ObjectCache):
+    """An L1-only function's object cache that records the key of every lookup. Each call looks up
+    once: a memoised call under the memo's key, any other call under the key it generated."""
+
+    def __init__(self) -> None:
+        super().__init__(max_entries=None, max_size_bytes=1 << 20)
+        self.reads: list[str] = []
+
+    def get(self, key: str) -> tuple[bool, Any]:
+        self.reads.append(key)
+        return super().get(key)
+
+    def get_with_swr(self, key: str, ttl: float) -> tuple[bool, Any, bool, int]:
+        self.reads.append(key)
+        return super().get_with_swr(key, ttl)
+
+
+def _l1_reads(fn: Any) -> list[str]:
+    """Give an L1-only function a recording object cache; returns the keys it looks up."""
+    recording = _RecordingObjectCache()
+    for name in ("_object_cache", "_l1_fast_cache"):
+        _closure_cell(fn, name).cell_contents = recording
+    return recording.reads
+
+
+def _memo(fn: Any) -> dict[tuple[Any, ...], tuple[str, str, str]]:
+    return _closure_cell(fn, "_key_memo").cell_contents
+
+
+def _deep_size(obj: Any, seen: set[int] | None = None) -> int:
+    """Bytes held by obj and every dict, tuple, str, bytes and number under it, each counted once."""
+    seen = set() if seen is None else seen
+    if id(obj) in seen or isinstance(obj, type):
+        return 0
+    seen.add(id(obj))
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        size += sum(_deep_size(k, seen) + _deep_size(v, seen) for k, v in obj.items())
+    elif isinstance(obj, tuple):
+        size += sum(_deep_size(item, seen) for item in obj)
+    return size
+
+
+def _l1_only(is_async: bool) -> tuple[Any, Any]:
+    """An L1-only function returning its argument, sync or async, and a plain function that calls it."""
+    if is_async:
+
+        @cache(backend=None, ttl=60, namespace="memo", encryption=False)
+        async def afn(x: int) -> int:
+            return x
+
+        return afn, lambda x: asyncio.run(afn(x))
+
+    @cache(backend=None, ttl=60, namespace="memo", encryption=False)
+    def fn(x: int) -> int:
+        return x
+
+    return fn, fn
+
+
+class _MutableName:
+    """A __module__ whose text changes while it stays the same object."""
+
+    text = "before"
+
+    def __str__(self) -> str:
+        return self.text
+
+
 # Arguments no memo entry may answer for: containers, subclasses that compare equal to an admitted
 # type, other numeric types, and str/bytes past the length cap.
 _NOT_MEMOISED = [
@@ -132,6 +204,21 @@ class TestMemoKey:
     def test_a_str_subclass_keyword_name_is_not_memoised(self) -> None:
         assert _memo_key((), {_Str("x"): 1}) is None
 
+    def test_keyword_names_past_the_length_cap_are_not_memoised(self) -> None:
+        """**kwargs takes names of any length, and the memo keeps each name it is keyed by."""
+        assert _memo_key((), {"x" * _MEMO_MAX_LEN: 1}) is not None
+        assert _memo_key((), {"x" * (_MEMO_MAX_LEN + 1): 1}) is None
+        assert _memo_key((1,), {"x" * (_MEMO_MAX_LEN + 1): 1}) is None
+
+    def test_strings_and_keyword_names_share_one_length_budget(self) -> None:
+        half, rest = _MEMO_MAX_LEN // 2, _MEMO_MAX_LEN - _MEMO_MAX_LEN // 2
+        for extra in (0, 1):
+            fits = extra == 0
+            assert (_memo_key(("x" * half, "y" * (rest + extra)), {}) is not None) is fits
+            assert (_memo_key((b"x" * half, 1, "y" * (rest + extra)), {}) is not None) is fits
+            assert (_memo_key(("x" * half,), {"y" * (rest - 1 + extra): "z"}) is not None) is fits
+            assert (_memo_key((), {"x": "y" * (_MEMO_MAX_LEN - 2 + extra), "n": 1}) is not None) is fits
+
     def test_types_are_tested_by_identity_never_hashed_or_compared(self) -> None:
         """A metaclass that defines __eq__ makes a class unhashable; one that hashes and compares
         like int would pass a set-membership test. Neither may reach the memo."""
@@ -159,7 +246,8 @@ def _key_now(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any], namespace: 
 
 @pytest.mark.unit
 class TestKeyBytesUnchanged:
-    """With L1 off, every call reads L2 under the key it resolved, so the backend sees each key."""
+    """Every L1-only call looks up its object cache once, under the key it used (see
+    _RecordingObjectCache): a memoised call's must be the one the key generator builds now."""
 
     @pytest.mark.parametrize(
         ("args", "kwargs"),
@@ -181,16 +269,14 @@ class TestKeyBytesUnchanged:
         ],
     )
     def test_a_memoised_call_reads_the_generated_key(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-        backend = _RecordingBackend()
-
-        @cache(backend=backend, l1_enabled=False, ttl=60, namespace="memo", encryption=False)
+        @cache(backend=None, ttl=60, namespace="memo", encryption=False)
         def fn(*a: Any, **k: Any) -> int:
             return 1
 
+        reads = _l1_reads(fn)
         for _ in range(3):
             fn(*args, **kwargs)
-        expected = _key_now(fn, args, kwargs, "memo")
-        assert backend.reads == [expected] * 3
+        assert reads == [_key_now(fn, args, kwargs, "memo")] * 3
 
     # Values that compare equal across types (1, 1.0, True; 0, 0.0, -0.0, False), values just past
     # the length cap, and a few the memo never takes, so equal-but-different calls interleave.
@@ -205,46 +291,87 @@ class TestKeyBytesUnchanged:
         )
     )
     def test_any_call_sequence_reads_the_generated_keys(self, calls: list[tuple[list[Any], dict[str, Any]]]) -> None:
-        backend = _RecordingBackend()
-
-        @cache(backend=backend, l1_enabled=False, ttl=60, namespace="memo", encryption=False)
+        @cache(backend=None, ttl=60, namespace="memo", encryption=False)
         def fn(*a: Any, **k: Any) -> int:
             return 1
 
+        reads = _l1_reads(fn)
         for args, kwargs in calls:
             fn(*args, **kwargs)
-            assert backend.reads[-1] == _key_now(fn, tuple(args), kwargs, "memo")
+            assert reads[-1] == _key_now(fn, tuple(args), kwargs, "memo")
 
     def test_keyword_order_does_not_change_the_key(self) -> None:
-        backend = _RecordingBackend()
-
-        @cache(backend=backend, l1_enabled=False, ttl=60, namespace="memo", encryption=False)
+        @cache(backend=None, ttl=60, namespace="memo", encryption=False)
         def fn(**k: Any) -> int:
             return 1
 
+        reads = _l1_reads(fn)
         fn(a=1, b=2)
         fn(b=2, a=1)
         fn(a=1, b=2)
-        assert len(set(backend.reads)) == 1
+        assert reads == [_key_now(fn, (), {"a": 1, "b": 2}, "memo")] * 3
 
-    def test_a_rename_after_the_first_call_rekeys(self) -> None:
-        backend = _RecordingBackend()
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    def test_a_rename_after_the_first_call_rekeys(self, is_async: bool) -> None:
+        """sync_wrapper and async_wrapper each check an entry's names before they use its key."""
+        fn, call = _l1_only(is_async)
+        reads = _l1_reads(fn)
+        call(1)
+        fn.__wrapped__.__qualname__ = "renamed"
+        renamed = _key_now(fn, (1,), {}, "memo")
+        call(1)
+        fn.__wrapped__.__module__ = "elsewhere"
+        moved = _key_now(fn, (1,), {}, "memo")
+        call(1)
+        call(1)
+        assert ":renamed:" not in reads[0]
+        assert reads[1:] == [renamed, moved, moved]
+        assert ":elsewhere.renamed:" in moved
 
-        @cache(backend=backend, l1_enabled=False, ttl=60, namespace="memo", encryption=False)
+    def test_names_that_are_not_exact_str_are_never_memoised(self) -> None:
+        """The generator formats __module__ and __qualname__ on every call, and an object can format
+        another way while it stays the same object, so no memo entry may answer for it."""
+
+        @cache(backend=None, ttl=60, namespace="memo", encryption=False)
         def fn(x: int) -> int:
             return x
 
+        reads = _l1_reads(fn)
+        module = _MutableName()
+        fn.__wrapped__.__module__ = module
         fn(1)
-        fn.__wrapped__.__qualname__ = "renamed"
-        renamed = _key_now(fn, (1,), {}, "memo")
+        before = _key_now(fn, (1,), {}, "memo")
+        module.text = "after"
         fn(1)
-        fn.__wrapped__.__module__ = "elsewhere"
-        moved = _key_now(fn, (1,), {}, "memo")
+        assert reads == [before, _key_now(fn, (1,), {}, "memo")]
+        assert reads[0] != reads[1]
+        fn.__wrapped__.__module__ = "plain"
+        fn.__wrapped__.__qualname__ = _Str("fn")
         fn(1)
-        fn(1)
-        assert ":renamed:" not in backend.reads[0]
-        assert backend.reads[1:] == [renamed, moved, moved]
-        assert ":elsewhere.renamed:" in moved
+        assert _memo(fn) == {}
+
+    @pytest.mark.parametrize(
+        "decorate",
+        [
+            lambda b: cache(backend=b, ttl=60, namespace="memo", encryption=False),
+            lambda b: cache(backend=b, l1_enabled=False, ttl=60, namespace="memo", encryption=False),
+            lambda b: cache.secure(master_key="ab" * 32, backend=b, ttl=60, namespace="memo"),
+        ],
+        ids=["l1", "l1-off", "encrypted"],
+    )
+    def test_a_backed_function_keeps_no_memo(self, decorate: Any) -> None:
+        """Other processes invalidate a backed function's L1, and with L1 off or encryption on the
+        process otherwise holds no plaintext argument, so a backed call builds its key every time."""
+        backend = _RecordingBackend()
+
+        @decorate(backend)
+        def fn(x: str) -> str:
+            return x
+
+        for _ in range(3):
+            assert fn("alice@example.com") == "alice@example.com"
+        assert _memo(fn) == {}
+        assert len(set(backend.reads)) == 1
 
 
 @pytest.mark.unit
@@ -283,6 +410,8 @@ class TestL1OnlyFastPath:
             worker.join()
         info = fn.cache_info()
         assert (info.hits, info.l1_hits, info.misses) == (threads * per_thread, threads * per_thread, 1)
+        fn.cache_clear()
+        assert fn.cache_info().l1_hits == 0
 
     def test_the_memo_stays_bounded(self) -> None:
         @cache(backend=None, encryption=False)
@@ -291,7 +420,7 @@ class TestL1OnlyFastPath:
 
         for i in range(_MEMO_MAX_ENTRIES + 10):
             fn(i)
-        assert 0 < len(_closure_cell(fn, "_key_memo").cell_contents) <= _MEMO_MAX_ENTRIES
+        assert 0 < len(_memo(fn)) <= _MEMO_MAX_ENTRIES
 
     def test_a_miss_still_runs_inside_the_stats_context(self) -> None:
         seen: list[Any] = []
@@ -325,7 +454,7 @@ class TestL1OnlyFastPath:
         def fn(x: str) -> str:
             return x
 
-        memo = _closure_cell(fn, "_key_memo").cell_contents
+        memo = _memo(fn)
         fn("alice@example.com")
         fn("bob@example.com")
         assert len(memo) == 2
@@ -339,24 +468,66 @@ class TestL1OnlyFastPath:
         def fn(*, user: str, org: str) -> str:
             return user
 
-        memo = _closure_cell(fn, "_key_memo").cell_contents
+        memo = _memo(fn)
         fn(user="alice@example.com", org="a")
         fn(org="a", user="alice@example.com")
         assert len(memo) == 1
         fn.invalidate_cache(org="a", user="alice@example.com")
         assert memo == {}
 
-    def test_an_encrypted_function_memoises_nothing(self) -> None:
-        backend = _RecordingBackend()
+    def test_invalidation_spelled_another_way_forgets_the_memoised_arguments(self) -> None:
+        """A Path keys like its str, and invalidate_cache keys without _bypass_cache: each erases the
+        entry, so each must also forget whatever arguments the memo kept for that key."""
+        calls = 0
 
-        @cache.secure(master_key="ab" * 32, backend=backend, ttl=60)
-        def fn(x: str) -> str:
-            return x
+        @cache(backend=None, encryption=False)
+        def fn(x: Any) -> int:
+            nonlocal calls
+            calls += 1
+            return 1
 
+        memo = _memo(fn)
+        fn("alice@example.com")
+        fn("bob@example.com")
+        fn.invalidate_cache(Path("alice@example.com"))
+        assert list(memo) == [(str, "bob@example.com")]
+        fn.invalidate_cache("bob@example.com", _bypass_cache=True)
+        assert memo == {}
+        fn("alice@example.com")
+        fn("bob@example.com")
+        assert calls == 4
+
+    def test_a_full_memo_at_every_cap_stays_small(self) -> None:
+        """Every call at every cap: eight keyword names and eight values of 4-byte characters, sharing
+        _MEMO_MAX_LEN between them. The memo keeps all of it, which docs/performance.md bounds."""
+
+        @cache(backend=None, encryption=False)
+        def fn(**kwargs: Any) -> int:
+            return 1
+
+        wide = "\U0001f600"
+        each = _MEMO_MAX_LEN // (2 * _MEMO_MAX_ARGS)
+        for i in range(_MEMO_MAX_ENTRIES):
+            tag = f"{i:04x}"
+            fn(**{tag + chr(97 + j) + wide * (each - 5): tag + wide * (each - 4) for j in range(_MEMO_MAX_ARGS)})
+        memo = _memo(fn)
+        assert len(memo) == _MEMO_MAX_ENTRIES
+        assert _deep_size(memo) < 6 * 2**20
+
+    def test_keyword_names_past_the_cap_cache_without_the_memo(self) -> None:
+        calls = 0
+
+        @cache(backend=None, encryption=False)
+        def fn(**kwargs: Any) -> int:
+            nonlocal calls
+            calls += 1
+            return 1
+
+        name = "x" * (_MEMO_MAX_LEN + 1)
         for _ in range(3):
-            assert fn("alice@example.com") == "alice@example.com"
-        assert _closure_cell(fn, "_key_memo").cell_contents == {}
-        assert len(set(backend.reads)) == 1
+            fn(**{name: 1})
+        assert calls == 1
+        assert _memo(fn) == {}
 
     def test_bypass_and_invalidation_reach_a_memoised_call(self) -> None:
         calls = 0
@@ -375,38 +546,26 @@ class TestL1OnlyFastPath:
         fn(1)
         assert calls == 3
 
-    def test_async_hits_take_the_fast_path(self) -> None:
-        calls = 0
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    def test_a_memoised_hit_returns_before_the_stats_context_is_set(
+        self, is_async: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only _sync_call and _async_call set the stats context, so only the miss may reach one."""
+        sets = 0
+        set_stats = wrapper_module.set_current_function_stats
 
-        @cache(backend=None, encryption=False)
-        async def fn(x: int) -> int:
-            nonlocal calls
-            calls += 1
-            return x
+        def counting(stats: Any) -> Any:
+            nonlocal sets
+            sets += 1
+            return set_stats(stats)
 
-        async def run() -> None:
-            for _ in range(5):
-                assert await fn(3) == 3
-
-        asyncio.run(run())
+        monkeypatch.setattr(wrapper_module, "set_current_function_stats", counting)
+        fn, call = _l1_only(is_async)
+        fn.cache_clear()  # cache_info() counts per function identity, which _l1_only's functions share
+        for _ in range(5):
+            assert call(3) == 3
         info = fn.cache_info()
-        assert (calls, info.l1_hits, info.misses) == (1, 4, 1)
-
-
-@pytest.mark.unit
-def test_function_stats_count_l1_hits_from_many_threads_exactly() -> None:
-    stats = _FunctionStats("memo.threads")
-    threads, per_thread = 8, 10_000
-    workers = [threading.Thread(target=lambda: [stats.record_l1_hit() for _ in range(per_thread)]) for _ in range(threads)]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join()
-    stats.record_miss()
-    info = stats.get_info()
-    assert (info.hits, info.l1_hits, info.misses) == (threads * per_thread, threads * per_thread, 1)
-    stats.clear()
-    assert stats.get_info().l1_hits == 0
+        assert (sets, info.l1_hits, info.misses) == (1, 4, 1)
 
 
 @pytest.mark.unit
