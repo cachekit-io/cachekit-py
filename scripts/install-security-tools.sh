@@ -29,13 +29,6 @@ else
 	cargo install --locked cargo-geiger && echo "  ${GREEN}✓ cargo-geiger installed${RESET}"
 fi
 
-echo "${YELLOW}Installing cargo-semver-checks...${RESET}"
-if command -v cargo-semver-checks >/dev/null 2>&1; then
-	echo "  ${GREEN}✓ cargo-semver-checks already installed${RESET}"
-else
-	cargo install --locked cargo-semver-checks && echo "  ${GREEN}✓ cargo-semver-checks installed${RESET}"
-fi
-
 echo "${YELLOW}Installing cargo-machete...${RESET}"
 if command -v cargo-machete >/dev/null 2>&1; then
 	echo "  ${GREEN}✓ cargo-machete already installed${RESET}"
