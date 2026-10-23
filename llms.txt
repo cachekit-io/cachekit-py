@@ -30,12 +30,12 @@ def get_patient(id: int):
 
 4 built-in backends, all implementing the BaseBackend protocol (get/set/delete/exists/health_check):
 
-| Backend | Install | Use Case | Latency |
-|---------|---------|----------|---------|
-| **Redis** | included | Production, distributed | 1-7ms |
-| **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra | 1-5ms |
-| **File** | included | Single-machine, zero-dependency | 1-10ms |
-| **CachekitIO** | included | Managed SaaS, zero infrastructure | 10-50ms |
+| Backend | Install | Use Case |
+|---------|---------|----------|
+| **Redis** | included | Production, distributed |
+| **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra |
+| **File** | included | Single-machine, zero-dependency |
+| **CachekitIO** | included | Managed SaaS, zero infrastructure |
 
 ### Redis
 ```python
@@ -108,7 +108,7 @@ class MyBackend:
 | Serializer | Speed | Use Case |
 |------------|:-----:|----------|
 | **StandardSerializer** | Fast | General Python types (MessagePack + LZ4); not NumPy arrays or pandas objects |
-| **OrjsonSerializer** | Fastest | JSON APIs (2-5x faster than stdlib) |
+| **OrjsonSerializer** | Fastest | JSON APIs |
 | **ArrowSerializer** | — | pandas DataFrames (columnar, exact round trip) |
 | **+ Encryption** | Fast | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
@@ -146,8 +146,8 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 
 ## L1+L2 Dual-Layer Cache
 
-- L1: In-memory (~50ns) — per-process, no network
-- L2: Backend (1-50ms) — shared across processes
+- L1: In-memory — per-process, no network; a hit takes microseconds (README, Performance)
+- L2: Backend — one round trip per read, shared across processes
 - L1 backfill on L2 hit, automatic invalidation
 
 ## Documentation

@@ -243,9 +243,9 @@ def test_cached_function():
 │  │   Breaker   │  │  Timeouts   │  │      Locking        │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
-│  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)     │
-│       ~50ns            │  Redis / CachekitIO / File /      │
-│                        │  Memcached    ~2-50ms             │
+│  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)      │
+│       in-process       │  Redis / CachekitIO / File /       │
+│                        │  Memcached: one backend round trip │
 ├─────────────────────────────────────────────────────────────┤
 │                    Rust Core (PyO3)                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
@@ -260,12 +260,31 @@ def test_cached_function():
 
 ---
 
+## Performance
+
+What a call costs inside your process, from the wall-clock guards in `tests/performance/` run on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with CPython 3.14.7. Each figure is the mean of five run medians with its 95% band.
+
+| Path | Time per call |
+|:-----|--------------:|
+| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 6.70 ± 0.09 µs |
+| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 6.69 ± 0.04 µs |
+| L1 hit with an L2 backend configured, same dict | 302 ± 19 µs |
+| Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 562 ± 25 µs |
+
+- With no backend, L1 keeps the returned object itself, so a hit costs key generation and a lookup, whatever the payload's size.
+- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 45 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 11 ± 16 µs, inside the noise.
+- An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
+
+Hosted runners come with other CPU models too: a run on an EPYC 9V45 runner took 46-61% as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
+
+---
+
 ## Features
 
 ### Production Hardened
 
 - Circuit breaker with graceful degradation
-- Connection pooling with thread affinity (+28% throughput)
+- Connection pooling with thread affinity
 - CachekitIO keeps idle connections pooled until the server closes them, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
@@ -279,7 +298,7 @@ def test_cached_function():
 | Serializer | Speed | Use Case |
 |:-----------|:-----:|:---------|
 | **StandardSerializer** | ★★★★☆ | General Python types; not NumPy arrays or pandas objects |
-| **OrjsonSerializer** | ★★★★★ | JSON APIs (2-5x faster than stdlib) — requires `cachekit[json]` |
+| **OrjsonSerializer** | ★★★★★ | JSON APIs — requires `cachekit[json]` |
 | **ArrowSerializer** | — | pandas DataFrames (columnar, exact round trip) |
 | **+ Encryption** | ★★★★☆ | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
@@ -329,15 +348,18 @@ assert calls == 1
 ### Integrity Checking
 
 > [!IMPORTANT]
-> All serializers support **configurable checksums** for corruption detection using xxHash3-64 (8 bytes). Enabled by default in `@cache.production` and `@cache.secure`.
+> Serializers detect corrupted entries with an xxHash3-64 checksum. It is on by default. `@cache.minimal` and `@cache.test` turn it off where the serializer allows it (`ArrowSerializer` always checks); `@cache.secure` refuses to turn it off.
 
-**Performance Impact** (benchmark-proven):
+Each checksum is an 8-byte digest, plus one pass over the payload on each write and read. What `enable_integrity_checking=False` changes depends on the serializer, and for `AutoSerializer` on the value:
 
-| Data Type | Latency Reduction (disabled) | Size Overhead |
-|:----------|:----------------------------:|:-------------:|
-| MessagePack (default) | 60-90% | 8 bytes |
-| Arrow DataFrames | 35-49% | 8 bytes |
-| JSON (orjson) | 37-68% | 8 bytes |
+| Serializer | Checking on (default) | Checking off |
+|:-----------|:----------------------|:-------------|
+| `StandardSerializer`, and `AutoSerializer` for values other than the two below | MessagePack in an LZ4 envelope that carries the checksum | Plain MessagePack: no checksum, no LZ4 |
+| `AutoSerializer`, NumPy arrays | The checksum, then the raw array bytes (never compressed) | The raw array bytes |
+| `AutoSerializer`, pandas DataFrames with pyarrow installed, and `ArrowSerializer` | The checksum, then the Arrow IPC data | No change: Arrow always checks |
+| `OrjsonSerializer` | The checksum, then the JSON | Plain JSON |
+
+Where the switch drops the LZ4 envelope, compressible entries get larger and small or incompressible ones about 25 bytes smaller; measure on your own payloads before you trade that.
 
 ### Security
 

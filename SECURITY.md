@@ -174,10 +174,10 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 
 | Mode | L1 Storage | L2 Storage | Performance |
 |:-----|:-----------|:-----------|:------------|
-| `@cache`, encryption off | Plaintext | Plaintext | ~50ns L1 / ~2-7ms L2 |
-| `@cache.secure` | **Encrypted** | **Encrypted** | ~50ns L1 / ~2-7ms L2 |
+| `@cache`, encryption off | Plaintext | Plaintext | L1 hit: in-process, no network; L2 hit: a backend round trip |
+| `@cache.secure` | **Encrypted** | **Encrypted** | The same, plus a decrypt on every hit |
 
-Both tiers store encrypted bytes when encryption is enabled (encrypt-at-rest everywhere). Decryption happens at read time only, minimizing plaintext exposure.
+Both tiers store encrypted bytes when encryption is enabled (encrypt-at-rest everywhere). Decryption happens at read time only, minimizing plaintext exposure. Measured figures: [README, Performance](README.md#performance).
 
 </details>
 
