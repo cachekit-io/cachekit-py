@@ -66,7 +66,7 @@ The `Bench` workflow (`.github/workflows/bench.yml`) runs five of these guards o
 | Same hit, plaintext and encrypted arms, interleaved | `test_production_realism.py::test_encryption_overhead` | 305 ± 11μs and 316 ± 16μs |
 | Redis L2 hit, L1 disabled, same 100-user dict | `test_production_realism.py::test_redis_l2_roundtrip` | 562 ± 25μs |
 
-The encryption guard's arms differ by 11 ± 16μs (Welch 95%), inside the noise, as in every pass on the other machine.
+The encryption guard's arms differ by 11 ± 16μs (Welch 95%), inside the noise, as in every pass on the other machine. Hosted runners do not always get the same CPU model: a run on an AMD EPYC 9V45 runner took between half and two-thirds as long on every row (4.09 ± 0.04μs for the dict's L1-only hit, 256 ± 13μs for the Redis L2 hit).
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
 

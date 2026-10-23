@@ -275,7 +275,7 @@ What a call costs inside your process, from the wall-clock guards in `tests/perf
 - With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 45 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 11 ± 16 µs, inside the noise.
 - An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
 
-The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
+Hosted runners come with other CPU models too: a run on an EPYC 9V45 runner took between half and two-thirds as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
 
 ---
 
