@@ -2585,8 +2585,8 @@ def create_cache_wrapper(
         # This ensures only one request executes the function while others wait.
         # LockableBackend protocol contract: pass the bare cache_key. Each backend
         # owns its internal lock-namespace derivation (Redis: ``<key>:lock``; SaaS:
-        # ``POST /v1/cache/{key}/lock``). Appending here would pollute the SaaS
-        # 7-segment canonical key and 400 at the edge.
+        # ``POST /v1/cache/{key}/lock``). Appending here would make the SaaS lock
+        # address a different key from the cached entry.
         lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
         blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 

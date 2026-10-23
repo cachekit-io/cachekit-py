@@ -905,8 +905,7 @@ class CachekitIOBackend:
         ``lock_key`` is the bare cache key (LockableBackend contract). The SaaS lock
         endpoint is ``POST /v1/cache/{key}/lock`` — no internal derivation is needed
         because lock semantics live in the URL path, not the key namespace. Appending
-        ``:lock`` here would push the SaaS validator past its 7-segment canonical key
-        budget and trigger a 400 at the edge.
+        ``:lock`` here would address a different key from the cached entry.
 
         Non-finite (NaN / ±inf) or non-positive ``timeout`` is clamped to 1ms — without
         the guard, ``int(NaN)`` / ``int(inf)`` would raise outside ``BackendError`` and
