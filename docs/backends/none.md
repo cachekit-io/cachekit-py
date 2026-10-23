@@ -204,7 +204,7 @@ assert len(calls) == 2  # ran on both calls: nothing was stored
 
 ## Characteristics
 
-- Latency: 0.86μs per hit on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)); in-memory, no network
+- Latency: 0.88μs per hit on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)); in-memory, no network
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
