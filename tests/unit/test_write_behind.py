@@ -345,6 +345,22 @@ class TestBounds:
         assert writer.close(_deadline()) == []
         assert sent == []  # k's queued value was dropped with the refusal; the caller wrote k-101 itself
 
+    def test_a_value_behind_its_own_send_is_taken_past_the_byte_bound(
+        self, one_writer: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Refusing it would leave the caller's write racing the older send, which could land last."""
+        writer = wb.WriteBehind(lambda *_: None)
+        sent: list[str] = []
+        held, release = threading.Event(), threading.Event()
+        monkeypatch.setattr(wb, "MAX_BYTES", 100)
+        assert writer.submit(("", "k"), 10, lambda: (held.set(), release.wait(_GUARD_SECONDS), sent.append("old")))
+        assert held.wait(_GUARD_SECONDS)
+        assert writer.submit(("", "k"), 1000, lambda: sent.append("new"))  # over the bound, behind its own send
+        assert not writer.submit(("", "other"), 10, lambda: sent.append("other"))  # the queue is over: refused
+        release.set()
+        assert writer.close(_deadline()) == []
+        assert sent == ["old", "new"]
+
     def test_the_entry_bound_counts_a_value_behind_its_own_send(self, one_writer: None, monkeypatch: pytest.MonkeyPatch) -> None:
         writer = wb.WriteBehind(lambda *_: None)
         sent: list[int] = []

@@ -15,10 +15,12 @@ calls are already what invalidation uses off the loop.
   after a newer one.
 - **Bounds.** A write is queued only while the queue then holds at most ``MAX_ENTRIES`` entries and
   ``MAX_BYTES`` bytes, replacements included. Otherwise ``submit`` refuses, drops the entry's queued value
-  (the refused one supersedes it), and the caller writes synchronously, as without the option. That write
-  can race a send of the same entry already in progress, as two concurrent synchronous misses race. At
-  most ``MAX_WORKERS`` threads send, started on demand and ending when the queue is empty. The bounds are
-  sized so a full queue drains within ``EXIT_FLUSH_SECONDS`` at half a second per write.
+  (the refused one supersedes it), and the caller writes synchronously, as without the option. The one
+  exception is a value for an entry being sent: it is always queued behind that send, since a caller write
+  could land before the older send and lose to it. Such values exceed the bounds by at most one per send
+  in flight, so by at most ``MAX_WORKERS`` values. At most ``MAX_WORKERS`` threads send, started on demand
+  and ending when the queue is empty. The bounds are sized so a full queue drains within
+  ``EXIT_FLUSH_SECONDS`` at half a second per write.
 - **Invalidation.** ``cancel`` drops matching queued writes and waits for matching sends to finish, so a
   delete issued after it is ordered behind every write the caller made before it. The module-level
   ``cancel`` reaches every writer of a group (one decorated function and namespace, however many times
@@ -126,7 +128,11 @@ class WriteBehind:
                 return False
             old = s.pending.get(entry)
             old_size = old.size if old is not None else 0
-            if len(s.pending) + (old is None) > MAX_ENTRIES or s.bytes - old_size + size > MAX_BYTES:
+            # A value behind its entry's own send is always taken: a caller write would race that older send
+            # and could lose to it. At most one such value per send in flight, so at most MAX_WORKERS.
+            if entry not in s.sending and (
+                len(s.pending) + (old is None) > MAX_ENTRIES or s.bytes - old_size + size > MAX_BYTES
+            ):
                 if old is not None:  # superseded by the value the caller now writes itself
                     del s.pending[entry]
                     s.bytes -= old_size
