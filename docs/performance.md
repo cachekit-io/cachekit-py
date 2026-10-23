@@ -29,7 +29,7 @@ Every figure on this page comes from a guard in `tests/performance/`:
 
 ## Measured Figures
 
-Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards, CPython 3.14.3, x86_64 Linux: the first two rows on 2026-10-03, the last on 2026-10-04. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. These passes also timed the `@cache(backend=None)` hits, before the key memo and the L1-only fast path (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path)); the [GitHub-Hosted Runner](#github-hosted-runner) table has the current figures for those. The memo also spares the last two rows their key generation, a few microseconds, well inside their bands.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards, CPython 3.14.3, x86_64 Linux: the first two rows on 2026-10-03, the last on 2026-10-04. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. These passes also timed the `@cache(backend=None)` hits, before the key memo and the L1-only fast path (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path)); the [GitHub-Hosted Runner](#github-hosted-runner) table has the current figures for those. The last two rows are functions with a backend, which keep no key memo and build their key on every call, as they did then.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
@@ -64,7 +64,7 @@ The `Bench` workflow (`.github/workflows/bench.yml`) runs five of these guards o
 
 The job summary prints each figure in the unit its guard reports: the dict's L1-only hit, the hit with a backend configured and the encryption arms in ns, the DataFrame hit and the Redis L2 hit in μs. This table is in μs, so divide the ns figures by 1,000 when you copy them in.
 
-The encryption guard's arms differ by 10 ± 21μs (Welch 95%), inside the noise: an encrypted hit adds a decrypt, and no hosted run has pinned that cost down (see [Not Measured Here](#not-measured-here)). Hosted runners do not always get the same CPU model: [a run of an earlier commit on an AMD EPYC 9V45 runner](https://github.com/cachekit-io/cachekit-py/actions/runs/39964388582/attempts/2) took 46-61% as long on every row (0.529μs for the dict's L1-only hit, 242 ± 12μs for the Redis L2 hit).
+The encryption guard's arms differ by 10 ± 21μs (Welch 95%), inside the noise: an encrypted hit adds a decrypt, and no hosted run has pinned that cost down (see [Not Measured Here](#not-measured-here)). Hosted runners do not always get the same CPU model: [a run of an earlier commit on an AMD EPYC 9V45 runner](https://github.com/cachekit-io/cachekit-py/actions/runs/39964388582/attempts/2) took 44-59% as long on every row (0.529μs for the dict's L1-only hit, 242 ± 12μs for the Redis L2 hit).
 
 The workflow runs these guards with this command, against a Redis it starts on the runner:
 
