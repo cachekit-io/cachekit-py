@@ -430,9 +430,9 @@ cachekit's own figures, measured on a GitHub-hosted runner (AMD EPYC 7763, CPyth
 
 | Operation | cachekit |
 |-----------|----------|
-| Cache hit, `@cache(backend=None)`, 100-user nested dict | 0.880μs |
-| Cache hit, L1 with an L2 backend configured, same dict (deserializes) | 276μs |
-| Cache hit, Redis L2 in a container on the same machine, L1 disabled | 528μs |
+| Cache hit, `@cache(backend=None)`, 100-user nested dict | 0.906μs |
+| Cache hit, L1 with an L2 backend configured, same dict (deserializes) | 310μs |
+| Cache hit, Redis L2 in a container on the same machine, L1 disabled | 551μs |
 
 `functools.lru_cache` is a dictionary lookup in C and costs a small fraction of a cachekit L1 hit, which also checks the entry's TTL, keeps its LRU order and counts the hit across threads. A distributed hit costs the round trip to the backend in any library. No guard here times the other libraries, so this page quotes no figure for them.
 
