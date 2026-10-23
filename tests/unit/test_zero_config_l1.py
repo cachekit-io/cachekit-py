@@ -72,8 +72,15 @@ def _named(fn: Callable[..., Any], label: str) -> Callable[..., Any]:
 
 
 def _state(wrapper: Callable[..., Any]) -> dict[str, Any]:
-    """The wrapper's mode state, read from its closure (cache_info() does not expose it)."""
-    names = inspect.getclosurevars(wrapper).nonlocals
+    """The wrapper's mode state, read from its closure (cache_info() does not expose it).
+
+    The wrapper holds its fast path; the rest of a call, and most of the state, is in the closure of
+    the _sync_call or _async_call it delegates to.
+    """
+    names = dict(inspect.getclosurevars(wrapper).nonlocals)
+    for full_call in ("_sync_call", "_async_call"):
+        if full_call in names:
+            names.update(inspect.getclosurevars(names[full_call]).nonlocals)
     return {
         "l1_only": names["_l1_only_mode"],
         "object_cache": names["_object_cache"] is not None,
