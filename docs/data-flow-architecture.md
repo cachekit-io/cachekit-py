@@ -288,6 +288,11 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  • If not ttl: redis_client.set(cache_key, serialized_data)                 │
 │                                                                             │
 │  Network latency: ~1-2ms (typical for Redis)                                │
+│                                                                             │
+│  write_behind=True (opt-in): the serialized bytes go to the function's      │
+│  writer (decorators/write_behind.py) instead, and a writer thread sends     │
+│  this set after the call returns. Not on the async locked path or the       │
+│  streaming path. See docs/features/write-behind.md.                         │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
                                    ▼

@@ -1563,11 +1563,13 @@ class StoreOutcome(NamedTuple):
     backfill) and None otherwise — a streamed value never reaches L1, and a failed
     serialization has no bytes. stored says whether the backend write succeeded, which the
     envelope cannot say: a buffered write whose backend set failed still has an envelope, and
-    a successful stream has none. Key tracking follows stored, L1 follows envelope.
+    a successful stream has none. Key tracking follows stored, L1 follows envelope. deferred says the
+    backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     """
 
     envelope: Optional[bytes]
     stored: bool
+    deferred: bool = False
 
 
 class CacheOperationHandler:
@@ -1990,6 +1992,7 @@ class CacheOperationHandler:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stale_ttl: int | None = None,
+        defer: Callable[[bytes], bool] | None = None,
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
@@ -1999,6 +2002,10 @@ class CacheOperationHandler:
             ttl: Time-to-live in seconds
             args: Function args (for tenant extraction in encryption)
             kwargs: Function kwargs (for tenant extraction in encryption)
+            defer: Write-behind hook. On the buffered path, called with the serialized bytes instead of
+                the backend write; True means it took the write (StoreOutcome.deferred), False that it
+                refused and the write runs here. Serialization stays here either way, so its errors
+                reach the caller as without it; the streaming path never defers.
 
         Returns:
             StoreOutcome. envelope: serialized bytes when the buffered path produced them
@@ -2039,6 +2046,8 @@ class CacheOperationHandler:
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
+            if defer is not None and defer(serialized_data):
+                return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
             # Only thread the SWR kwarg when set: strategy implementations without
             # **metadata (tests, custom handlers) must keep working unchanged.
             if stale_ttl is not None:

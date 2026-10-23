@@ -1,0 +1,193 @@
+"""Bounded write-behind for decorated misses (``write_behind=True``): the L2 write leaves the caller's path.
+
+With the option on, a miss serializes on the caller's thread, hands the backend write to this writer,
+puts the value in L1 and returns. The writer sends it from a background thread. The caller gains nothing
+by waiting for that write today: a failed L2 write is logged and the value is returned anyway. What it
+gives up is "L2 holds the value when the call returns": another process can miss the key until the write
+lands, and a process killed before then loses it (the value is recomputed on the next miss).
+
+One writer per decorated function, shared by its sync and async callers. Threads, not event-loop tasks,
+for both: a task dies in ``asyncio.run``'s teardown and cannot be flushed at exit, and the backends' sync
+calls are already what invalidation uses off the loop.
+
+- **Coalescing.** One pending write per entry (L2 scope, cache key): a newer value replaces a queued
+  one, and a write for an entry already being sent waits for that send, so an older value never lands
+  after a newer one.
+- **Bounds.** A new entry is admitted only while fewer than ``MAX_ENTRIES`` are queued and their bytes
+  stay within ``MAX_BYTES``; otherwise ``submit`` refuses and the caller writes synchronously, as without
+  the option. A replacement for an entry already queued or being sent is always taken, so a fallback never
+  races a deferred write of the same entry: the queue can exceed the bounds by one value per sending
+  thread, plus the growth of replaced values. At most ``MAX_WORKERS`` threads send, started on demand and
+  ending when the queue is empty. The bounds are sized so a full queue drains within ``EXIT_FLUSH_SECONDS``
+  at half a second per write.
+- **Invalidation.** ``cancel`` drops matching queued writes and waits for matching sends to finish, so a
+  delete issued after it is ordered behind every write the caller made before it.
+- **Fork.** A forked child starts empty (the owner-PID idiom): the parent's queue is the parent's to send.
+  A child forked without at-fork hooks starts no thread, so ``submit`` refuses there.
+- **Exit.** An ``atexit`` hook flushes every writer within ``EXIT_FLUSH_SECONDS`` in total and logs a
+  WARNING naming the writes it dropped. It closes nothing: a backend client's own exit handling is left
+  alone. ``os._exit`` (multiprocessing workers) and SIGKILL skip it, and lose the queue.
+"""
+
+from __future__ import annotations
+
+import atexit
+import contextvars
+import logging
+import os
+import threading
+import time
+import weakref
+from collections.abc import Callable
+from typing import NamedTuple
+
+from .. import l1_cache
+from ..hash_utils import redact_cache_key, redact_error_for_log
+
+_logger = logging.getLogger(__name__)
+
+MAX_WORKERS = 4
+MAX_ENTRIES = 64
+MAX_BYTES = 16 * 1024 * 1024
+EXIT_FLUSH_SECONDS = 10.0
+# Keys named in the exit WARNING; the count covers the rest.
+_EXIT_KEYS_LOGGED = 10
+
+Entry = tuple[str, str]  # (L2 scope, cache key), as _cached_keys records it
+
+
+class _Job(NamedTuple):
+    send: Callable[[], None]
+    context: contextvars.Context
+    size: int
+
+
+class WriteBehind:
+    """A decorated function's queue of deferred L2 writes and the threads that send them.
+
+    ``send`` callables run in a copy of the submitting caller's context (tenant contextvars included) and
+    must not raise: a raise is passed to ``on_error`` and the write counts as failed.
+    """
+
+    def __init__(self, on_error: Callable[[Entry, Exception], None]) -> None:
+        self._on_error = on_error
+        self.fallbacks = 0  # submits refused at a full queue: those callers wrote synchronously
+        self._reset()
+        _writers.add(self)
+
+    def _reset(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._pending: dict[Entry, _Job] = {}
+        self._sending: set[Entry] = set()
+        self._bytes = 0
+        self._workers = 0
+        self._closed = False
+        self._pid = os.getpid()
+
+    def _owned(self) -> None:
+        if self._pid != os.getpid():
+            # Forked child: the parent's threads do not exist here, and its lock may be held. A thread
+            # racing this swap can lose a write it just queued; the value is still in its L1.
+            self._reset()
+
+    def submit(self, entry: Entry, size: int, send: Callable[[], None]) -> bool:
+        """Queue ``send`` as the write of ``entry``. False if refused: the caller writes it synchronously."""
+        self._owned()
+        if l1_cache._forked_without_hooks():
+            return False  # no thread may start here
+        job = _Job(send, contextvars.copy_context(), size)
+        with self._cond:
+            if self._closed:
+                return False
+            old = self._pending.get(entry)
+            if (
+                old is None
+                and entry not in self._sending
+                and (len(self._pending) >= MAX_ENTRIES or self._bytes + size > MAX_BYTES)
+            ):
+                self.fallbacks += 1
+                return False
+            self._pending[entry] = job
+            self._bytes += size - (old.size if old is not None else 0)
+            if self._workers < MAX_WORKERS and self._workers < len(self._pending) + len(self._sending):
+                self._workers += 1
+                try:
+                    threading.Thread(target=self._work, daemon=True, name="cachekit-write-behind").start()
+                except RuntimeError:  # how Thread.start() refuses: "can't start new thread"
+                    self._workers -= 1
+                    if self._workers == 0:
+                        # No thread will ever send it. Only this job can be queued: a queued job always has one.
+                        del self._pending[entry]
+                        self._bytes -= size
+                        return False
+        return True
+
+    def _work(self) -> None:
+        cond = self._cond
+        try:
+            while True:
+                with cond:
+                    entry = next((e for e in self._pending if e not in self._sending), None)
+                    if entry is None:
+                        return
+                    job = self._pending.pop(entry)
+                    self._bytes -= job.size
+                    self._sending.add(entry)
+                try:
+                    job.context.run(job.send)
+                except Exception as exc:
+                    self._on_error(entry, exc)
+                finally:
+                    with cond:
+                        self._sending.discard(entry)
+                        cond.notify_all()
+        finally:
+            # Every exit, a raise included, gives up the thread's place, so the next submit can start one.
+            with cond:
+                self._workers -= 1
+                cond.notify_all()
+
+    def cancel(self, match: Callable[[Entry], bool], *, wait: bool = True) -> None:
+        """Drop the queued writes of every entry ``match`` accepts, then, with ``wait``, block until none
+        of them is being sent. Never call it from a ``send``: that send would wait on itself."""
+        self._owned()
+        with self._cond:
+            for entry in [e for e in self._pending if match(e)]:
+                self._bytes -= self._pending.pop(entry).size
+            if wait:
+                self._cond.wait_for(lambda: not any(match(e) for e in self._sending))
+
+    def close(self, deadline: float) -> list[Entry]:
+        """Refuse new writes, wait until the queue drains or ``deadline`` (``time.monotonic``) passes,
+        and return the entries still queued or being sent."""
+        self._owned()
+        with self._cond:
+            self._closed = True
+            self._cond.wait_for(lambda: not self._pending and not self._sending, timeout=max(0.0, deadline - time.monotonic()))
+            return [*self._sending, *self._pending]
+
+
+_writers: weakref.WeakSet[WriteBehind] = weakref.WeakSet()
+
+
+def _flush_at_exit() -> None:
+    """Send what every writer still holds, within EXIT_FLUSH_SECONDS in total. Never blocks past it."""
+    deadline = time.monotonic() + EXIT_FLUSH_SECONDS
+    dropped: list[Entry] = []
+    for writer in list(_writers):
+        try:
+            dropped += writer.close(deadline)
+        except Exception as exc:  # an exit hook has no caller: report, then flush the rest
+            _logger.warning("write-behind exit flush failed: %s", redact_error_for_log(exc))
+    if dropped:
+        redacted = ", ".join(redact_cache_key(key) for _, key in dropped[:_EXIT_KEYS_LOGGED])
+        _logger.warning(
+            "write-behind: %d deferred L2 write(s) were not sent within %.0f s of exit and are lost; other "
+            "processes miss those keys until they are recomputed. Keys: %s",
+            len(dropped),
+            EXIT_FLUSH_SECONDS,
+            redacted,
+        )
+
+
+atexit.register(_flush_at_exit)

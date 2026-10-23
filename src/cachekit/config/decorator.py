@@ -154,6 +154,12 @@ class DecoratorConfig:
              (tobytes() alone ignores dtype and shape; an object array's bytes are pointers)
         refresh_ttl_on_get: Extend TTL on cache hit
         ttl_refresh_threshold: Minimum remaining TTL fraction (0.0-1.0) to trigger refresh
+        write_behind: Return a miss before its L2 write lands (default: False; no preset sets it). The
+                      value is serialized and put in L1 on the caller's thread, so serialization errors
+                      still raise there; the backend write follows on a bounded background writer. Until
+                      it lands, other processes miss the key, and a process killed first loses it. Not on
+                      the async distributed-lock path or the streaming (File + Arrow) write path, which
+                      stay synchronous. See docs/features/write-behind.md.
         backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
                  @cache(backend=None) does. The default, UNSET, resolves per "Backend Resolution Priority".
         l1: L1 in-memory cache configuration
@@ -182,9 +188,12 @@ class DecoratorConfig:
     # values shared byte-identically with cachekit-rs / cachekit-ts. None = auto mode.
     interop: str | None = None
 
-    # Performance (2 fields)
+    # Performance (3 fields)
     refresh_ttl_on_get: bool = False
     ttl_refresh_threshold: float = 0.5
+    # Opt-in, set by no preset: a miss returns once its value is serialized and in L1, and the L2 write
+    # follows on a bounded background writer (decorators/write_behind.py).
+    write_behind: bool = False
 
     # Backend abstraction (1 field)
     backend: BaseBackend | None | Literal[_Unset.UNSET] = UNSET  # L2 backend; None = L1-only; UNSET = resolve
@@ -228,6 +237,9 @@ class DecoratorConfig:
         # TTL refresh threshold validation
         if not 0.0 <= self.ttl_refresh_threshold <= 1.0:
             raise ConfigurationError(f"ttl_refresh_threshold must be 0.0-1.0, got {self.ttl_refresh_threshold}")
+
+        if not isinstance(self.write_behind, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
+            raise ConfigurationError(f"write_behind must be a bool, got {type(self.write_behind).__name__}")
 
         # Under encryption integrity_checking becomes the AAD's `compressed` component, whose
         # tokens are frozen as exactly True / False (spec/encryption.md). A truthy 1 would seal
@@ -298,6 +310,7 @@ class DecoratorConfig:
             "key": self.key,
             "refresh_ttl_on_get": self.refresh_ttl_on_get,
             "ttl_refresh_threshold": self.ttl_refresh_threshold,
+            "write_behind": self.write_behind,
             "backend": None if self.backend is UNSET else self.backend,  # the legacy dict's "unset" was None
             # L1 cache (flattened)
             "l1_enabled": self.l1.enabled,

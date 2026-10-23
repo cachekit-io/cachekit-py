@@ -350,6 +350,14 @@ class TestSyncCallShape:
         shape = gate.run_sync(lambda: fn(1))
         assert shape == _Shape(blocking=["GET", "PUT"])
 
+    def test_cold_miss_write_behind(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, write_behind=True)
+        def fn(x: int) -> int:
+            return x * 2
+
+        shape = gate.run_sync(lambda: fn(1))
+        assert shape == _Shape(blocking=["GET"], background=["PUT"])
+
 
 class TestAsyncCallShape:
     """Async decorators: a miss takes the SaaS lock, re-reads only if it had to wait or its read failed, and releases in the background."""
@@ -361,6 +369,15 @@ class TestAsyncCallShape:
 
         shape = await gate.run_async(fn(1))
         # The first lock POST won after a clean miss: no re-read, and the release is not waited on.
+        assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
+
+    async def test_cold_miss_write_behind_keeps_the_put_inside_the_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, write_behind=True)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        shape = await gate.run_async(fn(1))
+        # Deferred, the PUT would land after the release, and a waiter's re-read would miss and recompute.
         assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
     async def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:

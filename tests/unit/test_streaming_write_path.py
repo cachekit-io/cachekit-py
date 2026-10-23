@@ -27,6 +27,7 @@ from cachekit.cache_handler import (
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
+    StoreOutcome,
     supports_streaming_write,
 )
 from cachekit.key_generator import CacheKeyGenerator
@@ -188,7 +189,7 @@ class TestStoreResultRouting:
         """Streaming success returns no envelope: it must never be copied into L1
         (mirrors the mmap read path's L1 exclusion, #171) — but it IS a stored write."""
         op = _operation_handler(file_backend)
-        assert op.store_result("k1", df, ttl=60) == (None, True)
+        assert op.store_result("k1", df, ttl=60) == StoreOutcome(envelope=None, stored=True)
         hit = op.get_cached_value("k1")
         assert hit is not None
         pd.testing.assert_frame_equal(hit.value, df)
@@ -236,14 +237,14 @@ class TestStoreResultRouting:
         monkeypatch.setattr(file_backend, "set_streaming", explode)
         set_spy = MagicMock(wraps=file_backend.set)
         monkeypatch.setattr(file_backend, "set", set_spy)
-        assert op.store_result("k4", df, ttl=60) == (None, False)
+        assert op.store_result("k4", df, ttl=60) == StoreOutcome(envelope=None, stored=False)
         set_spy.assert_not_called()
         assert file_backend.get("k4") is None
 
     @pytest.mark.asyncio
     async def test_async_streams_and_roundtrips(self, df, file_backend) -> None:
         op = _operation_handler(file_backend)
-        assert await op.store_result_async("k5", df, ttl=60) == (None, True)
+        assert await op.store_result_async("k5", df, ttl=60) == StoreOutcome(envelope=None, stored=True)
         hit = await op.get_cached_value_async("k5")
         assert hit is not None
         pd.testing.assert_frame_equal(hit.value, df)

@@ -183,6 +183,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Reference Caching](docs/features/reference-caching.md): @cache.local() for non-serializable objects
 - [Rust Serialization](docs/features/rust-serialization.md): ByteStorage layer (LZ4, xxHash3, AES-256-GCM)
 - [SSRF Protection](docs/features/ssrf-protection.md): CachekitIO URL allowlisting
+- [Write-Behind](docs/features/write-behind.md): Opt-in `write_behind=True`: a miss returns before its L2 write lands
 - [Architecture](docs/data-flow-architecture.md): L1+L2 internals
 
 ### Development
