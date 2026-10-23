@@ -460,6 +460,60 @@ jobs:
           pytest tests/critical/ -m "not slow"
         '
 
+  # Instruction-count gate (`make perf-ir`, tests/performance/ir_budget.py) on every PR. The
+  # committed budgets were recorded on one machine and interpreter build, and instruction counts
+  # move with both, so CI never compares against them: it builds the PR (the merge commit checked
+  # out here) and its base (that commit's first parent, the base branch tip) side by side and
+  # gates the PR's figures against the base's, measured on the same runner in the same job.
+  # Both trees sit at paths of equal length, which the gate requires: path length moves the
+  # measured process's heap layout. The two USGS real-data paths are skipped: pyarrow's parquet
+  # reader can hit an instruction valgrind does not support on some CPUs. Four shards split the
+  # remaining paths so the check finishes in minutes rather than half an hour.
+  perf-ir:
+    name: Instruction budget (shard ${{ matrix.shard }}/4)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target  # both builds share it, and rust-cache saves it
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        fetch-depth: 2  # the merge commit and its first parent
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: perf-ir
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: perf-ir
+
+    - name: Install valgrind
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y -q --no-install-recommends valgrind
+        valgrind --version
+
+    - name: Build the PR and its base
+      run: |
+        git worktree add --detach "$RUNNER_TEMP/ir/head" HEAD
+        git worktree add --detach "$RUNNER_TEMP/ir/base" HEAD^1
+        for tree in head base; do
+          (cd "$RUNNER_TEMP/ir/$tree" && uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev --reinstall-package cachekit)
+        done
+
+    - name: Gate the PR against its base
+      working-directory: ${{ runner.temp }}/ir/head
+      run: |
+        .venv/bin/python tests/performance/ir_budget.py --base ../base --shard ${{ matrix.shard }}/4 \
+          --skip serializer_arrow_usgs --skip serializer_auto_usgs
+
   # Version sync + dependency CVE scan (push to main only)
   post-merge:
     name: Post-Merge Checks

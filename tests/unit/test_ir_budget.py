@@ -204,9 +204,9 @@ def test_a_failed_run_fails_the_gate_without_waiting_for_the_runs_before_it(tmp_
     monkeypatch.setattr(ir_budget, "WORKLOAD", script)
     monkeypatch.setattr(ir_budget, "_stopped", False)  # measure() leaves it set, and _run reads it
 
-    def measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float) -> int:
+    def measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float, *tree: object) -> int:
         if n == ir_budget.N_LO:  # the earlier run: sleeps 60 s
-            ir_budget._run([], path, n, env, timeout_s)
+            ir_budget._run([], path, n, env, timeout_s, *tree)
             return 0
         deadline = time.monotonic() + 30
         while not any(f.read_text() != "1" for f in pids.iterdir()) and time.monotonic() < deadline:
@@ -406,3 +406,85 @@ def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> Non
     worker.start()
     worker.join()
     assert seen[0] > 1.7e9 + 1e6  # the real clock: 2023-11 + 11 days at the very least
+
+
+@pytest.mark.parametrize("n", [1, 4, len(PATHS) + 1])
+def test_shards_split_the_paths_exactly_once(n: int) -> None:
+    """N machines running --shard 1/N .. N/N measure every path that is not skipped, and none twice."""
+    skip = ["serializer_arrow_usgs", "serializer_auto_usgs"]
+    shards = [ir_budget.select_paths(None, skip, ir_budget._shard(f"{k}/{n}")) for k in range(1, n + 1)]
+    assert sorted(p for shard in shards for p in shard) == sorted(p for p in PATHS if p not in skip)
+
+
+@pytest.mark.parametrize("text", ["0/4", "5/4", "1", "a/b", "-1/2"])
+def test_a_shard_must_be_k_of_n(text: str) -> None:
+    with pytest.raises(ir_budget.argparse.ArgumentTypeError):
+        ir_budget._shard(text)
+
+
+def _trees(tmp_path: Path, base_paths: tuple[str, ...], base_name: str = "base") -> Path:
+    """A head and a base checkout side by side, the base with a venv interpreter and its baselines."""
+    for tree in ("head", base_name):
+        (tmp_path / tree / "tests" / "performance").mkdir(parents=True)
+        (tmp_path / tree / "tests" / "performance" / "ir_workload.py").touch()
+    base = tmp_path / base_name
+    (base / ".venv" / "bin").mkdir(parents=True)
+    (base / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    # The base's committed budgets are this checkout's, less the paths the base does not have yet.
+    data = json.loads(ir_budget.BASELINES.read_text())
+    for entry in data["interpreters"].values():
+        entry["budgets"] = {p: b for p, b in entry["budgets"].items() if p in base_paths}
+    (base / "tests" / "performance" / "ir_baselines.json").write_text(json.dumps(data))
+    return base
+
+
+def test_against_base_gates_this_checkout_on_the_base_measured_in_the_same_run(tmp_path, monkeypatch, capsys) -> None:
+    base = _trees(tmp_path, ("l1_hit", "l2_hit"))
+    monkeypatch.setattr(ir_budget, "WORKLOAD", tmp_path / "head" / "tests" / "performance" / "ir_workload.py")
+    calls = []
+
+    def fake_measure(paths, jobs, timeout_s, python, workload):
+        calls.append((tuple(paths), python, workload))
+        on_base = python == str(base / ".venv" / "bin" / "python")
+        return {"l1_hit": 1000, "l2_hit": 1000 if on_base else 1010}
+
+    monkeypatch.setattr(ir_budget, "measure", fake_measure)
+    assert ir_budget._against_base(base, ["l1_hit", "l2_hit", "file_set"], 2, 60) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  l2_hit" in out and "base     1,000  +1.00%" in out
+    assert "new   file_set" in out  # absent from the base: reported, not measured
+    assert calls == [
+        (("l1_hit", "l2_hit"), sys.executable, ir_budget.WORKLOAD.resolve()),
+        (("l1_hit", "l2_hit"), str(base / ".venv" / "bin" / "python"), base / "tests" / "performance" / "ir_workload.py"),
+    ]
+
+
+def test_against_base_refuses_a_base_whose_path_length_differs(tmp_path, monkeypatch, capsys) -> None:
+    """Path length moves the measured process's heap layout, so it would be a verdict on the paths."""
+    base = _trees(tmp_path, ("l1_hit",), base_name="base-longer")
+    monkeypatch.setattr(ir_budget, "WORKLOAD", tmp_path / "head" / "tests" / "performance" / "ir_workload.py")
+    monkeypatch.setattr(ir_budget, "measure", lambda *a: pytest.fail("measured despite the mismatch"))
+    assert ir_budget._against_base(base, ["l1_hit"], 2, 60) == 2
+    assert "must be as long as" in capsys.readouterr().err
+
+
+def test_against_base_refuses_a_base_without_its_own_venv(tmp_path, monkeypatch, capsys) -> None:
+    base = _trees(tmp_path, ("l1_hit",))
+    (base / ".venv" / "bin" / "python").unlink()
+    monkeypatch.setattr(ir_budget, "WORKLOAD", tmp_path / "head" / "tests" / "performance" / "ir_workload.py")
+    monkeypatch.setattr(ir_budget, "measure", lambda *a: pytest.fail("measured without a base venv"))
+    assert ir_budget._against_base(base, ["l1_hit"], 2, 60) == 2
+    assert "uv sync" in capsys.readouterr().err
+
+
+def test_a_raised_budget_raises_the_base_figure_by_the_same_ratio() -> None:
+    """A deliberate increase passes CI; a token raise does not carry a bigger regression through."""
+    allowed, notes = ir_budget.allow_raises(
+        {"l1_hit": 1000, "l2_hit": 2000, "miss": 3000},
+        {"l1_hit": 100, "l2_hit": 200, "miss": 300},
+        {"l1_hit": 110, "l2_hit": 190, "miss": 300},
+    )
+    assert allowed == {"l1_hit": 1100, "l2_hit": 2000, "miss": 3000}  # lowered budgets never tighten the base
+    assert notes == ["note: l1_hit budget raised +10.00% here, so its base figure is too"]
+    assert compare(allowed, {"l1_hit": 1100})[1]
+    assert not compare(allowed, {"l1_hit": 1111})[1]

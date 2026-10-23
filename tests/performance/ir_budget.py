@@ -27,7 +27,9 @@ editing it moves the heap layout the budgets were recorded at; this gate is kept
 process, so editing the gate does not.
 
 Budgets are keyed by interpreter (minor version, build flavour, machine): the same code costs a
-different number of instructions on 3.12 and 3.14. Instruction counts ignore cache misses and
+different number of instructions on 3.12 and 3.14. They hold only on the build that recorded them,
+so CI does not use them: ``--base DIR`` measures another checkout (the PR's base) on the same
+machine and gates this one against it. Instruction counts ignore cache misses and
 branch mispredictions, so a claimed wall-clock win still needs an interleaved wall-clock run.
 
 Run ``python tests/performance/ir_budget.py --help`` for the gate and ``--update`` (ratchet-down)
@@ -169,8 +171,16 @@ def _on_signal(signum: int, _frame: object) -> None:
     _kill_children()
 
 
-def _run(prefix: list[str], path: str, n: int, env: dict[str, str], timeout_s: float) -> None:
-    cmd = [*prefix, sys.executable, str(WORKLOAD), path, str(n), str(loops(path)[0])]
+def _run(
+    prefix: list[str],
+    path: str,
+    n: int,
+    env: dict[str, str],
+    timeout_s: float,
+    python: str | None = None,
+    workload: Path | None = None,
+) -> None:
+    cmd = [*prefix, python or sys.executable, str(workload or WORKLOAD), path, str(n), str(loops(path)[0])]
     run = f"{path} n={n} layout={env.get('IR_BUDGET_LAYOUT', '-')}"
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603 (trusted: valgrind + this file)
     with _children_lock:
@@ -191,16 +201,41 @@ def _run(prefix: list[str], path: str, n: int, env: dict[str, str], timeout_s: f
         raise RuntimeError(f"{run} exited {proc.returncode}:\n{stderr[-2000:]}")
 
 
-def _measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float) -> int:
+def _measure_one(
+    path: str,
+    n: int,
+    workdir: Path,
+    env: dict[str, str],
+    timeout_s: float,
+    python: str | None = None,
+    workload: Path | None = None,
+) -> int:
     workdir.mkdir(exist_ok=True)
     out = workdir / f"{path}.{n}.cg"
     valgrind = shutil.which("valgrind") or "valgrind"
-    _run([valgrind, "--tool=callgrind", "--separate-threads=yes", f"--callgrind-out-file={out}"], path, n, env, timeout_s)
+    _run(
+        [valgrind, "--tool=callgrind", "--separate-threads=yes", f"--callgrind-out-file={out}"],
+        path,
+        n,
+        env,
+        timeout_s,
+        python,
+        workload,
+    )
     return main_thread_ir(out)
 
 
-def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_MIN * 60) -> dict[str, int]:
+def measure(
+    paths: list[str],
+    jobs: int,
+    child_timeout_s: float = CHILD_TIMEOUT_MIN * 60,
+    python: str | None = None,
+    workload: Path | None = None,
+) -> dict[str, int]:
     """Per-op main-thread Ir for each path. Runs are independent processes, so they parallelise.
+
+    ``python`` and ``workload`` measure another checkout (``--base``): its interpreter imports its own
+    cachekit, and its own ``ir_workload.py`` runs. They default to this interpreter and this checkout.
 
     A first import compiles and writes ``.pyc`` files, and concurrent runs race to do it, which
     put hundreds of thousands of Ir/op of noise into a fresh venv. So every path first runs once
@@ -235,14 +270,21 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
     previous = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         for path in paths:
-            _run([], path, 1, env, child_timeout_s)
+            _run([], path, 1, env, child_timeout_s, python, workload)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in loops(p)[1:]]
         with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
             try:
                 futures = {
                     (p, n, shift): pool.submit(
-                        _measure_one, p, n, Path(tmp) / str(shift), env | {"IR_BUDGET_LAYOUT": str(shift)}, child_timeout_s
+                        _measure_one,
+                        p,
+                        n,
+                        Path(tmp) / str(shift),
+                        env | {"IR_BUDGET_LAYOUT": str(shift)},
+                        child_timeout_s,
+                        python,
+                        workload,
                     )
                     for p, n, shift in runs
                 }
@@ -269,8 +311,12 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
     return {p: median(p) for p in paths}
 
 
-def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str], bool]:
-    """Report lines and whether the gate passes. A path without a budget fails: record it first."""
+def compare(budgets: dict[str, int], measured: dict[str, int], against: str = "budget") -> tuple[list[str], bool]:
+    """Report lines and whether the gate passes. A path without a budget fails: record it first.
+
+    ``against`` names what the budgets are in the report: the committed ``budget``, or the ``base``
+    checkout's figures measured in the same run (``--base``).
+    """
     lines, ok = [], True
     for path, ir in measured.items():
         budget = budgets.get(path)
@@ -288,7 +334,7 @@ def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str
             verdict = "LOWER"  # cheaper: ratchet it down with --update if the change touched this path
         else:
             verdict = "ok"
-        lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  budget {budget:>9,}  {pct:+.2f}%")
+        lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  {against} {budget:>9,}  {pct:+.2f}%")
     return lines, ok
 
 
@@ -307,6 +353,85 @@ def _positive_minutes(text: str) -> float:
     if not 0 < minutes < math.inf:  # false for nan as well
         raise argparse.ArgumentTypeError(f"must be a positive number of minutes, not {text}")
     return minutes
+
+
+def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: float) -> int:
+    """``--base``: measure the base checkout and this one on this machine, and gate this one against it.
+
+    Both checkouts run from absolute paths of the same length. The measured process's argv and import
+    paths move its heap layout: a relative workload path against an absolute one read l1_hit 0.3% apart
+    on identical source. The venv interpreter path is not resolved, as that would follow its symlink.
+    """
+    base, root = base.resolve(), WORKLOAD.resolve().parents[2]
+    if len(str(base)) != len(str(root)):
+        print(
+            f"--base {base}: its path must be as long as this checkout's ({root}), or the heap layouts differ", file=sys.stderr
+        )
+        return 2
+    python = base / ".venv" / "bin" / "python"
+    workload = base / "tests" / "performance" / WORKLOAD.name
+    baselines = base / "tests" / "performance" / BASELINES.name
+    for required in (python, workload, baselines):
+        if not required.exists():
+            print(f"--base {base}: {required} not found (the base needs its own `uv sync`)", file=sys.stderr)
+            return 2
+    # Two interpreters cost different instructions for the same code, so a mismatch is no verdict at all.
+    version = subprocess.run(  # noqa: S603 (trusted: the base checkout's own venv)
+        [str(python), "-c", "import platform; print(platform.python_version())"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    if version != platform.python_version():
+        print(f"--base {base}: its venv runs Python {version}, this is {platform.python_version()}", file=sys.stderr)
+        return 2
+    # A path the base does not have yet has nothing to be compared against. Every path the base gates
+    # has a committed budget there (test_every_path_has_a_committed_budget), so its baselines list them.
+    base_interpreters = json.loads(baselines.read_text())["interpreters"]
+    known = set().union(*(entry["budgets"] for entry in base_interpreters.values()))
+    new = [p for p in paths if p not in known]
+    paths = [p for p in paths if p in known]
+
+    measured = measure(paths, jobs, child_timeout_s, sys.executable, WORKLOAD.resolve())
+    base_figures = measure(paths, jobs, child_timeout_s, str(python), workload)
+    key = interpreter_key()
+    head_budgets = json.loads(BASELINES.read_text())["interpreters"].get(key, {}).get("budgets", {})
+    allowed, notes = allow_raises(base_figures, base_interpreters.get(key, {}).get("budgets", {}), head_budgets)
+    lines, ok = compare(allowed, measured, against="base")
+    print("\n".join(notes))
+    print(f"main-thread Ir/op on {interpreter_key()} ({platform.python_version()}), this checkout against --base {base}")
+    print("\n".join(lines + [f"new   {p:22} not on the base: nothing to compare against" for p in new]))
+    print("PASS" if ok else f"FAIL: a path regressed by {FAIL_PCT}% or more against the base")
+    return 0 if ok else 1
+
+
+def allow_raises(
+    base_figures: dict[str, int], base_budgets: dict[str, int], head_budgets: dict[str, int]
+) -> tuple[dict[str, int], list[str]]:
+    """The base figures to gate against, raised where this checkout deliberately raised a budget.
+
+    A deliberate cost increase is committed as a higher budget (``--update --allow-increase``). The
+    base figure of such a path is scaled by the same ratio, so the increase passes and a larger
+    one still fails: a token raise cannot carry an unrelated regression through.
+    """
+    allowed, notes = dict(base_figures), []
+    for path, figure in base_figures.items():
+        old, new = base_budgets.get(path), head_budgets.get(path)
+        if old and new and new > old:
+            allowed[path] = round(figure * new / old)
+            notes.append(f"note: {path} budget raised {(new - old) / old * 100:+.2f}% here, so its base figure is too")
+    return allowed, notes
+
+
+def select_paths(only: list[str] | None, skip: list[str], shard: tuple[int, int]) -> list[str]:
+    """The paths one run measures: ``--path`` (default all), less ``--skip``, then this ``--shard``'s slice."""
+    k, n = shard
+    return [p for p in only or PATHS if p not in skip][k - 1 :: n]
+
+
+def _shard(text: str) -> tuple[int, int]:
+    """``--shard K/N``: the Kth of N interleaved slices of the paths, so N machines split one gate."""
+    k, _, n = text.partition("/")
+    if not (k.isdigit() and n.isdigit() and 1 <= int(k) <= int(n)):
+        raise argparse.ArgumentTypeError(f"must be K/N with 1 <= K <= N, not {text}")
+    return int(k), int(n)
 
 
 def _main() -> int:
@@ -328,18 +453,38 @@ def _main() -> int:
         metavar="MIN",
         help=f"kill a callgrind run after this many minutes and fail the gate (default {CHILD_TIMEOUT_MIN:g})",
     )
+    parser.add_argument("--skip", action="append", default=[], choices=PATHS, help="do not measure this path (repeatable)")
+    parser.add_argument(
+        "--base",
+        type=Path,
+        metavar="DIR",
+        help="compare against checkout DIR, measured in this run with DIR/.venv, not against the committed budgets. "
+        "Both figures come from one machine, so the verdict holds on any machine (CI measures a PR's base this way)",
+    )
+    parser.add_argument(
+        "--shard",
+        type=_shard,
+        default=(1, 1),
+        metavar="K/N",
+        help="measure only every Nth path, starting at the Kth, so N machines can split the gate",
+    )
     args = parser.parse_args()
+    if args.base and args.update:
+        parser.error("--update writes committed budgets; --base compares two checkouts and writes nothing")
+    paths = select_paths(args.path, args.skip, args.shard)
 
     if shutil.which("valgrind") is None:
         print("valgrind not found: install it (apt install valgrind) to run the instruction budget", file=sys.stderr)
         return 2
     key = interpreter_key()
+    if args.base:
+        return _against_base(args.base, paths, args.jobs, args.child_timeout * 60)
     data = json.loads(BASELINES.read_text())
     entry = data["interpreters"].get(key, {"budgets": {}})
     if entry.get("python") not in (None, platform.python_version()):
         print(f"note: budgets for {key} were recorded on {entry['python']}, this is {platform.python_version()}")
 
-    measured = measure(args.path or list(PATHS), args.jobs, args.child_timeout * 60)
+    measured = measure(paths, args.jobs, args.child_timeout * 60)
     lines, ok = compare(entry["budgets"], measured)
     print(f"main-thread Ir/op on {key} ({platform.python_version()}), (Ir[n_hi] - Ir[n_lo]) / (n_hi - n_lo)")
     print("\n".join(lines))
