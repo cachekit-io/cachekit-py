@@ -22,8 +22,9 @@ calls are already what invalidation uses off the loop.
   at half a second per write.
 - **Invalidation.** ``cancel`` drops matching queued writes and waits for matching sends to finish, so a
   delete issued after it is ordered behind every write the caller made before it.
-- **Fork.** A forked child starts empty (the owner-PID idiom): the parent's queue is the parent's to send.
-  A child forked without at-fork hooks starts no thread, so ``submit`` refuses there.
+- **Fork.** A forked child starts empty: its first caller publishes a fresh ``_State`` in one store, and
+  the parent's queue is the parent's to send. A child forked without at-fork hooks starts no thread, so
+  ``submit`` refuses there.
 - **Exit.** An ``atexit`` hook flushes every writer within ``EXIT_FLUSH_SECONDS`` in total and logs a
   WARNING naming the writes it dropped. It closes nothing: a backend client's own exit handling is left
   alone. ``os._exit`` (multiprocessing workers) and SIGKILL skip it, and lose the queue.
@@ -62,6 +63,31 @@ class _Job(NamedTuple):
     size: int
 
 
+class _State:
+    """Everything a writer mutates, owned by one process and published as one reference.
+
+    A forked child takes over with a fresh state in one store (``WriteBehind._current``), so no thread ever
+    pairs the child's PID with the parent's lock, queue or thread count. A worker binds the state it was
+    started for and touches no other, so a take-over never moves a send between states.
+    """
+
+    __slots__ = ("bytes", "closed", "cond", "pending", "pid", "sending", "workers")
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition(threading.Lock())
+        self.pending: dict[Entry, _Job] = {}
+        self.sending: dict[Entry, _Job] = {}  # entry -> the job being sent for it
+        self.bytes = 0
+        self.workers = 0
+        self.closed = False
+        self.pid = os.getpid()
+
+
+# The lock a forked child's first callers take over under. Keyed by PID, so no parent thread can hold it at
+# fork; setdefault is atomic with or without the GIL, so racing callers share one (l1_cache's take-over idiom).
+_take_over_locks: dict[int, threading.Lock] = {}
+
+
 class WriteBehind:
     """A decorated function's queue of deferred L2 writes and the threads that send them.
 
@@ -71,110 +97,105 @@ class WriteBehind:
 
     def __init__(self, on_error: Callable[[Entry, Exception], None]) -> None:
         self._on_error = on_error
-        self.fallbacks = 0  # submits refused at a full queue: those callers wrote synchronously
-        self._reset()
+        self._state = _State()
         _writers.add(self)
 
-    def _reset(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
-        self._pending: dict[Entry, _Job] = {}
-        self._sending: dict[Entry, _Job] = {}  # entry -> the job being sent for it
-        self._bytes = 0
-        self._workers = 0
-        self._closed = False
-        self._pid = os.getpid()
-
-    def _owned(self) -> None:
-        if self._pid != os.getpid():
-            # Forked child: the parent's threads do not exist here, and its lock may be held. A thread
-            # racing this swap can lose a write it just queued; the value is still in its L1.
-            self._reset()
+    def _current(self) -> _State:
+        """This process's state. A forked child's first caller replaces the parent's, once, with a re-check:
+        the parent's threads do not exist here, and its lock may be held."""
+        state, pid = self._state, os.getpid()
+        if state.pid == pid:
+            return state
+        with _take_over_locks.setdefault(pid, threading.Lock()):
+            state = self._state
+            if state.pid != pid:
+                state = self._state = _State()
+            return state
 
     def submit(self, entry: Entry, size: int, send: Callable[[], None]) -> bool:
         """Queue ``send`` as the write of ``entry``. False if refused: the caller writes it synchronously."""
-        self._owned()
+        s = self._current()
         if l1_cache._forked_without_hooks():
             return False  # no thread may start here
         job = _Job(send, contextvars.copy_context(), size)
-        with self._cond:
-            if self._closed:
+        with s.cond:
+            if s.closed:
                 return False
-            old = self._pending.get(entry)
-            if (
-                old is None
-                and entry not in self._sending
-                and (len(self._pending) >= MAX_ENTRIES or self._bytes + size > MAX_BYTES)
-            ):
-                self.fallbacks += 1
+            old = s.pending.get(entry)
+            if old is None and entry not in s.sending and (len(s.pending) >= MAX_ENTRIES or s.bytes + size > MAX_BYTES):
                 return False
-            self._pending[entry] = job
-            self._bytes += size - (old.size if old is not None else 0)
-            if self._workers < MAX_WORKERS and self._workers < len(self._pending) + len(self._sending):
-                self._workers += 1
+            s.pending[entry] = job
+            s.bytes += size - (old.size if old is not None else 0)
+            # Threads not busy sending pick up queued entries; start one only if those cannot cover every
+            # entry that can be sent now. An entry behind its own send waits for that send's thread.
+            runnable = sum(1 for e in s.pending if e not in s.sending)
+            if s.workers < MAX_WORKERS and s.workers - len(s.sending) < runnable:
+                s.workers += 1
                 try:
-                    threading.Thread(target=self._work, daemon=True, name="cachekit-write-behind").start()
+                    threading.Thread(target=self._work, args=(s,), daemon=True, name="cachekit-write-behind").start()
                 except RuntimeError:  # how Thread.start() refuses: "can't start new thread"
-                    self._workers -= 1
-                    if self._workers == 0:
+                    s.workers -= 1
+                    if s.workers == 0:
                         # No thread will ever send it. Only this job can be queued: a queued job always has one.
-                        del self._pending[entry]
-                        self._bytes -= size
+                        del s.pending[entry]
+                        s.bytes -= size
                         return False
         return True
 
-    def _work(self) -> None:
-        cond = self._cond
+    def _work(self, s: _State) -> None:
         quit_cleanly = False
         try:
             while True:
-                with cond:
-                    entry = next((e for e in self._pending if e not in self._sending), None)
+                with s.cond:
+                    entry = next((e for e in s.pending if e not in s.sending), None)
                     if entry is None:
                         # Given up in the same hold as the empty check: a submit in between would see this
                         # thread still counted, start none, and leave its write queued with no thread.
-                        self._workers -= 1
+                        s.workers -= 1
                         quit_cleanly = True
-                        cond.notify_all()
+                        s.cond.notify_all()
                         return
-                    job = self._pending.pop(entry)
-                    self._bytes -= job.size
-                    self._sending[entry] = job
+                    job = s.pending.pop(entry)
+                    s.bytes -= job.size
+                    s.sending[entry] = job
                 try:
                     job.context.run(job.send)
                 except Exception as exc:
                     self._on_error(entry, exc)
                 finally:
-                    with cond:
-                        del self._sending[entry]
-                        cond.notify_all()
+                    with s.cond:
+                        del s.sending[entry]
+                        s.cond.notify_all()
         finally:
             if not quit_cleanly:  # a raise: give up the thread's place, so the next submit can start one
-                with cond:
-                    self._workers -= 1
-                    cond.notify_all()
+                with s.cond:
+                    s.workers -= 1
+                    s.cond.notify_all()
 
     def cancel(self, match: Callable[[Entry], bool], *, wait: bool = True) -> None:
         """Drop the queued writes of every entry ``match`` accepts, then, with ``wait``, block until the
         sends of those entries in progress at the call have finished. A send that starts later is a write
         made after the call and is not waited for: a key taking misses throughout cannot hold the caller.
-        Never call it from a ``send``: that send would wait on itself."""
-        self._owned()
-        with self._cond:
-            for entry in [e for e in self._pending if match(e)]:
-                self._bytes -= self._pending.pop(entry).size
+        The wait lasts as long as those backend writes take: it has no timeout of its own, since a delete
+        sent before a write returns could be overtaken by it. Never call it from a ``send``: that send would
+        wait on itself."""
+        s = self._current()
+        with s.cond:
+            for entry in [e for e in s.pending if match(e)]:
+                s.bytes -= s.pending.pop(entry).size
             if wait:
                 # Jobs, not entries: a later send of the same entry is another job.
-                sending = [(e, job) for e, job in self._sending.items() if match(e)]
-                self._cond.wait_for(lambda: all(self._sending.get(e) is not job for e, job in sending))
+                sending = [(e, job) for e, job in s.sending.items() if match(e)]
+                s.cond.wait_for(lambda: all(s.sending.get(e) is not job for e, job in sending))
 
     def close(self, deadline: float) -> list[Entry]:
         """Refuse new writes, wait until the queue drains or ``deadline`` (``time.monotonic``) passes,
         and return the entries still queued or being sent."""
-        self._owned()
-        with self._cond:
-            self._closed = True
-            self._cond.wait_for(lambda: not self._pending and not self._sending, timeout=max(0.0, deadline - time.monotonic()))
-            return [*self._sending, *self._pending]
+        s = self._current()
+        with s.cond:
+            s.closed = True
+            s.cond.wait_for(lambda: not s.pending and not s.sending, timeout=max(0.0, deadline - time.monotonic()))
+            return [*s.sending, *s.pending]
 
 
 _writers: weakref.WeakSet[WriteBehind] = weakref.WeakSet()

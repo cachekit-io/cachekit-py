@@ -157,9 +157,10 @@ class DecoratorConfig:
         write_behind: Return a miss before its L2 write lands (default: False; no preset sets it). The
                       value is serialized and put in L1 on the caller's thread, so serialization errors
                       still raise there; the backend write follows on a bounded background writer. Until
-                      it lands, other processes miss the key, and a process killed first loses it. Not on
-                      the async distributed-lock path or the streaming (File + Arrow) write path, which
-                      stay synchronous. See docs/features/write-behind.md.
+                      it lands, other processes miss the key, and a process killed first loses it; a write
+                      queued before another process's invalidation can land after it. Not on the async
+                      distributed-lock path or a sync miss's streaming (File + Arrow) write, which stay
+                      synchronous. See docs/features/write-behind.md.
         backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
                  @cache(backend=None) does. The default, UNSET, resolves per "Backend Resolution Priority".
         l1: L1 in-memory cache configuration
@@ -191,8 +192,6 @@ class DecoratorConfig:
     # Performance (3 fields)
     refresh_ttl_on_get: bool = False
     ttl_refresh_threshold: float = 0.5
-    # Opt-in, set by no preset: a miss returns once its value is serialized and in L1, and the L2 write
-    # follows on a bounded background writer (decorators/write_behind.py).
     write_behind: bool = False
 
     # Backend abstraction (1 field)

@@ -2,7 +2,10 @@
 
 # Write-Behind: Return a Miss Before Its L2 Write Lands
 
-> `write_behind=True` is an opt-in, off by default and set by no preset. On a miss, the decorated call returns once the value is serialized and in L1; the L2 write follows on a background writer. The cost is visibility: until that write lands, **another process misses the key** and recomputes it.
+> `write_behind=True` is an opt-in, off by default and set by no preset. On a miss, the decorated call returns once the value is serialized and in L1; the L2 write follows on a background writer. The cost is visibility: until that write lands, **another process misses the key** and recomputes it, and a write still queued when **another process invalidates the key can land after that invalidation**.
+
+> [!CAUTION]
+> Do not enable it for values that must not outlive an invalidation in another process, such as authorization decisions or entitlements. Another process's `invalidate_cache()` does not reach this process's queue, so a value computed before the invalidation can be written to L2 after it, with its full TTL (see [Invalidation](#invalidation)).
 
 ## Why
 
@@ -27,13 +30,13 @@ assert lookup("sleep") == {"term": "sleep", "hits": 3}  # returns before the L2 
 assert lookup("sleep") == {"term": "sleep", "hits": 3}  # an L1 hit: the value was in L1 at return
 ```
 
-Every preset takes it: `@cache.io(write_behind=True)`, `@cache.production(write_behind=True)`, `DecoratorConfig(write_behind=True)`. Without a backend (`backend=None`, L1-only) there is no L2 write, and the option does nothing.
+Every serialized preset takes it: `@cache.io(write_behind=True)`, `@cache.production(write_behind=True)`, `DecoratorConfig(write_behind=True)`. `@cache.local()` stores no L2 entry and does not accept it. Without a backend (`backend=None`, L1-only) there is no L2 write, and the option does nothing.
 
 ## What stays on the caller's path
 
 - **Serialization and encryption.** The value is serialized (and encrypted) on the caller's thread, so `InteropError` and `KeyringConfigurationError` still raise to the caller, and the writer sends exactly the bytes that went into L1.
 - **The async distributed-lock path.** An async miss on a lockable backend (CachekitIO, Redis) writes inside its lock, as before: a write deferred past the lock's release would send waiting callers to an empty L2, and each would recompute. Write-behind applies to sync misses and to async misses that run without the lock.
-- **The streaming write path.** A plaintext Arrow value written to the File backend streams to disk on the caller's thread, as before.
+- **The sync streaming write.** On a sync miss, a plaintext Arrow value written to the File backend streams to disk on the caller's thread, as before. An async miss never streams: it serializes the value in full, so its File write is deferred like any other.
 
 ## The writer
 
@@ -44,11 +47,16 @@ Each decorated function gets one writer, shared by its sync and async callers.
 | Threads | Up to 4 per function, started when writes are queued and ended when the queue is empty |
 | Queue bound | 64 entries and 16 MiB. A miss that finds the queue full writes on the caller's thread, as without the option |
 | Coalescing | One pending write per key: a newer value replaces a queued one, and is never sent before an older one still in flight |
-| Invalidation | `invalidate_cache()` drops the queued writes it covers and waits for those being sent, so its delete always comes after them |
+| Invalidation | In this process, `invalidate_cache()` drops the queued writes it covers and waits for those being sent, so its delete comes after every write this process made before the call. The wait lasts as long as those backend writes take: it has no timeout of its own, so on a backend with no operation timeout it can be as long as the slowest write |
 | Key registry | A key is tracked (whole-function invalidation across processes) only after its write succeeds |
 | Failures | A failed write is a WARNING (throttled) and a failed `set` operation in the metrics. The value stays in this process's L1 |
+| Metrics | A deferred write records its `set` sample when it finishes, on the writer thread. The sample times the backend write alone (serialization ran on the caller) and reports `success=False` when the backend refused or failed it. Without the option, the sample covers serialization plus the write and is recorded before the call returns |
 
-A key queued for a write may also lose that write to another process's invalidation announcement (the [invalidation listener](l1-invalidation.md#cross-process-l1-eviction)): the queued write is dropped, so it cannot land after that process's delete.
+### Invalidation
+
+The ordering above holds within one process. Across processes it does not: process P returns a value, its write still queued; process Q then calls `invalidate_cache()` for the same key and returns; then P's write lands, and the value Q invalidated is back in L2 for its full TTL. Without the option, P's write would have landed before P returned.
+
+The [invalidation listener](l1-invalidation.md#cross-process-l1-eviction) narrows this but does not close it. When it delivers another process's announcement, this process drops its queued writes of that key (of every key, for a whole-function announcement, and for every tenant, since the event carries no tenant). It does not wait for a write already being sent. The announcement is published after the other process's delete and delivered at most once, the listener runs only on the tenant-scoped Redis backend, and a function with L1 off does not register for it.
 
 ## Process lifecycle
 

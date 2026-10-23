@@ -107,11 +107,46 @@ class _TrackingBackend(_GatedBackend):
         return keys
 
 
-def _drain(fn: Any) -> None:
-    """Wait until fn's writer holds nothing. The gate must be open."""
-    writer: wb.WriteBehind = fn._cachekit_write_behind
-    with writer._cond:
-        assert writer._cond.wait_for(lambda: not writer._pending and not writer._sending, _GUARD_SECONDS)
+# The writers the running test created, in order (the ``_writers_created`` fixture).
+_created: list[wb.WriteBehind] = []
+
+
+@pytest.fixture(autouse=True)
+def _writers_created(monkeypatch: pytest.MonkeyPatch) -> list[wb.WriteBehind]:
+    created: list[wb.WriteBehind] = []
+    init = wb.WriteBehind.__init__
+
+    def recording_init(self: wb.WriteBehind, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(wb.WriteBehind, "__init__", recording_init)
+    monkeypatch.setattr(sys.modules[__name__], "_created", created)
+    return created
+
+
+def _drain() -> None:
+    """Send everything the test's writers hold, then close them. The gate must be open."""
+    for writer in _created:
+        assert writer.close(_deadline()) == [], "a deferred write never finished"
+
+
+def _cancel_entered(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """An Event set when the next cancel() starts matching entries. It matches under the writer's lock and
+    then waits on it, so a thread that next takes that lock (any submit, a worker picking a write) runs only
+    once the cancel has dropped its queued writes and is waiting, or has returned."""
+    entered = threading.Event()
+    cancel = wb.WriteBehind.cancel
+
+    def signalling_cancel(self: wb.WriteBehind, match: Any, *, wait: bool = True) -> None:
+        def signalling_match(entry: Any) -> bool:
+            entered.set()
+            return match(entry)
+
+        cancel(self, signalling_match, wait=wait)
+
+    monkeypatch.setattr(wb.WriteBehind, "cancel", signalling_cancel)
+    return entered
 
 
 def _held(backend: _GatedBackend) -> None:
@@ -155,7 +190,7 @@ class TestOptIn:
 
         assert fn(1) == 2
         assert backend.writes() == [threading.current_thread().name]
-        assert fn._cachekit_write_behind is None  # type: ignore[attr-defined]
+        assert _created == []
 
     def test_l1_only_has_no_writer(self) -> None:
         @cache(backend=None, ttl=60, write_behind=True)
@@ -163,7 +198,7 @@ class TestOptIn:
             return x * 2
 
         assert fn(1) == 2
-        assert fn._cachekit_write_behind is None  # type: ignore[attr-defined]
+        assert _created == []
 
 
 class TestReturnsBeforeTheWrite:
@@ -180,7 +215,7 @@ class TestReturnsBeforeTheWrite:
         assert fn(1) == 2 and calls == 1  # an L1 hit: the value was in L1 before the first call returned
         assert backend.store == {}
         backend.gate.set()
-        _drain(fn)
+        _drain()
         assert backend.writes() == [_WRITER]
 
     async def test_async_unlocked_miss(self, backend: _GatedBackend) -> None:
@@ -196,7 +231,7 @@ class TestReturnsBeforeTheWrite:
         assert await fn(1) == 2 and calls == 1
         assert backend.store == {}
         backend.gate.set()
-        await asyncio.to_thread(_drain, fn)
+        await asyncio.to_thread(_drain)
         assert backend.writes() == [_WRITER]
 
     def test_l2_holds_the_value_for_a_cold_reader(self, backend: _GatedBackend) -> None:
@@ -206,7 +241,7 @@ class TestReturnsBeforeTheWrite:
 
         fn(1)
         backend.gate.set()
-        _drain(fn)
+        _drain()
 
         @cache(backend=backend, ttl=60, l1_enabled=False, namespace="wb")
         def fn(x: int) -> int:  # noqa: F811 - the same function identity, with no L1
@@ -271,11 +306,9 @@ class TestBounds:
         _held(backend)  # key 1 is being sent, so the queue is empty
         fn(2)  # queued: the one entry the bound allows
         fn(3)  # refused: written on the caller
-        writer: wb.WriteBehind = fn._cachekit_write_behind  # type: ignore[attr-defined]
-        assert writer.fallbacks == 1
         assert backend.writes() == [threading.current_thread().name]
         backend.gate.set()
-        _drain(fn)
+        _drain()
         assert backend.writes().count(_WRITER) == 2
 
     def test_bytes_bound(self, backend: _GatedBackend, one_writer: None, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -286,15 +319,13 @@ class TestBounds:
         fn(1)
         _held(backend)
         monkeypatch.setattr(wb, "MAX_BYTES", 500)
-        fn(1000)  # its envelope alone is over the bound
-        assert fn._cachekit_write_behind.fallbacks == 1  # type: ignore[attr-defined]
+        fn(1000)  # its envelope alone is over the bound: written on the caller
         assert backend.writes() == [threading.current_thread().name]
 
     def test_a_queued_entry_takes_a_newer_value_past_the_bound(
         self, backend: _GatedBackend, one_writer: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No fallback for an entry already queued or being sent: a caller write could race the deferred one."""
-        monkeypatch.setattr(wb, "MAX_ENTRIES", 0)
         writer = wb.WriteBehind(lambda *_: None)
         sent: list[int] = []
         held = threading.Event()
@@ -335,7 +366,7 @@ class TestCoalescingAndInvalidation:
         _held(backend)  # the one writer is held on key 0
         fn(1), fn(1), fn(1)  # no L1, and L2 has nothing yet: three misses, one queued entry
         backend.gate.set()
-        _drain(fn)
+        _drain()
         assert fn(1) == 4  # what L2 holds: the newest value
         assert len(backend.writes()) == 2  # key 0 and key 1, once each
 
@@ -351,27 +382,31 @@ class TestCoalescingAndInvalidation:
         fn(1)  # in L1, its write queued
         fn.invalidate_cache(1)  # type: ignore[attr-defined]
         backend.gate.set()
-        _drain(fn)
+        _drain()
         assert list(backend.store) == [_only_key(backend, "set")]  # key 0 only: key 1's write never ran
 
-    def test_invalidate_waits_out_a_write_being_sent(self, backend: _GatedBackend) -> None:
+    def test_invalidate_waits_out_a_write_being_sent(self, backend: _GatedBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         @cache(backend=backend, ttl=60, write_behind=True)
         def fn(x: int) -> int:
             return x * 2
 
         fn(1)
         _held(backend)
+        entered = _cancel_entered(monkeypatch)
         done = threading.Thread(target=fn.invalidate_cache, args=(1,))  # type: ignore[attr-defined]
         done.start()
-        _until(lambda: len(fn._cachekit_write_behind._cond._waiters) == 1)  # type: ignore[attr-defined]
-        assert backend.log == []  # the invalidation waits behind the held write, its delete not sent
+        assert entered.wait(_GUARD_SECONDS)
+        # The held write can finish only under the lock the cancel holds until it waits: had the cancel not
+        # waited, the delete would be logged before the set.
         backend.gate.set()
         done.join(_GUARD_SECONDS)
         assert [op for op, *_ in backend.log] == ["set", "delete"]
         assert backend.store == {}
 
     @pytest.mark.parametrize("tracking", [False, True], ids=["local", "registry"])
-    def test_no_args_invalidation_drops_queued_writes(self, one_writer: None, tracking: bool) -> None:
+    def test_no_args_invalidation_drops_queued_writes(
+        self, one_writer: None, tracking: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         backend = _TrackingBackend() if tracking else _GatedBackend()
 
         @cache(backend=backend, ttl=60, write_behind=True)
@@ -382,11 +417,12 @@ class TestCoalescingAndInvalidation:
             fn(0)
             _held(backend)
             fn(1)
-            writer: wb.WriteBehind = fn._cachekit_write_behind  # type: ignore[attr-defined]
-            # Opens the gate once the invalidation has dropped key 1's write and waits on key 0's.
-            threading.Thread(target=lambda: (_until(lambda: not writer._pending), backend.gate.set())).start()
+            entered = _cancel_entered(monkeypatch)
+            # Opens the gate once the invalidation has started dropping key 1's write: the writer picks its
+            # next write under the lock the cancel holds until it waits, by which time key 1's is gone.
+            threading.Thread(target=lambda: (entered.wait(_GUARD_SECONDS), backend.gate.set())).start()
             fn.invalidate_cache()  # type: ignore[attr-defined]
-            _drain(fn)
+            _drain()
             assert backend.store == {}
             assert len(backend.writes()) == 1
         finally:
@@ -413,18 +449,10 @@ class TestCoalescingAndInvalidation:
         monkeypatch.setattr(wb.WriteBehind, "cancel", cancel_then_miss)
         fn.invalidate_cache(1)  # type: ignore[attr-defined]
         backend.gate.set()
-        _drain(fn)
+        _drain()
         assert list(backend.store) != []  # landed after the invalidation's delete
         fn.invalidate_cache()  # type: ignore[attr-defined]
         assert backend.store == {}
-
-
-def _until(condition: Any) -> None:
-    """Wait for a state another thread reaches; the guard only fails a hang."""
-    deadline = time.monotonic() + _GUARD_SECONDS
-    while not condition():
-        assert time.monotonic() < deadline, "state never reached"
-        time.sleep(0.001)
 
 
 def _only_key(backend: _GatedBackend, op: str) -> str:
@@ -447,7 +475,7 @@ class TestOnTheWriter:
             tenant_var.reset(token)
         assert backend.registry == set()  # not tracked before the write
         backend.gate.set()
-        _drain(fn)
+        _drain()
         assert [(op, t) for op, _, t in backend.log] == [("set", _WRITER), ("track", _WRITER)]
         assert backend.tenants == ["tenant-a"]
 
@@ -468,7 +496,7 @@ class TestOnTheWriter:
         fn(1)
         with caplog.at_level(logging.WARNING, logger="cachekit"):
             backend.gate.set()
-            _drain(fn)
+            _drain()
         assert ("set", False) in recorded
         assert ("set", True) not in recorded
         assert any("Deferred L2 write failed" in r.getMessage() for r in caplog.records)
@@ -518,7 +546,8 @@ class TestPathsThatStaySynchronous:
 
         fn(3)
         assert threads == [threading.current_thread().name]
-        assert fn._cachekit_write_behind._pending == {}  # type: ignore[attr-defined]
+        (writer,) = _created
+        assert writer.close(time.monotonic()) == []  # nothing was queued
 
 
 class TestEncryption:
@@ -543,7 +572,7 @@ class TestEncryption:
 
         fn(1)
         backend.gate.set()
-        _drain(fn)
+        _drain()
         (key,) = backend.store
         assert backend.store[key] is put[key]
 
@@ -552,6 +581,62 @@ class TestEncryption:
             raise AssertionError("recomputed: L2 did not hold a readable value")
 
         assert fn(1) == {"v": 1}
+
+    def test_two_tenants_on_a_prefixing_backend_write_their_own_entries(self) -> None:
+        """Two tenants miss the same cache key on a tenant-prefixing backend: each deferred write runs in its
+        caller's context, so it lands under that tenant's prefix, sealed to it (the AAD binds the prefix)."""
+        backend = _PrefixingBackend()
+        options = {"backend": backend, "ttl": 60, "namespace": "tenants", "master_key": _MASTER_KEY, "single_tenant_mode": True}
+        computed: list[str] = []
+
+        @cache.secure(write_behind=True, **options)
+        def fn(x: int) -> str:
+            computed.append(tenant_var.get())
+            return f"value-of-{tenant_var.get()}"
+
+        for tenant in ("a", "b"):
+            assert _as_tenant(tenant, fn, 1) == f"value-of-{tenant}"
+        backend.gate.set()
+        _drain()
+        assert sorted(key.split(":", 2)[1] for key in backend.store) == ["a", "b"]
+        assert computed == ["a", "b"]
+
+        @cache.secure(l1_enabled=False, **options)
+        def fn(x: int) -> str:  # noqa: F811 - the same function identity, reading L2 only
+            computed.append(tenant_var.get())
+            return f"recomputed-for-{tenant_var.get()}"
+
+        assert [_as_tenant(t, fn, 1) for t in ("a", "b")] == ["value-of-a", "value-of-b"]
+        # Tenant a's ciphertext in tenant b's slot does not open as b: b recomputes instead.
+        (a_key,) = [k for k in backend.store if k.startswith("t:a:")]
+        (b_key,) = [k for k in backend.store if k.startswith("t:b:")]
+        backend.store[b_key] = backend.store[a_key]
+        assert _as_tenant("b", fn, 1) == "recomputed-for-b"
+
+
+class _PrefixingBackend(_GatedBackend):
+    """Prefixes every key with the calling tenant, as the tenant-scoped Redis backend does."""
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{tenant_var.get()}:"
+
+    def get(self, key: str) -> bytes | None:
+        return super().get(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        super().set(self.key_prefix + key, value, ttl)
+
+    def delete(self, key: str) -> bool:
+        return super().delete(self.key_prefix + key)
+
+
+def _as_tenant(tenant: str, fn: Any, *args: Any) -> Any:
+    token = tenant_var.set(tenant)
+    try:
+        return fn(*args)
+    finally:
+        tenant_var.reset(token)
 
 
 def _forked_child_outcome(fork: str) -> object:
@@ -572,7 +657,7 @@ def _forked_child_outcome(fork: str) -> object:
     wb.MAX_WORKERS = 0
     fn(1)  # queued in the parent, never sent
     wb.MAX_WORKERS = 4
-    writer: wb.WriteBehind = fn._cachekit_write_behind  # type: ignore[attr-defined]
+    (writer,) = wb._writers  # the only one in this fresh interpreter
     if threading.active_count() != 1:  # not an assert: python -O strips those
         raise RuntimeError(f"a thread would be alive at fork: {threading.enumerate()}")
     r, w = os.pipe()
@@ -591,7 +676,7 @@ def _forked_child_outcome(fork: str) -> object:
             outcome: object = {
                 "caller_writes": len(backend.writes()),
                 "requested": requested,
-                "queued": sorted(key for _, key in writer._pending),
+                "queued": sorted(key for _, key in writer.close(time.monotonic())),
             }
         except BaseException as e:
             outcome = {"error": repr(e)}
@@ -689,12 +774,18 @@ class TestWriterEdges:
         """A key taking misses throughout an invalidation cannot hold it: a send that starts after the
         cancel is a later write, not one the cancel waits for."""
         writer = wb.WriteBehind(lambda *_: None)
-        first, second = threading.Event(), threading.Event()
-        assert writer.submit(("", "k"), 1, lambda: first.wait(_GUARD_SECONDS))
-        _until(lambda: ("", "k") in writer._sending)
-        cancelled = threading.Thread(target=writer.cancel, args=(("", "k").__eq__,))
+        sending, first, second, matched = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+        assert writer.submit(("", "k"), 1, lambda: (sending.set(), first.wait(_GUARD_SECONDS)))
+        assert sending.wait(_GUARD_SECONDS)
+
+        def match(entry: Any) -> bool:
+            matched.set()
+            return entry == ("", "k")
+
+        cancelled = threading.Thread(target=writer.cancel, args=(match,))
         cancelled.start()
-        _until(lambda: len(writer._cond._waiters) == 1)  # type: ignore[attr-defined]
+        assert matched.wait(_GUARD_SECONDS)
+        # This submit takes the lock the cancel holds until it waits: it lands once the cancel is waiting.
         assert writer.submit(("", "k"), 1, lambda: second.wait(_GUARD_SECONDS))  # queued behind the first send
         first.set()  # the first send ends, and the second starts at once on the freed thread
         cancelled.join(_GUARD_SECONDS)
@@ -710,7 +801,7 @@ class TestWriterEdges:
 
         monkeypatch.setattr(threading.Thread, "start", refuse)
         assert not writer.submit(("", "k"), 1, lambda: None)
-        assert writer._pending == {} and writer._workers == 0
+        assert writer.close(time.monotonic()) == []  # nothing left queued with no thread to send it
 
     def test_exit_flush_names_what_it_dropped(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         writer = wb.WriteBehind(lambda *_: None)
@@ -725,3 +816,46 @@ class TestWriterEdges:
             release.set()
         assert any("1 deferred L2 write(s) were not sent" in r.getMessage() for r in caplog.records)
         assert not writer.submit(("", "other"), 1, lambda: None)  # closed: callers write synchronously
+
+    def test_a_forked_childs_callers_take_over_one_fresh_state(self) -> None:
+        """The PID travels with the state: every caller of a child sees the same fresh state, published once,
+        and the parent's queue stays on the parent's state, which no child thread touches."""
+        writer = wb.WriteBehind(lambda *_: None)
+        inherited = writer._state
+        inherited.pid = -1  # as a child sees its parent's state
+        inherited.pending[("", "parent")] = wb._Job(lambda: None, contextvars.copy_context(), 1)
+        barrier = threading.Barrier(8)
+        seen: list[object] = []
+
+        def first_call() -> None:
+            barrier.wait(_GUARD_SECONDS)
+            seen.append(writer._current())
+
+        threads = [threading.Thread(target=first_call) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_GUARD_SECONDS)
+        assert len(seen) == 8 and len({id(state) for state in seen}) == 1
+        assert seen[0] is not inherited and seen[0].pid == os.getpid()  # type: ignore[attr-defined]
+        assert list(inherited.pending) == [("", "parent")]
+        assert writer.close(time.monotonic()) == []
+
+    def test_a_newer_value_behind_a_send_starts_no_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        writer = wb.WriteBehind(lambda *_: None)
+        started: list[str] = []
+        start = threading.Thread.start
+
+        def counting_start(self: threading.Thread) -> None:
+            started.append(self.name)
+            start(self)
+
+        monkeypatch.setattr(threading.Thread, "start", counting_start)
+        sending, release = threading.Event(), threading.Event()
+        assert writer.submit(("", "k"), 1, lambda: (sending.set(), release.wait(_GUARD_SECONDS)))
+        assert sending.wait(_GUARD_SECONDS)
+        for _ in range(100):
+            assert writer.submit(("", "k"), 1, lambda: None)  # coalesced behind the send: its thread sends it
+        release.set()
+        assert writer.close(_deadline()) == []
+        assert started == [_WRITER]

@@ -2903,17 +2903,19 @@ def create_cache_wrapper(
             # Write-behind (unlocked path only: the locked path's write must land inside its lock, or
             # waiters re-read before L2 holds the value and recompute). A refusal writes here, as without it.
             deferred = _write_behind is not None and _defer_write(cache_key, twin_key, serialized_data)
-            stored = deferred or await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                cache_key,
-                serialized_data,
-                ttl=ttl,
-                stale_ttl=_stale_ttl,
-            )
+            stored = False  # a deferred write is not stored yet: the writer tracks it once it lands
+            if not deferred:
+                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                    cache_key,
+                    serialized_data,
+                    ttl=ttl,
+                    stale_ttl=_stale_ttl,
+                )
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
             _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-            if stored and not deferred:  # a deferred write tracks itself once it lands (_send_deferred)
+            if stored:
                 await _track_and_record_async(cache_key)
 
             # Record successful cache set
@@ -3285,7 +3287,6 @@ def create_cache_wrapper(
 
     if inspect.iscoroutinefunction(func):
         async_wrapper._cachekit_evict = _evict  # type: ignore[attr-defined]
-        async_wrapper._cachekit_write_behind = _write_behind  # type: ignore[attr-defined]
         async_wrapper.invalidate_cache = ainvalidate_cache  # type: ignore[attr-defined]
         async_wrapper.ainvalidate_cache = ainvalidate_cache  # async version  # type: ignore[attr-defined]
         async_wrapper.check_health = acheck_health  # async version  # type: ignore[attr-defined]
@@ -3296,7 +3297,6 @@ def create_cache_wrapper(
         return async_wrapper  # type: ignore[return-value]
     else:
         sync_wrapper._cachekit_evict = _evict  # type: ignore[attr-defined]
-        sync_wrapper._cachekit_write_behind = _write_behind  # type: ignore[attr-defined]
         sync_wrapper.invalidate_cache = invalidate_cache  # type: ignore[attr-defined]
         sync_wrapper.check_health = check_health  # type: ignore[attr-defined]
         sync_wrapper.get_health_status = get_health_status  # type: ignore[attr-defined]
