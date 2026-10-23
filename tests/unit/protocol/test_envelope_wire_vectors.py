@@ -33,9 +33,11 @@ paths that:
 6. **Named rejections**: every ``reject_vectors`` envelope is rejected by
    ``ByteStorage.retrieve`` with the error class and message its row names. The
    spec also asks that the reads of ``reject_original_size_over_cap`` and
-   ``reject_ratio_bomb`` stay below ``original_size`` in allocation; that bound
-   is not asserted here, because an SDK over cachekit-core may rely on it only
-   once core's allocation probe runs in CI on the core version this package pins.
+   ``reject_ratio_bomb`` stay below ``original_size`` in allocation. That bound
+   is relied on through cachekit-core's allocation probe, which runs in core's CI
+   on the 0.7.0 this package pins: the spec lets an SDK over core do so when it
+   passes the envelope bytes through, and ``ByteStorage.retrieve`` hands them to
+   core with no allocation of its own sized from an envelope field.
 7. **Payload decode bounds**: every ``payload_reject_vectors`` envelope passes the
    envelope read, and ``StandardSerializer`` then refuses its payload with the
    structural guard's own error, before the decode allocates.
