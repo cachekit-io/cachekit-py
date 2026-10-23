@@ -336,7 +336,7 @@ make security-install
 # Quick checks (< 3 min)
 make security-fast
 
-# Comprehensive (< 15 min)
+# Mirrors the Security Medium workflow: cargo-geiger (zero unsafe functions in cachekit-rs) and its Miri steps (< 15 min)
 make security-medium
 
 # Python dependencies

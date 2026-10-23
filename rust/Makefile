@@ -188,6 +188,7 @@ security-fast: ## Run fast security checks (< 3 min)
 	} 2>&1 | tee $(LOG_SECURITY_DIR)/fast_$(TIMESTAMP).log
 	@echo "$(GREEN)✓ Fast security checks completed$(RESET)"
 
+# Mirrors .github/workflows/security-medium.yml; keep the two in step.
 security-medium: ## Run medium security checks (< 15 min)
 	@echo "$(BLUE)Running medium security checks...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_SECURITY_DIR)/medium_$(TIMESTAMP).log$(RESET)"
@@ -195,24 +196,23 @@ security-medium: ## Run medium security checks (< 15 min)
 	@{ \
 		echo "$(YELLOW)Running cargo-geiger (unsafe analysis)...$(RESET)" && \
 		cargo geiger --output-format Json > geiger-report.json && \
-		TOTAL_FUNCS=$$(jq '[.packages[].package.functions.safe + .packages[].package.functions.unsafe] | add' geiger-report.json) && \
-		UNSAFE_FUNCS=$$(jq '[.packages[].package.functions.unsafe] | add' geiger-report.json) && \
-		UNSAFE_RATIO=$$(echo "scale=2; $$UNSAFE_FUNCS / $$TOTAL_FUNCS * 100" | bc) && \
-		echo "  Unsafe ratio: $$UNSAFE_RATIO% ($$UNSAFE_FUNCS / $$TOTAL_FUNCS functions)" && \
-		if (( $$(echo "$$UNSAFE_RATIO > 5.0" | bc -l) )); then \
-			echo "$(YELLOW)❌ Unsafe ratio exceeds 5% threshold$(RESET)"; \
+		UNSAFE_FUNCS=$$(jq '.packages[] | select(.package.id.name == "cachekit-rs") | .unsafety.used.functions.unsafe_' geiger-report.json) && \
+		if [ -z "$$UNSAFE_FUNCS" ]; then \
+			echo "$(YELLOW)❌ cachekit-rs not found in geiger report$(RESET)"; \
 			exit 1; \
 		fi && \
-		echo "$(GREEN)✓ cargo-geiger passed (< 5% unsafe)$(RESET)" && \
+		echo "  cachekit-rs unsafe functions: $$UNSAFE_FUNCS" && \
+		if [ "$$UNSAFE_FUNCS" != "0" ]; then \
+			echo "$(YELLOW)❌ cachekit-rs has $$UNSAFE_FUNCS unsafe functions — must be zero$(RESET)"; \
+			exit 1; \
+		fi && \
+		echo "$(GREEN)✓ cargo-geiger passed (cachekit-rs has zero unsafe functions)$(RESET)" && \
 		echo "$(YELLOW)Running Miri on byte_storage module...$(RESET)" && \
-		cargo +nightly miri test --lib --no-default-features --features compression,checksum byte_storage && \
+		cargo +nightly miri test --lib --no-default-features --features compression,checksum,messagepack byte_storage && \
 		echo "$(GREEN)✓ Miri byte_storage passed$(RESET)" && \
 		echo "$(YELLOW)Running Miri on encryption module...$(RESET)" && \
 		cargo +nightly miri test --lib --no-default-features --features encryption encryption && \
-		echo "$(GREEN)✓ Miri encryption passed$(RESET)" && \
-		echo "$(YELLOW)Running cargo-semver-checks...$(RESET)" && \
-		(cargo semver-checks check-release || echo "$(YELLOW)⚠️  No previous version - skipping semver check$(RESET)") && \
-		echo "$(GREEN)✓ cargo-semver-checks passed$(RESET)"; \
+		echo "$(GREEN)✓ Miri encryption passed$(RESET)"; \
 	} 2>&1 | tee $(LOG_SECURITY_DIR)/medium_$(TIMESTAMP).log
 	@echo "$(GREEN)✓ Medium security checks completed$(RESET)"
 
