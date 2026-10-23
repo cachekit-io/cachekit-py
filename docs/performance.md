@@ -68,6 +68,13 @@ The `Bench` workflow (`.github/workflows/bench.yml`) runs five of these guards o
 
 The encryption guard's arms differ by 11 ± 16μs (Welch 95%), inside the noise, as in every pass on the other machine. Hosted runners do not always get the same CPU model: a run on an AMD EPYC 9V45 runner took 46-61% as long on every row (4.09 ± 0.04μs for the dict's L1-only hit, 256 ± 13μs for the Redis L2 hit).
 
+The workflow runs these guards with this command, against a Redis it starts on the runner:
+
+```bash
+REDIS_URL=redis://localhost:6379 uv run pytest tests/performance/test_production_realism.py -s -q -p no:cacheprovider \
+  -k "complex_dict or dataframe or with_backend or encryption_overhead or redis_l2"
+```
+
 ## Why an L1-Only Hit Costs the Same for Any Payload
 
 With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict, a dataclass and a 10K-row DataFrame all cost about the same: key generation, the lookup and the decorator's bookkeeping.

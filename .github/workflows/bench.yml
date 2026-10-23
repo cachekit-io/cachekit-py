@@ -3,22 +3,24 @@ name: Bench
 # Runs the wall-clock guards behind the GitHub-hosted runner figures in
 # docs/performance.md and the README, on a GitHub-hosted runner, and writes
 # their run medians into the job summary. Run it from the Actions tab to
-# refresh those figures. A PR that changes this file runs it as well.
-# Informational only: nothing here gates a merge.
+# refresh those figures. A PR that changes the guards or this file runs it as
+# well. Informational only: nothing here gates a merge.
 
 on:
   workflow_dispatch:
   pull_request:
     branches: [ main ]
     paths:
+      - tests/performance/test_production_realism.py
+      - tests/performance/stats_utils.py
       - .github/workflows/bench.yml
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# No concurrency group: GitHub keeps at most one run of a group pending and
+# cancels it when the next one queues, and several manual runs are how the
+# spread between runs is measured.
 
 # bash -eo pipefail, so a failing guard is not hidden by the tee after it.
 defaults:

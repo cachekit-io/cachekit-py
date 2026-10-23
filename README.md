@@ -298,7 +298,7 @@ Hosted runners come with other CPU models too: a run on an EPYC 9V45 runner took
 | Serializer | Speed | Use Case |
 |:-----------|:-----:|:---------|
 | **StandardSerializer** | ★★★★☆ | General Python types; not NumPy arrays or pandas objects |
-| **OrjsonSerializer** | ★★★★★ | JSON APIs (2-5x faster than stdlib) — requires `cachekit[json]` |
+| **OrjsonSerializer** | ★★★★★ | JSON APIs — requires `cachekit[json]` |
 | **ArrowSerializer** | — | pandas DataFrames (columnar, exact round trip) |
 | **+ Encryption** | ★★★★☆ | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
@@ -348,9 +348,18 @@ assert calls == 1
 ### Integrity Checking
 
 > [!IMPORTANT]
-> All serializers support **configurable checksums** for corruption detection using xxHash3-64 (8 bytes). Enabled by default in `@cache.production` and `@cache.secure`.
+> Serializers detect corrupted entries with an xxHash3-64 checksum. It is on by default; `@cache.minimal` and `@cache.test` turn it off, and `@cache.secure` refuses to.
 
-Each checksum is an 8-byte xxHash3-64 digest, plus one pass over the payload on each write and read. `StandardSerializer` and `AutoSerializer` keep it in their LZ4 envelope; `OrjsonSerializer` and `ArrowSerializer` put it in front of the payload. `enable_integrity_checking=False` drops it on every serializer except `ArrowSerializer`, which always checks. On `StandardSerializer` and `AutoSerializer` the switch also drops LZ4 and its envelope, so compressible entries get larger and small or incompressible ones about 25 bytes smaller; measure on your own payloads before you trade that.
+Each checksum is an 8-byte digest, plus one pass over the payload on each write and read. What `enable_integrity_checking=False` changes depends on the serializer, and for `AutoSerializer` on the value:
+
+| Serializer | Checking on (default) | Checking off |
+|:-----------|:----------------------|:-------------|
+| `StandardSerializer`, and `AutoSerializer` for values other than the two below | MessagePack in an LZ4 envelope that carries the checksum | Plain MessagePack: no checksum, no LZ4 |
+| `AutoSerializer`, NumPy arrays | The checksum, then the raw array bytes (never compressed) | The raw array bytes |
+| `AutoSerializer`, pandas DataFrames with pyarrow installed, and `ArrowSerializer` | The checksum, then the Arrow IPC data | No change: Arrow always checks |
+| `OrjsonSerializer` | The checksum, then the JSON | Plain JSON |
+
+Where the switch drops the LZ4 envelope, compressible entries get larger and small or incompressible ones about 25 bytes smaller; measure on your own payloads before you trade that.
 
 ### Security
 
