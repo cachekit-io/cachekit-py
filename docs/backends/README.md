@@ -156,7 +156,7 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - You're in development with single-process code
 - You have a single-process application
 - You don't need cross-process cache sharing
-- You need the lowest possible latency (nanoseconds)
+- You need the lowest possible latency (no network round trip; see [Performance](../performance.md))
 
 ## Backend Resolution Priority
 

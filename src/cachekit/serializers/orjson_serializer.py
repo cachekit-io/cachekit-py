@@ -32,7 +32,7 @@ class OrjsonSerializer:
     No inheritance required - protocol compliance validated at runtime.
 
     Features:
-    - 2-3x faster than stdlib json (Rust-powered)
+    - Rust-powered JSON encoding (orjson)
     - Compact output (no whitespace)
     - Automatic datetime/UUID serialization
     - Streaming support for large objects

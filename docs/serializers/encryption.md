@@ -151,13 +151,7 @@ With a remote backend such as cachekit.io, the backend stores only opaque cipher
 
 ## Performance
 
-Encryption adds minimal overhead:
-
-- Small data (< 1KB): **3-5 μs overhead** — negligible vs network latency
-- Large DataFrames: **~2.5% overhead**
-
-> [!TIP]
-> For detailed encryption performance measurements including overhead vs data size, see [Zero-Knowledge Encryption: Performance Impact](../features/zero-knowledge-encryption.md#performance-impact).
+Encryption adds an encrypt to every store and a decrypt to every hit. Through the decorator, the hosted benchmark runs could not separate that cost from run-to-run noise; see [Zero-Knowledge Encryption: Performance Impact](../features/zero-knowledge-encryption.md#performance-impact).
 
 ---
 

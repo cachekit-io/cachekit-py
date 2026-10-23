@@ -4,9 +4,9 @@
 
 ## Executive Summary
 
-Your consistent **450-500ns p95 latency** is dominated by **lock acquisition overhead**. The cache is performing optimally given Python's threading model.
+The raw L1 lookup's latency is dominated by **lock acquisition overhead**. The cache is performing optimally given Python's threading model.
 
-**Key finding:** This measures **raw L1 cache performance only**. Real users experience ~242μs for realistic payloads due to decorator overhead and serialization (see [docs/performance.md](../../docs/performance.md) for full breakdown).
+**Key finding:** This measures **raw L1 cache performance only**. A decorated hit also pays for the decorator and, with an L2 backend configured, for deserializing the cached bytes (see [docs/performance.md](../../docs/performance.md) for measured figures).
 
 ## Component Breakdown (p95 measurements)
 

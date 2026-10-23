@@ -331,10 +331,7 @@ field list and an example stats endpoint.
 
 ## Performance Impact
 
-Metrics collection is minimal overhead:
-- Counter increments: ~10ns
-- Histogram updates: ~50ns per call
-- Total overhead: <1% latency impact
+Each recorded metric is a counter increment or a histogram observation in process memory. No guard times them, so the [Performance Guide](../performance.md) publishes no figure for metrics overhead. A memoised `@cache(backend=None)` hit records no Prometheus metric at all.
 
 ---
 

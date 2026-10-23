@@ -91,7 +91,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  • Return bytes (encrypted or plaintext msgpack)                            │
 │                                                                             │
 │  ┌──────────────────────────────────────────┐                               │
-│  │ L1 HIT → DESERIALIZE & RETURN (~242μs) ✓ │                               │
+│  │ L1 HIT → DESERIALIZE & RETURN ✓          │                               │
 │  │ Jump to STEP 6 (Deserialization)         │                               │
 │  └──────────────────────────────────────────┘                               │
 │                                                                             │
@@ -485,13 +485,7 @@ def _blake2b_pickle_hash(args, kwargs):
 
 ### Performance Impact
 
-**Typical Latencies:**
-- **L1 Hit (raw dict lookup)**: ~500ns
-- **L1 Hit (decorator + 10KB payload)**: ~242μs (0.242ms) including serialization
-- **L2 Hit (Redis)**: ~2-5ms (network RTT + deserialization)
-- **Speedup: 8-20x** for L1 vs L2 in production scenarios
-
-See [Performance Guide](performance.md) for comprehensive benchmarks and component breakdown.
+An L1 hit deserializes the cached bytes, an L2 hit adds a Redis round trip before it, and a miss runs your function. [Performance Characteristics](#performance-characteristics) below gives measured figures for each hit path.
 
 ---
 
@@ -674,7 +668,6 @@ class RedisBackend:
 **Implementation:**
 - Each thread gets its own Redis connection
 - Thread-local storage eliminates pool lock contention
-- **Result: +28% throughput, 95%+ reduction in pool overhead**
 
 ### Connection Pool Config
 
@@ -759,24 +752,17 @@ def deserialize(data: bytes, metadata) -> Any:
 
 ## Performance Characteristics
 
-### Latency Breakdown
+### Latency
 
-**Production numbers for 10KB payloads (p95 latency):**
+The Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table times whole hit paths on a GitHub-hosted AMD EPYC 7763 runner, for a 100-user nested dict (23.5KB as MessagePack):
 
-| Operation | L1 Hit | L2 Hit (Redis) | Miss (Execute) |
-|-----------|--------|----------------|----------------|
-| Decorator overhead | ~20μs | ~20μs | ~20μs |
-| Key generation | ~2μs | ~2μs | ~2μs |
-| L1 lookup (dict) | 500ns | 500ns (miss) | 500ns (miss) |
-| Serialization (msgpack) | ~100μs | - | ~100μs |
-| Deserialization | ~100μs | ~100μs | - |
-| Redis network | - | 2-5ms | 2-5ms (set) |
-| Function execution | - | - | Variable |
-| **TOTAL** | **~242μs** | **~2-5ms** | **Function + ~250μs** |
+| Path | Run median |
+|------|-----------:|
+| L1-only hit, `@cache(backend=None)` | 0.906 ± 0.007μs |
+| L1 hit with an L2 backend configured | 310 ± 20μs |
+| Redis L2 hit, L1 disabled, Redis on the same machine | 551 ± 18μs |
 
-**Note:** Raw L1 dict lookup is 500ns, but real user experience includes decorator and serialization overhead.
-
-For comprehensive breakdown, see [Performance Guide](performance.md).
+An L1-only hit hands back the cached object, so it deserializes nothing. With a backend configured, L1 holds bytes and every hit deserializes them. A miss costs your function's run time plus serializing and storing the result; no guard times it. No guard times the components (key generation, the lookup, serialization) on their own either: their deterministic costs are the Performance Guide's [Instruction Budgets](performance.md#instruction-budgets).
 
 ### Compression Ratios
 

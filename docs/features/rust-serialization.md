@@ -35,13 +35,7 @@ The Rust layer is transparent — you configure serializers and encryption at th
 
 ## Why Rust for This Layer?
 
-| Operation | Python | Rust (ByteStorage) |
-|-----------|--------|---------------------|
-| LZ4 compression | ~50-100 MB/s | ~500 MB/s |
-| xxHash3-64 hashing | ~35 GB/s (`xxhash` C ext) | ~35 GB/s |
-| AES-256-GCM | ~200 MB/s | ~1-4 GB/s (AES-NI) |
-
-For most workloads the bottleneck is Redis RTT (~2-50ms), not serialization. The Rust layer matters for large payloads (DataFrames, bulk data) where serialization time approaches network time.
+ByteStorage runs LZ4 compression, xxHash3-64 checksums and AES-256-GCM in Rust, in one call per store or retrieve. cachekit-core's README publishes [measured figures](https://github.com/cachekit-io/cachekit-core#performance) for those calls on named GitHub-hosted runners. The Rust layer matters most for large payloads (DataFrames, bulk data), where compression, checksumming and encryption grow with payload size.
 
 ---
 

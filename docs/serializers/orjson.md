@@ -24,14 +24,9 @@ Without orjson installed, `get_serializer("orjson")` raises `ImportError: orjson
 - When human-readable format matters
 
 **Performance characteristics:**
-- Serialization: **2-5x faster** than stdlib json
-- Deserialization: **2-3x faster** than stdlib json
+- Encoding: orjson, a Rust JSON library. No cachekit guard compares its speed with stdlib json or MessagePack, so the [Performance Guide](../performance.md#not-measured-here) publishes no figure for it
 - Memory overhead: Low
 - Network overhead: JSON format (larger than msgpack, but human-readable)
-
-**Measured speedups vs stdlib json:**
-- Nested structures (1K objects): **3-4x faster** serialization
-- Simple dicts (10 keys): **2x faster** roundtrip
 
 **Native type support:**
 - datetime → ISO-8601 strings (automatic conversion)
@@ -132,23 +127,13 @@ except TypeError as e:
     # "OrjsonSerializer only supports JSON types. Use StandardSerializer for binary data."
 ```
 
-## Performance Comparison
+## Comparison with StandardSerializer
 
-OrjsonSerializer vs stdlib json (measured):
-
-| Data Type | orjson | stdlib json | Speedup |
-|-----------|--------|-------------|---------|
-| Nested objects (1K) | 0.8ms | 3.2ms | **4.0x** |
-| Simple dict (10 keys) | 0.05ms | 0.10ms | **2.0x** |
-| Large flat dict (10K keys) | 2.5ms | 7.0ms | **2.8x** |
-
-OrjsonSerializer vs StandardSerializer (msgpack):
+No cachekit guard times OrjsonSerializer against stdlib json or StandardSerializer, so this table compares formats, not speed (see the [Performance Guide](../performance.md#not-measured-here)):
 
 | Metric | orjson | msgpack+LZ4 | Note |
 |--------|--------|-------------|------|
-| Serialization speed | Fast | Faster | msgpack ~10% faster |
-| Deserialization speed | Fast | Faster | Similar performance |
-| Output size | Medium | Small | msgpack+LZ4 ~30% smaller |
+| Output size | Larger | Smaller | JSON is text |
 | Human-readable | Yes ✅ | No ❌ | JSON is text |
 | Cross-language | Yes ✅ | Limited | JSON ubiquitous |
 
@@ -156,7 +141,7 @@ OrjsonSerializer vs StandardSerializer (msgpack):
 - JSON-native APIs (already producing JSON)
 - Cross-language interoperability matters
 - Human-readable cache inspection needed
-- Trading ~30% more storage for JSON compatibility
+- Trading larger cache entries for JSON compatibility
 
 **When to prefer StandardSerializer:**
 - Maximum compression needed
