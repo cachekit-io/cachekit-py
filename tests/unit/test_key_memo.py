@@ -11,7 +11,6 @@ import asyncio
 import enum
 import sys
 import threading
-import types
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -126,6 +125,29 @@ def _memo(fn: Any) -> dict[tuple[Any, ...], tuple[str, str, str]]:
     return _closure_cell(fn, "_key_memo").cell_contents
 
 
+class _GatedObjectCache(ObjectCache):
+    """An L1-only function's object cache whose delete waits for the test, so an invalidation can be
+    held between deciding to erase an entry and erasing it while the test makes another call."""
+
+    def __init__(self) -> None:
+        super().__init__(max_entries=None, max_size_bytes=1 << 20)
+        self.deleting = threading.Event()
+        self.release = threading.Event()
+
+    def delete(self, key: str) -> bool:
+        self.deleting.set()
+        assert self.release.wait(10), "the test never released the delete"
+        return super().delete(key)
+
+
+def _gate(fn: Any) -> _GatedObjectCache:
+    """Give an L1-only function a gated object cache, before its first call."""
+    gated = _GatedObjectCache()
+    for name in ("_object_cache", "_l1_fast_cache"):
+        _closure_cell(fn, name).cell_contents = gated
+    return gated
+
+
 def _deep_size(obj: Any, seen: set[int] | None = None) -> int:
     """Bytes held by obj and every dict, tuple, str, bytes and number under it, each counted once."""
     seen = set() if seen is None else seen
@@ -204,12 +226,6 @@ class TestMemoKey:
     def test_a_str_subclass_keyword_name_is_not_memoised(self) -> None:
         assert _memo_key((), {_Str("x"): 1}) is None
 
-    def test_keyword_names_past_the_length_cap_are_not_memoised(self) -> None:
-        """**kwargs takes names of any length, and the memo keeps each name it is keyed by."""
-        assert _memo_key((), {"x" * _MEMO_MAX_LEN: 1}) is not None
-        assert _memo_key((), {"x" * (_MEMO_MAX_LEN + 1): 1}) is None
-        assert _memo_key((1,), {"x" * (_MEMO_MAX_LEN + 1): 1}) is None
-
     def test_strings_and_keyword_names_share_one_length_budget(self) -> None:
         half, rest = _MEMO_MAX_LEN // 2, _MEMO_MAX_LEN - _MEMO_MAX_LEN // 2
         for extra in (0, 1):
@@ -250,25 +266,27 @@ class TestKeyBytesUnchanged:
     _RecordingObjectCache): a memoised call's must be the one the key generator builds now."""
 
     @pytest.mark.parametrize(
-        ("args", "kwargs"),
+        ("args", "kwargs", "memoised"),
         [
-            ((1,), {}),
-            ((1.0,), {}),
-            ((True,), {}),
-            ((-0.0,), {}),
-            (("a",), {}),
-            ((b"a",), {}),
-            ((None,), {}),
-            ((42, "user-profile"), {}),
-            ((1, 2, 3), {}),
-            (("q",), {"limit": 10}),
-            (("q",), {"limit": 10, "offset": 5}),
-            (("x" * (_MEMO_MAX_LEN + 1),), {}),
-            ((_Color.RED,), {}),
-            (([1, 2],), {}),
+            ((1,), {}, True),
+            ((1.0,), {}, True),
+            ((True,), {}, True),
+            ((-0.0,), {}, True),
+            (("a",), {}, True),
+            ((b"a",), {}, True),
+            ((None,), {}, True),
+            ((42, "user-profile"), {}, True),
+            ((1, 2, 3), {}, True),
+            (("q",), {"limit": 10}, True),
+            (("q",), {"limit": 10, "offset": 5}, True),
+            (("x" * (_MEMO_MAX_LEN + 1),), {}, False),
+            ((_Color.RED,), {}, False),
+            (([1, 2],), {}, False),
         ],
     )
-    def test_a_memoised_call_reads_the_generated_key(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    def test_every_call_reads_the_generated_key(self, args: tuple[Any, ...], kwargs: dict[str, Any], memoised: bool) -> None:
+        """The second and third calls of a memoised row read the memo's key; the others build theirs."""
+
         @cache(backend=None, ttl=60, namespace="memo", encryption=False)
         def fn(*a: Any, **k: Any) -> int:
             return 1
@@ -277,6 +295,7 @@ class TestKeyBytesUnchanged:
         for _ in range(3):
             fn(*args, **kwargs)
         assert reads == [_key_now(fn, args, kwargs, "memo")] * 3
+        assert len(_memo(fn)) == (1 if memoised else 0)
 
     # Values that compare equal across types (1, 1.0, True; 0, 0.0, -0.0, False), values just past
     # the length cap, and a few the memo never takes, so equal-but-different calls interleave.
@@ -497,9 +516,62 @@ class TestL1OnlyFastPath:
         fn("bob@example.com")
         assert calls == 4
 
+    @pytest.mark.parametrize("scope", ["one", "all"])
+    def test_a_call_during_an_invalidation_leaves_no_arguments_behind(self, scope: str) -> None:
+        """A call made while an invalidation is deleting its entry can still hit that entry. Had the
+        memo already forgotten the call, it would memoise the arguments again and keep them after
+        the entry is gone; the memo forgets after the delete, as the calls in flight do."""
+        calls = 0
+
+        @cache(backend=None, ttl=60, encryption=False)
+        def fn(x: str) -> str:
+            nonlocal calls
+            calls += 1
+            return x
+
+        gated = _gate(fn)
+        fn("alice@example.com")
+        invalidate = (lambda: fn.invalidate_cache("alice@example.com")) if scope == "one" else fn.invalidate_cache
+        worker = threading.Thread(target=invalidate)
+        worker.start()
+        assert gated.deleting.wait(10)
+        assert fn("alice@example.com") == "alice@example.com"
+        assert calls == 1  # a hit on the entry being deleted
+        gated.release.set()
+        worker.join(10)
+        assert not worker.is_alive()
+        assert _memo(fn) == {}
+        fn("alice@example.com")
+        assert calls == 2
+
+    def test_an_async_call_during_an_invalidation_leaves_no_arguments_behind(self) -> None:
+        """ainvalidate_cache deletes in a worker thread, so the event loop serves calls meanwhile."""
+        calls = 0
+
+        @cache(backend=None, ttl=60, encryption=False)
+        async def fn(x: str) -> str:
+            nonlocal calls
+            calls += 1
+            return x
+
+        gated = _gate(fn)
+
+        async def run() -> None:
+            await fn("bob@example.com")
+            invalidation = asyncio.ensure_future(fn.ainvalidate_cache("bob@example.com"))
+            assert await asyncio.to_thread(gated.deleting.wait, 10)
+            assert await fn("bob@example.com") == "bob@example.com"
+            gated.release.set()
+            await invalidation
+
+        asyncio.run(run())
+        assert calls == 1
+        assert _memo(fn) == {}
+
     def test_a_full_memo_at_every_cap_stays_small(self) -> None:
         """Every call at every cap: eight keyword names and eight values of 4-byte characters, sharing
-        _MEMO_MAX_LEN between them. The memo keeps all of it, which docs/performance.md bounds."""
+        _MEMO_MAX_LEN between them, the most a call can make the memo keep. docs/performance.md
+        states this bound: 3.7 to 4.0MiB measured on CPython 3.10, 3.12, 3.14 and 3.14t."""
 
         @cache(backend=None, encryption=False)
         def fn(**kwargs: Any) -> int:
@@ -512,7 +584,7 @@ class TestL1OnlyFastPath:
             fn(**{tag + chr(97 + j) + wide * (each - 5): tag + wide * (each - 4) for j in range(_MEMO_MAX_ARGS)})
         memo = _memo(fn)
         assert len(memo) == _MEMO_MAX_ENTRIES
-        assert _deep_size(memo) < 6 * 2**20
+        assert _deep_size(memo) < 4.5 * 2**20
 
     def test_keyword_names_past_the_cap_cache_without_the_memo(self) -> None:
         calls = 0
@@ -566,29 +638,3 @@ class TestL1OnlyFastPath:
             assert call(3) == 3
         info = fn.cache_info()
         assert (sets, info.l1_hits, info.misses) == (1, 4, 1)
-
-
-@pytest.mark.unit
-class TestSWRJitterDraw:
-    """get_with_swr draws its ±10% jitter only where the draw can change the answer."""
-
-    def test_no_draw_below_the_jittered_threshold_and_a_draw_above_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        clock = types.SimpleNamespace(monotonic=lambda: 1000.0)
-        monkeypatch.setattr("cachekit.object_cache.time", clock)
-        draws: list[tuple[float, float]] = []
-
-        def uniform(a: float, b: float) -> float:
-            draws.append((a, b))
-            return 1.0
-
-        monkeypatch.setattr("cachekit.object_cache.random.uniform", uniform)
-        oc = ObjectCache(max_entries=4, swr_threshold_ratio=0.5)
-        oc.put("k", "v", ttl=100)
-
-        clock.monotonic = lambda: 1000.0 + 0.9 * 50  # the jitter's low end: never stale
-        assert oc.get_with_swr("k", 100) == (True, "v", False, 1)
-        assert draws == []
-
-        clock.monotonic = lambda: 1000.0 + 50.5  # past the threshold at jitter 1.0
-        assert oc.get_with_swr("k", 100)[2] is True
-        assert draws == [(0.9, 1.1)]

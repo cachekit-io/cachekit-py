@@ -89,7 +89,7 @@ An L1-only hit takes 0.906μs for the 100-user dict and 0.91μs for the DataFram
 
 A memoised L1-only hit runs nothing that reads the stats context backend calls use, so it does not set one, and it records no Prometheus metric. A miss takes one more Python frame than it used to, so a recursive `@cache(backend=None)` function reaches the recursion limit sooner: on CPython 3.14 at the default limit of 1,000, it recurses 198 levels deep instead of 247.
 
-The memo keeps the arguments it is keyed by until an invalidation erases their key: `invalidate_cache()` with any arguments that build that key (a `Path` builds the same key as its string), `invalidate_cache()` with none, or `cache_clear()`. Full, it holds about 330KiB when each call passes one `int`, and at most about 4MiB, when every call fills its 256 characters with 4-byte ones.
+The memo keeps the arguments it is keyed by until an invalidation erases their key: `invalidate_cache()` with any arguments that build that key (a `Path` builds the same key as its string), `invalidate_cache()` with none, or `cache_clear()`. Full, it holds about 330KiB when each call passes one `int`, and under 4.5MiB when every call fills its 256 characters with 4-byte ones, the most a call can make it keep (3.7 to 4.0MiB measured on CPython 3.10, 3.12, 3.14 and free-threaded 3.14).
 
 Only an L1-only function keeps a memo. A function with a backend builds its key on every call, as it did before the memo: other processes can invalidate its entries, and the memo would keep the arguments they erase; with L1 off, the process keeps nothing else from a call; and an encrypted function must keep no plaintext argument. Its key is also a small part of what its hit costs.
 

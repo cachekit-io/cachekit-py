@@ -430,7 +430,7 @@ cachekit's own figures, measured on a GitHub-hosted runner (AMD EPYC 7763, CPyth
 
 | Operation | cachekit |
 |-----------|----------|
-| Cache hit, `@cache(backend=None)`, 100-user nested dict | 0.906μs |
+| Cache hit, `@cache(backend=None)`, 100-user nested dict, one `int` argument (a key memo hit) | 0.906μs |
 | Cache hit, L1 with an L2 backend configured, same dict (deserializes) | 310μs |
 | Cache hit, Redis L2 in a container on the same machine, L1 disabled | 551μs |
 

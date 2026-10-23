@@ -1153,8 +1153,9 @@ def create_cache_wrapper(
 
     # Set by _enter_l1_only(), below: backed wrappers keep these.
     _object_cache: ObjectCache | None = None
-    # _object_cache once an L1-only hit may skip the stats context (sync_wrapper): set last by
-    # _enter_l1_only, and only on generated keys, the only ones the key memo holds.
+    # _object_cache for an L1-only function on generated keys, else None; set last by _enter_l1_only.
+    # It is the key memo's on/off switch (_resolve_cache_key), and lets a memoised L1-only hit skip
+    # the stats context (sync_wrapper, async_wrapper).
     _l1_fast_cache: ObjectCache | None = None
     _l1_swr_active = False
     # SWR needs a TTL: freshness is measured against ttl * swr_threshold_ratio.
@@ -1626,8 +1627,11 @@ def create_cache_wrapper(
         would otherwise keep the arguments it was given. An entry goes whatever arguments built the
         key, so an invalidation spelled another way (a Path for its str, say) forgets it too. A scan
         of at most _MEMO_MAX_ENTRIES entries, on invalidation only."""
-        # A snapshot: a call on another thread may add an entry while this runs.
-        for memo_key, entry in list(_key_memo.items()):
+        # A snapshot, as calls on other threads add entries meanwhile. dict.copy() runs no Python
+        # code, so on a GIL build no other thread runs mid-copy, and a free-threaded build copies
+        # under the dict's lock. (list(d.items()) can let another thread in on 3.10 and 3.11, where
+        # allocating its tuples can run the collector.)
+        for memo_key, entry in _key_memo.copy().items():
             if entry[0] == cache_key:
                 _key_memo.pop(memo_key, None)
 
@@ -1674,14 +1678,10 @@ def create_cache_wrapper(
         return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
 
     def _resolve_invalidation_keys(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> list[str]:
-        """The key _resolve_cache_key derives, plus its pre-0.20.0 twin on the generated-key path.
-
-        The key memo forgets every argument tuple that builds the key (the memo holds no twin).
-        """
+        """The key _resolve_cache_key derives, plus its pre-0.20.0 twin on the generated-key path."""
         cache_key = _resolve_cache_key(call_args, call_kwargs)
         if not _generated_key_mode:
             return [cache_key]
-        _forget_memoised(cache_key)
         legacy_key = operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
         return [cache_key] if legacy_key == cache_key else [cache_key, legacy_key]
 
@@ -1801,9 +1801,10 @@ def create_cache_wrapper(
         _thread_flights.forget(cache_keys)
 
     def _delete_then_forget(cache_keys: list[str] | None) -> InvalidationOutcome | None:
-        """Delete these keys (all, for None), then forget their calls in flight: one that started
-        before the delete ended may have read the old entry. One call, so the forget runs after the
-        delete wherever the delete runs, even in a worker an async caller stopped waiting for.
+        """Delete these keys (all, for None), then forget their calls in flight and their memoised
+        arguments: a call made before the delete ended may have read the old entry, and may have
+        memoised its arguments again. One call, so the forgets run after the delete wherever the
+        delete runs, even in a worker an async caller stopped waiting for.
         Returns the current-format key's outcome (see _invalidate_keys); None for all."""
         try:
             if cache_keys is None:
@@ -1812,6 +1813,10 @@ def create_cache_wrapper(
             return _invalidate_keys(cache_keys)
         finally:
             _forget_flights(cache_keys)
+            if cache_keys is None:
+                _key_memo.clear()
+            else:
+                _forget_memoised(cache_keys[0])  # the memo holds current-format keys only
 
     def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> Any:
         """Run the function for an L1-only miss and store its result. A miss is a call that runs it."""
@@ -3280,10 +3285,10 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
-        # Calls in flight are forgotten after the deletes (_delete_then_forget): a read that starts
-        # after this returns must not join a miss that started before it.
+        # Calls in flight and memoised arguments are forgotten after the deletes (_delete_then_forget):
+        # a read that starts after this returns must not join a miss that started before it, and a
+        # call made during the deletes may have memoised its arguments again.
         if not args and not kwargs and _func_has_params:
-            _key_memo.clear()
             return _delete_then_forget(None)
 
         # Single-key invalidation (specific args provided, or zero-param function).
@@ -3314,7 +3319,6 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
-            _key_memo.clear()
             # Off the event loop: every L2 call in here is a sync Redis/backend round-trip. The worker
             # forgets the calls in flight after its deletes even if this caller is cancelled while it runs.
             return await asyncio.to_thread(_delete_then_forget, None)
