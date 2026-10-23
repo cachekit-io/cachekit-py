@@ -665,18 +665,18 @@ def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] 
             a, b = args
             t = type(a)
             u = type(b)
-            size = 0
-            if t is not int:
-                if t is str or t is bytes:
-                    size = len(a)
-                elif not (t is float or t is bool or a is None):
-                    return None
-            if u is not int:
-                if u is str or u is bytes:
-                    size += len(b)
-                elif not (u is float or u is bool or b is None):
-                    return None
-            return (t, a, u, b) if size <= _MEMO_MAX_LEN else None
+            # A pair with one str or bytes checks that one's length; only two add theirs up. Laid
+            # out so the common pair, a scalar then a string, takes the fewest checks.
+            if t is int or t is float or t is bool or a is None:
+                if u is int or ((u is str or u is bytes) and len(b) <= _MEMO_MAX_LEN) or u is float or u is bool or b is None:
+                    return (t, a, u, b)
+            elif t is str or t is bytes:
+                if u is int or u is float or u is bool or b is None:
+                    if len(a) <= _MEMO_MAX_LEN:
+                        return (t, a, u, b)
+                elif (u is str or u is bytes) and len(a) + len(b) <= _MEMO_MAX_LEN:
+                    return (t, a, u, b)
+            return None
     if len(args) + len(kwargs) > _MEMO_MAX_ARGS:
         return None
     # No zip(): its strict= keyword alone costs more to parse than these loops.
