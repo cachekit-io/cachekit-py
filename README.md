@@ -451,7 +451,7 @@ full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
 
 **Per-Function Statistics:**
 - Statistics tracked per function identity (`module.qualname`), shared across all calls and across re-decorations of the same function
-- Thread-safe via RLock (all methods safe for concurrent access)
+- Thread-safe: every count is exact (L1 hits on an atomic counter, everything else under an RLock), and all methods are safe for concurrent access
 - Fork-safe: a forked child starts with zeroed counters and its own session ID
 
 ```python

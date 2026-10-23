@@ -3347,8 +3347,12 @@ def create_cache_wrapper(
 
         Threading behavior:
             Statistics are tracked per function identity (``module.qualname``),
-            shared across all threads and all decorator applications, with
-            thread-safe locking via RLock. Re-applying a decorator to the same
+            shared across all threads and all decorator applications. Every
+            count is exact: L1 hits are counted on a native atomic counter and
+            everything else under an RLock. A read or ``cache_clear()`` that
+            races L1 hits is not a snapshot of one instant: such a hit can show
+            in ``l1_hits`` and not in ``last_operation_at``, or the other way
+            round. Re-applying a decorator to the same
             function reuses the existing counters rather than resetting them —
             the session ID is stable across re-decorations, and counters that
             reset under an unchanged session ID would trip the server's
