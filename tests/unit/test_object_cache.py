@@ -907,3 +907,29 @@ class TestObjectCacheFork:
         ref = weakref.ref(ObjectCache())
         gc.collect()
         assert ref() is None
+
+
+@pytest.mark.unit
+class TestSWRJitterDraw:
+    """get_with_swr draws its ±10% jitter only where the draw can change the answer."""
+
+    def test_no_draw_below_the_jittered_threshold_and_a_draw_above_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = types.SimpleNamespace(monotonic=lambda: 1000.0)
+        monkeypatch.setattr("cachekit.object_cache.time", clock)
+        draws: list[tuple[float, float]] = []
+
+        def uniform(a: float, b: float) -> float:
+            draws.append((a, b))
+            return 1.0
+
+        monkeypatch.setattr("cachekit.object_cache.random.uniform", uniform)
+        oc = ObjectCache(max_entries=4, swr_threshold_ratio=0.5)
+        oc.put("k", "v", ttl=100)
+
+        clock.monotonic = lambda: 1000.0 + 0.9 * 50  # the jitter's low end: never stale
+        assert oc.get_with_swr("k", 100) == (True, "v", False, 1)
+        assert draws == []
+
+        clock.monotonic = lambda: 1000.0 + 50.5  # past the threshold at jitter 1.0
+        assert oc.get_with_swr("k", 100)[2] is True
+        assert draws == [(0.9, 1.1)]

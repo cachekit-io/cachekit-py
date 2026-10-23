@@ -41,8 +41,8 @@ def _is_permit_wait(value: object) -> bool:
 class L1CacheConfig:
     """L1 (in-memory) cache configuration.
 
-    L1 cache provides sub-microsecond latency by caching results in process memory,
-    eliminating network round-trips for frequently accessed data.
+    L1 cache serves repeat calls from process memory, eliminating network
+    round-trips for frequently accessed data.
 
     Attributes:
         enabled: Enable L1 in-memory cache (default: True)

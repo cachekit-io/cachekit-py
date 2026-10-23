@@ -460,8 +460,8 @@ On the tenant-scoped Redis backend this deletes every process's L2 entries for `
 
 ### SWR Latency Characteristics (L1-only mode)
 
-- **Fresh hit** (~50ns): Return from L1 memory
-- **Stale hit** (~100ns): Return from L1 + schedule background re-run of your function (non-blocking)
+- **Fresh hit**: Return from L1 memory. With SWR on and a TTL set, the hit first checks the entry's age against its refresh threshold; without either, it is a plain lookup with no age check, like the [measured](../performance.md#github-hosted-runner) `backend=None` hit, which sets no TTL
+- **Stale hit**: Return from L1 + schedule background re-run of your function (non-blocking; the caller pays to start it: a thread for a sync function, a task for an async one)
 
 SWR keeps hits at L1 speed, even when serving slightly stale data. In backed modes (no within-TTL SWR) the usual tiers apply: **L2 hit** ~2ms (miss L1, fetch from Redis), **L2 miss** ~5-50ms (run your function, populate L1+L2).
 

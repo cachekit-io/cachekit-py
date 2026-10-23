@@ -102,7 +102,7 @@ def expensive_computation(x: int) -> dict:
 
 > [!IMPORTANT]
 > **Why cachekit wins:**
-> - **L1+L2 caching**: L1 hits ~50ns (local memory), L1 miss → L2 Redis (~2-7ms)
+> - **L1+L2 caching**: L1 hits from process memory with no network round trip, L1 miss → L2 Redis (~2-7ms)
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
 > - **Distributed locking**: Prevents cache stampedes across pods
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
@@ -113,7 +113,7 @@ from cachekit import cache
 
 @cache(ttl=3600)  # All features enabled by default
 def get_user_data(user_id: int) -> dict:
-    # First pod (same instance): L1 hit (~50ns)
+    # Same process again: L1 hit, no network round trip
     # Different pod: L2 hit from Redis (~2-7ms)
     # Redis down: errors are logged and the function runs, doesn't crash
     # Circuit breaker open: L1 hits still served; a miss runs the function and returns its result
@@ -132,7 +132,7 @@ sequenceDiagram
 
     Client->>L1: get(key)
     alt L1 Hit ✅
-        L1-->>Client: return (~50ns)
+        L1-->>Client: return (in process)
     else L1 Miss
         L1->>L2: get(key)
         alt L2 Hit ✅
@@ -426,17 +426,15 @@ All competitive claims validated by automated tests against real libraries (not 
 
 ## Performance Benchmarks
 
-**Latest Benchmarks**: Measured on real Redis instances
+cachekit's own figures, measured on a GitHub-hosted runner (AMD EPYC 7763, CPython 3.14.7), are in the [Performance Guide](performance.md#github-hosted-runner):
 
-| Operation | cachekit L1 | cachekit L2 | lru_cache | aiocache |
-|-----------|------------|------------|-----------|----------|
-| Cache hit (in-process) | ~50ns | n/a | ~50ns | n/a |
-| Cache hit (distributed) | n/a | ~2-7ms | n/a | ~2-7ms |
-| Cache miss | varies | varies | varies | varies |
-| Circuit breaker overhead | <10ns | <10ns | N/A | N/A |
-| Encryption (AES-256-GCM) | N/A | ~500μs | N/A | N/A |
+| Operation | cachekit |
+|-----------|----------|
+| Cache hit, `@cache(backend=None)`, 100-user nested dict, one `int` argument (a key memo hit) | 0.906μs |
+| Cache hit, L1 with an L2 backend configured, same dict (deserializes) | 310μs |
+| Cache hit, Redis L2 in a container on the same machine, L1 disabled | 551μs |
 
-**Conclusion**: cachekit L1 matches lru_cache, L2 matches competitors, plus all additional features.
+`functools.lru_cache` is a dictionary lookup in C and costs a small fraction of a cachekit L1 hit, which also checks the entry's TTL, keeps its LRU order and counts the hit across threads. A distributed hit costs the round trip to the backend in any library. No guard here times the other libraries, so this page quotes no figure for them.
 
 ---
 
