@@ -67,6 +67,7 @@ from .orchestrator import FeatureOrchestrator
 from .single_flight import AsyncFlights, ThreadFlights
 from .tenant_context import TenantContextExtractor
 from .write_behind import Entry, WriteBehind
+from .write_behind import cancel as _cancel_writes
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -1583,7 +1584,10 @@ def create_cache_wrapper(
         # Queued write-behind writes of the key (tenant-blind, as the event is) would land after the
         # other process's delete. Not waited out: this is the listener thread, and a send in progress
         # races that delete as a synchronous write would.
-        _cancel_deferred((lambda _entry: True) if key is None else (lambda entry: entry[1] == key), wait=False)
+        if key is None:
+            _cancel_deferred(lambda _entry: True, whole_function=True, wait=False)
+        else:
+            _cancel_deferred(lambda entry: entry[1] == key, whole_function=False, wait=False)
         if key is not None:
             _l1_cache.invalidate(key)
         else:
@@ -1658,7 +1662,7 @@ def create_cache_wrapper(
     # write_behind=True: a miss's L2 write leaves the caller's path (decorators/write_behind.py). None when
     # off, so the off path runs exactly as before.
     _write_behind = (
-        WriteBehind(lambda entry, exc: _warn_deferred_write(entry[1], redact_error_for_log(exc)))
+        WriteBehind(lambda entry, exc: _warn_deferred_write(entry[1], redact_error_for_log(exc)), group=_registry_id)
         if write_behind and not _l1_only_mode
         else None
     )
@@ -1700,10 +1704,14 @@ def create_cache_wrapper(
         send = functools.partial(_send_deferred, cache_key, envelope, twin, handler)
         return _write_behind.submit((_l2_scope(), cache_key), len(envelope), send)
 
-    def _cancel_deferred(match: Callable[[Entry], bool], *, wait: bool = True) -> None:
-        """Before an invalidation's deletes: drop matching queued writes and wait out matching sends."""
-        if _write_behind is not None:
-            _write_behind.cancel(match, wait=wait)
+    def _cancel_deferred(match: Callable[[Entry], bool], *, whole_function: bool, wait: bool = True) -> None:
+        """Before an invalidation's deletes: drop matching queued writes and wait out matching sends.
+
+        Every writer that can hold them, not only this wrapper's: a sibling decoration of this function
+        (same registry id) has its own writer, and this wrapper may have none. A whole-function match
+        stays within this function's writers; an exact-key match reaches every writer in the process.
+        """
+        _cancel_writes(match, group=_registry_id if whole_function else None, wait=wait)
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
@@ -3068,7 +3076,7 @@ def create_cache_wrapper(
         # The calling tenant's write-behind writes: dropped if queued, waited out if being sent, so no
         # write made before this call lands after its deletes.
         scope = _l2_scope()
-        _cancel_deferred(lambda entry: entry[0] == scope)
+        _cancel_deferred(lambda entry: entry[0] == scope, whole_function=True)
         if not _is_trackable():
             _local_invalidate_all()
             return
@@ -3113,7 +3121,7 @@ def create_cache_wrapper(
         the delete is then ordered behind every write made before this call.
         """
         entry = (_l2_scope(), cache_key)
-        _cancel_deferred(entry.__eq__)
+        _cancel_deferred(entry.__eq__, whole_function=False)
         _cached_keys.discard(entry)
         outcome = InvalidationOutcome.NO_L2 if _l1_only_mode else InvalidationOutcome.FAILED
         try:

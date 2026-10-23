@@ -13,15 +13,16 @@ calls are already what invalidation uses off the loop.
 - **Coalescing.** One pending write per entry (L2 scope, cache key): a newer value replaces a queued
   one, and a write for an entry already being sent waits for that send, so an older value never lands
   after a newer one.
-- **Bounds.** A new entry is admitted only while fewer than ``MAX_ENTRIES`` are queued and their bytes
-  stay within ``MAX_BYTES``; otherwise ``submit`` refuses and the caller writes synchronously, as without
-  the option. A replacement for an entry already queued or being sent is always taken, so a fallback never
-  races a deferred write of the same entry: the queue can exceed the bounds by one value per sending
-  thread, plus the growth of replaced values. At most ``MAX_WORKERS`` threads send, started on demand and
-  ending when the queue is empty. The bounds are sized so a full queue drains within ``EXIT_FLUSH_SECONDS``
-  at half a second per write.
+- **Bounds.** A write is queued only while the queue then holds at most ``MAX_ENTRIES`` entries and
+  ``MAX_BYTES`` bytes, replacements included. Otherwise ``submit`` refuses, drops the entry's queued value
+  (the refused one supersedes it), and the caller writes synchronously, as without the option. That write
+  can race a send of the same entry already in progress, as two concurrent synchronous misses race. At
+  most ``MAX_WORKERS`` threads send, started on demand and ending when the queue is empty. The bounds are
+  sized so a full queue drains within ``EXIT_FLUSH_SECONDS`` at half a second per write.
 - **Invalidation.** ``cancel`` drops matching queued writes and waits for matching sends to finish, so a
-  delete issued after it is ordered behind every write the caller made before it.
+  delete issued after it is ordered behind every write the caller made before it. The module-level
+  ``cancel`` reaches every writer of a group (one decorated function and namespace, however many times
+  it is decorated) or, for an exact key, every writer in the process.
 - **Fork.** A forked child starts empty: its first caller publishes a fresh ``_State`` in one store, and
   the parent's queue is the parent's to send. A child forked without at-fork hooks starts no thread, so
   ``submit`` refuses there.
@@ -95,10 +96,12 @@ class WriteBehind:
     must not raise: a raise is passed to ``on_error`` and the write counts as failed.
     """
 
-    def __init__(self, on_error: Callable[[Entry, BaseException], None]) -> None:
+    def __init__(self, on_error: Callable[[Entry, BaseException], None], group: str = "") -> None:
         self._on_error = on_error
+        self.group = group  # the decorated function's key registry id: its sibling wrappers share it
         self._state = _State()
-        _writers.add(self)
+        with _writers_lock():
+            _writers.add(self)
 
     def _current(self) -> _State:
         """This process's state. A forked child's first caller replaces the parent's, once, with a re-check:
@@ -122,10 +125,14 @@ class WriteBehind:
             if s.closed:
                 return False
             old = s.pending.get(entry)
-            if old is None and entry not in s.sending and (len(s.pending) >= MAX_ENTRIES or s.bytes + size > MAX_BYTES):
+            old_size = old.size if old is not None else 0
+            if len(s.pending) + (old is None) > MAX_ENTRIES or s.bytes - old_size + size > MAX_BYTES:
+                if old is not None:  # superseded by the value the caller now writes itself
+                    del s.pending[entry]
+                    s.bytes -= old_size
                 return False
             s.pending[entry] = job
-            s.bytes += size - (old.size if old is not None else 0)
+            s.bytes += size - old_size
             # Threads not busy sending pick up queued entries; start one only if those cannot cover every
             # entry that can be sent now. An entry behind its own send waits for that send's thread.
             runnable = sum(1 for e in s.pending if e not in s.sending)
@@ -199,13 +206,37 @@ class WriteBehind:
 
 
 _writers: weakref.WeakSet[WriteBehind] = weakref.WeakSet()
+# Guards _writers: a decoration can add while an invalidation walks it. Per PID, so a child never waits on
+# a lock a parent thread held at fork.
+_writers_locks: dict[int, threading.Lock] = {}
+
+
+def _writers_lock() -> threading.Lock:
+    return _writers_locks.setdefault(os.getpid(), threading.Lock())
+
+
+def _all_writers() -> list[WriteBehind]:
+    with _writers_lock():
+        return list(_writers)
+
+
+def cancel(match: Callable[[Entry], bool], *, group: str | None = None, wait: bool = True) -> None:
+    """``WriteBehind.cancel`` on every writer in this process, or on those of ``group`` only.
+
+    An invalidation reaches the writes of every wrapper that can hold them: sibling decorations of one
+    function share its group, and an exact key reaches every writer, so a function sharing keys with
+    another (interop) is covered too.
+    """
+    for writer in _all_writers():
+        if group is None or writer.group == group:
+            writer.cancel(match, wait=wait)
 
 
 def _flush_at_exit() -> None:
     """Send what every writer still holds, within EXIT_FLUSH_SECONDS in total. Never blocks past it."""
     deadline = time.monotonic() + EXIT_FLUSH_SECONDS
     dropped: list[Entry] = []
-    for writer in list(_writers):
+    for writer in _all_writers():
         try:
             dropped += writer.close(deadline)
         except Exception as exc:  # an exit hook has no caller: report, then flush the rest

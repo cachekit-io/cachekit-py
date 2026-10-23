@@ -140,6 +140,10 @@ def _cancel_entered(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
     cancel = wb.WriteBehind.cancel
 
     def signalling_cancel(self: wb.WriteBehind, match: Any, *, wait: bool = True) -> None:
+        if self not in _created:  # another test's writer, still alive: an invalidation walks every writer
+            cancel(self, match, wait=wait)
+            return
+
         def signalling_match(entry: Any) -> bool:
             entered.set()
             return match(entry)
@@ -324,25 +328,33 @@ class TestBounds:
         fn(1000)  # its envelope alone is over the bound: written on the caller
         assert backend.writes() == [threading.current_thread().name]
 
-    def test_a_queued_entry_takes_a_newer_value_past_the_bound(self, one_writer: None, monkeypatch: pytest.MonkeyPatch) -> None:
-        """No fallback for an entry already queued or being sent: a caller write could race the deferred one."""
+    def test_replacements_count_against_the_bounds(self, one_writer: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A newer value for a queued entry is admitted only within the byte bound. Past it, the queued value is
+        dropped (the caller now writes the newer one itself), so replacements cannot grow the queue unbounded."""
+        writer = wb.WriteBehind(lambda *_: None)
+        sent: list[str] = []
+        held, release = threading.Event(), threading.Event()
+        monkeypatch.setattr(wb, "MAX_BYTES", 100)
+        assert writer.submit(("", "busy"), 10, lambda: (held.set(), release.wait(_GUARD_SECONDS)))
+        assert held.wait(_GUARD_SECONDS)  # the one thread is held, so what follows stays queued
+        assert writer.submit(("", "k"), 40, lambda: sent.append("k-40"))
+        assert writer.submit(("", "k"), 90, lambda: sent.append("k-90"))  # replaces: 90 bytes queued
+        assert not writer.submit(("", "other"), 20, lambda: sent.append("other"))  # 90 + 20 is over: refused
+        assert not writer.submit(("", "k"), 101, lambda: sent.append("k-101"))  # over the bound: refused
+        release.set()
+        assert writer.close(_deadline()) == []
+        assert sent == []  # k's queued value was dropped with the refusal; the caller wrote k-101 itself
+
+    def test_the_entry_bound_counts_a_value_behind_its_own_send(self, one_writer: None, monkeypatch: pytest.MonkeyPatch) -> None:
         writer = wb.WriteBehind(lambda *_: None)
         sent: list[int] = []
-        held = threading.Event()
-        release = threading.Event()
-
-        def send(n: int) -> None:
-            held.set()
-            assert release.wait(_GUARD_SECONDS)
-            sent.append(n)
-
+        held, release = threading.Event(), threading.Event()
         monkeypatch.setattr(wb, "MAX_ENTRIES", 1)
-        assert writer.submit(("", "k"), 1, lambda: send(1))
+        assert writer.submit(("", "k"), 1, lambda: (held.set(), release.wait(_GUARD_SECONDS), sent.append(1)))
         assert held.wait(_GUARD_SECONDS)
-        monkeypatch.setattr(wb, "MAX_ENTRIES", 0)
-        assert writer.submit(("", "k"), 1, lambda: send(2))  # being sent: queued behind it
-        assert writer.submit(("", "k"), 1, lambda: send(3))  # queued: replaced
-        assert not writer.submit(("", "other"), 1, lambda: send(4))  # a new entry: refused
+        assert writer.submit(("", "k"), 1, lambda: sent.append(2))  # behind its send: the one queued entry
+        assert writer.submit(("", "k"), 1, lambda: sent.append(3))  # replaces it: still one entry
+        assert not writer.submit(("", "other"), 1, lambda: sent.append(4))  # a second entry: refused
         release.set()
         assert writer.close(_deadline()) == []
         assert sent == [1, 3]
@@ -384,6 +396,30 @@ class TestCoalescingAndInvalidation:
         backend.gate.set()
         _drain()
         assert list(backend.store) == [_only_key(backend, "set")]  # key 0 only: key 1's write never ran
+
+    @pytest.mark.parametrize("whole_function", [False, True], ids=["exact-key", "whole-function"])
+    def test_a_sibling_decorations_invalidation_drops_this_ones_queued_write(
+        self, backend: _GatedBackend, one_writer: None, whole_function: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two decorations of one function, backend and namespace have a writer each. An invalidation through
+        either must still reach the other's queued write, or that write lands after the delete."""
+
+        def double(x: int) -> int:
+            return x * 2
+
+        namespace = f"sibling-{os.urandom(4).hex()}"  # L1 is per namespace and process: no earlier run's entries
+        writer_side = cache(backend=backend, ttl=60, namespace=namespace, write_behind=True)(double)
+        other_side = cache(backend=backend, ttl=60, namespace=namespace)(double)
+        writer_side(0)
+        _held(backend)
+        writer_side(1)  # queued behind key 0's held send
+        entered = _cancel_entered(monkeypatch)
+        # Opens the gate once the invalidation has started dropping: a whole-function one also waits out key 0.
+        threading.Thread(target=lambda: (entered.wait(_GUARD_SECONDS), backend.gate.set())).start()
+        args = () if whole_function else (1,)
+        other_side.invalidate_cache(*args)  # type: ignore[attr-defined]
+        _drain()
+        assert len(backend.writes()) == 1  # key 1's queued write was dropped, never sent after the delete
 
     def test_invalidate_waits_out_a_write_being_sent(self, backend: _GatedBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         @cache(backend=backend, ttl=60, write_behind=True)
@@ -439,14 +475,16 @@ class TestCoalescingAndInvalidation:
         def fn(x: int) -> int:
             return x * 2
 
-        cancel = wb.WriteBehind.cancel
+        import cachekit.decorators.wrapper as wrapper_module
 
-        def cancel_then_miss(self: wb.WriteBehind, match: Any, *, wait: bool = True) -> None:
-            cancel(self, match, wait=wait)
-            monkeypatch.setattr(wb.WriteBehind, "cancel", cancel)
+        cancel = wrapper_module._cancel_writes
+
+        def cancel_then_miss(match: Any, **kwargs: Any) -> None:
+            cancel(match, **kwargs)
+            monkeypatch.setattr(wrapper_module, "_cancel_writes", cancel)
             fn(1)
 
-        monkeypatch.setattr(wb.WriteBehind, "cancel", cancel_then_miss)
+        monkeypatch.setattr(wrapper_module, "_cancel_writes", cancel_then_miss)
         fn.invalidate_cache(1)  # type: ignore[attr-defined]
         backend.gate.set()
         _drain()
