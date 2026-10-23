@@ -18,6 +18,10 @@ pub use cachekit_core::{
 #[cfg(feature = "python")]
 pub mod python_bindings;
 
+// The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's
+// own tests run in the pure-Rust test build too.
+pub mod hit_counter;
+
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
@@ -34,6 +38,9 @@ use pyo3::prelude::*;
 fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add byte storage class
     m.add_class::<python_bindings::PyByteStorage>()?;
+
+    // Per-function L1-hit statistics, counted without a lock (decorators/wrapper.py)
+    m.add_class::<hit_counter::PyHitCounter>()?;
 
     // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the

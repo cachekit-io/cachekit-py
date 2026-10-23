@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation, l1_cache
+from .._rust_serializer import HitCounter
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
@@ -353,12 +354,14 @@ class _FunctionStats:
     """Tracks cache performance statistics for a single decorated function.
 
     Thread Safety:
-        Uses RLock for thread-safe counter updates. All methods are safe to call
-        from multiple threads concurrently. Statistics are shared across all
-        threads calling the same decorated function.
+        All methods are safe to call from multiple threads concurrently. L1 hits
+        are counted without a lock, by a native atomic counter: one is recorded
+        per L1 hit, the decorator's hottest path. Everything else is updated
+        under an RLock. Statistics are shared across all threads calling the
+        same decorated function.
 
     Attributes:
-        _l1_hits: Count of L1 cache hits
+        l1_hit_counter: Counts L1 cache hits and stamps the latest (HitCounter)
         _l2_hits: Count of L2 cache hits (Redis)
         _misses: Count of cache misses
         _l2_cumulative_latency_ms: Sum of L2 operation latencies (ms)
@@ -410,27 +413,20 @@ class _FunctionStats:
         """
         self._lock = threading.RLock()
         self._misses = 0
-        self._l1_hits = 0
+        # Reset in place, never replaced: create_cache_wrapper binds its hit method once.
+        self.l1_hit_counter = HitCounter()
         self._l2_hits = 0
         self._l2_cumulative_latency_ms = 0.0  # Sum of all L2 latencies
         self._l2_cached_avg_ms = 0.0  # Cached average (recalculated on L2 hit)
-        self._last_operation_at: float | None = None  # Unix timestamp
+        self._last_operation_at: float | None = None  # Unix timestamp of the last locked update
         self._function_identifier = function_identifier  # Store for lazy session ID generation
         self._clear_count = 0  # Incremented on each cache_clear() call
         self.session_id: str | None = None  # Lazy-initialized on first access
         self.l1_enabled = l1_enabled  # Rate limit classification flag
 
     def record_l1_hit(self):
-        """Record an L1 (in-memory) cache hit."""
-        # Once per L1 hit: acquire and release, as the with statement's __exit__ call costs more
-        # than the update it guards.
-        lock = self._lock
-        lock.acquire()
-        try:
-            self._l1_hits += 1
-            self._last_operation_at = time.time()
-        finally:
-            lock.release()
+        """Record an L1 (in-memory) cache hit, on the lock-free counter."""
+        self.l1_hit_counter.hit()
 
     def record_l2_hit(self, latency_ms: float):
         """Record an L2 (Redis) cache hit with latency measurement."""
@@ -478,16 +474,22 @@ class _FunctionStats:
         with self._lock:
             # Ensure session ID is initialized (lazy init or post-clear regeneration)
             current_session_id = self._ensure_session_id()
+            l1_hits = self.l1_hit_counter.count
+            # The later of the last locked update and the last L1 hit, which the counter stamps
+            last_operation_at = self._last_operation_at
+            last_l1_hit = self.l1_hit_counter.last_hit
+            if last_l1_hit is not None and (last_operation_at is None or last_l1_hit > last_operation_at):
+                last_operation_at = last_l1_hit
 
             return CacheInfo(
-                hits=self._l1_hits + self._l2_hits,
+                hits=l1_hits + self._l2_hits,
                 misses=self._misses,
-                l1_hits=self._l1_hits,
+                l1_hits=l1_hits,
                 l2_hits=self._l2_hits,
                 maxsize=None,  # Not applicable for external cache
                 currsize=None,  # Not applicable
                 l2_avg_latency_ms=self._l2_cached_avg_ms,
-                last_operation_at=self._last_operation_at,
+                last_operation_at=last_operation_at,
                 session_id=current_session_id,
             )
 
@@ -504,7 +506,7 @@ class _FunctionStats:
         """
         with self._lock:
             self._misses = 0
-            self._l1_hits = 0
+            self.l1_hit_counter.reset()
             self._l2_hits = 0
             self._l2_cumulative_latency_ms = 0.0
             self._l2_cached_avg_ms = 0.0
@@ -527,7 +529,7 @@ class _FunctionStats:
         """
         self._lock = threading.RLock()
         self._misses = 0
-        self._l1_hits = 0
+        self.l1_hit_counter.reset()
         self._l2_hits = 0
         self._l2_cumulative_latency_ms = 0.0
         self._l2_cached_avg_ms = 0.0
@@ -651,18 +653,20 @@ def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] 
             ):
                 return (t, a, u, b)
             return None
-    types = tuple(map(type, args))
-    for t, a in zip(types, args, strict=True):
+    # No zip(): its strict= keyword alone costs more to parse than these loops.
+    for a in args:
+        t = type(a)
         if t not in _MEMO_SCALAR_TYPES and not ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN):
             return None
     if not kwargs:
-        return (args, types)
-    items = tuple(kwargs.items())
-    kw_types = tuple(map(type, kwargs.values()))
-    for (name, a), t in zip(items, kw_types, strict=True):
+        return (args, tuple(map(type, args)))
+    for name, a in kwargs.items():
+        t = type(a)
+        # A str subclass name equals its str and so would share the entry, but the key generator
+        # refuses it, so it must take the full path.
         if type(name) is not str or (t not in _MEMO_SCALAR_TYPES and not ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN)):
             return None
-    return (args, types, items, kw_types)
+    return (args, tuple(map(type, args)), tuple(kwargs.items()), tuple(map(type, kwargs.values())))
 
 
 def _is_encrypting_serializer(serializer: object) -> bool:
@@ -1716,6 +1720,8 @@ def create_cache_wrapper(
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
     _stats = _get_function_stats(function_identifier, l1_enabled)
+    # The fast paths below record their hits through this, without record_l1_hit's Python frame.
+    _record_l1_hit = _stats.l1_hit_counter.hit
 
     # Per-key suppression alone doesn't bound refresh concurrency: a workload
     # crossing the SWR threshold on many distinct keys at once would spawn one
@@ -2313,12 +2319,12 @@ def create_cache_wrapper(
                 if _l1_swr_active and ttl is not None:
                     l1_lookup = _l1_fast_cache.get_with_swr(cache_key, ttl)
                     if l1_lookup[0] and not l1_lookup[2]:
-                        _stats.record_l1_hit()
+                        _record_l1_hit()
                         return l1_lookup[1]
                 else:
                     found, cached_value = _l1_fast_cache.get(cache_key)
                     if found:
-                        _stats.record_l1_hit()
+                        _record_l1_hit()
                         return cached_value
                     l1_lookup = (False, None, False, 0)
         return _sync_call(args, kwargs, cache_key, l1_lookup)
@@ -2590,12 +2596,12 @@ def create_cache_wrapper(
                 if _l1_swr_active and ttl is not None:
                     l1_lookup = _l1_fast_cache.get_with_swr(cache_key, ttl)
                     if l1_lookup[0] and not l1_lookup[2]:
-                        _stats.record_l1_hit()
+                        _record_l1_hit()
                         return l1_lookup[1]
                 else:
                     found, cached_value = _l1_fast_cache.get(cache_key)
                     if found:
-                        _stats.record_l1_hit()
+                        _record_l1_hit()
                         return cached_value
                     l1_lookup = (False, None, False, 0)
         return await _async_call(args, kwargs, cache_key, l1_lookup)
