@@ -322,8 +322,10 @@ self-calibrates the timer, so numbers come with the context needed to trust them
 `make perf-ir` is the deterministic one: it counts main-thread instructions per call under
 valgrind against budgets committed in `tests/performance/ir_baselines.json`, so a 1% regression
 is visible however loaded the machine is. Budgets belong to the build that recorded them; on a
-different interpreter, extension or C library, record a baseline on `main` first. Method and
-budgets: [docs/performance.md](docs/performance.md#instruction-budgets).
+different interpreter, extension or C library, record a baseline on `main` first. Every pull
+request also runs it in CI (the `Instruction budget` jobs, CPython 3.12), against the PR's base
+measured on the same runner rather than against the committed budgets. Method, budgets and the
+CI job: [docs/performance.md](docs/performance.md#instruction-budgets).
 
 ### Formatting Code
 

@@ -230,7 +230,7 @@ Wall-clock benchmarks do not gate CI, and no test in `tests/performance/` assert
 uv run pytest tests/performance/ -v -m performance
 ```
 
-The regression gate is the instruction budget, run locally with `make perf-ir`.
+The regression gate is the instruction budget: `make perf-ir` on your machine, and the `Instruction budget` check on every pull request (see [In CI](#in-ci)).
 
 ## Instruction Budgets
 
@@ -291,6 +291,24 @@ The gate does not call `systemd-run` itself, because CI runners and macOS lack i
 ```bash
 uv run pytest tests/unit/test_real_dataset.py
 uv run python tests/performance/ir_budget.py --path serializer_arrow_usgs --path serializer_auto_usgs
+```
+
+### In CI
+
+Every pull request runs the gate in the `Instruction budget (shard K/4)` jobs of `.github/workflows/ci.yml`, on GitHub-hosted `ubuntu-latest` runners with CPython 3.12. They do not compare against the committed budgets: those belong to the machine and interpreter build that recorded them, and a CPython 3.12 patch release alone read 2.0% to 3.6% over them with no code change. Instead each job builds two checkouts side by side, the pull request (its merge commit) and its base (the base branch tip), measures both on the same runner, and fails when a path costs 1% or more above the base (2% for the orjson round trip). That is `ir_budget.py --base DIR`, which writes nothing.
+
+- Both checkouts must sit at absolute paths of the same length, and the gate refuses a base that does not. The measured process's argv and import paths move its heap layout: a relative workload path against an absolute one read `l1_hit` 0.3% apart on identical source; at equal-length absolute paths the same pair agreed within 0.01%.
+- The two `serializer_*_usgs` paths are skipped (`--skip`): pyarrow's parquet reader can execute an instruction valgrind does not support on some CPUs, and the run then dies with SIGILL.
+- Four runners split the remaining paths (`--shard 1/4` to `--shard 4/4`), so the check takes minutes rather than half an hour.
+- A path the base does not have yet is reported as `new` and not compared.
+- CI keeps no budgets of its own, so there is nothing to re-record for it, and it ignores the committed ones entirely. They are still ratcheted on your machine with `make perf-ir-update`. A deliberate cost increase (`--update --allow-increase`, with the reason in the PR) therefore shows as a red `Instruction budget` check: the check is not part of `CI Success`, and the reviewer accepts the increase at merge. A raised committed budget cannot waive it, because a budget diff cannot tell a deliberate increase from a re-record on another interpreter or extension build, which moved one path 8.8% with no code change.
+
+To reproduce a CI verdict, check the base out beside your branch at a path of the same length, run `uv sync --group dev` in both, and run the gate from your branch:
+
+```bash
+git worktree add --detach ../base origin/main   # ../base must be as long as this checkout's path
+(cd ../base && uv sync --python 3.12 --group dev)
+uv run python tests/performance/ir_budget.py --base ../base --skip serializer_arrow_usgs --skip serializer_auto_usgs
 ```
 
 ---
