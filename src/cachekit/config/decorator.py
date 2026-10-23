@@ -503,7 +503,7 @@ class DecoratorConfig:
             "ttl": 600,
             "integrity_checking": True,  # NON-NEGOTIABLE for encryption (security invariant)
             "l1": L1CacheConfig(
-                enabled=True,  # L1 stores encrypted bytes. Enabled: ~50ns hits vs 2-7ms Redis
+                enabled=True,  # L1 stores encrypted bytes, decrypted on each hit: no network round trip
                 swr_enabled=True,
             ),
             "circuit_breaker": CircuitBreakerConfig(enabled=True),

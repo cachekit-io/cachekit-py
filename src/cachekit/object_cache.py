@@ -1,8 +1,8 @@
 """Thread-safe in-memory object cache with TTL, LRU eviction, byte bounds, and SWR.
 
 Stores Python object references directly — no serialization. Used by @cache.local()
-and by @cache(backend=None) (L1-only mode) to provide low-latency (~50ns)
-caching for objects that do not need to cross process boundaries or survive restarts.
+and by @cache(backend=None) (L1-only mode) to cache objects that do not need to
+cross process boundaries or survive restarts, with no serialization or network round trip.
 """
 
 from __future__ import annotations

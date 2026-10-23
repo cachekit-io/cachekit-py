@@ -1067,8 +1067,8 @@ def create_cache_wrapper(
     validate_encryption_config(encryption, master_key=master_key)
 
     # Note: L1 cache + encryption is supported.
-    # L1 stores encrypted bytes (not plaintext), decryption happens at read time only.
-    # This maintains security while enabling sub-microsecond cache hits.
+    # L1 stores encrypted bytes (not plaintext), decryption happens at read time only:
+    # every L1 hit decrypts, and none crosses the network.
 
     # Initialize feature orchestrator using EXISTING reliability/monitoring modules
     features = FeatureOrchestrator(
@@ -2025,7 +2025,7 @@ def create_cache_wrapper(
                 l1_start = time.perf_counter()
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
                 if l1_found and l1_bytes:
-                    # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
+                    # L1 cache hit - deserialize bytes
                     try:
                         l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
                         l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
@@ -2300,7 +2300,7 @@ def create_cache_wrapper(
 
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        # Bypass check (5-10μs savings)
+        # _bypass_cache: call through, uncached
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return func(*args, **kwargs)
@@ -2424,7 +2424,7 @@ def create_cache_wrapper(
                 l1_start = time.perf_counter()
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
                 if l1_found and l1_bytes:
-                    # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
+                    # L1 cache hit - deserialize bytes
                     try:
                         l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
                         l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
@@ -2580,7 +2580,7 @@ def create_cache_wrapper(
 
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-        # Bypass check (5-10μs savings)
+        # _bypass_cache: call through, uncached
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return await func(*args, **kwargs)

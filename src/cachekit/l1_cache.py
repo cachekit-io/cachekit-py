@@ -98,7 +98,7 @@ class L1Cache:
     - Respects Redis TTL (entries expire at Redis TTL time)
     - Memory bounded (100MB default limit; one entry at most an eighth of it)
     - LRU eviction when memory limit reached
-    - Fast lookups (~50ns for hits)
+    - In-process lookups, with no network round trip
     - Background TTL synchronization
     - Stores bytes (encrypted or plaintext msgpack), not Python objects
 
