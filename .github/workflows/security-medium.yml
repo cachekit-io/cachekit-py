@@ -29,6 +29,12 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        # After a Cargo.lock change, rust-cache restores an older target/ whose
+        # dep-info names crates the new lockfile never unpacks; cargo-geiger
+        # reads every dep-info file and fails on the first missing source. A
+        # clean target/ takes about as long here; the binary and registry stay cached.
+        cache-targets: "false"
 
     - name: Install cargo-geiger
       run: cargo install --locked cargo-geiger
