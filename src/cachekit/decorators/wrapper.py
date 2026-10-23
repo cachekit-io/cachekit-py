@@ -641,6 +641,8 @@ def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] 
     (<class 'int'>, 1, <class 'str'>, 'a')
     >>> _memo_key((1, "a"), {"b": 2.0})
     ((1, 'a'), (<class 'int'>, <class 'str'>), (('b', 2.0),), (<class 'float'>,))
+    >>> _memo_key((), {"b": 1, "a": 2}) == _memo_key((), {"a": 2, "b": 1})
+    True
     >>> _memo_key(([1],), {}) is None
     True
     """
@@ -674,7 +676,10 @@ def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] 
         # refuses it, so it must take the full path.
         if type(name) is not str or not _memoisable(a):
             return None
-    return (args, tuple(map(type, args)), tuple(kwargs.items()), tuple(map(type, kwargs.values())))
+    # Sorted by name, as the key generator sorts them: keywords in any order share one entry, and an
+    # invalidation in any order finds it. Names are distinct str, so no value is ever compared.
+    items = tuple(sorted(kwargs.items()))
+    return (args, tuple(map(type, args)), items, tuple([type(value) for _, value in items]))
 
 
 def _is_encrypting_serializer(serializer: object) -> bool:

@@ -334,6 +334,18 @@ class TestL1OnlyFastPath:
         fn.cache_clear()
         assert memo == {}
 
+    def test_invalidation_with_keywords_in_another_order_forgets_the_entry(self) -> None:
+        @cache(backend=None, encryption=False)
+        def fn(*, user: str, org: str) -> str:
+            return user
+
+        memo = _closure_cell(fn, "_key_memo").cell_contents
+        fn(user="alice@example.com", org="a")
+        fn(org="a", user="alice@example.com")
+        assert len(memo) == 1
+        fn.invalidate_cache(org="a", user="alice@example.com")
+        assert memo == {}
+
     def test_an_encrypted_function_memoises_nothing(self) -> None:
         backend = _RecordingBackend()
 
