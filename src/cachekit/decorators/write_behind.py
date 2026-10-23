@@ -124,11 +124,17 @@ class WriteBehind:
 
     def _work(self) -> None:
         cond = self._cond
+        quit_cleanly = False
         try:
             while True:
                 with cond:
                     entry = next((e for e in self._pending if e not in self._sending), None)
                     if entry is None:
+                        # Given up in the same hold as the empty check: a submit in between would see this
+                        # thread still counted, start none, and leave its write queued with no thread.
+                        self._workers -= 1
+                        quit_cleanly = True
+                        cond.notify_all()
                         return
                     job = self._pending.pop(entry)
                     self._bytes -= job.size
@@ -142,10 +148,10 @@ class WriteBehind:
                         self._sending.discard(entry)
                         cond.notify_all()
         finally:
-            # Every exit, a raise included, gives up the thread's place, so the next submit can start one.
-            with cond:
-                self._workers -= 1
-                cond.notify_all()
+            if not quit_cleanly:  # a raise: give up the thread's place, so the next submit can start one
+                with cond:
+                    self._workers -= 1
+                    cond.notify_all()
 
     def cancel(self, match: Callable[[Entry], bool], *, wait: bool = True) -> None:
         """Drop the queued writes of every entry ``match`` accepts, then, with ``wait``, block until none
