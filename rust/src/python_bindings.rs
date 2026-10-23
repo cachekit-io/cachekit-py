@@ -1,12 +1,10 @@
 //! Python bindings for cachekit-core
 //!
 //! This module provides thin PyO3 wrappers around cachekit-core functionality, plus the
-//! buffer-borrow helper they share. Business logic lives in cachekit-core, except the
-//! SDK-owned msgpack decode bound in `crate::msgpack_bounds`.
+//! buffer-borrow helper they share. Business logic lives in cachekit-core.
 
-use crate::msgpack_bounds::check_msgpack_structure;
 use cachekit_core::byte_storage::ByteStorageError;
-use cachekit_core::ByteStorage;
+use cachekit_core::{check_msgpack_structure, ByteStorage};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -129,9 +127,11 @@ fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesVi
     Ok(BytesView::Owned(buf.to_vec(py)?))
 }
 
-/// Reject a MessagePack document whose headers would make decoding it allocate out of
-/// proportion to its size — see `check_msgpack_structure`. Zero-copy for `bytes` and for
-/// read-only `memoryview`s of `bytes`; raises ValueError naming the violated bound.
+/// Reject a MessagePack document that nests deeper than `max_depth` (every array or map
+/// header counts, an empty one included) or whose headers would make decoding it allocate
+/// out of proportion to its size — cachekit-core's `check_msgpack_structure`, run over a
+/// zero-copy view for `bytes` and for read-only `memoryview`s of `bytes`. Raises ValueError
+/// naming the violated bound.
 #[pyfunction]
 #[pyo3(name = "check_msgpack_structure")]
 pub fn check_msgpack_structure_py(
