@@ -350,7 +350,7 @@ assert calls == 1
 > [!IMPORTANT]
 > All serializers support **configurable checksums** for corruption detection using xxHash3-64 (8 bytes). Enabled by default in `@cache.production` and `@cache.secure`.
 
-Each checksum adds 8 bytes to an entry and one xxHash3-64 pass over the payload on each write and read. `StandardSerializer` and `OrjsonSerializer` drop it with `enable_integrity_checking=False`; `ArrowSerializer` always checks. On `StandardSerializer` the same switch also turns LZ4 compression off, so entries get larger; measure on your own payloads before you trade that.
+Each checksum adds 8 bytes to an entry and one xxHash3-64 pass over the payload on each write and read. `StandardSerializer` and `OrjsonSerializer` drop it with `enable_integrity_checking=False`; `ArrowSerializer` always checks. On `StandardSerializer` the same switch also turns LZ4 compression and its envelope off, so compressible entries get larger and small or incompressible ones about 25 bytes smaller; measure on your own payloads before you trade that.
 
 ### Security
 
