@@ -280,7 +280,7 @@ Every pull request runs the gate in the `Instruction budget (shard K/4)` jobs of
 - The two `serializer_*_usgs` paths are skipped (`--skip`): pyarrow's parquet reader can execute an instruction valgrind does not support on some CPUs, and the run then dies with SIGILL.
 - Four runners split the remaining paths (`--shard 1/4` to `--shard 4/4`), so the check takes minutes rather than half an hour.
 - A path the base does not have yet is reported as `new` and not compared.
-- CI keeps no budgets of its own, so there is nothing to re-record for it. The committed budgets are still ratcheted on your machine with `make perf-ir-update`, and a deliberate increase still needs `--update --allow-increase` and a reason in the PR. CI reads that raise from the PR's `ir_baselines.json` and raises the path's base figure by the same ratio, so the deliberate increase passes and anything beyond it still fails.
+- CI keeps no budgets of its own, so there is nothing to re-record for it. The committed budgets are still ratcheted on your machine with `make perf-ir-update`, and a deliberate increase still needs `--update --allow-increase` and a reason in the PR. CI reads that raise from the PR's `ir_baselines.json` and raises the path's base figure by the same ratio, so the deliberate increase passes and anything beyond it still fails. Only a raise recorded on the same CPython release as the base's budgets counts: budgets re-recorded on another release grant no allowance, because that drift moves both checkouts alike.
 
 To reproduce a CI verdict, check the base out beside your branch at a path of the same length, run `uv sync --group dev` in both, and run the gate from your branch:
 
