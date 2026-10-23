@@ -99,8 +99,9 @@ def _assert_contained(request: FakeRequest, key: str, *, suffix: str = "") -> No
         assert bad not in encoded_key, f"unencoded {bad!r} survived in key segment: {encoded_key!r}"
 
     # Round-trip: decode-once recovers the original key byte-for-byte. The
-    # client encodes with exactly the inverse of the SaaS validator's
-    # single ``decodeURIComponent`` (cache-key-validator.ts), so no double-encoding
+    # client encodes with exactly the inverse of the server's single
+    # ``decodeURIComponent`` (protocol spec/saas-api.md § Cache-Key Path Encoding,
+    # rule 3: decode once), so no double-encoding
     # and no crafted key resolves to a *different* server-side key.
     assert unquote(encoded_key) == key, f"key not recoverable by single decode: {encoded_key!r} != {key!r}"
 

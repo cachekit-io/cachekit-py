@@ -349,7 +349,7 @@ jobs:
         run: |
           count=$(jq '.components | length' sbom.cdx.json)
           echo "SBOM components: $count"
-          # ponytail: floor of 5 catches empty/grossly-partial; cachekit's Python+Rust
+          # A floor of 5 catches empty/grossly-partial; cachekit's Python+Rust
           # graph is far above it. Tighten to an exact manifest only if a partial slips.
           test "$count" -ge 5
 

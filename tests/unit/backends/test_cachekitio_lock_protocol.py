@@ -7,7 +7,7 @@ The wrapper at decorators/wrapper.py:1072 calls the backend as an async context
 manager with (key, timeout, blocking_timeout). The backend must conform to the
 LockableBackend protocol in backends/base.py.
 
-SaaS contract (saas/apps/cache/src/index.ts:732): POST {key}/lock always returns
+SaaS contract (protocol spec/saas-api.md § POST /v1/cache/{key}/lock): POST {key}/lock always returns
 HTTP 200 with body {"lock_id": <id_or_null>}; null indicates lock held by another
 caller. DELETE {key}/lock releases, sending the lock id in the X-CacheKit-Lock-Id
 header (CWE-532) rather than a ?lock_id= query param.

@@ -1,15 +1,12 @@
 """Regression test for bare-cache-key contract on LockableBackend.acquire_lock.
 
-Production bug: SaaS cache worker returns HTTP 400 on lock POST because the
-wrapper at ``decorators/wrapper.py:1064`` prepended ``:lock`` to the canonical
-cache_key before passing it to ``acquire_lock``. The SaaS validator
-(``apps/cache/src/index.ts``) requires exactly 7 colon-separated segments in
-the canonical key format:
+Production bug: the wrapper at ``decorators/wrapper.py:1064`` prepended ``:lock``
+to the canonical cache_key before passing it to ``acquire_lock``. The SaaS lock
+endpoint takes the bare cache key (protocol spec/saas-api.md § POST
+/v1/cache/{key}/lock), so the polluted key (`ns:...:1s:lock`) addressed a
+different key from the cached entry. The SDK's canonical key format is:
 
     ns:{namespace}:func:{module.function}:args:{64-hex-blake2b}:{flags}
-
-The pollution turned a 7-segment key into 8 (`ns:...:1s:lock`), which fails
-validation.
 
 The architectural fix is to make the protocol contract explicit: every
 LockableBackend method receives the **bare cache key** — identical to what
@@ -34,9 +31,9 @@ from urllib3.util.url import _encode_target
 
 from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
 
-# Canonical 7-segment cache key (matches saas/apps/cache/src/index.ts validator):
+# Canonical 7-segment cache key (SDK convention, protocol spec/cache-key-format.md):
 # ns:{namespace}:func:{module.function}:args:{64-hex-blake2b}:{flags}
-_CANONICAL_KEY = "ns:articles-prod:func:insight_times.api.routes._list_articles_cached:args:" + ("a" * 64) + ":1s"
+_CANONICAL_KEY = "ns:articles-prod:func:example_app.api.routes._list_articles_cached:args:" + ("a" * 64) + ":1s"
 
 
 def _lock_api(request: FakeRequest) -> HTTPResponse:
@@ -53,7 +50,7 @@ class TestBareCacheKeyContract:
 
         Decoding the encoded-key portion must yield exactly 7 colon-separated parts.
         If the wrapper (or the backend) appends ``:lock`` to the key, the decoded key has
-        8 segments and the SaaS validator returns 400.
+        8 segments and addresses a different key from the cached entry.
         """
         backend, pool = fake_backend(_lock_api)
 
@@ -72,8 +69,8 @@ class TestBareCacheKeyContract:
         encoded_key_portion = post_path[len("/v1/cache/") : -len("/lock")]
 
         # The encoded key portion must NOT itself end with the encoded form of `:lock`
-        # (i.e. `%3Alock`). That is exactly the bug the canonical 7-segment validator
-        # catches at the SaaS edge.
+        # (i.e. `%3Alock`). That is exactly the bug: the lock endpoint takes the bare
+        # cache key.
         assert not encoded_key_portion.endswith("%3Alock"), (
             f"encoded key smuggled :lock suffix; got {encoded_key_portion!r} — "
             f"the wrapper polluted the cache_key with ':lock' before encoding"
@@ -84,5 +81,5 @@ class TestBareCacheKeyContract:
         decoded_key = unquote(encoded_key_portion)
         assert decoded_key == _CANONICAL_KEY, f"decoded key drift: {decoded_key!r} != {_CANONICAL_KEY!r}"
         assert decoded_key.count(":") == 6, (
-            f"canonical SaaS key must have exactly 7 colon-segments (6 colons); got {decoded_key.count(':')} in {decoded_key!r}"
+            f"SDK canonical key must have exactly 7 colon-segments (6 colons); got {decoded_key.count(':')} in {decoded_key!r}"
         )
