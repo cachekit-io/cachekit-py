@@ -682,3 +682,46 @@ def _reader(cache_dir: Path) -> Any:
     return cache(backend=FileBackend(FileBackendConfig(cache_dir=str(cache_dir))), ttl=600, namespace="exit", l1_enabled=False)(
         fn
     )
+
+
+class TestWriterEdges:
+    def test_cancel_waits_only_for_sends_in_progress_at_the_call(self) -> None:
+        """A key taking misses throughout an invalidation cannot hold it: a send that starts after the
+        cancel is a later write, not one the cancel waits for."""
+        writer = wb.WriteBehind(lambda *_: None)
+        first, second = threading.Event(), threading.Event()
+        assert writer.submit(("", "k"), 1, lambda: first.wait(_GUARD_SECONDS))
+        _until(lambda: ("", "k") in writer._sending)
+        cancelled = threading.Thread(target=writer.cancel, args=(("", "k").__eq__,))
+        cancelled.start()
+        _until(lambda: len(writer._cond._waiters) == 1)  # type: ignore[attr-defined]
+        assert writer.submit(("", "k"), 1, lambda: second.wait(_GUARD_SECONDS))  # queued behind the first send
+        first.set()  # the first send ends, and the second starts at once on the freed thread
+        cancelled.join(_GUARD_SECONDS)
+        assert not cancelled.is_alive(), "cancel waited on a send that started after it"
+        second.set()
+        assert writer.close(_deadline()) == []
+
+    def test_a_refused_thread_start_refuses_the_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        writer = wb.WriteBehind(lambda *_: None)
+
+        def refuse(self: threading.Thread) -> None:
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", refuse)
+        assert not writer.submit(("", "k"), 1, lambda: None)
+        assert writer._pending == {} and writer._workers == 0
+
+    def test_exit_flush_names_what_it_dropped(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        writer = wb.WriteBehind(lambda *_: None)
+        release = threading.Event()
+        writer.submit(("", "k"), 1, lambda: release.wait(_GUARD_SECONDS))
+        monkeypatch.setattr(wb, "_writers", {writer})
+        monkeypatch.setattr(wb, "EXIT_FLUSH_SECONDS", 0.1)
+        try:
+            with caplog.at_level(logging.WARNING, logger="cachekit"):
+                wb._flush_at_exit()
+        finally:
+            release.set()
+        assert any("1 deferred L2 write(s) were not sent" in r.getMessage() for r in caplog.records)
+        assert not writer.submit(("", "other"), 1, lambda: None)  # closed: callers write synchronously

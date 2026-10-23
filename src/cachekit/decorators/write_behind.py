@@ -78,7 +78,7 @@ class WriteBehind:
     def _reset(self) -> None:
         self._cond = threading.Condition(threading.Lock())
         self._pending: dict[Entry, _Job] = {}
-        self._sending: set[Entry] = set()
+        self._sending: dict[Entry, _Job] = {}  # entry -> the job being sent for it
         self._bytes = 0
         self._workers = 0
         self._closed = False
@@ -138,14 +138,14 @@ class WriteBehind:
                         return
                     job = self._pending.pop(entry)
                     self._bytes -= job.size
-                    self._sending.add(entry)
+                    self._sending[entry] = job
                 try:
                     job.context.run(job.send)
                 except Exception as exc:
                     self._on_error(entry, exc)
                 finally:
                     with cond:
-                        self._sending.discard(entry)
+                        del self._sending[entry]
                         cond.notify_all()
         finally:
             if not quit_cleanly:  # a raise: give up the thread's place, so the next submit can start one
@@ -154,14 +154,18 @@ class WriteBehind:
                     cond.notify_all()
 
     def cancel(self, match: Callable[[Entry], bool], *, wait: bool = True) -> None:
-        """Drop the queued writes of every entry ``match`` accepts, then, with ``wait``, block until none
-        of them is being sent. Never call it from a ``send``: that send would wait on itself."""
+        """Drop the queued writes of every entry ``match`` accepts, then, with ``wait``, block until the
+        sends of those entries in progress at the call have finished. A send that starts later is a write
+        made after the call and is not waited for: a key taking misses throughout cannot hold the caller.
+        Never call it from a ``send``: that send would wait on itself."""
         self._owned()
         with self._cond:
             for entry in [e for e in self._pending if match(e)]:
                 self._bytes -= self._pending.pop(entry).size
             if wait:
-                self._cond.wait_for(lambda: not any(match(e) for e in self._sending))
+                # Jobs, not entries: a later send of the same entry is another job.
+                sending = [(e, job) for e, job in self._sending.items() if match(e)]
+                self._cond.wait_for(lambda: all(self._sending.get(e) is not job for e, job in sending))
 
     def close(self, deadline: float) -> list[Entry]:
         """Refuse new writes, wait until the queue drains or ``deadline`` (``time.monotonic``) passes,

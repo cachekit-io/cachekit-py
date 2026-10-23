@@ -20,6 +20,7 @@ from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 from .. import invalidation, l1_cache
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
+    CacheHandlerStrategy,
     CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -1662,7 +1663,7 @@ def create_cache_wrapper(
         else None
     )
 
-    def _send_deferred(cache_key: str, envelope: bytes, twin: str | None, handler: Any) -> None:
+    def _send_deferred(cache_key: str, envelope: bytes, twin: str | None, handler: CacheHandlerStrategy) -> None:
         """A write-behind miss write, on the writer's thread in the caller's context: the backend write
         store_result would have made, then what the miss path does after a stored one.
 
@@ -1694,8 +1695,9 @@ def create_cache_wrapper(
 
     def _defer_write(cache_key: str, twin: str | None, envelope: bytes) -> bool:
         """Hand a miss's serialized value to the writer. False if it refused: the caller writes it now."""
-        assert _write_behind is not None  # noqa: S101 - only called with write_behind on
-        send = functools.partial(_send_deferred, cache_key, envelope, twin, operation_handler.cache_handler)
+        handler = operation_handler.cache_handler
+        assert _write_behind is not None and handler is not None  # noqa: S101 - only on the miss path, write_behind on
+        send = functools.partial(_send_deferred, cache_key, envelope, twin, handler)
         return _write_behind.submit((_l2_scope(), cache_key), len(envelope), send)
 
     def _cancel_deferred(match: Callable[[Entry], bool], *, wait: bool = True) -> None:
