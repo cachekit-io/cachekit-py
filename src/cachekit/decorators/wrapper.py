@@ -605,18 +605,26 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 )
 
 
-# The key memo (create_cache_wrapper's _key_memo) takes an argument only by one of these exact types,
-# or as an exact str or bytes of at most _MEMO_MAX_LEN items. Two equal values of one of them always
-# produce the same key: their MessagePack is the same, 0.0 and -0.0 included, since both normalise to
-# 0.0. A subclass (IntEnum, a str subclass) or a container never matches, so it takes the full key
-# path on every call.
-_MEMO_SCALAR_TYPES = frozenset({int, bool, float, type(None)})
+# The key memo (create_cache_wrapper's _key_memo) takes an argument only when its exact type is int,
+# float, bool or NoneType, or str or bytes of at most _MEMO_MAX_LEN items. Two equal values of one of
+# these types always produce the same key: their MessagePack is the same, 0.0 and -0.0 included, since
+# both normalise to 0.0. Types are tested by identity, as the key generator's fast path does, so an
+# argument's type is never hashed or compared through its metaclass. A subclass (IntEnum, a str
+# subclass) or a container never matches, so it takes the full key path on every call.
 # The memo keeps what it is keyed by, and hashing a long string afresh on every call costs as much as
 # the key generation it would save.
 _MEMO_MAX_LEN = 256
+# Arguments per call, positional and keyword together: with _MEMO_MAX_LEN, this bounds an entry's size.
+_MEMO_MAX_ARGS = 8
 # Entries per decorated function. A full memo is emptied rather than evicted entry by entry, so a hit
 # writes nothing.
 _MEMO_MAX_ENTRIES = 1024
+
+
+def _memoisable(a: Any) -> bool:
+    """Whether the key memo takes this argument (see _MEMO_MAX_LEN). _memo_key inlines it for one and two arguments."""
+    t = type(a)
+    return t is int or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN) or t is float or t is bool or a is None
 
 
 def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] | None:
@@ -641,30 +649,30 @@ def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] 
         if n == 1:
             a = args[0]
             t = type(a)
-            if t in _MEMO_SCALAR_TYPES or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN):
+            if t is int or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN) or t is float or t is bool or a is None:
                 return (t, a)
             return None
         if n == 2:
             a, b = args
             t = type(a)
             u = type(b)
-            if (t in _MEMO_SCALAR_TYPES or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN)) and (
-                u in _MEMO_SCALAR_TYPES or ((u is str or u is bytes) and len(b) <= _MEMO_MAX_LEN)
+            if (t is int or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN) or t is float or t is bool or a is None) and (
+                u is int or ((u is str or u is bytes) and len(b) <= _MEMO_MAX_LEN) or u is float or u is bool or b is None
             ):
                 return (t, a, u, b)
             return None
+    if len(args) + len(kwargs) > _MEMO_MAX_ARGS:
+        return None
     # No zip(): its strict= keyword alone costs more to parse than these loops.
     for a in args:
-        t = type(a)
-        if t not in _MEMO_SCALAR_TYPES and not ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN):
+        if not _memoisable(a):
             return None
     if not kwargs:
         return (args, tuple(map(type, args)))
     for name, a in kwargs.items():
-        t = type(a)
         # A str subclass name equals its str and so would share the entry, but the key generator
         # refuses it, so it must take the full path.
-        if type(name) is not str or (t not in _MEMO_SCALAR_TYPES and not ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN)):
+        if type(name) is not str or not _memoisable(a):
             return None
     return (args, tuple(map(type, args)), tuple(kwargs.items()), tuple(map(type, kwargs.values())))
 
@@ -1580,13 +1588,27 @@ def create_cache_wrapper(
     # Generated keys by argument tuple (see _memo_key): memo key -> (cache key, and the
     # func.__module__ and func.__qualname__ objects it was built from). An entry answers only
     # while both names are still those objects, so renaming the function re-keys it as before.
-    _key_memo: dict[tuple[Any, ...], tuple[str, Any, Any]] = {}
+    # __module__ is typed Any: Python lets it hold any object, and the key generator formats it.
+    _key_memo: dict[tuple[Any, ...], tuple[str, Any, str]] = {}
+    # The memo holds its callers' arguments in memory. An encrypted function's L1 holds only
+    # ciphertext, so it keeps no plaintext argument either: it builds its key on every call.
+    _key_memo_on = _generated_key_mode and not serialization_handler.encryption
+
+    def _forget_memoised(call_args: tuple[Any, ...] | None, call_kwargs: dict[str, Any] | None = None) -> None:
+        """Drop these arguments from the key memo, or every entry (None): an invalidation can be an
+        erasure, and the memo would otherwise keep the arguments it was given."""
+        if call_args is None:
+            _key_memo.clear()
+            return
+        memo_key = _memo_key(call_args, call_kwargs or {})
+        if memo_key is not None:
+            _key_memo.pop(memo_key, None)
 
     def _resolve_cache_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str:
         """Single key derivation shared by the read/write and invalidate paths."""
         # Standard key generation with type-aware handling
         if _generated_key_mode:
-            memo_key = _memo_key(call_args, call_kwargs)
+            memo_key = _memo_key(call_args, call_kwargs) if _key_memo_on else None
             if memo_key is not None:
                 entry = _key_memo.get(memo_key)
                 if entry is not None and entry[1] is func.__module__ and entry[2] is func.__qualname__:
@@ -1622,10 +1644,14 @@ def create_cache_wrapper(
         return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
 
     def _resolve_invalidation_keys(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> list[str]:
-        """The key _resolve_cache_key derives, plus its pre-0.20.0 twin on the generated-key path."""
+        """The key _resolve_cache_key derives, plus its pre-0.20.0 twin on the generated-key path.
+
+        The key memo forgets these arguments.
+        """
         cache_key = _resolve_cache_key(call_args, call_kwargs)
         if not _generated_key_mode:
             return [cache_key]
+        _forget_memoised(call_args, call_kwargs)
         legacy_key = operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
         return [cache_key] if legacy_key == cache_key else [cache_key, legacy_key]
 
@@ -3226,6 +3252,7 @@ def create_cache_wrapper(
         # Calls in flight are forgotten after the deletes (_delete_then_forget): a read that starts
         # after this returns must not join a miss that started before it.
         if not args and not kwargs and _func_has_params:
+            _forget_memoised(None)
             return _delete_then_forget(None)
 
         # Single-key invalidation (specific args provided, or zero-param function).
@@ -3256,6 +3283,7 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
+            _forget_memoised(None)
             # Off the event loop: every L2 call in here is a sync Redis/backend round-trip. The worker
             # forgets the calls in flight after its deletes even if this caller is cancelled while it runs.
             return await asyncio.to_thread(_delete_then_forget, None)

@@ -271,7 +271,7 @@ What a call costs inside your process, from the wall-clock guards in `tests/perf
 | L1 hit with an L2 backend configured, same dict | 286 ± 19 µs |
 | Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 540 ± 27 µs |
 
-- With no backend, L1 keeps the returned object itself, whatever the payload's size. A repeat call also finds its cache key in a per-function memo instead of building it again, when every argument is an `int`, `float`, `bool`, `None`, a `str` of up to 256 characters or `bytes` of up to 256 bytes. Other arguments, such as a list, a dict, a `datetime` or a longer string, build the key on every call.
+- With no backend, L1 keeps the returned object itself, whatever the payload's size. A repeat call also finds its cache key in a per-function memo instead of building it again, when it has at most 8 arguments and every one is an `int`, `float`, `bool`, `None`, a `str` of up to 256 characters or `bytes` of up to 256 bytes. Other arguments, such as a list, a dict, a `datetime` or a longer string, build the key on every call.
 - With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 330 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 12 ± 20 µs, inside the noise.
 - An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
 

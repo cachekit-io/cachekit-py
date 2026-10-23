@@ -20,7 +20,7 @@ from hypothesis import strategies as st
 
 from cachekit import cache
 from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.decorators.wrapper import _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _FunctionStats, _memo_key
+from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _FunctionStats, _memo_key
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
@@ -36,6 +36,38 @@ class _Str(str):
 
 class _Int(int):
     pass
+
+
+class _EqMeta(type):
+    """A metaclass defining __eq__, which leaves its classes unhashable."""
+
+    def __eq__(cls, other: object) -> bool:
+        return NotImplemented
+
+
+class _Token(metaclass=_EqMeta):
+    pass
+
+
+class _IntLikeMeta(type):
+    """Makes its classes hash and compare equal to int."""
+
+    def __hash__(cls) -> int:
+        return hash(int)
+
+    def __eq__(cls, other: object) -> bool:
+        return other is int or type.__eq__(cls, other)
+
+
+class _IntLike(metaclass=_IntLikeMeta):
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    def __hash__(self) -> int:
+        return hash(self.v)
+
+    def __eq__(self, other: object) -> bool:
+        return other == self.v
 
 
 class _RecordingBackend:
@@ -99,6 +131,20 @@ class TestMemoKey:
 
     def test_a_str_subclass_keyword_name_is_not_memoised(self) -> None:
         assert _memo_key((), {_Str("x"): 1}) is None
+
+    def test_types_are_tested_by_identity_never_hashed_or_compared(self) -> None:
+        """A metaclass that defines __eq__ makes a class unhashable; one that hashes and compares
+        like int would pass a set-membership test. Neither may reach the memo."""
+        for value in (_Token(), _IntLike(1)):
+            assert _memo_key((value,), {}) is None
+            assert _memo_key((1, value), {}) is None
+            assert _memo_key((1, 2, value), {}) is None
+            assert _memo_key((), {"x": value}) is None
+
+    def test_at_most_max_args_arguments_are_memoised(self) -> None:
+        assert _memo_key(tuple(range(_MEMO_MAX_ARGS)), {}) is not None
+        assert _memo_key(tuple(range(_MEMO_MAX_ARGS + 1)), {}) is None
+        assert _memo_key(tuple(range(_MEMO_MAX_ARGS)), {"x": 1}) is None
 
     def test_shapes_never_collide(self) -> None:
         calls = [((1,), {}), ((1, 2), {}), ((1, 2, 3), {}), ((), {}), ((1,), {"b": 2}), ((1, 2), {"b": 2})]
@@ -261,6 +307,44 @@ class TestL1OnlyFastPath:
         fn(1)
         assert len(seen) == 2
         assert all(stats is not None for stats in seen)
+
+    def test_metaclass_arguments_run_uncached_as_before(self) -> None:
+        calls = 0
+
+        @cache(backend=None, encryption=False)
+        def fn(x: Any) -> str:
+            nonlocal calls
+            calls += 1
+            return type(x).__name__
+
+        assert [fn(1), fn(1), fn(_IntLike(1)), fn(_Token()), fn(_Token())] == ["int", "int", "_IntLike", "_Token", "_Token"]
+        assert calls == 4  # one miss for 1; the others cannot be keyed, so they run every time
+
+    def test_invalidation_forgets_the_memoised_arguments(self) -> None:
+        @cache(backend=None, encryption=False)
+        def fn(x: str) -> str:
+            return x
+
+        memo = _closure_cell(fn, "_key_memo").cell_contents
+        fn("alice@example.com")
+        fn("bob@example.com")
+        assert len(memo) == 2
+        fn.invalidate_cache("alice@example.com")
+        assert list(memo) == [(str, "bob@example.com")]
+        fn.cache_clear()
+        assert memo == {}
+
+    def test_an_encrypted_function_memoises_nothing(self) -> None:
+        backend = _RecordingBackend()
+
+        @cache.secure(master_key="ab" * 32, backend=backend, ttl=60)
+        def fn(x: str) -> str:
+            return x
+
+        for _ in range(3):
+            assert fn("alice@example.com") == "alice@example.com"
+        assert _closure_cell(fn, "_key_memo").cell_contents == {}
+        assert len(set(backend.reads)) == 1
 
     def test_bypass_and_invalidation_reach_a_memoised_call(self) -> None:
         calls = 0

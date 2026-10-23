@@ -225,11 +225,7 @@ class ObjectCache:
             value is None in that case.
         """
         s = self._state
-        # get and get_with_swr run once per L1 hit, so they acquire and release rather than use the
-        # with statement, whose __exit__ call costs about a third of what they guard.
-        lock = s.lock
-        lock.acquire()
-        try:
+        with s.lock:
             entry = s.store.get(key)
             if entry is None:
                 self._misses += 1
@@ -245,8 +241,6 @@ class ObjectCache:
             s.store.move_to_end(key)
             self._hits += 1
             return True, entry.value
-        finally:
-            lock.release()
 
     def peek(self, key: str) -> tuple[bool, Any]:
         """Look up a value without counting a hit or miss or moving it in LRU order.
@@ -292,9 +286,7 @@ class ObjectCache:
             - version: Entry version at read time (pass to complete_refresh)
         """
         s = self._state
-        lock = s.lock  # acquire and release, not with: see get
-        lock.acquire()
-        try:
+        with s.lock:
             entry = s.store.get(key)
             if entry is None:
                 self._misses += 1
@@ -325,8 +317,6 @@ class ObjectCache:
                 needs_refresh = True
 
             return True, entry.value, needs_refresh, version
-        finally:
-            lock.release()
 
     def complete_refresh(self, key: str, version: int, value: Any, ttl: float) -> bool:
         """Complete a background refresh started by ``get_with_swr``.
