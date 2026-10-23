@@ -1,7 +1,7 @@
 """L1 in-memory cache implementation with TTL respect and memory bounds.
 
-This module provides a thread-safe L1 cache that sits in front of Redis (L2),
-dramatically reducing network latency while maintaining Redis as the source of truth.
+This module provides a thread-safe L1 cache that sits in front of the L2 backend, so a
+hit skips the backend's round trip while L2 stays the source of truth.
 """
 
 import logging
@@ -95,7 +95,7 @@ class L1Cache:
 
     Key features:
     - Thread-safe with RLock for concurrent access
-    - Respects Redis TTL (entries expire at Redis TTL time)
+    - Respects the L2 TTL (an entry expires ttl_buffer_seconds before its L2 entry)
     - Memory bounded (100MB default limit; one entry at most an eighth of it)
     - LRU eviction when memory limit reached
     - In-process lookups, with no network round trip
@@ -107,8 +107,8 @@ class L1Cache:
     - Supports both encrypted bytes (when encryption enabled) and plaintext msgpack
     - Decryption/deserialization happens at read time (not storage time)
 
-    This cache eliminates the 1,000μs network latency for cache hits
-    while maintaining eventual consistency with Redis.
+    A hit skips the L2 round trip, whichever backend L2 is; entries stay eventually
+    consistent with L2.
     """
 
     def __init__(
@@ -122,7 +122,7 @@ class L1Cache:
 
         Args:
             max_memory_mb: Maximum memory usage in MB (default 100MB)
-            ttl_buffer_seconds: Buffer time before Redis TTL expiry (default 1s)
+            ttl_buffer_seconds: Buffer time before the L2 entry's TTL expiry (default 1s)
             namespace: Cache namespace for isolation
             before_store: Called before each store. L1CacheManager passes its fork take-over
                 here: decorators capture this cache once and never call the manager again.
@@ -212,7 +212,7 @@ class L1Cache:
         Args:
             key: Cache key
             value: Bytes to cache (encrypted or plaintext msgpack, not deserialized object)
-            redis_ttl: TTL in seconds from Redis (used to calculate expiry)
+            redis_ttl: The L2 entry's TTL in seconds, whichever the backend (used to calculate expiry)
             expires_at: Absolute expiry timestamp (overrides redis_ttl)
 
         Raises:
