@@ -96,7 +96,7 @@ def test_roundtrip_unchanged_by_gil_release(payload: bytes) -> None:
 
 def test_concurrent_stores_are_correct(payload: bytes) -> None:
     """Two threads storing through one ByteStorage while detached from the GIL
-    must not corrupt each other (inner metrics state is Mutex-guarded)."""
+    must not corrupt each other (ByteStorage holds no mutable state)."""
     storage = ByteStorage(None)
     chunks = [payload[: 8 * 1024 * 1024], payload[8 * 1024 * 1024 : 16 * 1024 * 1024]]
     results: dict[int, bytes] = {}

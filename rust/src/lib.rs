@@ -30,8 +30,10 @@ use pyo3::prelude::*;
 /// `gil_used = false` (the PyO3 0.28+ default, made explicit): declares the
 /// module thread-safe under free-threaded CPython so importing it does not
 /// force the GIL back on. Verified by audit: every `#[pyclass]`
-/// exposes only `&self` methods, and shared state in cachekit-core is atomic
-/// or Mutex-guarded — no interior mutability the GIL was papering over. PyO3
+/// exposes only `&self` methods, and in the features enabled here
+/// cachekit-core's only shared state is its `AtomicU64` nonce counters (its
+/// `Mutex` handle registry is behind the `ffi` feature, which is off) — no
+/// interior mutability the GIL was papering over. PyO3
 /// enforces `Send + Sync` on every pyclass at compile time.
 #[cfg(feature = "python")]
 #[pymodule(gil_used = false)]
