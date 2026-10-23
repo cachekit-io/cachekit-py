@@ -20,6 +20,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# bash -eo pipefail, so a failing guard is not hidden by the tee after it.
 defaults:
   run:
     shell: bash

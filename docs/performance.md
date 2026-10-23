@@ -54,6 +54,20 @@ uv run pytest tests/performance/test_production_realism.py -v -s \
 # The encryption guard generates a throwaway key; it needs no CACHEKIT_MASTER_KEY
 ```
 
+### GitHub-Hosted Runner
+
+The `Bench` workflow (`.github/workflows/bench.yml`) runs five of these guards on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. Its run on 2026-10-23 used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
+
+| Path | Guard (`tests/performance/`) | Run median |
+|------|------------------------------|-----------:|
+| Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as MessagePack) | `test_production_realism.py::test_decorator_overhead_complex_dict` | 6.70 ± 0.09μs |
+| Decorator + L1 hit, `@cache(backend=None, serializer="auto")`, 10K-row DataFrame | `test_production_realism.py::test_decorator_overhead_dataframe` | 6.69 ± 0.04μs |
+| Decorator + L1 hit with an L2 backend configured (in-process, never reached), same 100-user dict | `test_production_realism.py::test_decorator_overhead_l1_hit_with_backend` | 302 ± 19μs |
+| Same hit, plaintext and encrypted arms, interleaved | `test_production_realism.py::test_encryption_overhead` | 305 ± 11μs and 316 ± 16μs |
+| Redis L2 hit, L1 disabled, same 100-user dict | `test_production_realism.py::test_redis_l2_roundtrip` | 562 ± 25μs |
+
+The encryption guard's arms differ by 11 ± 16μs (Welch 95%), inside the noise, as in every pass on the other machine.
+
 ## Why an L1-Only Hit Costs the Same for Any Payload
 
 With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict, a dataclass and a 10K-row DataFrame all cost about the same: key generation, the lookup and the decorator's bookkeeping.

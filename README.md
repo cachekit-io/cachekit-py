@@ -243,9 +243,9 @@ def test_cached_function():
 │  │   Breaker   │  │  Timeouts   │  │      Locking        │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
-│  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)     │
-│       ~50ns            │  Redis / CachekitIO / File /      │
-│                        │  Memcached    ~2-50ms             │
+│  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)      │
+│       in-process       │  Redis / CachekitIO / File /       │
+│                        │  Memcached: one backend round trip │
 ├─────────────────────────────────────────────────────────────┤
 │                    Rust Core (PyO3)                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
@@ -260,12 +260,31 @@ def test_cached_function():
 
 ---
 
+## Performance
+
+What a call costs inside your process, from the wall-clock guards in `tests/performance/` run on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with CPython 3.14.7. Each figure is the mean of five run medians with its 95% band.
+
+| Path | Time per call |
+|:-----|--------------:|
+| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 6.70 ± 0.09 µs |
+| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 6.69 ± 0.04 µs |
+| L1 hit with an L2 backend configured, same dict | 302 ± 19 µs |
+| Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 562 ± 25 µs |
+
+- With no backend, L1 keeps the returned object itself, so a hit costs key generation and a lookup, whatever the payload's size.
+- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 45 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 11 ± 16 µs, inside the noise.
+- An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
+
+The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
+
+---
+
 ## Features
 
 ### Production Hardened
 
 - Circuit breaker with graceful degradation
-- Connection pooling with thread affinity (+28% throughput)
+- Connection pooling with thread affinity
 - CachekitIO keeps idle connections pooled until the server closes them, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
@@ -331,13 +350,7 @@ assert calls == 1
 > [!IMPORTANT]
 > All serializers support **configurable checksums** for corruption detection using xxHash3-64 (8 bytes). Enabled by default in `@cache.production` and `@cache.secure`.
 
-**Performance Impact** (benchmark-proven):
-
-| Data Type | Latency Reduction (disabled) | Size Overhead |
-|:----------|:----------------------------:|:-------------:|
-| MessagePack (default) | 60-90% | 8 bytes |
-| Arrow DataFrames | 35-49% | 8 bytes |
-| JSON (orjson) | 37-68% | 8 bytes |
+Each checksum adds 8 bytes to an entry and one xxHash3-64 pass over the payload on each write and read. `StandardSerializer` and `OrjsonSerializer` drop it with `enable_integrity_checking=False`; `ArrowSerializer` always checks. On `StandardSerializer` the same switch also turns LZ4 compression off, so entries get larger; measure on your own payloads before you trade that.
 
 ### Security
 
