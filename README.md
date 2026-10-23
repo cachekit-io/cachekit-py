@@ -348,7 +348,7 @@ assert calls == 1
 ### Integrity Checking
 
 > [!IMPORTANT]
-> Serializers detect corrupted entries with an xxHash3-64 checksum. It is on by default; `@cache.minimal` and `@cache.test` turn it off, and `@cache.secure` refuses to.
+> Serializers detect corrupted entries with an xxHash3-64 checksum. It is on by default. `@cache.minimal` and `@cache.test` turn it off where the serializer allows it (`ArrowSerializer` always checks); `@cache.secure` refuses to turn it off.
 
 Each checksum is an 8-byte digest, plus one pass over the payload on each write and read. What `enable_integrity_checking=False` changes depends on the serializer, and for `AutoSerializer` on the value:
 
