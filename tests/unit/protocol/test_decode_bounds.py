@@ -10,7 +10,8 @@ msgpack-python bump cannot silently move it:
 - ``validate_data`` (which returns a bool) proves the same through a spy on the guard;
 - every accept vector decodes on every path at its declared depth (the bound cannot over-tighten);
 - fed to ``ByteStorage.retrieve`` as envelope bytes, every reject vector is refused by cachekit-core's
-  envelope pre-scan (Retrieve Flow step 2) for its own reason, as a plain ValueError, so a metadata-less
+  envelope pre-scan (Retrieve Flow step 2; a vector whose only reason is depth or overclaim, for that
+  reason), as a plain ValueError, so a metadata-less
   integrity-on read still falls through to the plain decode; every accept vector gets past the pre-scan;
 - the nesting ceiling is exactly MSGPACK_MAX_NESTING;
 - the read path turns a bomb into SerializationError (a controlled miss), not a crash.
@@ -201,8 +202,8 @@ ENVELOPE_PRE_SCAN_PREFIX = f"Retrieval failed: deserialization failed: {PRE_SCAN
 ENVELOPE_MAX_DEPTH = 100
 # The reason a depth-only or overclaim-only vector must carry. The prefix alone survives deleting the slot
 # check, because the pre-scan's end-of-input rejection carries it too; the depth message pins core's bound.
-# "declares more " covers both the elements and the bytes overclaim. The incomplete vectors pin only the
-# prefix: core's slot budget rejects them as overclaims before they run out of input.
+# "declares more " covers both the elements and the bytes overclaim. Two-reason and incomplete vectors pin
+# only the prefix: core's check order, not the vector's reason, picks their message.
 PRE_SCAN_REJECT_ERRORS = {"depth": f"nests deeper than {ENVELOPE_MAX_DEPTH} levels", "overclaim": "declares more "}
 
 

@@ -251,8 +251,11 @@ class TestRejectVectors:
         """Item 6 relies on core's allocation probe, which counts only on the core release it ran on."""
         pinned = re.search(r'name = "cachekit-core"\nversion = "([^"]+)"', CARGO_LOCK.read_text(encoding="utf-8"))
         assert pinned, "Cargo.lock has no cachekit-core entry"
-        # A new core release needs its own probe run: check that its publish job ran it, then update the constant.
-        assert pinned[1] == PROBE_VERIFIED_CORE_VERSION
+        assert pinned[1] == PROBE_VERIFIED_CORE_VERSION, (
+            f"Cargo.lock pins cachekit-core {pinned[1]}; item 6 relies on the allocation probe only on a release it ran"
+            " on. Check that this release's publish job ran the probe and its positive control, then update"
+            " PROBE_VERIFIED_CORE_VERSION."
+        )
 
     def test_reject_vector_names_are_pinned(self):
         """An emptied or renamed group fails here instead of passing on zero parametrized cases."""

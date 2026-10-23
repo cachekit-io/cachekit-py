@@ -28,8 +28,8 @@ use pyo3::prelude::*;
 /// force the GIL back on. Verified by audit: every `#[pyclass]`
 /// exposes only `&self` methods, and in the features enabled here
 /// cachekit-core's only shared state is its `AtomicU64` nonce counters (its
-/// `Mutex` handle registry is behind the `ffi` feature, which is off; see
-/// docs/free-threading.md) — no interior mutability the GIL was papering over. PyO3
+/// `Mutex` handle registry is behind the `ffi` feature, which is off) — no
+/// interior mutability the GIL was papering over. PyO3
 /// enforces `Send + Sync` on every pyclass at compile time.
 #[cfg(feature = "python")]
 #[pymodule(gil_used = false)]
