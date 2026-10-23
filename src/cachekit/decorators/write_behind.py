@@ -95,7 +95,7 @@ class WriteBehind:
     must not raise: a raise is passed to ``on_error`` and the write counts as failed.
     """
 
-    def __init__(self, on_error: Callable[[Entry, Exception], None]) -> None:
+    def __init__(self, on_error: Callable[[Entry, BaseException], None]) -> None:
         self._on_error = on_error
         self._state = _State()
         _writers.add(self)
@@ -160,8 +160,8 @@ class WriteBehind:
                     s.sending[entry] = job
                 try:
                     job.context.run(job.send)
-                except Exception as exc:
-                    self._on_error(entry, exc)
+                except BaseException as exc:  # gevent.Timeout and the like too: a dead thread would strand
+                    self._on_error(entry, exc)  # the newer value queued behind this send
                 finally:
                     with s.cond:
                         del s.sending[entry]

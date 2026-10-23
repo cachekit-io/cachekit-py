@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextvars
+import itertools
 import logging
 import os
 import subprocess
@@ -18,6 +19,7 @@ import sys
 import textwrap
 import threading
 import time
+import types
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -112,7 +114,7 @@ _created: list[wb.WriteBehind] = []
 
 
 @pytest.fixture(autouse=True)
-def _writers_created(monkeypatch: pytest.MonkeyPatch) -> list[wb.WriteBehind]:
+def _writers_created(monkeypatch: pytest.MonkeyPatch) -> None:
     created: list[wb.WriteBehind] = []
     init = wb.WriteBehind.__init__
 
@@ -122,7 +124,6 @@ def _writers_created(monkeypatch: pytest.MonkeyPatch) -> list[wb.WriteBehind]:
 
     monkeypatch.setattr(wb.WriteBehind, "__init__", recording_init)
     monkeypatch.setattr(sys.modules[__name__], "_created", created)
-    return created
 
 
 def _drain() -> None:
@@ -168,6 +169,7 @@ def one_writer(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestOptIn:
     def test_off_by_default_and_in_every_preset(self) -> None:
         assert DecoratorConfig().write_behind is False
+        assert DecoratorConfig.io(api_key="ck_test_write_behind").write_behind is False  # pragma: allowlist secret
         assert not any(
             getattr(DecoratorConfig, preset)(**kwargs).write_behind
             for preset, kwargs in {
@@ -322,9 +324,7 @@ class TestBounds:
         fn(1000)  # its envelope alone is over the bound: written on the caller
         assert backend.writes() == [threading.current_thread().name]
 
-    def test_a_queued_entry_takes_a_newer_value_past_the_bound(
-        self, backend: _GatedBackend, one_writer: None, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_queued_entry_takes_a_newer_value_past_the_bound(self, one_writer: None, monkeypatch: pytest.MonkeyPatch) -> None:
         """No fallback for an entry already queued or being sent: a caller write could race the deferred one."""
         writer = wb.WriteBehind(lambda *_: None)
         sent: list[int] = []
@@ -468,11 +468,7 @@ class TestOnTheWriter:
         def fn(x: int) -> int:
             return x * 2
 
-        token = tenant_var.set("tenant-a")
-        try:
-            fn(1)
-        finally:
-            tenant_var.reset(token)
+        _as_tenant("tenant-a", fn, 1)
         assert backend.registry == set()  # not tracked before the write
         backend.gate.set()
         _drain()
@@ -598,6 +594,7 @@ class TestEncryption:
             assert _as_tenant(tenant, fn, 1) == f"value-of-{tenant}"
         backend.gate.set()
         _drain()
+        assert backend.writes() == [_WRITER, _WRITER]  # both deferred, each in its caller's context
         assert sorted(key.split(":", 2)[1] for key in backend.store) == ["a", "b"]
         assert computed == ["a", "b"]
 
@@ -770,21 +767,17 @@ def _reader(cache_dir: Path) -> Any:
 
 
 class TestWriterEdges:
-    def test_cancel_waits_only_for_sends_in_progress_at_the_call(self) -> None:
+    def test_cancel_waits_only_for_sends_in_progress_at_the_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A key taking misses throughout an invalidation cannot hold it: a send that starts after the
         cancel is a later write, not one the cancel waits for."""
         writer = wb.WriteBehind(lambda *_: None)
-        sending, first, second, matched = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+        sending, first, second = threading.Event(), threading.Event(), threading.Event()
         assert writer.submit(("", "k"), 1, lambda: (sending.set(), first.wait(_GUARD_SECONDS)))
         assert sending.wait(_GUARD_SECONDS)
-
-        def match(entry: Any) -> bool:
-            matched.set()
-            return entry == ("", "k")
-
-        cancelled = threading.Thread(target=writer.cancel, args=(match,))
+        entered = _cancel_entered(monkeypatch)
+        cancelled = threading.Thread(target=writer.cancel, args=(("", "k").__eq__,))
         cancelled.start()
-        assert matched.wait(_GUARD_SECONDS)
+        assert entered.wait(_GUARD_SECONDS)
         # This submit takes the lock the cancel holds until it waits: it lands once the cancel is waiting.
         assert writer.submit(("", "k"), 1, lambda: second.wait(_GUARD_SECONDS))  # queued behind the first send
         first.set()  # the first send ends, and the second starts at once on the freed thread
@@ -817,18 +810,29 @@ class TestWriterEdges:
         assert any("1 deferred L2 write(s) were not sent" in r.getMessage() for r in caplog.records)
         assert not writer.submit(("", "other"), 1, lambda: None)  # closed: callers write synchronously
 
-    def test_a_forked_childs_callers_take_over_one_fresh_state(self) -> None:
+    def test_a_forked_childs_callers_take_over_one_fresh_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The PID travels with the state: every caller of a child sees the same fresh state, published once,
-        and the parent's queue stays on the parent's state, which no child thread touches."""
+        and the parent's queue stays on the parent's state, which no child thread touches.
+
+        The first 8 PID reads wait for each other, so every caller has read the inherited state's PID before
+        any can publish: a take-over without the lock and its re-check publishes 8 states here."""
         writer = wb.WriteBehind(lambda *_: None)
         inherited = writer._state
         inherited.pid = -1  # as a child sees its parent's state
         inherited.pending[("", "parent")] = wb._Job(lambda: None, contextvars.copy_context(), 1)
         barrier = threading.Barrier(8)
+        reads = itertools.count()
+        real_getpid = os.getpid
+
+        def getpid() -> int:
+            if next(reads) < 8:
+                barrier.wait(_GUARD_SECONDS)
+            return real_getpid()
+
+        monkeypatch.setattr(wb, "os", types.SimpleNamespace(getpid=getpid))
         seen: list[object] = []
 
         def first_call() -> None:
-            barrier.wait(_GUARD_SECONDS)
             seen.append(writer._current())
 
         threads = [threading.Thread(target=first_call) for _ in range(8)]
@@ -859,3 +863,27 @@ class TestWriterEdges:
         release.set()
         assert writer.close(_deadline()) == []
         assert started == [_WRITER]
+
+    def test_a_send_raising_a_base_exception_does_not_strand_the_next_write(self) -> None:
+        """A BaseException out of a send (gevent.Timeout is one) is reported, and its thread keeps going, so the
+        newer value queued behind that send is still sent."""
+
+        class _Escape(BaseException):
+            pass
+
+        errors: list[BaseException] = []
+        writer = wb.WriteBehind(lambda _entry, exc: errors.append(exc))
+        sending, release = threading.Event(), threading.Event()
+        sent: list[str] = []
+
+        def escaping_send() -> None:
+            sending.set()
+            release.wait(_GUARD_SECONDS)
+            raise _Escape
+
+        assert writer.submit(("", "k"), 1, escaping_send)
+        assert sending.wait(_GUARD_SECONDS)
+        assert writer.submit(("", "k"), 1, lambda: sent.append("newer"))  # behind the send: no new thread
+        release.set()
+        assert writer.close(_deadline()) == []
+        assert sent == ["newer"] and [type(e) for e in errors] == [_Escape]
