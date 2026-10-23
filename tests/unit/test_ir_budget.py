@@ -477,25 +477,16 @@ def test_against_base_refuses_a_base_without_its_own_venv(tmp_path, monkeypatch,
     assert "uv sync" in capsys.readouterr().err
 
 
-def test_a_raised_budget_raises_the_base_figure_by_the_same_ratio() -> None:
-    """A deliberate increase passes CI; a token raise does not carry a bigger regression through."""
-    allowed, notes = ir_budget.allow_raises(
-        {"l1_hit": 1000, "l2_hit": 2000, "miss": 3000},
-        {"python": "3.12.12", "budgets": {"l1_hit": 100, "l2_hit": 200, "miss": 300}},
-        {"python": "3.12.12", "budgets": {"l1_hit": 110, "l2_hit": 190, "miss": 300}},
-    )
-    assert allowed == {"l1_hit": 1100, "l2_hit": 2000, "miss": 3000}  # lowered budgets never tighten the base
-    assert notes == ["note: l1_hit budget raised +10.00% here, so its base figure is too"]
-    assert compare(allowed, {"l1_hit": 1100})[1]
-    assert not compare(allowed, {"l1_hit": 1111})[1]
-
-
-def test_budgets_re_recorded_on_another_build_grant_no_allowance() -> None:
-    """A patch-release re-record raises budgets for a reason both CI checkouts share: it is no cost concession."""
-    base = {"python": "3.12.12", "budgets": {"l1_hit": 59343}}
-    head = {"python": "3.12.14", "budgets": {"l1_hit": 61479}}  # +3.60%, interpreter drift only
-    allowed, notes = ir_budget.allow_raises({"l1_hit": 100_000}, base, head)
-    assert allowed == {"l1_hit": 100_000}
-    assert notes and "no raise is taken" in notes[0]
-    lines, ok = compare(allowed, {"l1_hit": 102_000}, against="base")
-    assert not ok and lines[0].startswith("FAIL")  # the genuine +2% still fails
+def test_against_base_ignores_the_committed_budgets(tmp_path, monkeypatch, capsys) -> None:
+    """A budget diff cannot tell a deliberate increase from build drift, so it never moves the CI verdict."""
+    base = _trees(tmp_path, ("l1_hit",))
+    baselines = base / "tests" / "performance" / "ir_baselines.json"
+    data = json.loads(baselines.read_text())
+    for entry in data["interpreters"].values():
+        entry["budgets"]["l1_hit"] //= 2  # the PR "raised" l1_hit's committed budget 100%
+    baselines.write_text(json.dumps(data))
+    monkeypatch.setattr(ir_budget, "WORKLOAD", tmp_path / "head" / "tests" / "performance" / "ir_workload.py")
+    on_base = str(base / ".venv" / "bin" / "python")
+    monkeypatch.setattr(ir_budget, "measure", lambda paths, *a: {"l1_hit": 100_000 if a[2] == on_base else 102_000})
+    assert ir_budget._against_base(base, ["l1_hit"], 2, 60) == 1
+    assert "FAIL  l1_hit" in capsys.readouterr().out

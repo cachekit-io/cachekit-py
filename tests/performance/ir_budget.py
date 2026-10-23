@@ -64,7 +64,6 @@ import tempfile
 import threading
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any
 
 N_LO, N_HI = 1000, 3000
 WARMUP = 50
@@ -392,44 +391,11 @@ def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: floa
 
     measured = measure(paths, jobs, child_timeout_s, sys.executable, WORKLOAD.resolve())
     base_figures = measure(paths, jobs, child_timeout_s, str(python), workload)
-    key = interpreter_key()
-    head_entry = json.loads(BASELINES.read_text())["interpreters"].get(key, {})
-    allowed, notes = allow_raises(base_figures, base_interpreters.get(key, {}), head_entry)
-    lines, ok = compare(allowed, measured, against="base")
-    print("\n".join(notes))
+    lines, ok = compare(base_figures, measured, against="base")
     print(f"main-thread Ir/op on {interpreter_key()} ({platform.python_version()}), this checkout against --base {base}")
     print("\n".join(lines + [f"new   {p:22} not on the base: nothing to compare against" for p in new]))
     print("PASS" if ok else f"FAIL: a path regressed by {FAIL_PCT}% or more against the base")
     return 0 if ok else 1
-
-
-def allow_raises(
-    base_figures: dict[str, int], base_entry: dict[str, Any], head_entry: dict[str, Any]
-) -> tuple[dict[str, int], list[str]]:
-    """The base figures to gate against, raised where this checkout deliberately raised a budget.
-
-    A deliberate cost increase is committed as a higher budget (``--update --allow-increase``). The
-    base figure of such a path is scaled by the same ratio, so the increase passes and a larger
-    one still fails: a token raise cannot carry an unrelated regression through.
-
-    Only a raise recorded on the interpreter build the base's budgets were recorded on counts. A
-    re-record on another build (a new patch release read 2.0% to 3.6% higher with no code change) moves
-    budgets for reasons both CI checkouts share, so it grants nothing.
-    """
-    allowed, notes = dict(base_figures), []
-    if base_entry.get("python") != head_entry.get("python"):
-        notes.append(
-            f"note: budgets re-recorded on Python {head_entry.get('python')} (base: {base_entry.get('python')}), "
-            "so no raise is taken as a cost allowance"
-        )
-        return allowed, notes
-    base_budgets, head_budgets = base_entry.get("budgets", {}), head_entry.get("budgets", {})
-    for path, figure in base_figures.items():
-        old, new = base_budgets.get(path), head_budgets.get(path)
-        if old and new and new > old:
-            allowed[path] = round(figure * new / old)
-            notes.append(f"note: {path} budget raised {(new - old) / old * 100:+.2f}% here, so its base figure is too")
-    return allowed, notes
 
 
 def select_paths(only: list[str] | None, skip: list[str], shard: tuple[int, int]) -> list[str]:
