@@ -374,7 +374,7 @@ make security-fast     # Run fast checks (< 3 min)
 | Tier | Time | Coverage |
 |:-----|:----:|:---------|
 | Fast | < 3 min | Vulnerability scanning, license checks, linting |
-| Medium | < 15 min | Unsafe code analysis, API stability, Miri subset |
+| Medium | < 15 min | Unsafe code analysis (cargo-geiger) |
 | Deep | < 2 hours | Formal verification, extended fuzzing, full sanitizers |
 
 See [SECURITY.md][security-url] for vulnerability reporting and detailed documentation.
