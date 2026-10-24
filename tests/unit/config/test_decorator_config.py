@@ -134,7 +134,9 @@ class TestDecoratorConfigValidation:
 
     def test_validate_delegates_to_circuit_breaker_config(self) -> None:
         """Test validation delegates to CircuitBreakerConfig."""
-        with pytest.raises(ConfigurationError, match="failure_threshold must be >= 1, got 0"):
+        with pytest.raises(
+            ConfigurationError, match="failure_threshold must be an int or NumPy integer >= 1, not a bool, got 0"
+        ):
             DecoratorConfig(circuit_breaker=CircuitBreakerConfig(failure_threshold=0))
 
     def test_top_level_circuit_breaker_config_rejected_naming_the_nested_class(self) -> None:
@@ -146,7 +148,9 @@ class TestDecoratorConfigValidation:
 
     def test_validate_delegates_to_backpressure_config(self) -> None:
         """Test validation delegates to BackpressureConfig."""
-        with pytest.raises(ConfigurationError, match="max_concurrent_requests must be a whole number >= 1, got 0"):
+        with pytest.raises(
+            ConfigurationError, match="max_concurrent_requests must be an int or NumPy integer >= 1, not a bool, got 0"
+        ):
             DecoratorConfig(backpressure=BackpressureConfig(max_concurrent_requests=0))
 
     def test_validate_delegates_to_monitoring_config(self) -> None:
