@@ -16,7 +16,7 @@ CacheKit includes a Rust extension (`ByteStorage`) that handles the low-level bi
 ```
 Python object
     ↓
-Serializer (MessagePack / Arrow / Orjson — your choice)
+Serializer (StandardSerializer / AutoSerializer: MessagePack)
     ↓  [Rust ByteStorage takes over here]
 LZ4 compression
     ↓
@@ -27,9 +27,9 @@ xxHash3-64 integrity hash  (detects corruption)
 Storage backend (Redis / CachekitIO / File)
 ```
 
-**Retrieval is the exact reverse pipeline.**
+**Retrieval is the exact reverse pipeline.** ArrowSerializer and OrjsonSerializer skip ByteStorage; for them only `@cache.secure`'s AES-256-GCM step runs in Rust.
 
-The Rust layer is transparent — you configure serializers and encryption at the Python level; ByteStorage handles the rest automatically.
+The Rust layer is transparent — you configure serializers and encryption at the Python level; ByteStorage handles the rest for the MessagePack serializers automatically.
 
 ---
 

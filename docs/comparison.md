@@ -102,7 +102,7 @@ def expensive_computation(x: int) -> dict:
 
 > [!IMPORTANT]
 > **Why cachekit wins:**
-> - **L1+L2 caching**: L1 hits from process memory with no network round trip, L1 miss → L2 Redis, one round trip (see [Performance](performance.md))
+> - **L1+L2 caching**: L1 hits from process memory with no network round trip, an L1 miss that hits L2 costs one Redis round trip (see [Performance](performance.md))
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
 > - **Distributed locking**: Prevents cache stampedes across pods
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)

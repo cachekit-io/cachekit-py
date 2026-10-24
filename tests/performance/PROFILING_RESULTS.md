@@ -4,7 +4,7 @@
 
 ## Executive Summary
 
-The raw L1 lookup's latency is dominated by **lock acquisition overhead**. The cache is performing optimally given Python's threading model.
+In this profile, **lock acquisition** was the largest measured component of the raw L1 lookup.
 
 **Key finding:** This measures **raw L1 cache performance only**. A decorated hit also pays for the decorator and, with an L2 backend configured, for deserializing the cached bytes (see [docs/performance.md](../../docs/performance.md) for measured figures).
 

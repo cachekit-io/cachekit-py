@@ -133,7 +133,7 @@ This table compares formats, not speed:
 
 | Metric | orjson | msgpack+LZ4 | Note |
 |--------|--------|-------------|------|
-| Output size | Larger | Smaller | msgpack+LZ4 is compressed binary |
+| Output size | Usually larger | Usually smaller | msgpack+LZ4 is compressed binary; small payloads can differ |
 | Human-readable | Yes ✅ | No ❌ | JSON is text |
 | Cross-language | Yes ✅ | Limited | JSON ubiquitous |
 
@@ -141,7 +141,7 @@ This table compares formats, not speed:
 - JSON-native APIs (already producing JSON)
 - Cross-language interoperability matters
 - Human-readable cache inspection needed
-- Trading larger cache entries for JSON compatibility
+- Trading usually larger cache entries for JSON compatibility
 
 **When to prefer StandardSerializer:**
 - Maximum compression needed
@@ -152,7 +152,7 @@ This table compares formats, not speed:
 - JSON-compatible types only (dict, list, str, int, float, bool, None)
 - NO binary data (`bytes`) → use StandardSerializer
 - NO arbitrary Python objects → convert to a dict first
-- Output is larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
+- Output is usually larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
 
 ---
 
