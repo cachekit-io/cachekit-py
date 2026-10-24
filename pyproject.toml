@@ -282,4 +282,10 @@ constraint-dependencies = [
     # 2026.10.19 fixes PYSEC-2026-4320 (distrusts the emSign ECC Root CA - G3,
     # whose intermediates had compromised keys).
     "certifi>=2026.10.19",
+    # filelock is a dev-only transitive dep (pip-audit -> cachecontrol[filecache] ->
+    # filelock). 4.2.1 fixes GHSA-v4x8-3wr5-3wq8, GHSA-9vhv-jxww-xfm5 and
+    # GHSA-567q-5qvw-pf92 but needs Python 3.11+, so the floor is 3.11+ only; 3.10
+    # keeps 3.25.2 (4.1.0, the last 3.10 release, adds three more advisories).
+    # Drop the marker once requires-python >= 3.11.
+    "filelock>=4.2.1; python_version >= '3.11'",
 ]
