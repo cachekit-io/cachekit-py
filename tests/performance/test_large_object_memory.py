@@ -158,7 +158,7 @@ def test_streaming_write_path_peak_rss_bounded():
 
         from cachekit.backends.file import FileBackend
         from cachekit.backends.file.config import FileBackendConfig
-        from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, StandardCacheHandler
+        from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, StandardCacheHandler, StoreOutcome
         from cachekit.key_generator import CacheKeyGenerator
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
@@ -177,7 +177,7 @@ def test_streaming_write_path_peak_rss_bounded():
             op.set_cache_handler(StandardCacheHandler(backend))
 
             ret = op.store_result("k", df, ttl=60)
-            assert ret == (None, True), "streaming path did not engage (fell back to buffered set)"
+            assert ret == StoreOutcome(envelope=None, stored=True), "streaming path did not engage (fell back to buffered set)"
             # Sanity via on-disk size, NOT backend.get(): a full readback would materialize
             # the envelope and pollute the ru_maxrss high-water mark this test measures.
             import os as _os
