@@ -51,7 +51,7 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-ByteStorage LZ4 compression of serialized envelopes (MessagePack, orjson) runs automatically and is not configurable. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
+ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically and is not configurable. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
 
 ---
 
@@ -112,11 +112,15 @@ every ByteStorage envelope and to `xxhash.xxh3_64_digest` from the `xxhash` pack
 
 ## AES-256-GCM Encryption
 
-When using `@cache.secure`, the Rust layer applies AES-256-GCM after compression:
+When using `@cache.secure`, the Rust layer applies AES-256-GCM to the serializer's output. With StandardSerializer (the default), that output is a ByteStorage envelope, so encryption runs after LZ4 compression:
 
 ```
-LZ4(serialized_data) → AES-256-GCM(compressed) → storage
+StandardSerializer:  LZ4(msgpack) → AES-256-GCM(compressed) → storage
+OrjsonSerializer:    JSON bytes   → AES-256-GCM               → storage
+ArrowSerializer:     Arrow IPC    → AES-256-GCM               → storage
 ```
+
+OrjsonSerializer and ArrowSerializer skip ByteStorage, so ByteStorage's LZ4 step does not run before encryption. Arrow IPC bytes carry their own codec instead: zstd by default, set by the serializer's `compression` argument or `CACHEKIT_ARROW_COMPRESSION`. AutoSerializer cannot be encrypted: `@cache.secure` refuses it.
 
 Encryption is authenticated — any tampering with ciphertext raises a decryption error before data reaches your application.
 

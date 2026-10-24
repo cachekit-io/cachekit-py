@@ -31,7 +31,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 > **Architecture Principles:**
 > - **L1 + L2 Caching**: In-memory bytes cache (L1) + pluggable backend storage (L2) for optimal performance
 > - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CachekitIO, File, Memcached, custom)
-> - **Bytes-Only Storage**: L1 stores serialized bytes (encrypted or plaintext msgpack), not Python objects
+> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself
 > - **Security First**: Decompression bomb protection, checksum validation, size limits, encrypted-at-rest
 > - **Performance Optimized**: Thread affinity, connection pooling, pre-cached serializers
 > - **Flexible Configuration**: L1+L2, L1-only, L2-only, or observability-only modes
@@ -306,7 +306,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  5. Store bytes in OrderedDict with metadata                                │
 │  6. Mark as most recently used (move_to_end)                                │
 │                                                                             │
-│  Note: Stores bytes (encrypted or plaintext msgpack), not Python objects    │
+│  Note: with a backend, L1 stores bytes (encrypted or plaintext), not Python │
+│  objects. L1-only mode (backend=None) stores the object itself.             │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
                                    ▼
@@ -472,7 +473,10 @@ def _blake2b_pickle_hash(args, kwargs):
 
 ### Storage Architecture
 
-**L1 Cache Storage (Bytes-Only):**
+**L1 Cache Storage (Bytes-Only, with a backend configured):**
+
+L1-only mode (`backend=None`) skips this layer: it stores the Python object itself and returns it on a hit without deserializing.
+
 - **Before refactor**: Stored Python objects → recursive `sys.getsizeof()` for size estimation
 - **After refactor**: Stores bytes (encrypted or plaintext msgpack) → `len(bytes)` for size estimation
 - **Performance improvement**: O(1) size calculation vs recursive traversal
@@ -754,7 +758,7 @@ def deserialize(data: bytes, metadata) -> Any:
 
 ### Latency
 
-The Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table times whole hit paths on a named GitHub-hosted runner: an L1-only hit, an L1 hit with an L2 backend configured, and a Redis L2 hit. An L1-only hit hands back the cached object, so it deserializes nothing. With a backend configured, L1 holds bytes and every hit deserializes them, which is why that hit costs far more than an L1-only one. Neither of the guide's timing tables covers a miss, key generation or serialization on its own; its [Instruction Budgets](performance.md#instruction-budgets) give deterministic instruction counts for the `miss` path and for each serializer's round trip.
+For measured latencies, see the Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table; for deterministic instruction counts per path, see its [Instruction Budgets](performance.md#instruction-budgets). An L1-only hit hands back the cached object, so it deserializes nothing. With a backend configured, L1 holds bytes and every hit deserializes them, which is why that hit costs far more than an L1-only one.
 
 ### Compression Ratios
 
