@@ -161,7 +161,7 @@ This table compares formats, not speed:
 - [StandardSerializer](default.md) — General-purpose alternative with binary data support
 - [ArrowSerializer](arrow.md) — DataFrame-optimized serializer
 - [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to OrjsonSerializer
-- [Performance Guide](../performance.md) — Full benchmark comparisons
+- [Performance Guide](../performance.md) — How cachekit's figures are measured
 
 ---
 

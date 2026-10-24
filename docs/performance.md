@@ -29,7 +29,7 @@ Every figure on this page comes from a guard in `tests/performance/`:
 
 ## Measured Figures
 
-Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guard, CPython 3.14.3, x86_64 Linux, 2026-10-03. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. The same sessions (2026-10-03 and 2026-10-04) also timed the decorated hits and a Redis L2 hit; later changes made those paths faster, and the [GitHub-Hosted Runner](#github-hosted-runner) table has their current figures.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guard, CPython 3.14.3, x86_64 Linux, 2026-10-03. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. Sessions on 2026-10-03 and 2026-10-04 also timed the decorated hits and a Redis L2 hit; later changes made those paths faster, and the [GitHub-Hosted Runner](#github-hosted-runner) table has their current figures.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|

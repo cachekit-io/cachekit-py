@@ -35,7 +35,7 @@ The Rust layer is transparent — you configure serializers and encryption at th
 
 ## Why Rust for This Layer?
 
-ByteStorage runs LZ4 compression and xxHash3-64 checksums in Rust, and `@cache.secure` adds a separate Rust AES-256-GCM call. cachekit-core's README publishes [measured figures](https://github.com/cachekit-io/cachekit-core#performance) for those calls on named GitHub-hosted runners. The Rust layer matters most for large payloads (DataFrames, bulk data), where compression, checksumming and encryption grow with payload size.
+ByteStorage runs LZ4 compression and xxHash3-64 checksums in Rust over the MessagePack bytes of StandardSerializer and AutoSerializer; ArrowSerializer and OrjsonSerializer do not use it. `@cache.secure` adds a separate Rust AES-256-GCM call for each serializer it wraps. cachekit-core's README publishes [measured figures](https://github.com/cachekit-io/cachekit-core#performance) for those calls on named GitHub-hosted runners; their cost grows with payload size.
 
 ---
 
