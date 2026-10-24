@@ -711,12 +711,12 @@ class TestAsyncCallShape:
 
         await gate.run_async(fn(1))
         saas.fail_next_reads = 1
-        fired = asyncio.Event()
+        fired, finish = asyncio.Event(), asyncio.Event()
 
         async def background() -> None:
             await asyncio.sleep(0.001)
             fired.set()
-            await asyncio.sleep(0.001)  # still running when the caller returns
+            await finish.wait()  # still running when the caller returns
 
         async def caller() -> int:
             value = await fn(1)
@@ -724,6 +724,7 @@ class TestAsyncCallShape:
             task = asyncio.ensure_future(background())  # the gate's drain holds it to the end
             await fired.wait()  # the background timer has fired while the release was held
             assert not task.done()
+            finish.set()  # the task cannot run before this, the caller's last step, ends
             return value
 
         shape = await gate.run_async(caller())
