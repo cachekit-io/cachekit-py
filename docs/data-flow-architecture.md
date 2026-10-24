@@ -88,7 +88,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  • Check if key exists                                                      │
 │  • Validate TTL (not expired)                                               │
 │  • Update LRU (move to end)                                                 │
-│  • Return bytes (encrypted or plaintext msgpack)                            │
+│  • Return bytes (encrypted or plaintext)                                    │
 │                                                                             │
 │  ┌──────────────────────────────────────────┐                               │
 │  │ L1 HIT → DESERIALIZE & RETURN ✓          │                               │
@@ -139,8 +139,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  _deserialize_bytes(data: bytes) → Python object                            │
 │                                                                             │
 │  Decrypt-at-read-time flow:                                                 │
-│  1. If encryption_wrapper set: decrypt bytes → plaintext msgpack bytes      │
-│  2. If not set: pass through (already plaintext msgpack bytes)              │
+│  1. If encryption_wrapper set: decrypt bytes → plaintext bytes              │
+│  2. If not set: pass through (already plaintext bytes)                      │
 │  3. StandardSerializer.deserialize(msgpack_bytes, metadata)                  │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────┐             │
@@ -478,7 +478,7 @@ def _blake2b_pickle_hash(args, kwargs):
 L1-only mode (`backend=None`) skips this layer: it stores the Python object itself and returns it on a hit without deserializing.
 
 - **Before refactor**: Stored Python objects → recursive `sys.getsizeof()` for size estimation
-- **After refactor**: Stores bytes (encrypted or plaintext msgpack) → `len(bytes)` for size estimation
+- **After refactor**: Stores bytes (encrypted or plaintext) → `len(bytes)` for size estimation
 - **Performance improvement**: O(1) size calculation vs recursive traversal
 - **Security improvement**: Encrypted bytes at rest (decrypt-at-read-time only)
 
@@ -758,7 +758,7 @@ def deserialize(data: bytes, metadata) -> Any:
 
 ### Latency
 
-For measured latencies, see the Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table; for deterministic instruction counts per path, see its [Instruction Budgets](performance.md#instruction-budgets). An L1-only hit hands back the cached object, so it deserializes nothing. With a backend configured, L1 holds bytes and every hit deserializes them, which is why that hit costs far more than an L1-only one.
+For measured latencies, see the Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table; for deterministic instruction counts per path, see its [Instruction Budgets](performance.md#instruction-budgets). Because every hit with a backend configured deserializes the bytes L1 holds, an L1 hit with a backend costs far more than an L1-only hit.
 
 ### Compression Ratios
 

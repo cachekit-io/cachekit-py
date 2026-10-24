@@ -22,7 +22,7 @@ LZ4 compression
     ↓
 xxHash3-64 integrity hash  (detects corruption)
     ↓
-[Optional] AES-256-GCM encryption  (if @cache.secure; StandardSerializer only)
+[Optional] AES-256-GCM encryption  (if @cache.secure; AutoSerializer is refused)
     ↓
 Storage backend (Redis / CachekitIO / File)
 ```
@@ -51,7 +51,7 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically and is not configurable. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
+ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically whenever integrity checking is on (the default, and always under `@cache.secure`); it has no separate switch. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
 
 ---
 
@@ -130,7 +130,7 @@ See [Zero-Knowledge Encryption](zero-knowledge-encryption.md) for full details.
 
 ## Choosing a Serializer
 
-The Rust ByteStorage layer is orthogonal to the serializer. Mix and match:
+Encryption is orthogonal to the serializer. Mix and match:
 
 | Use Case | Serializer | Encryption |
 |----------|-----------|------------|
@@ -140,7 +140,7 @@ The Rust ByteStorage layer is orthogonal to the serializer. Mix and match:
 | Typed models | [Pydantic](../serializers/pydantic.md) | Optional |
 | Custom types | [Custom](../serializers/custom.md) | Optional |
 
-All serializers pass through the same ByteStorage pipeline (LZ4 + xxHash3-64 + optional AES-256-GCM).
+StandardSerializer, and AutoSerializer for MessagePack values, use ByteStorage (LZ4 + xxHash3-64); OrjsonSerializer and ArrowSerializer write their own xxHash3-64 prefix instead (Orjson only with integrity checking on). `@cache.secure` adds AES-256-GCM over the output of any of Standard, Orjson or Arrow.
 
 ---
 
