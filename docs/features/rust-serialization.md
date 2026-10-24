@@ -22,12 +22,12 @@ LZ4 compression
     ↓
 xxHash3-64 integrity hash  (detects corruption)
     ↓
-[Optional] AES-256-GCM encryption  (if @cache.secure)
+[Optional] AES-256-GCM encryption  (if @cache.secure; StandardSerializer only)
     ↓
 Storage backend (Redis / CachekitIO / File)
 ```
 
-**Retrieval is the exact reverse pipeline.** ArrowSerializer and OrjsonSerializer skip ByteStorage; for them only `@cache.secure`'s AES-256-GCM step runs in Rust.
+**Retrieval is the exact reverse pipeline.** ArrowSerializer and OrjsonSerializer skip ByteStorage; for them only `@cache.secure`'s AES-256-GCM step runs in cachekit's Rust extension.
 
 The Rust layer is transparent — you configure serializers and encryption at the Python level; ByteStorage handles the rest for the MessagePack serializers automatically.
 
