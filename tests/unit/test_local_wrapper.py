@@ -5,9 +5,13 @@ All tests are isolated; no Redis or external services required.
 
 from __future__ import annotations
 
+import inspect
+import warnings
+
 import pytest
 
 from cachekit import cache
+from cachekit.decorators.local_wrapper import create_local_wrapper
 
 
 @pytest.mark.unit
@@ -139,6 +143,18 @@ class TestLocalWrapperAsync:
 
         afn.cache_clear()  # must not raise
         assert afn.cache_info().currsize == 0
+
+    def test_async_detection_raises_no_deprecation_warning(self) -> None:
+        """asyncio.iscoroutinefunction is deprecated since 3.14; detection must use inspect."""
+
+        async def afn(x: int) -> int:
+            return x
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            wrapped = create_local_wrapper(afn)
+
+        assert inspect.iscoroutinefunction(wrapped)
 
 
 @pytest.mark.unit
