@@ -16,32 +16,26 @@ CacheKit includes a Rust extension (`ByteStorage`) that handles the low-level bi
 ```
 Python object
     ↓
-Serializer (MessagePack / Arrow / Orjson — your choice)
+Serializer (StandardSerializer / AutoSerializer: MessagePack)
     ↓  [Rust ByteStorage takes over here]
-LZ4 compression  (fast, ~500MB/s)
+LZ4 compression
     ↓
-xxHash3-64 integrity hash  (~GB/s, detects corruption)
+xxHash3-64 integrity hash  (detects corruption)
     ↓
-[Optional] AES-256-GCM encryption  (if @cache.secure)
+[Optional] AES-256-GCM encryption  (if @cache.secure; AutoSerializer is refused)
     ↓
 Storage backend (Redis / CachekitIO / File)
 ```
 
-**Retrieval is the exact reverse pipeline.**
+**Retrieval is the exact reverse pipeline.** ArrowSerializer and OrjsonSerializer skip ByteStorage; for them only `@cache.secure`'s AES-256-GCM step runs in cachekit's Rust extension.
 
-The Rust layer is transparent — you configure serializers and encryption at the Python level; ByteStorage handles the rest automatically.
+The Rust layer is transparent — you configure serializers and encryption at the Python level; ByteStorage handles the rest for the MessagePack serializers automatically.
 
 ---
 
 ## Why Rust for This Layer?
 
-| Operation | Python | Rust (ByteStorage) |
-|-----------|--------|---------------------|
-| LZ4 compression | ~50-100 MB/s | ~500 MB/s |
-| xxHash3-64 hashing | ~35 GB/s (`xxhash` C ext) | ~35 GB/s |
-| AES-256-GCM | ~200 MB/s | ~1-4 GB/s (AES-NI) |
-
-For most workloads the bottleneck is Redis RTT (~2-50ms), not serialization. The Rust layer matters for large payloads (DataFrames, bulk data) where serialization time approaches network time.
+ByteStorage runs LZ4 compression and xxHash3-64 checksums in Rust over the MessagePack bytes of StandardSerializer and AutoSerializer; ArrowSerializer and OrjsonSerializer do not use it. `@cache.secure` adds a separate Rust AES-256-GCM call for each serializer it wraps. cachekit-core's README publishes [measured figures](https://github.com/cachekit-io/cachekit-core#performance) for those calls on named GitHub-hosted runners; their cost grows with payload size.
 
 ---
 
@@ -57,7 +51,7 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-ByteStorage LZ4 compression of serialized envelopes (MessagePack, orjson) runs automatically and is not configurable. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
+ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically whenever integrity checking is on (the default; `@cache.secure` forces it on for a serializer named by string, while a serializer instance you pass keeps its own setting); it has no separate switch. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
 
 ---
 
@@ -118,11 +112,15 @@ every ByteStorage envelope and to `xxhash.xxh3_64_digest` from the `xxhash` pack
 
 ## AES-256-GCM Encryption
 
-When using `@cache.secure`, the Rust layer applies AES-256-GCM after compression:
+When using `@cache.secure`, the Rust layer applies AES-256-GCM to the serializer's output. With StandardSerializer (the default), that output is a ByteStorage envelope, so encryption runs after LZ4 compression:
 
 ```
-LZ4(serialized_data) → AES-256-GCM(compressed) → storage
+StandardSerializer:  LZ4(msgpack) → AES-256-GCM(compressed) → storage
+OrjsonSerializer:    JSON bytes   → AES-256-GCM               → storage
+ArrowSerializer:     Arrow IPC    → AES-256-GCM               → storage
 ```
+
+OrjsonSerializer and ArrowSerializer skip ByteStorage, so ByteStorage's LZ4 step does not run before encryption. Arrow IPC bytes carry their own codec instead: zstd by default, set by the serializer's `compression` argument or `CACHEKIT_ARROW_COMPRESSION`. AutoSerializer cannot be encrypted: `@cache.secure` refuses it.
 
 Encryption is authenticated — any tampering with ciphertext raises a decryption error before data reaches your application.
 
@@ -132,17 +130,17 @@ See [Zero-Knowledge Encryption](zero-knowledge-encryption.md) for full details.
 
 ## Choosing a Serializer
 
-The Rust ByteStorage layer is orthogonal to the serializer. Mix and match:
+Encryption works with any serializer whose class declares `cross_sdk_compatible = True`: Standard, Orjson, Arrow, or a custom serializer that opts in (see [Under Encryption](../serializers/custom.md#under-encryption)). AutoSerializer and unmarked custom serializers are refused. Mix and match:
 
 | Use Case | Serializer | Encryption |
 |----------|-----------|------------|
 | General caching | [Default (MessagePack)](../serializers/default.md) | Optional |
 | JSON APIs | [Orjson](../serializers/orjson.md) | Optional |
 | DataFrames / ML | [Arrow](../serializers/arrow.md) | Optional |
-| Typed models | [Pydantic](../serializers/pydantic.md) | Optional |
-| Custom types | [Custom](../serializers/custom.md) | Optional |
+| Typed models | [Pydantic](../serializers/pydantic.md) | Only if marked `cross_sdk_compatible` |
+| Custom types | [Custom](../serializers/custom.md) | Only if marked `cross_sdk_compatible` |
 
-All serializers pass through the same ByteStorage pipeline (LZ4 + xxHash3-64 + optional AES-256-GCM).
+With integrity checking on, StandardSerializer, and AutoSerializer for MessagePack values, use ByteStorage (LZ4 + xxHash3-64); OrjsonSerializer and ArrowSerializer write their own xxHash3-64 prefix instead (Orjson only with integrity checking on). `@cache.secure` adds AES-256-GCM over the output of any of Standard, Orjson, Arrow or an opted-in custom serializer.
 
 ---
 

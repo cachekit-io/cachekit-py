@@ -331,10 +331,7 @@ field list and an example stats endpoint.
 
 ## Performance Impact
 
-Metrics collection is minimal overhead:
-- Counter increments: ~10ns
-- Histogram updates: ~50ns per call
-- Total overhead: <1% latency impact
+No wall-clock guard times metrics recording, so the Performance Guide publishes no timing for it. Its [Instruction Budgets](../performance.md#instruction-budgets) give the instruction cost of an L2 hit with synchronous and with batched metrics recording.
 
 ---
 

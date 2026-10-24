@@ -102,7 +102,7 @@ def expensive_computation(x: int) -> dict:
 
 > [!IMPORTANT]
 > **Why cachekit wins:**
-> - **L1+L2 caching**: L1 hits from process memory with no network round trip, L1 miss → L2 Redis (~2-7ms)
+> - **L1+L2 caching**: L1 hits from process memory with no network round trip, an L1 miss that hits L2 costs one Redis round trip (see [Performance](performance.md))
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
 > - **Distributed locking**: Prevents cache stampedes across pods
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
@@ -114,7 +114,7 @@ from cachekit import cache
 @cache(ttl=3600)  # All features enabled by default
 def get_user_data(user_id: int) -> dict:
     # Same process again: L1 hit, no network round trip
-    # Different pod: L2 hit from Redis (~2-7ms)
+    # Different pod: L2 hit from Redis (one network round trip)
     # Redis down: errors are logged and the function runs, doesn't crash
     # Circuit breaker open: L1 hits still served; a miss runs the function and returns its result
     # Multiple pods calling simultaneously: Distributed lock prevents stampede
@@ -136,7 +136,7 @@ sequenceDiagram
     else L1 Miss
         L1->>L2: get(key)
         alt L2 Hit ✅
-            L2-->>L1: value (~2-7ms)
+            L2-->>L1: value (network round trip)
             L1->>L1: populate L1
             L1-->>Client: return value
         else L2 Miss (Cache Stampede Risk)
@@ -155,7 +155,7 @@ sequenceDiagram
 ```
 
 **Limitations of alternatives**:
-- `aiocache`: L2-only (every hit is 2-7ms network), no circuit breaker, no locking
+- `aiocache`: L2-only (every hit is a network round trip), no circuit breaker, no locking
 - `redis-cache`: Minimal features, no encryption, no metrics
 - `dogpile.cache`: More complex API, heavier dependencies
 

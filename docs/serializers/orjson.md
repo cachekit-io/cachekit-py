@@ -24,14 +24,9 @@ Without orjson installed, `get_serializer("orjson")` raises `ImportError: orjson
 - When human-readable format matters
 
 **Performance characteristics:**
-- Serialization: **2-5x faster** than stdlib json
-- Deserialization: **2-3x faster** than stdlib json
+- Encoding: orjson, a Rust JSON library. The [Performance Guide](../performance.md#not-measured-here) publishes no timing for it against stdlib json or MessagePack
 - Memory overhead: Low
 - Network overhead: JSON format (larger than msgpack, but human-readable)
-
-**Measured speedups vs stdlib json:**
-- Nested structures (1K objects): **3-4x faster** serialization
-- Simple dicts (10 keys): **2x faster** roundtrip
 
 **Native type support:**
 - datetime → ISO-8601 strings (automatic conversion)
@@ -132,23 +127,13 @@ except TypeError as e:
     # "OrjsonSerializer only supports JSON types. Use StandardSerializer for binary data."
 ```
 
-## Performance Comparison
+## Comparison with StandardSerializer
 
-OrjsonSerializer vs stdlib json (measured):
-
-| Data Type | orjson | stdlib json | Speedup |
-|-----------|--------|-------------|---------|
-| Nested objects (1K) | 0.8ms | 3.2ms | **4.0x** |
-| Simple dict (10 keys) | 0.05ms | 0.10ms | **2.0x** |
-| Large flat dict (10K keys) | 2.5ms | 7.0ms | **2.8x** |
-
-OrjsonSerializer vs StandardSerializer (msgpack):
+This table compares formats, not speed:
 
 | Metric | orjson | msgpack+LZ4 | Note |
 |--------|--------|-------------|------|
-| Serialization speed | Fast | Faster | msgpack ~10% faster |
-| Deserialization speed | Fast | Faster | Similar performance |
-| Output size | Medium | Small | msgpack+LZ4 ~30% smaller |
+| Output size | Usually larger | Usually smaller | msgpack+LZ4 is compressed binary; small payloads can differ |
 | Human-readable | Yes ✅ | No ❌ | JSON is text |
 | Cross-language | Yes ✅ | Limited | JSON ubiquitous |
 
@@ -156,7 +141,7 @@ OrjsonSerializer vs StandardSerializer (msgpack):
 - JSON-native APIs (already producing JSON)
 - Cross-language interoperability matters
 - Human-readable cache inspection needed
-- Trading ~30% more storage for JSON compatibility
+- Trading usually larger cache entries for JSON compatibility
 
 **When to prefer StandardSerializer:**
 - Maximum compression needed
@@ -167,7 +152,7 @@ OrjsonSerializer vs StandardSerializer (msgpack):
 - JSON-compatible types only (dict, list, str, int, float, bool, None)
 - NO binary data (`bytes`) → use StandardSerializer
 - NO arbitrary Python objects → convert to a dict first
-- Output is ~20-50% larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
+- Output is usually larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
 
 ---
 
@@ -176,7 +161,7 @@ OrjsonSerializer vs StandardSerializer (msgpack):
 - [StandardSerializer](default.md) — General-purpose alternative with binary data support
 - [ArrowSerializer](arrow.md) — DataFrame-optimized serializer
 - [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to OrjsonSerializer
-- [Performance Guide](../performance.md) — Full benchmark comparisons
+- [Performance Guide](../performance.md) — How cachekit's figures are measured
 
 ---
 

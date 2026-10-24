@@ -29,30 +29,22 @@ Every figure on this page comes from a guard in `tests/performance/`:
 
 ## Measured Figures
 
-Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards, CPython 3.14.3, x86_64 Linux: the first two rows on 2026-10-03, the last on 2026-10-04. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. These passes also timed the `@cache(backend=None)` hits, before the key memo and the L1-only fast path (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path)); the [GitHub-Hosted Runner](#github-hosted-runner) table has the current figures for those. The last two rows are functions with a backend, which keep no key memo and build their key on every call, as they did then.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guard, CPython 3.14.3, x86_64 Linux, 2026-10-03. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. Sessions on 2026-10-03 and 2026-10-04 also timed the decorated hits and a Redis L2 hit; later changes made those paths faster, and the [GitHub-Hosted Runner](#github-hosted-runner) table has their current figures.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
 | Raw L1 byte-cache lookup, `L1Cache.get` of 1KB, no decorator | `test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous` | 354 ± 68ns | 362 ± 41ns |
-| Redis L2 hit, L1 disabled, 100-user nested dict (23.5KB as MessagePack), Redis on loopback | `test_production_realism.py::test_redis_l2_roundtrip` | 416 ± 139μs | 407 ± 159μs |
-| Decorator + L1 hit with an L2 backend configured (in-process, never reached), same 100-user dict | `test_production_realism.py::test_decorator_overhead_l1_hit_with_backend` | 239 ± 31μs | 276 ± 120μs |
 
-The bands run from ±11% to ±43% of their figure, and pass 2 sits within 3% of pass 1 on the first two rows and 15% above it on the last. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
+In this table the band is ±19% of its figure in pass 1 and ±11% in pass 2. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
 
-Run them yourself:
+Run it yourself:
 ```bash
-uv run pytest tests/performance/test_production_realism.py -v -s \
-  -k "complex_dict or dataclass or dataframe or redis_l2"
 uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous -v -s
-uv run pytest tests/performance/test_production_realism.py -v -s \
-  -k "with_backend or concurrent or encryption_overhead"
-# The Redis guard uses the pytest-redis server the suite starts (or REDIS_URL's, when set)
-# The encryption guard generates a throwaway key; it needs no CACHEKIT_MASTER_KEY
 ```
 
 ### GitHub-Hosted Runner
 
-The `Bench` workflow (`.github/workflows/bench.yml`) runs five of these guards on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. [Its run on 2026-10-23](https://github.com/cachekit-io/cachekit-py/actions/runs/39987019881) used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
+The `Bench` workflow (`.github/workflows/bench.yml`) runs five guards from `tests/performance/` on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. [Its run on 2026-10-23](https://github.com/cachekit-io/cachekit-py/actions/runs/39987019881) used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
 
 | Path | Guard (`tests/performance/`) | Run median |
 |------|------------------------------|-----------:|
@@ -72,6 +64,8 @@ The workflow runs these guards with this command, against a Redis it starts on t
 REDIS_URL=redis://localhost:6379 uv run pytest tests/performance/test_production_realism.py -s -q -p no:cacheprovider \
   -k "complex_dict or dataframe or with_backend or encryption_overhead or redis_l2"
 ```
+
+Without `REDIS_URL`, the Redis guard uses the pytest-redis server the suite starts. The encryption guard generates a throwaway key, so it needs no `CACHEKIT_MASTER_KEY`.
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
 
@@ -101,12 +95,12 @@ The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-on
 
 ## L2 Backend (Redis) Performance
 
-An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis in a container on the same runner takes 551 ± 18μs on the hosted EPYC 7763 (0.41–0.42ms over loopback in [Measured Figures](#measured-figures)): the decorator, the round trip and deserialization. That is about 610 times an L1-only hit of the same dict on the same runner. A Redis on another machine adds its network latency on top; no guard measures that.
+An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis in a container on the same runner takes 551 ± 18μs on the hosted EPYC 7763: the decorator, the round trip and deserialization. That is about 610 times an L1-only hit of the same dict on the same runner. A Redis on another machine adds its network latency on top; no guard measures that.
 
 ## Not Measured Here
 
 These have no figure from the run-level harness that supports a claim:
-- **Encryption overhead through the decorator**: `test_encryption_overhead` interleaves its plaintext and encrypted runs and prints both results, but on this shared host the difference between the arms' run medians stayed inside its own band in all four passes on the 100-user dict (from −0.4 ± 14.6μs to −97 ± 194μs, Welch 95%): two on a quiet host with one arm's runs after the other's, and two interleaved on a loaded host. That bounds nothing: decryption may cost little next to deserialization, or the noise may hide it. The hosted runs do not settle it either ([GitHub-Hosted Runner](#github-hosted-runner)). The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
+- **Encryption overhead through the decorator**: `test_encryption_overhead` interleaves its plaintext and encrypted runs and prints both results, but the difference between the arms' run medians has stayed inside its own band in every pass on the 100-user dict, on a shared host and on the hosted runner ([GitHub-Hosted Runner](#github-hosted-runner)). That bounds nothing: decryption may cost little next to deserialization, or the noise may hide it. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
 - **Request latency under contention**: the 10-thread guard times each call after its thread is scheduled (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
 - **The async decorator, serializer comparisons and a Redis on another machine**
 
@@ -233,7 +227,7 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 ## Performance Regression Testing
 
-Wall-clock benchmarks do not gate CI, and no test in `tests/performance/` asserts a time budget: on a shared machine one guard's run-level band reaches ±39% (see [Measured Figures](#measured-figures)). The wall-clock suites below run in the default `pytest tests/` invocation, report their figures, and fail only on behaviour:
+Wall-clock benchmarks do not gate CI, and no test in `tests/performance/` asserts a time budget: on a shared machine the run-level bands are too wide to gate on (see [Measured Figures](#measured-figures)). The wall-clock suites below run in the default `pytest tests/` invocation, report their figures, and fail only on behaviour:
 
 ```bash
 uv run pytest tests/performance/ -v -m performance

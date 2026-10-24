@@ -5,7 +5,7 @@ for multi-tenant caching.
 
 Architecture:
 - Singleton: Connection pool (expensive, created once in __init__)
-- Backend wrapper (cheap ~50ns): bound to one tenant, or — as RedisBackendProvider hands
+- Backend wrapper (cheap, no I/O): bound to one tenant, or — as RedisBackendProvider hands
   it out — reading tenant_context at every operation, so it is safe to hold across requests
 - Tenant isolation: Via URL-encoded tenant_id in key prefix (t:{tenant}:{key})
 """
@@ -975,7 +975,7 @@ class RedisBackendProvider:
             del error
 
     def get_backend(self) -> BaseBackend:
-        """Get a backend whose fallback tenant is the current one (cheap: ~50ns).
+        """Get a backend whose fallback tenant is the current one (cheap: no I/O).
 
         Extracts tenant_id from ContextVar; operations still follow the calling context.
 
@@ -989,7 +989,7 @@ class RedisBackendProvider:
         # Extract tenant from ContextVar
         tenant_id = tenant_context.get()
 
-        # Create per-request wrapper (cheap: ~50ns)
+        # Create per-request wrapper (cheap: no I/O)
         # Fail-fast validation happens in PerRequestRedisBackend.__init__
         return PerRequestRedisBackend(self._client, tenant_id, follow_context=True)
 

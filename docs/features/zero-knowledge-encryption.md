@@ -765,34 +765,11 @@ didn't recently disable encryption for that function, investigate.
 
 ## Performance Impact
 
-### Encryption Overhead (Measured)
+### Encryption Overhead
 
-**Evidence-based benchmarks** (P95 latency, roundtrip serialize + deserialize):
+An encrypted cache encrypts every value it stores and decrypts every hit. Through the decorator, the hosted benchmark could not separate that cost from run-to-run noise: in the Performance Guide's [GitHub-Hosted Runner](../performance.md#github-hosted-runner) table, the difference between the plaintext and encrypted arms of an L1 hit with a backend configured sits inside its own Welch band (see [Not Measured Here](../performance.md#not-measured-here)). The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of the guide's [Instruction Budgets](../performance.md#instruction-budgets).
 
-| Serializer | Plain | Encrypted | Overhead | Relative |
-|------------|-------|-----------|----------|----------|
-| **JSON** (OrjsonSerializer) | 0.75 μs | 4.25 μs | +3.50 μs | +467% |
-| **MessagePack** (StandardSerializer) | 3.21 μs | 6.54 μs | +3.33 μs | +104% |
-| **DataFrames** (ArrowSerializer, 1000 rows) | 731.67 μs | 749.75 μs | +18.08 μs | **+2.5%** |
-
-**Key insights**:
-1. **Small data** (JSON/MessagePack): Encryption adds 3-5 μs absolute
-   - Relative overhead looks high because baseline is fast
-   - Absolute cost <10 μs is negligible vs network latency (1-10 ms)
-
-2. **Large data** (DataFrames): Encryption overhead **virtually disappears**
-   - Serialization dominates (731 μs for 1000-row DataFrame)
-   - Encryption only 18 μs = 2.5% overhead
-   - **Zero-knowledge DataFrame caching is 97.5% free**
-
-3. **Production implications**:
-   - API caching: 5 μs encryption < network jitter
-   - ML features: 2.5% overhead = rounding error
-   - **Zero-knowledge caching overhead is negligible in the benchmarked scenarios** (synthetic API payloads, user profiles, and 1,000-row DataFrames)
-
-Run benchmarks: `pytest tests/performance/test_encryption_overhead.py -v -s`
-
-Through the decorator, a wall-clock comparison of an L1 hit of a 23.5KB dict with and without encryption is inconclusive: the difference stayed inside run-to-run noise. See [Not Measured Here](../performance.md#not-measured-here) in the Performance Guide.
+To time encryption per serializer on your own machine: `pytest tests/performance/test_encryption_overhead.py -v -s`
 
 ### Key Derivation (Per-Tenant)
 ```
@@ -848,7 +825,7 @@ rotation pattern above: keep the retiring key decrypt-only until the runbook's
 drain window has closed.
 
 **Q: Performance degraded after enabling encryption**
-A: Expected 100-500μs overhead. Profile to confirm acceptable.
+A: Every hit now pays a decrypt and every store an encrypt; the hosted runs could not separate that cost from noise (see [Encryption Overhead](#encryption-overhead)). Profile your own workload to confirm it is acceptable.
 
 ---
 
