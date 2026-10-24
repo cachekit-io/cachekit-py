@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 def _is_count(value: object) -> bool:
-    """Whether value is a whole number >= 1 (an int or a NumPy integer). A bool is refused: it is an int, but never a count.
+    """Whether value is an int or a NumPy integer >= 1. A bool is refused: it is an int, but never a count.
 
     Both numbers.Integral and SupportsIndex: every NumPy array has __index__ (a 0-d integer array converts) but none
     is Integral, and np.timedelta64 is Integral but has no __index__.
@@ -138,17 +138,17 @@ class CircuitBreakerConfig:
 
     Attributes:
         enabled: Enable circuit breaker protection (default: True)
-        failure_threshold: Failures within a 60 s rolling window that open the circuit,
-            a whole number >= 1 (default: 5)
-        success_threshold: Consecutive successes in HALF_OPEN to close circuit, a whole
-            number >= 1 (default: 3)
+        failure_threshold: Failures within a 60 s rolling window that open the circuit;
+            an int or NumPy integer >= 1, not a bool or a float (default: 5)
+        success_threshold: Consecutive successes in HALF_OPEN to close circuit; an int
+            or NumPy integer >= 1, not a bool or a float (default: 3)
         recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
             probe; an int, a float, a Fraction or a NumPy integer or float, finite
             and > 0 (default: 30.0).
             It also caps a cycle's probe slots at half_open_requests per cooldown,
             so 0 would remove that cap.
-        half_open_requests: Probe slots per HALF_OPEN cycle, a whole number >= 1, not a
-            concurrency limit. Every admitted probe holds one until the cycle ends,
+        half_open_requests: Probe slots per HALF_OPEN cycle (an int or NumPy integer
+            >= 1), not a concurrency limit. Every admitted probe holds one until the cycle ends,
             cancelled ones included, except a probe whose function raises: it gives
             its slot back, so more calls than this can reach the backend in one cycle.
             Must be >= success_threshold, or a cycle could never close (default: 3)
@@ -189,7 +189,7 @@ class CircuitBreakerConfig:
         >>> CircuitBreakerConfig(failure_threshold=0).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        cachekit.config.validation.ConfigurationError: failure_threshold must be a whole number >= 1, got 0
+        cachekit.config.validation.ConfigurationError: failure_threshold must be an int or NumPy integer >= 1, not a bool, got 0
     """
 
     enabled: bool = True
@@ -204,12 +204,10 @@ class CircuitBreakerConfig:
         Raises:
             ConfigurationError: If thresholds are invalid
         """
-        # The breaker compares whole counts of calls against these, so a fraction acts as the next whole number up,
-        # and with NaN or inf failure_threshold is never reached and the circuit never opens.
         for name in ("failure_threshold", "success_threshold", "half_open_requests"):
             value = getattr(self, name)
             if not _is_count(value):
-                raise ConfigurationError(f"{name} must be a whole number >= 1, got {value!r}")
+                raise ConfigurationError(f"{name} must be an int or NumPy integer >= 1, not a bool, got {value!r}")
         # Every success holds one of a cycle's half_open_requests slots; fewer than
         # success_threshold can never close it, and each cycle restart discards the
         # successes collected so far.
@@ -233,8 +231,8 @@ class BackpressureConfig:
 
     Attributes:
         enabled: Enable backpressure protection (default: True)
-        max_concurrent_requests: Maximum concurrent cache requests (default: 100, a whole number >= 1)
-        queue_size: Queue size for waiting requests (default: 1000, a whole number >= 1)
+        max_concurrent_requests: Maximum concurrent cache requests (default: 100, an int or NumPy integer >= 1)
+        queue_size: Queue size for waiting requests (default: 1000, an int or NumPy integer >= 1)
         timeout: Seconds to wait in queue before giving up (default: 0.1, from 0 to threading.TIMEOUT_MAX)
 
     Examples:
@@ -256,7 +254,7 @@ class BackpressureConfig:
         >>> BackpressureConfig(max_concurrent_requests=0).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        cachekit.config.validation.ConfigurationError: max_concurrent_requests must be a whole number >= 1, got 0
+        cachekit.config.validation.ConfigurationError: max_concurrent_requests must be an int or NumPy integer >= 1, not a bool, got 0
     """
 
     enabled: bool = True
@@ -274,12 +272,12 @@ class BackpressureConfig:
         # reaches 0, which would silently remove the concurrency limit.
         if not _is_count(self.max_concurrent_requests):
             raise ConfigurationError(
-                f"max_concurrent_requests must be a whole number >= 1, got {self.max_concurrent_requests!r}"
+                f"max_concurrent_requests must be an int or NumPy integer >= 1, not a bool, got {self.max_concurrent_requests!r}"
             )
         # Every backend operation joins the queue before it waits for a permit, even one that gets a
         # permit at once, so at 0 every operation is rejected. NaN or inf would silently remove the cap.
         if not _is_count(self.queue_size):
-            raise ConfigurationError(f"queue_size must be a whole number >= 1, got {self.queue_size!r}")
+            raise ConfigurationError(f"queue_size must be an int or NumPy integer >= 1, not a bool, got {self.queue_size!r}")
         # The permit wait hands timeout to threading.Semaphore.acquire. While every permit is held, NaN never
         # returns, and inf or a value past the platform limit raises OverflowError instead of waiting.
         # threading.TIMEOUT_MAX is the documented maximum.

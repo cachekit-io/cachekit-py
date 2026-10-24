@@ -81,7 +81,9 @@ class TestCircuitBreakerConfig:
     @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), 1.5, 5.0, True])
     def test_count_that_is_not_a_whole_number_at_least_one_is_rejected(self, field, bad):
         """With a NaN or inf failure_threshold the circuit never opens; a fraction or a bool is not a count."""
-        with pytest.raises(ValueError, match=f"{field} must be a whole number >= 1, got {re.escape(repr(bad))}"):
+        with pytest.raises(
+            ValueError, match=f"{field} must be an int or NumPy integer >= 1, not a bool, got {re.escape(repr(bad))}"
+        ):
             CircuitBreakerConfig(**{field: bad})
 
     def test_numpy_values(self):
@@ -95,12 +97,12 @@ class TestCircuitBreakerConfig:
         )
         assert (config.failure_threshold, config.timeout_seconds) == (4, 1.5)
         for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
-            with pytest.raises(ValueError, match="failure_threshold must be a whole number >= 1"):
+            with pytest.raises(ValueError, match="failure_threshold must be an int or NumPy integer >= 1, not a bool"):
                 CircuitBreakerConfig(failure_threshold=bad)
         # np.timedelta64 is registered as Integral and Real, but has no __index__ and does not compare with a float.
         for bad in (np.timedelta64(5, "s"), np.timedelta64(5), np.timedelta64("NaT")):
             for field in ("failure_threshold", "success_threshold", "half_open_requests"):
-                with pytest.raises(ValueError, match=f"{field} must be a whole number >= 1"):
+                with pytest.raises(ValueError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
                     CircuitBreakerConfig(**{field: bad})
             with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
                 CircuitBreakerConfig(timeout_seconds=bad)

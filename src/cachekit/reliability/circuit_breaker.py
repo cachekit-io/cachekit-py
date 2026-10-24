@@ -75,12 +75,13 @@ class CircuitBreakerConfig:
 
     Attributes:
         failure_threshold: Number of failures within a 60 s rolling window that opens
-            the circuit, a whole number >= 1. Successes do not reset the count; failures
-            older than the window stop counting. Lower values make the circuit more
-            sensitive to errors.
-        success_threshold: Number of consecutive successes in HALF_OPEN before closing,
-            a whole number >= 1, counting only probes the current cycle admitted when
-            the outcome carries its cycle. Higher values ensure more stable recovery.
+            the circuit; an int or NumPy integer >= 1, not a bool or a float. Successes
+            do not reset the count; failures older than the window stop counting. Lower
+            values make the circuit more sensitive to errors.
+        success_threshold: Number of consecutive successes in HALF_OPEN before closing;
+            an int or NumPy integer >= 1, not a bool or a float. It counts only probes
+            the current cycle admitted when the outcome carries its cycle. Higher values
+            ensure more stable recovery.
         timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
@@ -88,8 +89,8 @@ class CircuitBreakerConfig:
             finite and > 0: NaN or inf never leaves OPEN, and that restart caps a
             cycle's probe slots at half_open_requests per timeout_seconds. Balance
             between giving service time to recover vs detecting recovery quickly.
-        half_open_requests: Probe slots per HALF_OPEN cycle, a whole number >= 1, not a
-            concurrency limit. Every admitted probe holds one until the cycle ends,
+        half_open_requests: Probe slots per HALF_OPEN cycle (an int or NumPy integer
+            >= 1), not a concurrency limit. Every admitted probe holds one until the cycle ends,
             whether it records an outcome or never reports back, unless release_probe
             hands it back for the next call. Keep it >= success_threshold: every
             success holds one of a cycle's slots, so a smaller budget can never close
@@ -117,7 +118,7 @@ class CircuitBreakerConfig:
         >>> CircuitBreakerConfig(failure_threshold=0)  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        ValueError: failure_threshold must be a whole number >= 1, got 0
+        ValueError: failure_threshold must be an int or NumPy integer >= 1, not a bool, got 0
     """
 
     failure_threshold: int = 5  # Opens circuit after 5 failures within 60 s
@@ -130,17 +131,15 @@ class CircuitBreakerConfig:
         """Validate configuration."""
         # The breaker compares whole counts of calls against these, so a fraction acts as the next whole number up,
         # and with NaN or inf failure_threshold is never reached and the circuit never opens.
-        for name in ("failure_threshold", "success_threshold"):
+        for name in ("failure_threshold", "success_threshold", "half_open_requests"):
             value = getattr(self, name)
             if not _is_count(value):
-                raise ValueError(f"{name} must be a whole number >= 1, got {value!r}")
+                raise ValueError(f"{name} must be an int or NumPy integer >= 1, not a bool, got {value!r}")
         # NaN or inf would keep the breaker OPEN forever (NaN compares False). Zero
         # would let a spent HALF_OPEN cycle restart on every clock tick, removing
         # the half_open_requests-per-timeout cap on probes.
         if not _is_cooldown(self.timeout_seconds):
             raise ValueError(f"timeout_seconds must be a finite number > 0, got {self.timeout_seconds!r}")
-        if not _is_count(self.half_open_requests):
-            raise ValueError(f"half_open_requests must be a whole number >= 1, got {self.half_open_requests!r}")
 
 
 @dataclass

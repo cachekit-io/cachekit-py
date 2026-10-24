@@ -2,7 +2,7 @@
 
 Tests all 5 nested config classes:
 - L1CacheConfig: max_size_mb >= 1, defaults, frozen immutability
-- CircuitBreakerConfig: whole-number thresholds >= 1, finite recovery_timeout > 0, defaults
+- CircuitBreakerConfig: int thresholds >= 1, finite recovery_timeout > 0, defaults
 - BackpressureConfig: max_concurrent >= 1
 - MonitoringConfig: boolean flags, no validation constraints
 - EncryptionConfig: master_key required if enabled, tenant mode mutual exclusivity
@@ -132,7 +132,9 @@ class TestCircuitBreakerConfig:
         """With a NaN or inf failure_threshold the circuit never opens; a fraction or a bool is not a count. The
         message names the field: inf or 5.0 as success_threshold once failed only the half_open_requests check."""
         config = CircuitBreakerConfig(**{field: bad})  # pyright: ignore[reportArgumentType]
-        with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1, got {re.escape(repr(bad))}"):
+        with pytest.raises(
+            ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool, got {re.escape(repr(bad))}"
+        ):
             config.validate()
 
     @pytest.mark.parametrize(
@@ -165,12 +167,12 @@ class TestCircuitBreakerConfig:
             )
             assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
         for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
-            with pytest.raises(ConfigurationError, match="failure_threshold must be a whole number >= 1"):
+            with pytest.raises(ConfigurationError, match="failure_threshold must be an int or NumPy integer >= 1, not a bool"):
                 CircuitBreakerConfig(failure_threshold=bad).validate()
         # np.timedelta64 is registered as Integral and Real, but has no __index__ and does not compare with a float.
         for bad in (np.timedelta64(5, "s"), np.timedelta64(5), np.timedelta64("NaT")):
             for field in ("failure_threshold", "success_threshold", "half_open_requests"):
-                with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1"):
+                with pytest.raises(ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
                     CircuitBreakerConfig(**{field: bad}).validate()
         for bad in (np.float64("nan"), np.array(30.0), np.True_, np.timedelta64(5, "s"), np.timedelta64("NaT")):
             with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
@@ -224,7 +226,8 @@ class TestBackpressureConfig:
         """Below 1 nothing runs; from NaN, inf or a fraction threading.Semaphore never reaches 0, so nothing is limited."""
         config = BackpressureConfig(max_concurrent_requests=max_concurrent)  # pyright: ignore[reportArgumentType]
         with pytest.raises(
-            ConfigurationError, match=f"max_concurrent_requests must be a whole number >= 1, got {max_concurrent!r}"
+            ConfigurationError,
+            match=f"max_concurrent_requests must be an int or NumPy integer >= 1, not a bool, got {max_concurrent!r}",
         ):
             config.validate()
 
@@ -245,13 +248,15 @@ class TestBackpressureConfig:
                 BackpressureConfig(timeout=bad).validate()
         for field in ("max_concurrent_requests", "queue_size"):
             for bad in (np.array(8), np.timedelta64(8, "s"), np.timedelta64("NaT")):
-                with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1"):
+                with pytest.raises(ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
                     BackpressureConfig(**{field: bad}).validate()
 
     @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
     def test_validate_queue_size_invalid(self, queue_size: float) -> None:
         """Below 1 every operation is rejected (each joins the queue); NaN or inf would remove the cap."""
-        with pytest.raises(ConfigurationError, match=f"queue_size must be a whole number >= 1, got {queue_size!r}"):
+        with pytest.raises(
+            ConfigurationError, match=f"queue_size must be an int or NumPy integer >= 1, not a bool, got {queue_size!r}"
+        ):
             BackpressureConfig(queue_size=queue_size).validate()  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
