@@ -14,8 +14,9 @@ waits on the executor job that sent the request.
 
 Async: every request is parked on the gate, its worker thread held until the event loop releases it.
 A request from an executor job whose future nothing waits on (the miss path's lock release) is never released
-while the caller is pending: as on the sync side, it is held until the caller has returned, so it can only be
-background, however late the caller returns. Any other parked request is judged by the caller. Once the loop
+while the caller is pending: as on the sync side, it is held until the caller has returned, so it is background
+however long the caller keeps running. One thing books it blocking instead: a timer firing while the caller waits
+(see below). Any other parked request is judged by the caller. Once the loop
 has run everything it can, for a whole settle since the latest request parked, and the caller is still
 pending, the caller waits on a parked request: the oldest is released as blocking. With none parked yet,
 the gate waits for one to arrive or for the caller to finish, because a request still on its way through a
@@ -24,8 +25,9 @@ the caller spawns cannot send before the caller's current step ends, and on ever
 returns within a few turns of that step: the miss runs in a single-flight task the caller awaits.
 A caller that kept awaiting after spawning one would let the task's request read as blocking: the pinned
 list fails, it does not pass by mistake. A wait on a held request that bypasses its job's future (on an
-Event the job sets, say) is the one the gate cannot see: unbounded, it hangs until the guard fails the run;
-bounded, it gives up and the request reads as background. No path here waits that way.
+Event the job sets, say) is one the gate cannot see. Unbounded, it hangs until the guard fails the run.
+Bounded, its timer fires while the request is held, and the gate books the request blocking. So a caller that
+sleeps after its background release reads as waiting on it; no pinned path does.
 
 Sync: a request blocks if it runs on the caller's thread, where the caller cannot return until it does;
 a request on any other thread is held until the caller has returned, so it can only be background.
@@ -37,11 +39,12 @@ count and order from run to run, so they belong to invariant tests, not here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import threading
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any
@@ -194,6 +197,7 @@ class _Gate:
         self._respond_lock = threading.Lock()
         # Async run: every request, each on a worker thread, waits here until run_async releases it.
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._waiting: asyncio.Future[Any] | None = None  # the caller, while run_async runs it
         self._jobs: list[_Job] = []  # every executor job of the run
         self._parked: list[_Parked] = []
         self._arrived = asyncio.Event()
@@ -225,6 +229,23 @@ class _Gate:
         job.inner.add_done_callback(job.relay)
         self._jobs.append(job)
         return job
+
+    def _call_at(
+        self, when: float, callback: Callable[..., object], *args: Any, context: contextvars.Context | None = None
+    ) -> asyncio.TimerHandle:
+        """The loop's ``call_at`` during an async run (``call_later``, ``asyncio.sleep`` and ``wait_for`` call it too)."""
+        assert self._loop is not None
+        return type(self._loop).call_at(self._loop, when, self._timer_fired, callback, *args, context=context)
+
+    def _timer_fired(self, callback: Callable[..., object], *args: Any) -> None:
+        # A wait on a held request can bypass its job's future (on an Event the job sets): the gate cannot see that wait,
+        # but a bounded one leaves a trace, its timer firing while the caller still waits. So the held request was waited on.
+        if self._waiting is not None and not self._waiting.done():
+            for held in [parked for parked in self._parked if not parked.awaited]:
+                self._parked.remove(held)
+                self.shape.blocking.append(held.op)
+                held.release()
+        callback(*args)
 
     def handler(self, request: FakeRequest) -> HTTPResponse:
         op = _parse(request)[1]
@@ -263,8 +284,9 @@ class _Gate:
         self.arrivals, self._jobs = [], []
         self._loop = loop = asyncio.get_running_loop()
         loop.run_in_executor = self._run_in_executor  # type: ignore[method-assign]
+        loop.call_at = self._call_at  # type: ignore[method-assign]
         try:
-            caller = asyncio.ensure_future(call)
+            self._waiting = caller = asyncio.ensure_future(call)
             while True:
                 arrivals = len(self.arrivals)
                 await _settle()
@@ -300,8 +322,8 @@ class _Gate:
             for parked in self._parked:  # left by a caller that raised: never strand a worker thread
                 parked.release()
             self._parked.clear()
-            del loop.run_in_executor
-            self._loop = None
+            del loop.run_in_executor, loop.call_at
+            self._loop = self._waiting = None
         assert not self.errors, self.errors
         return shape
 
@@ -623,3 +645,39 @@ class TestAsyncCallShape:
 
         shape = await gate.run_async(late_caller())
         assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
+
+    async def test_a_bounded_wait_on_the_release_reads_as_blocking(
+        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A check on the gate itself, through a release that regressed: it still runs in the background, but the
+        caller then waits up to a bound for an Event the release sets. That wait bypasses the job's future, and
+        the gate must book the DELETE blocking all the same."""
+        released = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        delete_lock_sync = CachekitIOBackend._delete_lock_sync
+        acquire_fill_lock = CachekitIOBackend.acquire_fill_lock
+
+        def delete_and_signal(self: CachekitIOBackend, lock_key: str, lock_id: str) -> None:
+            delete_lock_sync(self, lock_key, lock_id)
+            loop.call_soon_threadsafe(released.set)
+
+        @contextlib.asynccontextmanager
+        async def wait_for_the_release(
+            self: CachekitIOBackend, key: str, timeout: float, blocking_timeout: float | None = None
+        ) -> AsyncIterator[tuple[bool, bool]]:
+            async with acquire_fill_lock(self, key, timeout, blocking_timeout) as grant:
+                yield grant
+            await gate.arrival("DELETE /lock")  # parked, so the bound's timer fires while it is held
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(released.wait(), 0.001)
+
+        @cache(backend=backend, ttl=60, l1_enabled=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        await gate.run_async(fn(1))
+        monkeypatch.setattr(CachekitIOBackend, "_delete_lock_sync", delete_and_signal)
+        monkeypatch.setattr(CachekitIOBackend, "acquire_fill_lock", wait_for_the_release)
+        saas.fail_next_reads = 1
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])
