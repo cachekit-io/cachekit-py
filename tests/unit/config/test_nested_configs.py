@@ -167,7 +167,12 @@ class TestCircuitBreakerConfig:
         for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
             with pytest.raises(ConfigurationError, match="failure_threshold must be a whole number >= 1"):
                 CircuitBreakerConfig(failure_threshold=bad).validate()
-        for bad in (np.float64("nan"), np.array(30.0), np.True_):
+        # np.timedelta64 is registered as Integral and Real, but has no __index__ and does not compare with a float.
+        for bad in (np.timedelta64(5, "s"), np.timedelta64(5), np.timedelta64("NaT")):
+            for field in ("failure_threshold", "success_threshold", "half_open_requests"):
+                with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1"):
+                    CircuitBreakerConfig(**{field: bad}).validate()
+        for bad in (np.float64("nan"), np.array(30.0), np.True_, np.timedelta64(5, "s"), np.timedelta64("NaT")):
             with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
                 CircuitBreakerConfig(recovery_timeout=bad).validate()
 
@@ -235,11 +240,13 @@ class TestBackpressureConfig:
         for timeout in (np.float64(0.5), np.int64(1)):
             config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16), timeout=timeout)
             assert DecoratorConfig(backpressure=config).backpressure is config
-        with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
-            BackpressureConfig(timeout=np.float32(0.5)).validate()
+        for bad in (np.float32(0.5), np.array(0.5), np.array(1), np.timedelta64(1, "s")):
+            with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
+                BackpressureConfig(timeout=bad).validate()
         for field in ("max_concurrent_requests", "queue_size"):
-            with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1"):
-                BackpressureConfig(**{field: np.array(8)}).validate()
+            for bad in (np.array(8), np.timedelta64(8, "s"), np.timedelta64("NaT")):
+                with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1"):
+                    BackpressureConfig(**{field: bad}).validate()
 
     @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
     def test_validate_queue_size_invalid(self, queue_size: float) -> None:

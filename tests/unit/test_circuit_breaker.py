@@ -97,6 +97,13 @@ class TestCircuitBreakerConfig:
         for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
             with pytest.raises(ValueError, match="failure_threshold must be a whole number >= 1"):
                 CircuitBreakerConfig(failure_threshold=bad)
+        # np.timedelta64 is registered as Integral and Real, but has no __index__ and does not compare with a float.
+        for bad in (np.timedelta64(5, "s"), np.timedelta64(5), np.timedelta64("NaT")):
+            for field in ("failure_threshold", "success_threshold", "half_open_requests"):
+                with pytest.raises(ValueError, match=f"{field} must be a whole number >= 1"):
+                    CircuitBreakerConfig(**{field: bad})
+            with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+                CircuitBreakerConfig(timeout_seconds=bad)
 
 
 class TestCacheOperationMetrics:

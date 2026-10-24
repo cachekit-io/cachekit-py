@@ -23,23 +23,29 @@ if TYPE_CHECKING:
 def _is_count(value: object) -> bool:
     """Whether value is a whole number >= 1 (an int or a NumPy integer). A bool is refused: it is an int, but never a count.
 
-    numbers.Integral, not SupportsIndex: every NumPy array has __index__, and a 0-d integer array converts.
+    Both numbers.Integral and SupportsIndex: every NumPy array has __index__ (a 0-d integer array converts) but none
+    is Integral, and np.timedelta64 is Integral but has no __index__.
     """
-    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex) or not isinstance(value, numbers.Integral):
         return False
     return operator.index(value) >= 1
 
 
 def _is_cooldown(value: object) -> bool:
-    """Whether value is a finite number of seconds > 0: an int, a float or a NumPy number, not a bool.
+    """Whether value is a finite number of seconds > 0: an int, a float, a Fraction or a NumPy integer or float.
 
-    numbers.Real is that set (plus Fraction); a Decimal is not one, as it does not mix with float arithmetic.
+    That is numbers.Real, less a bool and any Real that does not compare with a float (np.timedelta64, which NumPy
+    registers as Real). A Decimal is not Real, as it does not mix with float arithmetic.
     """
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         return False
     # Not math.isfinite, which raises OverflowError for an int past float range. Real declares only < and <=,
     # so NaN is refused by the inf bound (every comparison with NaN is False) and the rest by "not <= 0".
-    return value < math.inf and not value <= 0
+    # The breaker compares the timeout with float seconds, so a value that cannot be compared is refused here.
+    try:
+        return value < math.inf and not value <= 0
+    except TypeError:
+        return False
 
 
 def _is_permit_wait(value: object) -> bool:
@@ -50,7 +56,7 @@ def _is_permit_wait(value: object) -> bool:
     """
     if isinstance(value, bool):
         return False
-    if isinstance(value, SupportsIndex):  # an int, or a NumPy integer
+    if isinstance(value, SupportsIndex) and isinstance(value, numbers.Integral):  # an int, or a NumPy integer, not an array
         value = operator.index(value)
     return isinstance(value, (int, float)) and 0 <= value <= threading.TIMEOUT_MAX
 
@@ -137,7 +143,8 @@ class CircuitBreakerConfig:
         success_threshold: Consecutive successes in HALF_OPEN to close circuit, a whole
             number >= 1 (default: 3)
         recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
-            probe; an int, a float or a NumPy number, finite and > 0 (default: 30.0).
+            probe; an int, a float, a Fraction or a NumPy integer or float, finite
+            and > 0 (default: 30.0).
             It also caps a cycle's probe slots at half_open_requests per cooldown,
             so 0 would remove that cap.
         half_open_requests: Probe slots per HALF_OPEN cycle, a whole number >= 1, not a

@@ -84,10 +84,10 @@ class CircuitBreakerConfig:
         timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
-            starts. Must be an int, a float or a NumPy number, finite and > 0: NaN or
-            inf never leaves OPEN, and that restart caps a cycle's probe slots at
-            half_open_requests per timeout_seconds. Balance between giving service
-            time to recover vs detecting recovery quickly.
+            starts. Must be an int, a float, a Fraction or a NumPy integer or float,
+            finite and > 0: NaN or inf never leaves OPEN, and that restart caps a
+            cycle's probe slots at half_open_requests per timeout_seconds. Balance
+            between giving service time to recover vs detecting recovery quickly.
         half_open_requests: Probe slots per HALF_OPEN cycle, a whole number >= 1, not a
             concurrency limit. Every admitted probe holds one until the cycle ends,
             whether it records an outcome or never reports back, unless release_probe

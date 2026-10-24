@@ -64,7 +64,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `enabled` | `bool` | `True` | Turn the breaker on or off |
 | `failure_threshold` | `int` | `5` | Failures within a 60 s rolling window that open the circuit. Successes do not reset the count; older failures stop counting. A whole number `>= 1` |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes. A whole number `>= 1` |
-| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). An int, a float or a NumPy number, finite and `> 0`: it also caps a cycle's probe slots at `half_open_requests` per cooldown |
+| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). An int, a float, a `Fraction` or a NumPy integer or float, finite and `> 0`: it also caps a cycle's probe slots at `half_open_requests` per cooldown |
 | `half_open_requests` | `int` | `3` | Probe slots per HALF_OPEN cycle (not a concurrency limit), a whole number `>= 1`. Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a HALF_OPEN cycle could never close |
 
 > [!NOTE]
