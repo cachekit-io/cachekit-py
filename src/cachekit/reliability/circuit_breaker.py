@@ -11,7 +11,6 @@ scrape, which reads each live breaker's ``_state`` as a single lock-free attribu
 
 import functools
 import logging
-import math
 import os
 import threading
 import time
@@ -24,6 +23,7 @@ from typing import Optional
 
 # Import backend error types for failure detection
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.config.nested import _is_cooldown, _is_count
 from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, circuit_breaker_gauge
 
 # Legacy in-process 0/1/2 value (last writer per namespace wins). Not the Prometheus series.
@@ -75,24 +75,25 @@ class CircuitBreakerConfig:
 
     Attributes:
         failure_threshold: Number of failures within a 60 s rolling window that opens
-            the circuit. Successes do not reset the count; failures older than the
-            window stop counting. Lower values make the circuit more sensitive to errors.
+            the circuit, a whole number >= 1. Successes do not reset the count; failures
+            older than the window stop counting. Lower values make the circuit more
+            sensitive to errors.
         success_threshold: Number of consecutive successes in HALF_OPEN before closing,
-            counting only probes the current cycle admitted when the outcome carries
-            its cycle. Higher values ensure more stable recovery.
+            a whole number >= 1, counting only probes the current cycle admitted when
+            the outcome carries its cycle. Higher values ensure more stable recovery.
         timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
-            starts. Must be finite and > 0: NaN or inf never leaves OPEN, and that
-            restart caps a cycle's probe slots at half_open_requests per
-            timeout_seconds. Balance
-            between giving service time to recover vs detecting recovery quickly.
-        half_open_requests: Probe slots per HALF_OPEN cycle, not a concurrency
-            limit. Every admitted probe holds one until the cycle ends, whether it
-            records an outcome or never reports back, unless release_probe hands it
-            back for the next call. Keep it >= success_threshold: every success
-            holds one of a cycle's slots, so a smaller budget can never close it.
-            Unlike the @cache config, this class does not reject a smaller value.
+            starts. Must be an int, a float or a NumPy number, finite and > 0: NaN or
+            inf never leaves OPEN, and that restart caps a cycle's probe slots at
+            half_open_requests per timeout_seconds. Balance between giving service
+            time to recover vs detecting recovery quickly.
+        half_open_requests: Probe slots per HALF_OPEN cycle, a whole number >= 1, not a
+            concurrency limit. Every admitted probe holds one until the cycle ends,
+            whether it records an outcome or never reports back, unless release_probe
+            hands it back for the next call. Keep it >= success_threshold: every
+            success holds one of a cycle's slots, so a smaller budget can never close
+            it. Unlike the @cache config, this class does not reject a smaller value.
         excluded_error_types: BackendErrorType values that don't count as failures.
             Example: BackendErrorType.PERMANENT for config errors
 
@@ -116,7 +117,7 @@ class CircuitBreakerConfig:
         >>> CircuitBreakerConfig(failure_threshold=0)  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        ValueError: failure_threshold must be positive, got 0
+        ValueError: failure_threshold must be a whole number >= 1, got 0
     """
 
     failure_threshold: int = 5  # Opens circuit after 5 failures within 60 s
@@ -127,18 +128,19 @@ class CircuitBreakerConfig:
 
     def __post_init__(self):
         """Validate configuration."""
-        # Validate thresholds
-        if self.failure_threshold <= 0:
-            raise ValueError(f"failure_threshold must be positive, got {self.failure_threshold}")
-        if self.success_threshold <= 0:
-            raise ValueError(f"success_threshold must be positive, got {self.success_threshold}")
+        # The breaker compares whole counts of calls against these, so a fraction acts as the next whole number up,
+        # and with NaN or inf failure_threshold is never reached and the circuit never opens.
+        for name in ("failure_threshold", "success_threshold"):
+            value = getattr(self, name)
+            if not _is_count(value):
+                raise ValueError(f"{name} must be a whole number >= 1, got {value!r}")
         # NaN or inf would keep the breaker OPEN forever (NaN compares False). Zero
         # would let a spent HALF_OPEN cycle restart on every clock tick, removing
         # the half_open_requests-per-timeout cap on probes.
-        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+        if not _is_cooldown(self.timeout_seconds):
             raise ValueError(f"timeout_seconds must be a finite number > 0, got {self.timeout_seconds!r}")
-        if self.half_open_requests <= 0:
-            raise ValueError(f"half_open_requests must be positive, got {self.half_open_requests}")
+        if not _is_count(self.half_open_requests):
+            raise ValueError(f"half_open_requests must be a whole number >= 1, got {self.half_open_requests!r}")
 
 
 @dataclass

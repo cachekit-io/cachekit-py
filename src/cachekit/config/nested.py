@@ -8,6 +8,7 @@ timeout, backpressure, monitoring, encryption).
 from __future__ import annotations
 
 import math
+import numbers
 import operator
 import threading
 from dataclasses import dataclass, field
@@ -21,7 +22,24 @@ if TYPE_CHECKING:
 
 def _is_count(value: object) -> bool:
     """Whether value is a whole number >= 1 (an int or a NumPy integer). A bool is refused: it is an int, but never a count."""
-    return isinstance(value, SupportsIndex) and not isinstance(value, bool) and operator.index(value) >= 1
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
+        return False
+    try:
+        return operator.index(value) >= 1
+    except TypeError:  # every NumPy array has __index__, but only a 0-d integer array converts
+        return False
+
+
+def _is_cooldown(value: object) -> bool:
+    """Whether value is a finite number of seconds > 0: an int, a float or a NumPy number, not a bool.
+
+    numbers.Real is that set (plus Fraction); a Decimal is not one, as it does not mix with float arithmetic.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return False
+    # Not math.isfinite, which raises OverflowError for an int past float range. Real declares only < and <=,
+    # so NaN is refused by the inf bound (every comparison with NaN is False) and the rest by "not <= 0".
+    return value < math.inf and not value <= 0
 
 
 def _is_permit_wait(value: object) -> bool:
@@ -114,16 +132,19 @@ class CircuitBreakerConfig:
 
     Attributes:
         enabled: Enable circuit breaker protection (default: True)
-        failure_threshold: Failures within a 60 s rolling window that open the circuit (default: 5)
-        success_threshold: Consecutive successes in HALF_OPEN to close circuit (default: 3)
+        failure_threshold: Failures within a 60 s rolling window that open the circuit,
+            a whole number >= 1 (default: 5)
+        success_threshold: Consecutive successes in HALF_OPEN to close circuit, a whole
+            number >= 1 (default: 3)
         recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
-            probe; finite and > 0 (default: 30.0). It also caps a cycle's probe slots
-            at half_open_requests per cooldown, so 0 would remove that cap.
-        half_open_requests: Probe slots per HALF_OPEN cycle, not a concurrency limit.
-            Every admitted probe holds one until the cycle ends, cancelled ones
-            included, except a probe whose function raises: it gives its slot back,
-            so more calls than this can reach the backend in one cycle. Must be
-            >= success_threshold, or a cycle could never close (default: 3)
+            probe; an int, a float or a NumPy number, finite and > 0 (default: 30.0).
+            It also caps a cycle's probe slots at half_open_requests per cooldown,
+            so 0 would remove that cap.
+        half_open_requests: Probe slots per HALF_OPEN cycle, a whole number >= 1, not a
+            concurrency limit. Every admitted probe holds one until the cycle ends,
+            cancelled ones included, except a probe whose function raises: it gives
+            its slot back, so more calls than this can reach the backend in one cycle.
+            Must be >= success_threshold, or a cycle could never close (default: 3)
 
     The four knobs are forwarded to the live breaker (``recovery_timeout`` becomes its
     ``timeout_seconds``), and ``fn.get_health_status()["circuit_breaker"]["config"]``
@@ -161,7 +182,7 @@ class CircuitBreakerConfig:
         >>> CircuitBreakerConfig(failure_threshold=0).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        cachekit.config.validation.ConfigurationError: failure_threshold must be >= 1, got 0
+        cachekit.config.validation.ConfigurationError: failure_threshold must be a whole number >= 1, got 0
     """
 
     enabled: bool = True
@@ -176,12 +197,12 @@ class CircuitBreakerConfig:
         Raises:
             ConfigurationError: If thresholds are invalid
         """
-        if self.failure_threshold < 1:
-            raise ConfigurationError(f"failure_threshold must be >= 1, got {self.failure_threshold}")
-        if self.success_threshold < 1:
-            raise ConfigurationError(f"success_threshold must be >= 1, got {self.success_threshold}")
-        if self.half_open_requests < 1:
-            raise ConfigurationError(f"half_open_requests must be >= 1, got {self.half_open_requests}")
+        # The breaker compares whole counts of calls against these, so a fraction acts as the next whole number up,
+        # and with NaN or inf failure_threshold is never reached and the circuit never opens.
+        for name in ("failure_threshold", "success_threshold", "half_open_requests"):
+            value = getattr(self, name)
+            if not _is_count(value):
+                raise ConfigurationError(f"{name} must be a whole number >= 1, got {value!r}")
         # Every success holds one of a cycle's half_open_requests slots; fewer than
         # success_threshold can never close it, and each cycle restart discards the
         # successes collected so far.
@@ -192,7 +213,7 @@ class CircuitBreakerConfig:
             )
         # The cooldown also bounds a cycle's probe slots to half_open_requests per
         # cooldown; at 0 a spent cycle restarts on every clock tick, without bound.
-        if not math.isfinite(self.recovery_timeout) or self.recovery_timeout <= 0:
+        if not _is_cooldown(self.recovery_timeout):
             raise ConfigurationError(f"recovery_timeout must be a finite number > 0, got {self.recovery_timeout!r}")
 
 

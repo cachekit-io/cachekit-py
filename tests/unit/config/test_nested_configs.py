@@ -2,7 +2,7 @@
 
 Tests all 5 nested config classes:
 - L1CacheConfig: max_size_mb >= 1, defaults, frozen immutability
-- CircuitBreakerConfig: thresholds >= 1, defaults
+- CircuitBreakerConfig: whole-number thresholds >= 1, finite recovery_timeout > 0, defaults
 - BackpressureConfig: max_concurrent >= 1
 - MonitoringConfig: boolean flags, no validation constraints
 - EncryptionConfig: master_key required if enabled, tenant mode mutual exclusivity
@@ -10,6 +10,7 @@ Tests all 5 nested config classes:
 
 from __future__ import annotations
 
+import re
 import threading
 from decimal import Decimal
 from fractions import Fraction
@@ -125,30 +126,50 @@ class TestCircuitBreakerConfig:
         config = CircuitBreakerConfig(failure_threshold=1, success_threshold=1, half_open_requests=1)
         assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
 
-    def test_validate_failure_threshold_too_small(self) -> None:
-        """Test validation fails when failure_threshold < 1."""
-        config = CircuitBreakerConfig(failure_threshold=0)
-        with pytest.raises(ConfigurationError, match="failure_threshold must be >= 1, got 0"):
+    @pytest.mark.parametrize("field", ["failure_threshold", "success_threshold", "half_open_requests"])
+    @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), 1.5, 5.0, True])
+    def test_validate_count_not_a_whole_number_at_least_one(self, field: str, bad: object) -> None:
+        """With a NaN or inf failure_threshold the circuit never opens; a fraction or a bool is not a count. The
+        message names the field: inf or 5.0 as success_threshold once failed only the half_open_requests check."""
+        config = CircuitBreakerConfig(**{field: bad})  # pyright: ignore[reportArgumentType]
+        with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1, got {re.escape(repr(bad))}"):
             config.validate()
 
-    def test_validate_success_threshold_too_small(self) -> None:
-        """Test validation fails when success_threshold < 1."""
-        config = CircuitBreakerConfig(success_threshold=0)
-        with pytest.raises(ConfigurationError, match="success_threshold must be >= 1, got 0"):
-            config.validate()
-
-    def test_validate_half_open_requests_too_small(self) -> None:
-        """Test validation fails when half_open_requests < 1."""
-        config = CircuitBreakerConfig(half_open_requests=0)
-        with pytest.raises(ConfigurationError, match="half_open_requests must be >= 1, got 0"):
-            config.validate()
-
-    @pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("nan"), float("inf")])
-    def test_validate_recovery_timeout_rejects_zero_negative_and_non_finite(self, bad: float) -> None:
-        """NaN or inf could never half-open; 0 would restart spent probe cycles on every clock tick."""
-        config = CircuitBreakerConfig(recovery_timeout=bad)
+    @pytest.mark.parametrize(
+        "bad",
+        [0, 0.0, -1.0, float("nan"), float("inf"), float("-inf"), True, None, "30", Decimal("30"), complex(30)],
+    )
+    def test_validate_recovery_timeout_invalid(self, bad: object) -> None:
+        """NaN or inf could never half-open; 0 would restart spent probe cycles on every clock tick. A bool, None,
+        a str, a Decimal or a complex is refused with ConfigurationError, not accepted or a bare TypeError."""
+        config = CircuitBreakerConfig(recovery_timeout=bad)  # pyright: ignore[reportArgumentType]
         with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
             config.validate()
+
+    @pytest.mark.parametrize("timeout", [1, 0.5, Fraction(1, 2), 10**400])
+    def test_validate_recovery_timeout_valid(self, timeout: object) -> None:
+        """Any real number of seconds > 0 passes, including an int past float range (no OverflowError)."""
+        config = CircuitBreakerConfig(recovery_timeout=timeout)  # pyright: ignore[reportArgumentType]
+        assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
+
+    def test_validate_numpy_values(self) -> None:
+        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or an array is refused with
+        ConfigurationError (every array has __index__, but only a 0-d integer array converts)."""
+        np = pytest.importorskip("numpy")
+        for timeout in (np.float64(0.5), np.float32(0.5), np.int64(30)):
+            config = CircuitBreakerConfig(
+                failure_threshold=np.int64(4),
+                success_threshold=np.int32(2),
+                recovery_timeout=timeout,
+                half_open_requests=np.int8(2),
+            )
+            assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
+        for bad in (np.float64(5.0), np.array(1.5), np.array([5])):
+            with pytest.raises(ConfigurationError, match="failure_threshold must be a whole number >= 1"):
+                CircuitBreakerConfig(failure_threshold=bad).validate()
+        for bad in (np.float64("nan"), np.array(30.0), np.True_):
+            with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
+                CircuitBreakerConfig(recovery_timeout=bad).validate()
 
     def test_validate_half_open_requests_below_success_threshold(self) -> None:
         """A cycle admits at most half_open_requests probes, so fewer than success_threshold can never close."""
