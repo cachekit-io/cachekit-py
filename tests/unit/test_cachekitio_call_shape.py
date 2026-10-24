@@ -15,7 +15,7 @@ waits on the executor job that sent the request.
 Async: every request is parked on the gate, its worker thread held until the event loop releases it.
 A request from an executor job whose future nothing waits on (the miss path's lock release) is never released
 while the caller is pending: as on the sync side, it is held until the caller has returned, so it is background
-however long the caller keeps running, unless one of the caller's own timers fires meanwhile (see below).
+however long the caller keeps running, unless a timer fires meanwhile (see below).
 Any other parked request is judged by the caller. Once the loop
 has run everything it can, for a whole settle since the latest request parked, and the caller is still
 pending, the caller waits on a parked request: the oldest is released as blocking. With none parked yet,
@@ -26,10 +26,12 @@ returns within a few turns of that step: the miss runs in a single-flight task t
 A caller that kept awaiting after spawning one would let the task's request read as blocking: the pinned
 list fails, it does not pass by mistake. A wait on a held request that bypasses its job's future (on an
 Event the job sets, say) is one the gate cannot see. Unbounded, it hangs until the guard fails the run.
-Bounded, its timer fires while the request is held. Once the caller has returned, the request is booked blocking
-if the task that set that timer has ended too (the caller, or a task it awaited), and stays background if that
-task is background work still running. So a caller that sleeps after its background release reads as waiting
-on it; no pinned path does.
+Bounded, its timer fires while the request is held, and the gate books the request blocking. Any timer that
+fires then counts, whichever task set it: a helper task can bound the wait for the caller and live on, so neither
+the task nor its fate shows whose wait it was. The gate errs toward blocking instead. A caller that sleeps after
+its background release, or background work whose timer fires before the caller returns, makes the pinned list
+fail rather than pass by mistake. No pinned path has a timer after its background release. A wait bounded
+without a loop timer (by counting turns, say) stays invisible.
 
 Sync: a request blocks if it runs on the caller's thread, where the caller cannot return until it does;
 a request on any other thread is held until the caller has returned, so it can only be background.
@@ -201,7 +203,6 @@ class _Gate:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._waiting: asyncio.Future[Any] | None = None  # the caller, while run_async runs it
         self._jobs: list[_Job] = []  # every executor job of the run
-        self._timed: list[tuple[asyncio.Task[Any] | None, list[_Parked]]] = []  # (timer's task, requests held as it fired)
         self._parked: list[_Parked] = []
         self._arrived = asyncio.Event()
         self.arrivals: list[str] = []  # every request parked this run, in order
@@ -238,15 +239,18 @@ class _Gate:
     ) -> asyncio.TimerHandle:
         """The loop's ``call_at`` during an async run (``call_later``, ``asyncio.sleep`` and ``wait_for`` call it too)."""
         assert self._loop is not None
-        task = asyncio.current_task(self._loop)
-        return type(self._loop).call_at(self._loop, when, self._timer_fired, task, callback, *args, context=context)
+        return type(self._loop).call_at(self._loop, when, self._timer_fired, callback, *args, context=context)
 
-    def _timer_fired(self, task: asyncio.Task[Any] | None, callback: Callable[..., object], *args: Any) -> None:
+    def _timer_fired(self, callback: Callable[..., object], *args: Any) -> None:
         # A wait on a held request can bypass its job's future (on an Event the job sets): the gate cannot see that wait,
-        # but a bounded one leaves a trace, its timer firing while the caller still waits. Judged once the caller returns.
+        # but a bounded one leaves a trace, its timer firing while the caller still waits. Nor can the gate tell whose
+        # wait a timer bounds (a helper task can bound it for the caller and live on), so any timer counts: an unrelated
+        # one fails the run instead of letting a real wait pass.
         if self._waiting is not None and not self._waiting.done():
-            if held := [parked for parked in self._parked if not parked.awaited]:
-                self._timed.append((task, held))
+            for held in [parked for parked in self._parked if not parked.awaited]:
+                self._parked.remove(held)
+                self.shape.blocking.append(held.op)
+                held.release()
         callback(*args)
 
     def handler(self, request: FakeRequest) -> HTTPResponse:
@@ -283,12 +287,12 @@ class _Gate:
 
     async def run_async(self, call: Awaitable[Any]) -> _Shape:
         self.shape = shape = _Shape()
-        self.arrivals, self._jobs, self._timed = [], [], []
+        self.arrivals, self._jobs = [], []
         self._loop = loop = asyncio.get_running_loop()
         loop.run_in_executor = self._run_in_executor  # type: ignore[method-assign]
         loop.call_at = self._call_at  # type: ignore[method-assign]
         try:
-            self._waiting = caller = asyncio.ensure_future(self._judge_timers_on_return(call))
+            self._waiting = caller = asyncio.ensure_future(call)
             while True:
                 arrivals = len(self.arrivals)
                 await _settle()
@@ -328,21 +332,6 @@ class _Gate:
             self._loop = self._waiting = None
         assert not self.errors, self.errors
         return shape
-
-    async def _judge_timers_on_return(self, call: Awaitable[Any]) -> Any:
-        """Await ``call`` as the caller, then judge the timers that fired while a request was held, in the caller's last
-        step. A request held then was waited on if the timer's task has ended too: the caller, or a task it awaited.
-        A timer of background work, still running at this point, is not the caller's wait."""
-        try:
-            return await call
-        finally:
-            caller = asyncio.current_task()
-            for task, held in self._timed:
-                for parked in held if task is None or task is caller or task.done() else ():
-                    if parked in self._parked:
-                        self._parked.remove(parked)
-                        self.shape.blocking.append(parked.op)
-                        parked.release()
 
     async def _next_event(self, tasks: set[Any]) -> None:
         """Wait until one of ``tasks`` finishes, a request is parked, or a job is first waited on."""
@@ -663,20 +652,40 @@ class TestAsyncCallShape:
         shape = await gate.run_async(late_caller())
         assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
 
+    @pytest.mark.parametrize("in_helper", [False, True], ids=["in-the-call", "in-a-helper-that-lives-on"])
     async def test_a_bounded_wait_on_the_release_reads_as_blocking(
-        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, monkeypatch: pytest.MonkeyPatch
+        self,
+        backend: CachekitIOBackend,
+        gate: _Gate,
+        saas: _FakeSaaS,
+        monkeypatch: pytest.MonkeyPatch,
+        in_helper: bool,
     ) -> None:
         """A check on the gate itself, through a release that regressed: it still runs in the background, but the
         caller then waits up to a bound for an Event the release sets. That wait bypasses the job's future, and
-        the gate must book the DELETE blocking all the same."""
+        the gate must book the DELETE blocking all the same, also when a helper task runs the bound, wakes the
+        caller once it expires, and lives on until the release lands."""
         released = asyncio.Event()
         loop = asyncio.get_running_loop()
         delete_lock_sync = CachekitIOBackend._delete_lock_sync
         acquire_fill_lock = CachekitIOBackend.acquire_fill_lock
+        helpers: list[asyncio.Future[None]] = []
 
         def delete_and_signal(self: CachekitIOBackend, lock_key: str, lock_id: str) -> None:
             delete_lock_sync(self, lock_key, lock_id)
             loop.call_soon_threadsafe(released.set)
+
+        async def bounded_wait() -> None:
+            # asyncio.wait sets its bound with call_later, a loop timer on every Python. wait_for (3.12+) uses call_soon
+            # instead if the deadline has passed by the time it is set: under load that is a wait of no length at all.
+            waiting = asyncio.ensure_future(released.wait())
+            await asyncio.wait({waiting}, timeout=0.001)
+            waiting.cancel()
+
+        async def bound_then_drain(expired: asyncio.Event) -> None:
+            await bounded_wait()
+            expired.set()
+            await released.wait()
 
         @contextlib.asynccontextmanager
         async def wait_for_the_release(
@@ -685,8 +694,12 @@ class TestAsyncCallShape:
             async with acquire_fill_lock(self, key, timeout, blocking_timeout) as grant:
                 yield grant
             await gate.arrival("DELETE /lock")  # parked, so the bound's timer fires while it is held
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(released.wait(), 0.001)
+            if not in_helper:
+                await bounded_wait()
+                return
+            expired = asyncio.Event()
+            helpers.append(asyncio.ensure_future(bound_then_drain(expired)))
+            await expired.wait()
 
         @cache(backend=backend, ttl=60, l1_enabled=False)
         async def fn(x: int) -> int:
@@ -699,11 +712,12 @@ class TestAsyncCallShape:
         shape = await gate.run_async(fn(1))
         assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])
 
-    async def test_a_background_timer_leaves_the_release_in_the_background(
+    async def test_any_timer_while_the_release_is_held_reads_as_blocking(
         self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS
     ) -> None:
-        """A check on the gate itself: a timer that fires while the release is held and the caller still runs is
-        not the caller's wait when background work set it, work that is still running once the caller returns."""
+        """A check on the gate itself, pinning the side it errs on: a timer of unrelated background work that fires
+        while the release is held and the caller still runs books the release blocking. The gate cannot tell it
+        from a bounded wait in a helper task, so the run fails rather than passes by mistake."""
 
         @cache(backend=backend, ttl=60, l1_enabled=False)
         async def fn(x: int) -> int:
@@ -711,21 +725,19 @@ class TestAsyncCallShape:
 
         await gate.run_async(fn(1))
         saas.fail_next_reads = 1
-        fired, finish = asyncio.Event(), asyncio.Event()
+        fired = asyncio.Event()
 
         async def background() -> None:
             await asyncio.sleep(0.001)
             fired.set()
-            await finish.wait()  # still running when the caller returns
 
         async def caller() -> int:
             value = await fn(1)
             await gate.arrival("DELETE /lock")
-            task = asyncio.ensure_future(background())  # the gate's drain holds it to the end
+            task = asyncio.ensure_future(background())
             await fired.wait()  # the background timer has fired while the release was held
-            assert not task.done()
-            finish.set()  # the task cannot run before this, the caller's last step, ends
+            assert task.done()  # and that work is over: nothing of the caller's waited on the release
             return value
 
         shape = await gate.run_async(caller())
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
+        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])
