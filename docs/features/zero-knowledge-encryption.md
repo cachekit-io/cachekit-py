@@ -767,9 +767,9 @@ didn't recently disable encryption for that function, investigate.
 
 ### Encryption Overhead
 
-An encrypted cache encrypts every value it stores and decrypts every hit. No harness has pinned that cost down. On the Performance Guide's [GitHub-Hosted Runner](../performance.md#github-hosted-runner) (AMD EPYC 7763), an L1 hit of a 23.5KB dict with an L2 backend configured took 313 ± 10μs plaintext and 323 ± 20μs encrypted, a difference inside the run-to-run noise (see [Not Measured Here](../performance.md#not-measured-here)). The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of the Performance Guide's [Instruction Budgets](../performance.md#instruction-budgets).
+An encrypted cache encrypts every value it stores and decrypts every hit. Through the decorator, the hosted benchmark could not separate that cost from run-to-run noise: in the Performance Guide's [GitHub-Hosted Runner](../performance.md#github-hosted-runner) table, the plaintext and encrypted arms of an L1 hit with a backend configured differ by less than their bands (see [Not Measured Here](../performance.md#not-measured-here)). The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of the guide's [Instruction Budgets](../performance.md#instruction-budgets).
 
-Run benchmarks: `pytest tests/performance/test_encryption_overhead.py -v -s`
+To time encryption per serializer on your own machine: `pytest tests/performance/test_encryption_overhead.py -v -s`
 
 ### Key Derivation (Per-Tenant)
 ```

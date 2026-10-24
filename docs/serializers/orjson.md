@@ -24,7 +24,7 @@ Without orjson installed, `get_serializer("orjson")` raises `ImportError: orjson
 - When human-readable format matters
 
 **Performance characteristics:**
-- Encoding: orjson, a Rust JSON library. No cachekit guard compares its speed with stdlib json or MessagePack, so the [Performance Guide](../performance.md#not-measured-here) publishes no figure for it
+- Encoding: orjson, a Rust JSON library. The [Performance Guide](../performance.md#not-measured-here) publishes no timing for it against stdlib json or MessagePack
 - Memory overhead: Low
 - Network overhead: JSON format (larger than msgpack, but human-readable)
 
@@ -129,11 +129,11 @@ except TypeError as e:
 
 ## Comparison with StandardSerializer
 
-No cachekit guard times OrjsonSerializer against stdlib json or StandardSerializer, so this table compares formats, not speed (see the [Performance Guide](../performance.md#not-measured-here)):
+This table compares formats, not speed:
 
 | Metric | orjson | msgpack+LZ4 | Note |
 |--------|--------|-------------|------|
-| Output size | Larger | Smaller | JSON is text |
+| Output size | Larger | Smaller | msgpack+LZ4 is compressed binary |
 | Human-readable | Yes ✅ | No ❌ | JSON is text |
 | Cross-language | Yes ✅ | Limited | JSON ubiquitous |
 
@@ -152,7 +152,7 @@ No cachekit guard times OrjsonSerializer against stdlib json or StandardSerializ
 - JSON-compatible types only (dict, list, str, int, float, bool, None)
 - NO binary data (`bytes`) → use StandardSerializer
 - NO arbitrary Python objects → convert to a dict first
-- Output is ~20-50% larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
+- Output is larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
 
 ---
 

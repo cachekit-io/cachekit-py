@@ -14,7 +14,7 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 |-----------|-------|----------|
 | [StandardSerializer](default.md) | Fast | General Python objects, cross-language SDK interop |
 | [AutoSerializer](auto.md) | Fast | Python-only — preserves tuples, sets, frozensets, UUID, NumPy, top-level DataFrame/Series |
-| [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
+| [OrjsonSerializer](orjson.md) | Fast | JSON-heavy APIs, cross-language interop, human-readable |
 | [ArrowSerializer](arrow.md) | — | pandas/polars DataFrames, any size |
 | [EncryptionWrapper](encryption.md) | Adds encrypt/decrypt | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer, which picks its decoder by inspecting the bytes) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
 | [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
@@ -31,7 +31,7 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 | Python-only with type preservation | AutoSerializer | Preserves tuples, sets, frozensets, UUID, NumPy |
 | JSON-heavy data | OrjsonSerializer | JSON-native, Rust-backed |
 | API response caching | OrjsonSerializer | JSON-native, human-readable |
-| Web session data | OrjsonSerializer | Fast JSON, cross-language |
+| Web session data | OrjsonSerializer | JSON-native, cross-language |
 | DataFrames, any size | ArrowSerializer | Columnar and exact; StandardSerializer refuses DataFrames |
 | Mixed object types | StandardSerializer | Broad type support |
 | Real-time data pipelines | ArrowSerializer | Columnar Arrow IPC |

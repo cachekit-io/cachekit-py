@@ -29,7 +29,7 @@ Every figure on this page comes from a guard in `tests/performance/`:
 
 ## Measured Figures
 
-Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guard, CPython 3.14.3, x86_64 Linux, 2026-10-03. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. These passes also timed the decorated hits and a Redis L2 hit, before later changes made those paths faster: the key memo and the L1-only fast path (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path)), the L2 cache handler built once per backend, and skipping disabled cache-op logging. The [GitHub-Hosted Runner](#github-hosted-runner) table has the current figures for those paths.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guard, CPython 3.14.3, x86_64 Linux, 2026-10-03. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine. The same sessions (2026-10-03 and 2026-10-04) also timed the decorated hits and a Redis L2 hit; later changes made those paths faster, and the [GitHub-Hosted Runner](#github-hosted-runner) table has their current figures.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
@@ -37,14 +37,14 @@ Each cell is the mean of five run medians ± its 95% t band (the summary's `Run 
 
 In this table the band is ±19% of its figure in pass 1 and ±11% in pass 2. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
 
-Run them yourself:
+Run it yourself:
 ```bash
 uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous -v -s
 ```
 
 ### GitHub-Hosted Runner
 
-The `Bench` workflow (`.github/workflows/bench.yml`) runs five of these guards on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. [Its run on 2026-10-23](https://github.com/cachekit-io/cachekit-py/actions/runs/39987019881) used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
+The `Bench` workflow (`.github/workflows/bench.yml`) runs five guards from `tests/performance/` on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. [Its run on 2026-10-23](https://github.com/cachekit-io/cachekit-py/actions/runs/39987019881) used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
 
 | Path | Guard (`tests/performance/`) | Run median |
 |------|------------------------------|-----------:|
@@ -65,7 +65,7 @@ REDIS_URL=redis://localhost:6379 uv run pytest tests/performance/test_production
   -k "complex_dict or dataframe or with_backend or encryption_overhead or redis_l2"
 ```
 
-Run locally without `REDIS_URL`, the Redis guard uses the pytest-redis server the suite starts. The encryption guard generates a throwaway key, so it needs no `CACHEKIT_MASTER_KEY`.
+Without `REDIS_URL`, the Redis guard uses the pytest-redis server the suite starts. The encryption guard generates a throwaway key, so it needs no `CACHEKIT_MASTER_KEY`.
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
 

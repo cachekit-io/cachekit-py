@@ -18,9 +18,9 @@ Python object
     ↓
 Serializer (MessagePack / Arrow / Orjson — your choice)
     ↓  [Rust ByteStorage takes over here]
-LZ4 compression  (fast, ~500MB/s)
+LZ4 compression
     ↓
-xxHash3-64 integrity hash  (~GB/s, detects corruption)
+xxHash3-64 integrity hash  (detects corruption)
     ↓
 [Optional] AES-256-GCM encryption  (if @cache.secure)
     ↓
@@ -35,7 +35,7 @@ The Rust layer is transparent — you configure serializers and encryption at th
 
 ## Why Rust for This Layer?
 
-ByteStorage runs LZ4 compression, xxHash3-64 checksums and AES-256-GCM in Rust, in one call per store or retrieve. cachekit-core's README publishes [measured figures](https://github.com/cachekit-io/cachekit-core#performance) for those calls on named GitHub-hosted runners. The Rust layer matters most for large payloads (DataFrames, bulk data), where compression, checksumming and encryption grow with payload size.
+ByteStorage runs LZ4 compression and xxHash3-64 checksums in Rust, and `@cache.secure` adds a separate Rust AES-256-GCM call. cachekit-core's README publishes [measured figures](https://github.com/cachekit-io/cachekit-core#performance) for those calls on named GitHub-hosted runners. The Rust layer matters most for large payloads (DataFrames, bulk data), where compression, checksumming and encryption grow with payload size.
 
 ---
 

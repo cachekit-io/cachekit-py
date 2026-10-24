@@ -331,7 +331,7 @@ field list and an example stats endpoint.
 
 ## Performance Impact
 
-Each recorded metric is a counter increment or a histogram observation in process memory. No guard times them, so the [Performance Guide](../performance.md) publishes no figure for metrics overhead. A memoised `@cache(backend=None)` hit records no Prometheus metric at all.
+No wall-clock guard times metrics recording, so the Performance Guide publishes no timing for it. Its [Instruction Budgets](../performance.md#instruction-budgets) give the instruction cost of an L2 hit with synchronous and with batched metrics recording.
 
 ---
 

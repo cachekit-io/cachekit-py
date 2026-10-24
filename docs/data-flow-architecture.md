@@ -485,7 +485,7 @@ def _blake2b_pickle_hash(args, kwargs):
 
 ### Performance Impact
 
-An L1 hit deserializes the cached bytes, an L2 hit adds a Redis round trip before it, and a miss runs your function. [Performance Characteristics](#performance-characteristics) below gives measured figures for each hit path.
+With a backend configured, an L1 hit deserializes the cached bytes, an L2 hit adds a Redis round trip before that, and a miss runs your function. See [Performance Characteristics](#performance-characteristics) below.
 
 ---
 
@@ -754,15 +754,7 @@ def deserialize(data: bytes, metadata) -> Any:
 
 ### Latency
 
-The Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table times whole hit paths on a GitHub-hosted AMD EPYC 7763 runner, for a 100-user nested dict (23.5KB as MessagePack):
-
-| Path | Run median |
-|------|-----------:|
-| L1-only hit, `@cache(backend=None)` | 0.906 ± 0.007μs |
-| L1 hit with an L2 backend configured | 310 ± 20μs |
-| Redis L2 hit, L1 disabled, Redis on the same machine | 551 ± 18μs |
-
-An L1-only hit hands back the cached object, so it deserializes nothing. With a backend configured, L1 holds bytes and every hit deserializes them. A miss costs your function's run time plus serializing and storing the result; no guard times it. No guard times the components (key generation, the lookup, serialization) on their own either: their deterministic costs are the Performance Guide's [Instruction Budgets](performance.md#instruction-budgets).
+The Performance Guide's [GitHub-Hosted Runner](performance.md#github-hosted-runner) table times whole hit paths on a named GitHub-hosted runner: an L1-only hit, an L1 hit with an L2 backend configured, and a Redis L2 hit. An L1-only hit hands back the cached object, so it deserializes nothing. With a backend configured, L1 holds bytes and every hit deserializes them, which is why that hit costs far more than an L1-only one. Neither of the guide's timing tables covers a miss, key generation or serialization on its own; its [Instruction Budgets](performance.md#instruction-budgets) give deterministic instruction counts for the `miss` path and for each serializer's round trip.
 
 ### Compression Ratios
 
