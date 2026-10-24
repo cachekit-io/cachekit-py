@@ -51,7 +51,7 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically whenever integrity checking is on (the default, and always under `@cache.secure`); it has no separate switch. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
+ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically whenever integrity checking is on (the default; `@cache.secure` forces it on for a serializer named by string, while a serializer instance you pass keeps its own setting); it has no separate switch. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
 
 ---
 
@@ -130,17 +130,17 @@ See [Zero-Knowledge Encryption](zero-knowledge-encryption.md) for full details.
 
 ## Choosing a Serializer
 
-Encryption is orthogonal to the serializer. Mix and match:
+Encryption works with any serializer whose class declares `cross_sdk_compatible = True`: Standard, Orjson, Arrow, or a custom serializer that opts in (see [Under Encryption](../serializers/custom.md#under-encryption)). AutoSerializer and unmarked custom serializers are refused. Mix and match:
 
 | Use Case | Serializer | Encryption |
 |----------|-----------|------------|
 | General caching | [Default (MessagePack)](../serializers/default.md) | Optional |
 | JSON APIs | [Orjson](../serializers/orjson.md) | Optional |
 | DataFrames / ML | [Arrow](../serializers/arrow.md) | Optional |
-| Typed models | [Pydantic](../serializers/pydantic.md) | Optional |
-| Custom types | [Custom](../serializers/custom.md) | Optional |
+| Typed models | [Pydantic](../serializers/pydantic.md) | Only if marked `cross_sdk_compatible` |
+| Custom types | [Custom](../serializers/custom.md) | Only if marked `cross_sdk_compatible` |
 
-StandardSerializer, and AutoSerializer for MessagePack values, use ByteStorage (LZ4 + xxHash3-64); OrjsonSerializer and ArrowSerializer write their own xxHash3-64 prefix instead (Orjson only with integrity checking on). `@cache.secure` adds AES-256-GCM over the output of any of Standard, Orjson or Arrow.
+StandardSerializer, and AutoSerializer for MessagePack values, use ByteStorage (LZ4 + xxHash3-64); OrjsonSerializer and ArrowSerializer write their own xxHash3-64 prefix instead (Orjson only with integrity checking on). `@cache.secure` adds AES-256-GCM over the output of any of Standard, Orjson, Arrow or an opted-in custom serializer.
 
 ---
 
