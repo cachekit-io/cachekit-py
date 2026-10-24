@@ -489,7 +489,7 @@ L1-only mode (`backend=None`) skips this layer: it stores the Python object itse
 
 ### Performance Impact
 
-With a backend configured, an L1 hit deserializes the cached bytes, an L2 hit adds a Redis round trip before that, and a miss runs your function. See [Performance Characteristics](#performance-characteristics) below.
+With a backend configured, an L1 hit deserializes the cached bytes, an L2 hit adds a lookup in the configured backend before that, and a miss runs your function. See [Performance Characteristics](#performance-characteristics) below.
 
 ---
 
