@@ -153,8 +153,8 @@ class TestCircuitBreakerConfig:
         assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
 
     def test_validate_numpy_values(self) -> None:
-        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or an array is refused with
-        ConfigurationError (every array has __index__, but only a 0-d integer array converts)."""
+        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or an array, a 0-d integer one
+        included, is refused with ConfigurationError."""
         np = pytest.importorskip("numpy")
         for timeout in (np.float64(0.5), np.float32(0.5), np.int64(30)):
             config = CircuitBreakerConfig(
@@ -164,7 +164,7 @@ class TestCircuitBreakerConfig:
                 half_open_requests=np.int8(2),
             )
             assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
-        for bad in (np.float64(5.0), np.array(1.5), np.array([5])):
+        for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
             with pytest.raises(ConfigurationError, match="failure_threshold must be a whole number >= 1"):
                 CircuitBreakerConfig(failure_threshold=bad).validate()
         for bad in (np.float64("nan"), np.array(30.0), np.True_):
@@ -237,6 +237,9 @@ class TestBackpressureConfig:
             assert DecoratorConfig(backpressure=config).backpressure is config
         with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
             BackpressureConfig(timeout=np.float32(0.5)).validate()
+        for field in ("max_concurrent_requests", "queue_size"):
+            with pytest.raises(ConfigurationError, match=f"{field} must be a whole number >= 1"):
+                BackpressureConfig(**{field: np.array(8)}).validate()
 
     @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
     def test_validate_queue_size_invalid(self, queue_size: float) -> None:

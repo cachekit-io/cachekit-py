@@ -85,7 +85,7 @@ class TestCircuitBreakerConfig:
             CircuitBreakerConfig(**{field: bad})
 
     def test_numpy_values(self):
-        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or an array is refused."""
+        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or any array is refused."""
         np = pytest.importorskip("numpy")
         config = CircuitBreakerConfig(
             failure_threshold=np.int64(4),
@@ -94,7 +94,7 @@ class TestCircuitBreakerConfig:
             half_open_requests=np.int8(2),
         )
         assert (config.failure_threshold, config.timeout_seconds) == (4, 1.5)
-        for bad in (np.float64(5.0), np.array(1.5), np.array([5])):
+        for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
             with pytest.raises(ValueError, match="failure_threshold must be a whole number >= 1"):
                 CircuitBreakerConfig(failure_threshold=bad)
 

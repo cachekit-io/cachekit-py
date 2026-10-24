@@ -21,13 +21,13 @@ if TYPE_CHECKING:
 
 
 def _is_count(value: object) -> bool:
-    """Whether value is a whole number >= 1 (an int or a NumPy integer). A bool is refused: it is an int, but never a count."""
-    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
+    """Whether value is a whole number >= 1 (an int or a NumPy integer). A bool is refused: it is an int, but never a count.
+
+    numbers.Integral, not SupportsIndex: every NumPy array has __index__, and a 0-d integer array converts.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
         return False
-    try:
-        return operator.index(value) >= 1
-    except TypeError:  # every NumPy array has __index__, but only a 0-d integer array converts
-        return False
+    return operator.index(value) >= 1
 
 
 def _is_cooldown(value: object) -> bool:
