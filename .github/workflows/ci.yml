@@ -421,7 +421,7 @@ jobs:
       if: ${{ !cancelled() }}
       run: uv run pytest --markdown-docs README.md docs/
 
-  # pandas 3 safety net. The lockfile resolves pandas 2.x, so every other job
+  # pandas 3 safety net. The lockfile resolves pandas 2.x below Python 3.15, so every other job
   # tests that, while a fresh install resolves the newest pandas, and pandas 3
   # changes copy semantics (copy-on-write) in ways 2.x cannot show. This job
   # overlays the newest pandas 3.x on the locked environment and runs the unit

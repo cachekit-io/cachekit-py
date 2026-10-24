@@ -251,7 +251,10 @@ dev = [
     "pip-audit>=2.7.0",
     # Data science support (for testing AutoSerializer with numpy/pandas)
     "numpy>=2.0.2",
-    "pandas>=2.2.2",
+    # The lock holds pandas 2.x on purpose: the test-pandas3 CI job overlays 3.x. 3.15 is the
+    # exception, because 3.0.6 is the first pandas release with cp315 wheels.
+    "pandas>=2.2.2,<3; python_version < '3.15'",
+    "pandas>=3.0.6; python_version >= '3.15'",
     "pyarrow>=21.0.0",
     # OrjsonSerializer support — now the [json] optional extra; kept here so the
     # orjson tests, doctests, and markdown-docs still resolve it in dev/CI.
