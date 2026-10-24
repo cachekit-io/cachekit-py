@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.25.0](https://github.com/cachekit-io/cachekit-py/compare/v0.24.1...v0.25.0) (2026-10-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* `cachekit.monitoring.CircuitBreakerProtocol` now requires a `get_stats() -> dict` method instead of the `state`, `failure_count`, `success_count` and `last_failure_time` properties. The dict holds `state` (the upper-case state name: `"CLOSED"`, `"OPEN"` or `"HALF_OPEN"`), `failure_count`, `success_count` and `last_failure_time` (epoch seconds of the last counted failure, `0.0` before the first). `HealthChecker` reads a circuit breaker only through `get_stats()`, and a state it does not recognise now reports UNHEALTHY instead of falling through to HEALTHY. `cachekit.reliability.CircuitBreaker` already implements the method. `BackpressureConfig.queue_size` and `timeout` now take effect. `BackpressureConfig.validate()`, which `DecoratorConfig` runs, raises `ConfigurationError` when `max_concurrent_requests` or `queue_size` is not a whole number >= 1 (a bool, a float or NaN included), or when `timeout` is not an int or float from 0 to `threading.TIMEOUT_MAX` (None, a str, a bool, a `Decimal`, a `Fraction` or NaN included). Those `queue_size` and `timeout` values were previously accepted and ignored, and such a `max_concurrent_requests` was accepted and disabled the limit.
+
+### Bug Fixes
+
+* **deps:** floor filelock at 4.2.1 on Python 3.11+ for pip-audit (LAB-10807) ([#629](https://github.com/cachekit-io/cachekit-py/issues/629)) ([234e3e2](https://github.com/cachekit-io/cachekit-py/commit/234e3e2a822186de5dbb6c7cecc1ed27b91e855c))
+* **readme:** replace the unmeasured performance figures with measured ones (LAB-10638) ([#622](https://github.com/cachekit-io/cachekit-py/issues/622)) ([9d00c5e](https://github.com/cachekit-io/cachekit-py/commit/9d00c5ece33af57b98111629373b0f7d63831fdd))
+* **security:** make security-medium mirror the Security Medium workflow (LAB-10606) ([#621](https://github.com/cachekit-io/cachekit-py/issues/621)) ([60c5182](https://github.com/cachekit-io/cachekit-py/commit/60c5182a92c161a8c311027ce845e3b1c767de89))
+* **serializers:** count empty collections toward the nesting bound; the guard's ValueError replaces msgpack's StackError (LAB-6485) ([#618](https://github.com/cachekit-io/cachekit-py/issues/618)) ([39320e5](https://github.com/cachekit-io/cachekit-py/commit/39320e5218aaac21a25ec56c2c01c1bf779d3f59))
+* six defects in health checks, backpressure wiring and serializer and breaker docs (LAB-10106) ([#615](https://github.com/cachekit-io/cachekit-py/issues/615)) ([a46c9c1](https://github.com/cachekit-io/cachekit-py/commit/a46c9c168bea6cb133c380191ec03588d38ba83b))
+
+
+### Performance Improvements
+
+* **decorators:** memoise generated keys and serve L1-only hits on a fast path (LAB-10663) ([#625](https://github.com/cachekit-io/cachekit-py/issues/625)) ([75440ff](https://github.com/cachekit-io/cachekit-py/commit/75440ffec434bc5b21ceb31b1243eb800dc9c54a))
+
 ## [0.24.1](https://github.com/cachekit-io/cachekit-py/compare/v0.24.0...v0.24.1) (2026-10-21)
 
 

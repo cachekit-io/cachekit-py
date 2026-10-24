@@ -68,7 +68,7 @@ Example Usage:
     ```
 """
 
-__version__ = "0.24.1"
+__version__ = "0.25.0"
 
 from collections.abc import Callable
 from typing import Any, TypeVar
