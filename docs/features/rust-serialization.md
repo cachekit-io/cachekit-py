@@ -140,7 +140,7 @@ Encryption works with any serializer whose class declares `cross_sdk_compatible 
 | Typed models | [Pydantic](../serializers/pydantic.md) | Only if marked `cross_sdk_compatible` |
 | Custom types | [Custom](../serializers/custom.md) | Only if marked `cross_sdk_compatible` |
 
-StandardSerializer, and AutoSerializer for MessagePack values, use ByteStorage (LZ4 + xxHash3-64); OrjsonSerializer and ArrowSerializer write their own xxHash3-64 prefix instead (Orjson only with integrity checking on). `@cache.secure` adds AES-256-GCM over the output of any of Standard, Orjson, Arrow or an opted-in custom serializer.
+With integrity checking on, StandardSerializer, and AutoSerializer for MessagePack values, use ByteStorage (LZ4 + xxHash3-64); OrjsonSerializer and ArrowSerializer write their own xxHash3-64 prefix instead (Orjson only with integrity checking on). `@cache.secure` adds AES-256-GCM over the output of any of Standard, Orjson, Arrow or an opted-in custom serializer.
 
 ---
 
