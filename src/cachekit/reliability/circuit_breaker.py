@@ -139,7 +139,9 @@ class CircuitBreakerConfig:
         # would let a spent HALF_OPEN cycle restart on every clock tick, removing
         # the half_open_requests-per-timeout cap on probes.
         if not _is_cooldown(self.timeout_seconds):
-            raise ValueError(f"timeout_seconds must be a finite number > 0, got {self.timeout_seconds!r}")
+            raise ValueError(
+                f"timeout_seconds must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0, got {self.timeout_seconds!r}"
+            )
 
 
 @dataclass

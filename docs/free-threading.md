@@ -13,7 +13,8 @@ is made for it.)
 - **From the release after 0.24.1, CPython 3.15 and later get one
   free-threaded stable-ABI (`abi3t`) wheel per platform** (`cp315-abi3.abi3t`),
   which loads on both the GIL and the free-threaded build. On 3.15t, `pip install --only-binary :all: cachekit`
-  installs cachekit and every runtime dependency from wheels. See
+  (pip 26.1+ or uv 0.11.3+) installs cachekit and every runtime dependency
+  from wheels. See
   [CPython 3.15+: one abi3t wheel](#cpython-315-one-abi3t-wheel).
 - **No 3.14t (`cp314t`) wheel is published**, and installing cachekit on a
   free-threaded interpreter is not officially supported. See
@@ -92,7 +93,7 @@ covered, plus what the free-threaded CI lane surfaced and sites added since:
    The 3.15t leg builds the extension as the release does, as abi3t, by
    setting `MATURIN_PEP517_ARGS="--features pyo3/abi3t-py315"`, and asserts
    that `_rust_serializer.abi3t.so` is the module it loaded. The GIL 3.15 leg
-   of the `test` job builds abi3t the same way.
+   of the `test` job (push matrix only) builds and asserts abi3t the same way.
 
    The `test` dependency group is the core test toolchain. orjson, numpy,
    pandas and pyarrow live only in the `dev` group and the `[data]`/`[json]`
@@ -254,7 +255,7 @@ the GIL off (72,000 shared-backend operations) failed none.
 ## CPython 3.15+: one abi3t wheel
 
 From 3.15, each `build-wheels` row in `.github/workflows/release-please.yml`
-builds per-version wheels for 3.10 to 3.14 plus one
+builds per-version wheels for each supported CPython below 3.15 plus one
 `cp315-abi3.abi3t-<platform>` wheel, with PyO3's `abi3t-py315` feature on
 (PEP 803). One wheel serves the GIL and the free-threaded builds of 3.15 and
 of every later CPython, so a new CPython release gets a wheel on its release
@@ -277,7 +278,7 @@ after a benchmark against per-version `cp315` / `cp315t` builds, with the rule
 fixed before measuring: abi3t ships for an interpreter only if every point's
 95% upper bound of abi3t ÷ per-version is 1.10 or less (the repo's own 10%
 serializer regression bar, `make benchmark-compare`). Otherwise 3.15 keeps
-per-version wheels (with or without an extra abi3t wheel for 3.15t). Both
+per-version wheels. Both
 interpreters passed, so **abi3t replaces the cp315 per-version wheel**. The
 largest estimate was GIL 3.15 `verify_checksum` at 64 B: +3.7% (upper bound
 +4.7%), about 6 ns per call. The largest upper bound was 3.15t

@@ -84,7 +84,7 @@ jobs:
       if: success() || failure()
       run: cd rust && cargo clippy --locked -- -D warnings
 
-  # PR: floor (3.10) + 3.12, unit + critical; executable docs on 3.12 only
+  # PR: floor (3.11) + 3.12, unit + critical; executable docs on 3.12 only
   # Push: full matrix, full test suite
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -96,7 +96,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ github.event_name == 'push' && fromJSON('["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]') || fromJSON('["3.10", "3.12"]') }}
+        python-version: ${{ github.event_name == 'push' && fromJSON('["3.11", "3.12", "3.13", "3.14", "3.15"]') || fromJSON('["3.11", "3.12"]') }}
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -109,8 +109,8 @@ jobs:
         version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         cache-suffix: py${{ matrix.python-version }}  # setup-uv keys on lockfile hash only, not job/matrix
 
-    # pyo3 is built per interpreter (abi3t from 3.15), so key the Rust cache per matrix
-    # leg — with one shared key the first leg to save wins and every other leg
+    # pyo3's build flags differ per leg (per-interpreter, abi3t on 3.15), so key the Rust
+    # cache per matrix leg — with one shared key the first leg to save wins and every other leg
     # restores foreign pyo3 artifacts and rebuilds anyway (cargo fingerprints
     # catch the mismatch), so the cache would thrash instead of hit.
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -297,9 +297,9 @@ jobs:
   # Free-threaded CPython safety net. Runs the core suites on the 3.14 and
   # 3.15 free-threaded builds and fails if the GIL gets re-enabled, so code
   # whose correctness silently depended on the GIL's memory ordering cannot
-  # regress unnoticed. Optional native deps without free-threaded wheels
-  # (orjson, numpy, pandas, pyarrow) are dev-group-only and stay out
-  # (--group test); hiredis is skipped because it does not declare
+  # regress unnoticed. The optional native deps (orjson, numpy, pandas,
+  # pyarrow) are dev-group or extras only and stay out (--group test);
+  # orjson ships no free-threaded wheels, and [data] is not exercised here; hiredis is skipped because it does not declare
   # free-threaded support — importing it re-enables the GIL — and redis-py
   # transparently falls back to its pure-Python parser.
   test-freethreaded:
@@ -566,10 +566,10 @@ jobs:
 
     - name: Scan Python dependencies for CVEs
       run: |
-        # No suppressions: every prior CVE is resolved at source on the py3.10+
+        # No suppressions: every prior CVE is resolved at source on the py3.11+
         # resolution. Vulnerable dev-only transitives are floored via
         # [tool.uv] constraint-dependencies; pygments/pyarrow advisories cleared
-        # by their py3.10+ fix versions. Keep this list IDENTICAL to
+        # by their py3.11+ fix versions. Keep this list IDENTICAL to
         # security-fast.yml's pip-audit so the two cannot drift.
         uv run pip-audit --desc
 

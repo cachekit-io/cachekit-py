@@ -219,7 +219,9 @@ class CircuitBreakerConfig:
         # The cooldown also bounds a cycle's probe slots to half_open_requests per
         # cooldown; at 0 a spent cycle restarts on every clock tick, without bound.
         if not _is_cooldown(self.recovery_timeout):
-            raise ConfigurationError(f"recovery_timeout must be a finite number > 0, got {self.recovery_timeout!r}")
+            raise ConfigurationError(
+                f"recovery_timeout must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0, got {self.recovery_timeout!r}"
+            )
 
 
 @dataclass(frozen=True)

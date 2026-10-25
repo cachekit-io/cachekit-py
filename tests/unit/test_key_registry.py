@@ -13,10 +13,9 @@ import asyncio
 import contextvars
 import logging
 import os
-import sys
 import threading
 import time
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -808,16 +807,12 @@ class TestL1InvalidateMany:
         assert l1.get("k2499") == (False, None)
 
 
-class _NS(str, Enum):
+class _NS(str, Enum):  # noqa: UP042 - the str mixin is the case under test
     USERS = "users"
 
 
-class _StrEnumNS(str, Enum):
-    """enum.StrEnum's rendering (3.11+), spelled out so the test also runs on 3.10."""
-
+class _StrEnumNS(StrEnum):
     USERS = "users"
-    __str__ = str.__str__
-    __format__ = str.__format__
 
 
 class _FormatsAs(str):
@@ -954,8 +949,7 @@ class TestNamespaceExactStr:
             ("users", None, None),
             (_StrEnumNS.USERS, None, None),
             (None, None, None),
-            # f"{member}" is "_NS.USERS" only from 3.11; on 3.10 the set name never moved.
-            (_NS.USERS, None, "_NS.USERS" if sys.version_info >= (3, 11) else None),
+            (_NS.USERS, None, "_NS.USERS"),
             # 0.20.0 shipped the registry with interop's exact-str rebind: no pre-fix set exists.
             (_NS.USERS, "get_user", None),
         ],

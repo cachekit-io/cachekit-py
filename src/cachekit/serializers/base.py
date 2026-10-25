@@ -150,7 +150,7 @@ class CrossSDKSerializerProtocol(SerializerProtocol, Protocol):
     cross_sdk_compatible: ClassVar[bool]
 
 
-class SerializerType(str, Enum):
+class SerializerType(str, Enum):  # noqa: UP042 - StrEnum would change str() of members
     """Available serialization strategies (user-facing API).
 
     USER-FACING: Defines which serializer **implementation** to use.
