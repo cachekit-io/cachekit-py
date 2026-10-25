@@ -531,7 +531,8 @@ jobs:
 
   # The shards' verdicts as one PR comment, so a FAIL or WARN does not hide in four job logs. Two jobs keep
   # the write token away from repository code: this one renders the comment with read-only scopes (actions:
-  # read lists the shard jobs, to link a shard that left no report), and perf-ir-comment, which never checks
+  # read lists the shard jobs and their artifacts, to link a shard that left no report and to drop a report
+  # an earlier attempt left behind), and perf-ir-comment, which never checks
   # out the repository, posts it. Fork PRs are skipped: their token cannot write to the PR. A cancelled run
   # (a newer push) posts nothing, so it cannot overwrite the newer run's comment.
   perf-ir-report:
@@ -564,12 +565,14 @@ jobs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-          --jq '.jobs[] | {name, html_url, conclusion}' > "$RUNNER_TEMP/jobs.jsonl"
+          --jq '.jobs[] | {name, html_url, conclusion, started_at}' > "$RUNNER_TEMP/jobs.jsonl"
+        gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+          --jq '.artifacts[] | {name, created_at}' > "$RUNNER_TEMP/artifacts.jsonl"
         delimiter="EOF_$(openssl rand -hex 16)"
         {
           echo "body<<$delimiter"
           python3 tests/performance/ir_report.py --reports "$RUNNER_TEMP/reports" --shards 4 --jobs "$RUNNER_TEMP/jobs.jsonl" \
-            --head "$(git rev-parse HEAD^2)" --base "$(git rev-parse HEAD^1)" --run-url "$RUN_URL"
+            --artifacts "$RUNNER_TEMP/artifacts.jsonl" --head "$(git rev-parse HEAD^2)" --base "$(git rev-parse HEAD^1)" --run-url "$RUN_URL"
           echo "$delimiter"
         } >> "$GITHUB_OUTPUT"
 

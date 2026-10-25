@@ -17,6 +17,8 @@ JOBS = {
     f"Instruction budget (shard {k}/4)": {
         "html_url": f"https://github.com/o/r/actions/runs/1/job/{k}",
         "conclusion": c,
+        "started_at": "2026-10-25T01:30:05Z",
+        "report_at": "2026-10-25T01:40:00Z",
     }
     for k, c in ((1, "success"), (2, "success"), (3, "success"), (4, "success"))
 }
@@ -89,15 +91,31 @@ def test_a_missing_shard_is_incomplete_and_links_its_job(other: str) -> None:
     assert row in body.splitlines()
 
 
-@pytest.mark.parametrize(("verdict", "conclusion"), [("PASS", "failure"), ("FAIL", "success"), ("PASS", "cancelled")])
-def test_a_report_its_job_did_not_end_with_is_no_result(verdict: str, conclusion: str) -> None:
-    """A re-run shard that dies before its upload leaves the earlier attempt's report: an old PASS must not count."""
+@pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
+def test_a_report_uploaded_before_its_job_started_is_no_result(verdict: str) -> None:
+    """A re-run shard that dies before its upload leaves the earlier attempt's report: it must not count."""
     reports = _all_ok()
-    reports[3] = _report(("l2_hit", "ok", 1, 1, 0.0), verdict=verdict)
+    reports[3] = _report(("l2_hit", "FAIL" if verdict == "FAIL" else "ok", 1, 1, 0.0), verdict=verdict)
     name = "Instruction budget (shard 3/4)"
-    body = render(reports, 4, JOBS | {name: JOBS[name] | {"conclusion": conclusion}}, "aaa", "bbb", RUN)
+    rerun = JOBS[name] | {"conclusion": "failure", "started_at": "2026-10-25T02:00:00Z"}  # report_at 01:40, attempt 1
+    body = render(reports, 4, JOBS | {name: rerun}, "aaa", "bbb", RUN)
     assert "### Instruction budget: INCOMPLETE" in body
     assert "`l2_hit`" not in body
+    assert "| **no result** | [Instruction budget (shard 3/4)](https://github.com/o/r/actions/runs/1/job/3) (failure) |" in body
+
+
+def test_a_shard_a_partial_rerun_skipped_keeps_its_report() -> None:
+    """A partial re-run lists the shards it skipped with their original start times, before their uploads."""
+    name = "Instruction budget (shard 2/4)"
+    rerun = JOBS[name] | {"started_at": "2026-10-25T01:47:30Z", "report_at": "2026-10-25T02:00:09Z"}
+    assert "### Instruction budget: PASS" in render(_all_ok(), 4, JOBS | {name: rerun}, "aaa", "bbb", RUN)
+
+
+@pytest.mark.parametrize("drop", ["started_at", "report_at"])
+def test_a_report_with_no_upload_or_start_time_is_no_result(drop: str) -> None:
+    name = "Instruction budget (shard 1/4)"
+    job = {key: value for key, value in JOBS[name].items() if key != drop}
+    assert "### Instruction budget: INCOMPLETE" in render(_all_ok(), 4, JOBS | {name: job}, "aaa", "bbb", RUN)
 
 
 def test_a_missing_shard_without_a_listed_job_links_the_run() -> None:
@@ -125,19 +143,26 @@ def test_ci_names_the_marker_and_the_shard_jobs() -> None:
     ci = (Path(__file__).parents[2] / ".github" / "workflows" / "ci.yml").read_text()
     assert f"marker='{MARKER}'" in ci
     assert "name: " + ir_report.JOB_NAME.format(k="${{ matrix.shard }}", n=4) in ci
+    assert "name: " + ir_report.ARTIFACT.format(k="${{ matrix.shard }}") in ci
 
 
 def test_the_cli_renders_shard_files(tmp_path) -> None:
-    """As CI runs it: system python, one ir-report-K.json per shard (shard 2 left its placeholder), jobs as JSON lines."""
+    """As CI runs it: system python, one ir-report-K.json per shard (shard 2 left its placeholder), API lists as JSON lines."""
     reports = tmp_path / "reports"
     reports.mkdir()
     for k in (1, 3, 4):
         (reports / f"ir-report-{k}.json").write_text(json.dumps(_report((f"p{k}", "ok", 1, 1, 0.0))))
     (reports / "ir-report-2.json").write_text("{}\n")
     jobs = tmp_path / "jobs.jsonl"
-    jobs.write_text("".join(json.dumps({"name": n} | j) + "\n" for n, j in JOBS.items()))
+    listed = {n: {key: v for key, v in j.items() if key != "report_at"} for n, j in JOBS.items()}  # as the API lists them
+    jobs.write_text("".join(json.dumps({"name": n} | j) + "\n" for n, j in listed.items()))
+    artifacts = tmp_path / "artifacts.jsonl"
+    artifacts.write_text(
+        "".join(json.dumps({"name": f"perf-ir-report-{k}", "created_at": "2026-10-25T01:40:00Z"}) + "\n" for k in range(1, 5))
+    )
     script = Path(ir_report.__file__)
-    args = ["--reports", reports, "--shards", "4", "--jobs", jobs, "--head", "aaa", "--base", "bbb", "--run-url", RUN]
+    args = ["--reports", reports, "--shards", "4", "--jobs", jobs, "--artifacts", artifacts]
+    args += ["--head", "aaa", "--base", "bbb", "--run-url", RUN]
     cmd = [sys.executable, str(script), *map(str, args)]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout  # noqa: S603 (trusted: this repo's script)
     assert out == render({k: load_report(reports / f"ir-report-{k}.json") for k in range(1, 5)}, 4, JOBS, "aaa", "bbb", RUN)
