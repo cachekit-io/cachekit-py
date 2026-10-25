@@ -84,7 +84,7 @@ jobs:
       if: success() || failure()
       run: cd rust && cargo clippy --locked -- -D warnings
 
-  # PR: floor (3.10) + 3.12, unit + critical; executable docs on 3.12 only
+  # PR: floor (3.11) + 3.12, unit + critical; executable docs on 3.12 only
   # Push: full matrix, full test suite
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -96,7 +96,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ github.event_name == 'push' && fromJSON('["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]') || fromJSON('["3.10", "3.12"]') }}
+        python-version: ${{ github.event_name == 'push' && fromJSON('["3.11", "3.12", "3.13", "3.14", "3.15"]') || fromJSON('["3.11", "3.12"]') }}
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -544,10 +544,10 @@ jobs:
 
     - name: Scan Python dependencies for CVEs
       run: |
-        # No suppressions: every prior CVE is resolved at source on the py3.10+
+        # No suppressions: every prior CVE is resolved at source on the py3.11+
         # resolution. Vulnerable dev-only transitives are floored via
         # [tool.uv] constraint-dependencies; pygments/pyarrow advisories cleared
-        # by their py3.10+ fix versions. Keep this list IDENTICAL to
+        # by their py3.11+ fix versions. Keep this list IDENTICAL to
         # security-fast.yml's pip-audit so the two cannot drift.
         uv run pip-audit --desc
 

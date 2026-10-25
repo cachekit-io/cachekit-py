@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args, overload
+from typing import Any, Self, TypeVar, cast, get_args, overload
 
 from pydantic import GetCoreSchemaHandler, SecretBytes, SecretStr, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
@@ -13,9 +13,6 @@ from pydantic_core.core_schema import ErrorType
 from pydantic_settings import BaseSettings, SettingsError
 
 from cachekit.hash_utils import redact_error_for_log
-
-if TYPE_CHECKING:
-    from typing_extensions import Self  # typing.Self is 3.11+
 
 logger = logging.getLogger(__name__)
 

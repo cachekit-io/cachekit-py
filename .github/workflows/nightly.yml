@@ -90,7 +90,7 @@ jobs:
   # the built wheel at the lowest versions its metadata allows, on the oldest
   # supported Python, and runs the unit suite against that wheel.
   dependency-floors:
-    name: Unit suite (Python 3.10, dependency floors)
+    name: Unit suite (Python 3.11, dependency floors)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -106,10 +106,10 @@ jobs:
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
-        key: py3.10
+        key: py3.11
 
     - name: Build the wheel
-      run: uv build --wheel --python 3.10 --out-dir dist
+      run: uv build --wheel --python 3.11 --out-dir dist
 
     - name: Resolve the wheel at its floors
       run: |
@@ -117,20 +117,20 @@ jobs:
         echo "cachekit[data,json,memcached] @ file://$PWD/$wheel" > "$RUNNER_TEMP/floors.in"
         # python-dateutil 2.8.2 pulls six 1.5.0, whose lazy _gdbm import breaks Hypothesis's module scan.
         echo "six>=1.16.0" > "$RUNNER_TEMP/overrides.txt"
-        uv pip compile "$RUNNER_TEMP/floors.in" --python-version 3.10 --resolution lowest \
+        uv pip compile "$RUNNER_TEMP/floors.in" --python-version 3.11 --resolution lowest \
           --override "$RUNNER_TEMP/overrides.txt" --no-header --output-file "$RUNNER_TEMP/floors.txt"
         cat "$RUNNER_TEMP/floors.txt"
 
     # Test tools come from the lock; the project itself is not installed, so the
     # only cachekit on the path is the wheel in the floors overlay below.
     - name: Install test tools from the lock
-      run: uv sync --python 3.10 --group dev --no-install-project
+      run: uv sync --python 3.11 --group dev --no-install-project
 
     # The floors are read from the installed wheel's own metadata, so a floor
     # raised in pyproject.toml is checked here without editing this file.
     - name: Assert the data extra resolved at its floors
       run: |
-        uv run --python 3.10 --no-sync --with-requirements "$RUNNER_TEMP/floors.txt" python - <<'PY'
+        uv run --python 3.11 --no-sync --with-requirements "$RUNNER_TEMP/floors.txt" python - <<'PY'
         import importlib.metadata as md
         import cachekit
         from packaging.requirements import Requirement
@@ -159,7 +159,7 @@ jobs:
       env:
         REDIS_URL: redis://localhost:6379
       run: |
-        uv run --python 3.10 --no-sync --with-requirements "$RUNNER_TEMP/floors.txt" \
+        uv run --python 3.11 --no-sync --with-requirements "$RUNNER_TEMP/floors.txt" \
           pytest tests/unit/ -m "not slow" -n auto -o pythonpath= -rs
 
   # A scheduled job that fails silently is worse than none: open or update one

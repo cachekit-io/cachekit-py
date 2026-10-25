@@ -5,7 +5,7 @@ connection pool status, circuit breaker state, and metrics collection.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -39,7 +39,7 @@ class TestHealthChecker:
 
     def test_component_health_to_dict(self):
         """Test ComponentHealth serialization."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         component = ComponentHealth(
             name="test_component",
             status=HealthStatus.HEALTHY,
@@ -148,12 +148,11 @@ class TestHealthChecker:
     @pytest.mark.asyncio
     async def test_async_redis_health_check_timeout(self, health_checker):
         """Test Redis health check with timeout."""
-        import asyncio
 
         with patch("cachekit.health.container") as mock_container:
             with patch("cachekit.health.asyncio.wait_for") as mock_wait_for:
                 # Simulate timeout
-                mock_wait_for.side_effect = asyncio.TimeoutError()
+                mock_wait_for.side_effect = TimeoutError()
                 mock_provider = Mock()
                 mock_container.get.return_value = mock_provider
 
@@ -247,7 +246,7 @@ class TestHealthChecker:
             assert "OPEN" in component.message
             assert component.details["state"] == "OPEN"
             assert component.details["failure_count"] == 2
-            assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, timezone.utc).isoformat()
+            assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, UTC).isoformat()
             json.dumps(component.to_dict())  # the health endpoint returns this dict as JSON
 
             traveller.shift(31)
@@ -261,7 +260,7 @@ class TestHealthChecker:
             component = health_checker._check_circuit_breaker()
             assert component.status == HealthStatus.HEALTHY
             assert component.details["state"] == "CLOSED"
-            assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, timezone.utc).isoformat()
+            assert component.details["last_failure_time"] == datetime.fromtimestamp(failed_at, UTC).isoformat()
 
     def test_circuit_breaker_unknown_state_is_unhealthy(self):
         """A state outside CLOSED, OPEN and HALF_OPEN (here lowercase) is never read as HEALTHY."""

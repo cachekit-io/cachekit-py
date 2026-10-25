@@ -6,7 +6,7 @@ to fix 'can not serialize Timestamp object' errors.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 
 from cachekit.serializers.auto_serializer import AutoSerializer
 
@@ -29,7 +29,7 @@ class TestAutoSerializerDatetime:
     def test_serialize_datetime_with_timezone(self):
         """Test serializing datetime with timezone info."""
         serializer = AutoSerializer()
-        dt = datetime(2025, 11, 13, 15, 30, 45, tzinfo=timezone.utc)
+        dt = datetime(2025, 11, 13, 15, 30, 45, tzinfo=UTC)
         data = {"timestamp": dt}
 
         serialized, metadata = serializer.serialize(data)
@@ -37,7 +37,7 @@ class TestAutoSerializerDatetime:
 
         assert isinstance(deserialized["timestamp"], datetime)
         assert deserialized["timestamp"] == dt
-        assert deserialized["timestamp"].tzinfo == timezone.utc
+        assert deserialized["timestamp"].tzinfo == UTC
 
     def test_serialize_date_object(self):
         """Test serializing a date object."""

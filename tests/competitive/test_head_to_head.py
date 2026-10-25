@@ -33,7 +33,7 @@ import enum
 import math
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 
@@ -376,7 +376,7 @@ class TestRichTypes:
 
     def test_datetime_preservation(self):
         """datetime should preserve through all caches."""
-        dt = datetime(2026, 3, 28, 12, 0, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 3, 28, 12, 0, 0, tzinfo=UTC)
 
         def fn():
             return dt
