@@ -3,12 +3,12 @@
 Error trackers capture the locals of every frame on a raised exception's traceback, and on every exception chained to it, by
 default (Sentry's ``include_local_variables``), and serialise an object they do not recognise by its repr. redis-py's client,
 connection pool and pipeline list every connection argument in their repr, the password included, and redis-py's frames
-hold them, and the AUTH arguments, as locals. So the error must reach none of those frames: not through ``__cause__``,
+hold them, and the AUTH or HELLO arguments, as locals. So the error must reach none of those frames: not through ``__cause__``,
 ``__context__`` or ``original_exception``. Nor may a cachekit frame on it hold the client, the pool, a pipeline, the raw URL
 or a config whose repr shows it.
 
-Each operation fails against a loopback server speaking just enough RESP: it refuses AUTH with WRONGPASS, or completes the
-handshake and drops the connection on the first command. Every frame is walked, third-party ones included.
+Each operation fails against a loopback server speaking just enough RESP: it refuses the password (AUTH, or HELLO on RESP3) with
+WRONGPASS, or completes the handshake and drops the connection on the first command. Every frame is walked, third-party ones included.
 
 An interrupt raised while redis-py is mid-call (``KeyboardInterrupt``, the ``SystemExit`` a worker-timeout signal raises) is
 not a failure cachekit classifies: it propagates as itself, through redis-py's frames, so it must reach none of them holding
@@ -69,9 +69,11 @@ def _read_command(reader: BinaryIO) -> list[bytes]:
 class _FakeRedis:
     """A loopback Redis that fails every command.
 
-    ``refusing``: AUTH is answered with WRONGPASS. Otherwise the handshake (AUTH, PING, CLIENT, SELECT) succeeds and any
-    other command drops the connection unanswered, except those ``serving`` answers. With ``hold``, a command about to
-    fail sets ``holding`` and waits for ``hold`` first, so the client's call is in flight until the test lets it fail.
+    ``refusing``: AUTH, or the HELLO that carries the password on RESP3 (redis-py 8's default), is answered with WRONGPASS.
+    Otherwise the handshake (HELLO, AUTH, PING, CLIENT, SELECT) succeeds and any other command drops the connection
+    unanswered, except those ``serving`` answers; ``dropped_before_auth`` names any it dropped before the password was
+    accepted. With ``hold``, a command about to fail sets ``holding`` and waits for
+    ``hold`` first, so the client's call is in flight until the test lets it fail.
     """
 
     def __init__(
@@ -81,6 +83,7 @@ class _FakeRedis:
         self._serving = serving or {}
         self._hold = hold
         self.holding = threading.Event()
+        self.dropped_before_auth: list[bytes] = []
         self._sock = socket.create_server(("127.0.0.1", 0))
         self.port = self._sock.getsockname()[1]
         self._handlers: list[threading.Thread] = []
@@ -97,19 +100,27 @@ class _FakeRedis:
             self._handlers.append(handler)
 
     def _handle(self, conn: socket.socket) -> None:
+        authenticated = False
         with conn, conn.makefile("rb") as reader:
             while command := _read_command(reader):
                 name = command[0].upper()
-                if name == b"AUTH" and self.refusing:
+                if name in (b"AUTH", b"HELLO") and self.refusing:
                     self._wait_for_hold()
                     conn.sendall(b"-WRONGPASS invalid username-password pair or user is disabled.\r\n")
+                elif name == b"HELLO":
+                    authenticated = True
+                    # A real server's reply cut to the fields redis-py reads: a map, in the protocol asked for.
+                    conn.sendall(b"%%3\r\n+server\r\n+redis\r\n+version\r\n+7.4.0\r\n+proto\r\n:%s\r\n" % command[1])
                 elif name in (b"AUTH", b"CLIENT", b"SELECT"):
+                    authenticated |= name == b"AUTH"
                     conn.sendall(b"+OK\r\n")
                 elif name == b"PING":
                     conn.sendall(b"+PONG\r\n")
                 elif name in self._serving:
                     conn.sendall(self._serving[name])
                 else:
+                    if not authenticated:
+                        self.dropped_before_auth.append(name)
                     self._wait_for_hold()
                     return
 
@@ -119,13 +130,14 @@ class _FakeRedis:
             self._hold.wait(5)
 
     def refuse_from_now(self, backend: object) -> None:
-        """Refuse every later AUTH, so ``backend``'s next command opens a new connection and its AUTH is refused.
+        """Refuse every later AUTH and HELLO, so ``backend``'s next command opens a new connection and its handshake is
+        refused.
 
         A provider backend's init ping leaves an authenticated connection in its redis-py pool. The pool drops it here,
         before the command runs, and this returns once the server has seen every connection it accepted close. A close
         from the server's side would not do: the pool reconnects only a connection it already sees closed, and the
         client sees the server's close only once the kernel delivers it, so a command sent before then fails on the old
-        connection without reaching AUTH.
+        connection without reaching the handshake.
         """
         self.refusing = True
         if (client := getattr(backend, "_client", None)) is not None:
@@ -162,6 +174,9 @@ def fake_redis() -> Iterator[Callable[..., _FakeRedis]]:
     yield start
     for server in servers:
         server.close()
+    # A handshake command the fake does not know is dropped like a failing one, so every test would walk a connection that
+    # never reached the password: the failure it was written for.
+    assert [name for server in servers for name in server.dropped_before_auth] == []
 
 
 @pytest.fixture
@@ -336,7 +351,7 @@ def test_provider_init_failure_reaches_no_frame_holding_the_password(
 def test_provider_backend_failure_reaches_no_frame_holding_the_password(
     fake_redis: Callable[..., _FakeRedis], password: str, failure: str, call: str
 ) -> None:
-    """``wrongpass``: the server refuses AUTH once the provider's init ping has passed, so the operation reconnects."""
+    """``wrongpass``: the server refuses the handshake once the provider's init ping has passed, so the operation reconnects."""
     exc_type, error_type = _FAILURES[failure]
     server = fake_redis(refusing=False)
     backend = RedisBackendProvider(_url(server, password).get_secret_value()).get_shared_backend()
@@ -596,7 +611,7 @@ _NEVER_RAISING: dict[str, tuple[Callable[[SecretStr], Any], Callable[[Any], obje
 
 @contextmanager
 def _interrupting_sends(interrupt: type[BaseException]) -> Iterator[None]:
-    """redis-py raises ``interrupt`` as it sends a command, a new connection's AUTH included, as a signal landing there
+    """redis-py raises ``interrupt`` as it sends a command, a new connection's handshake included, as a signal landing there
     would. A pipeline sends its commands packed. The async operations run redis-py on an executor thread, which a signal
     does not interrupt, so there it stands in for an interrupt raised in the worker (a ``gevent.Timeout``)."""
 
@@ -678,7 +693,7 @@ def test_an_interrupt_while_classifying_a_failure_clears_the_failures_frames_too
     build, run = _OPERATIONS[operation]
     server = fake_redis(refusing=False)
     built = build(_url(server, password))
-    server.refuse_from_now(built)  # the next command opens a new connection, whose AUTH fails
+    server.refuse_from_now(built)  # the next command opens a new connection, whose handshake is refused
     monkeypatch.setattr(backend_module, "_command_error", classify)
     monkeypatch.setattr(provider_module, "classify_redis_error", classify)
 
