@@ -246,10 +246,8 @@ def _normalize_arg(v: object) -> object:
         return int.__int__(u)
     if issubclass(t, float):
         return float.__float__(u)
-    # bytes.__bytes__ does not exist on Python 3.10; the base type's full slice
-    # copies the buffer without calling anything a subclass defines.
     if issubclass(t, bytes):
-        return bytes.__getitem__(u, slice(None))
+        return bytes.__bytes__(u)
     if issubclass(t, bytearray):
         return bytes(bytearray.__getitem__(u, slice(None)))
     if isinstance(v, (bool, int, float, str, bytes, bytearray)):
@@ -469,25 +467,14 @@ def encode_interop_value(value: Any) -> bytes:
     return _encode_canonical(_normalize_value(value), collapse_floats=False)
 
 
-def _iso_utc(value: str) -> str:
-    """Normalize a trailing Z/z designator to +00:00.
-
-    JS Date.toISOString() and Rust chrono RFC 3339 writers emit "…Z";
-    datetime.fromisoformat only learned the Z designator in Python 3.11, and
-    this SDK supports 3.10 — without this, every foreign datetime-bearing
-    entry would decode-fail and be evicted by a 3.10 reader.
-    """
-    return value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
-
-
 def _revive_sentinels(obj: dict[Any, Any]) -> Any:
     """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is."""
     if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
-        return datetime.fromisoformat(_iso_utc(obj["value"]))
+        return datetime.fromisoformat(obj["value"])
     if obj.get("__date__") is True and isinstance(obj.get("value"), str):
         return date.fromisoformat(obj["value"])
     if obj.get("__time__") is True and isinstance(obj.get("value"), str):
-        return time.fromisoformat(_iso_utc(obj["value"]))
+        return time.fromisoformat(obj["value"])
     return obj
 
 

@@ -205,7 +205,7 @@ as asyncio Tasks, and `asyncio.run()` teardown cancels every Task, so a request
 cut short there falls back on that same server-side timeout. The decorator's own
 release is the exception (see below): it is sent from a worker thread, which
 `asyncio.run()` waits for, so it lands even when the decorated call is the last
-thing the process does, and even if `close_http_clients()` runs straight after. On CPython 3.10.0-3.10.7 and 3.11.0 only, a loop closed by hand
+thing the process does, and even if `close_http_clients()` runs straight after. On CPython 3.11.0 only, a loop closed by hand
 (`loop.close()`, not `asyncio.run()`) before that release finishes logs one
 `concurrent.futures` "Event loop is closed" error; the release still lands.
 

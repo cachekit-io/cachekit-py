@@ -49,9 +49,9 @@ _inside: contextvars.ContextVar[tuple[_Inside, ...]] = contextvars.ContextVar("c
 
 
 def _not_cancelling() -> bool:
-    """Whether nobody has asked to cancel the current task. Python 3.10 cannot tell, so it says no."""
-    cancelling = getattr(asyncio.current_task(), "cancelling", None)
-    return cancelling is not None and cancelling() == 0
+    """Whether nobody has asked to cancel the current task."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() == 0
 
 
 class _FlightMap(Generic[_F]):
@@ -105,9 +105,8 @@ class AsyncFlights(_FlightMap[_AsyncFlight]):
     a dropped client) cancels only that caller's wait while others still wait: the call runs on and
     they get its value. When the last waiting caller is cancelled, nobody wants the call any more,
     so it is cancelled as an unshared call would be, and that caller returns once it has unwound.
-    On Python 3.11 and later, a caller whose shared call was cancelled under it, without being
-    cancelled itself, runs its own call, unshared, as it would have run alone; 3.10 cannot tell the
-    two apart, so there it gets the ``CancelledError``.
+    A caller whose shared call was cancelled under it, without being cancelled itself, runs its own
+    call, unshared, as it would have run alone.
 
     A miss on a key from inside that key's own call, while it runs, runs unshared, since joining
     would wait on itself: from the call's task, from a cached call it awaits (which runs in a task

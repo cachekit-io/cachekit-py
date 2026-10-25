@@ -604,9 +604,8 @@ class TestInteropRejections:
                 return x
 
     def test_z_suffix_sentinel_revives(self):
-        """Regression: JS/Rust writers emit ISO-8601 with a Z designator;
-        Python 3.10's fromisoformat cannot parse it — the decoder must normalize,
-        or foreign datetime-bearing entries get evicted on read."""
+        """Regression: JS/Rust writers emit ISO-8601 with a Z designator; the
+        decoder must revive it, or foreign datetime-bearing entries get evicted on read."""
         import msgpack
 
         from cachekit.interop import decode_interop_value

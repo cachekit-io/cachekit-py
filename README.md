@@ -553,7 +553,7 @@ See [CONTRIBUTING.md][contributing-url] for full development guidelines.
 
 | Component | Version |
 |:----------|:--------|
-| Python | 3.10+ |
+| Python | 3.11+ |
 
 ---
 
