@@ -288,9 +288,15 @@ def measure(
                     )
                     for p, n, shift in runs
                 }
-                # A run that fails behind a long earlier one is seen now, not once that one finishes.
-                for future in wait(futures.values(), return_when=FIRST_EXCEPTION).done:
-                    future.result()
+                # A run that fails behind a long earlier one is seen now, not once that one finishes. The wait
+                # wakes every 0.1 s because _on_signal runs only once this thread wakes, and a signal can land
+                # without waking it: on a free-threaded build, a lock acquire spins before it sleeps and does
+                # not look for signals while it spins, so an unbounded wait slept through the signal.
+                pending = set(futures.values())
+                while pending:
+                    done, pending = wait(pending, timeout=0.1, return_when=FIRST_EXCEPTION)
+                    for future in done:
+                        future.result()
                 ir = {key: future.result() for key, future in futures.items()}
             finally:
                 # Leaving the pool waits for its live runs, so they are killed first, from the first submit on.
