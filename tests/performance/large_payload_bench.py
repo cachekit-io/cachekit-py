@@ -142,6 +142,10 @@ def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
         computed[0] += 1
         return value
 
+    # A module-level name, as a user's function has: a "<locals>" name sends every key build down the
+    # sanitizer's slow path, which no real call takes.
+    body.__module__ = "bench"
+    body.__qualname__ = "large_payload"
     # @cache.io always builds a CachekitIOBackend; swap the class for the in-process one while it does.
     real, ckio.CachekitIOBackend = ckio.CachekitIOBackend, lambda api_key=None: Backend()
     try:
@@ -274,8 +278,8 @@ def run(args: argparse.Namespace) -> dict:
 def ab(args: argparse.Namespace) -> dict:
     arms = {"base": (args.base, parse_env(args.base_env)), "candidate": (args.candidate, parse_env(args.candidate_env))}
     lays, rng, out = layouts(), random.Random(0), {}
-    if args.base != args.candidate:
-        # Two interpreters that import the same cachekit make a silent A/A run.
+    if args.base != args.candidate and arms["base"][1] == arms["candidate"][1]:
+        # Two interpreters that import the same cachekit, in the same environment, make a silent A/A run.
         imported = {arm: spawn(python, env, "json-64b", "hit", 0)["cachekit"] for arm, (python, env) in arms.items()}
         if imported["base"] == imported["candidate"]:
             raise SystemExit(f"--base and --candidate both import {imported['base']}: that compares a build with itself")
