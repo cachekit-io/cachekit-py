@@ -334,12 +334,14 @@ jobs:
         uv run --no-sync pytest tests/unit/ -m "not slow" -n auto
         uv run --no-sync pytest tests/critical/ -m "not slow"
 
-  # Oldest-supported redis-py safety net. The lockfile resolves the newest
-  # redis-py, so every other job tests that, while pip accepts any release at
-  # or above the floor in pyproject.toml. Below the real floor nothing fails at
-  # import: client creation fails and every decorated call runs uncached. This
-  # job installs exactly the declared floor and runs the unit suite, so code
-  # that needs a newer redis-py cannot ship with the floor left behind.
+  # Oldest-supported redis-py safety net. Every other job tests the redis-py
+  # uv.lock pins, the newest release when it was last relocked (no bot relocks
+  # it: run `uv lock --upgrade-package redis` when one ships), while pip
+  # accepts any release at or above the floor in pyproject.toml. Below the
+  # real floor nothing fails at import: client creation fails and every
+  # decorated call runs uncached. This job installs exactly the declared floor
+  # and runs the unit suite, so code that needs a newer redis-py cannot ship
+  # with the floor left behind.
   test-redis-floor:
     name: Tests (redis-py floor)
     runs-on: ubuntu-latest
