@@ -34,13 +34,13 @@ PYRIGHT_COMMAND := basedpyright
 # Timestamp for log files
 TIMESTAMP := $(shell date +%Y%m%d_%H%M%S)
 
-# Unique test directory (timestamp + random to prevent collisions). Short on purpose: pytest-redis
-# puts its unix socket under it, and a long path fails with UnixSocketTooLong (CONTRIBUTING.md).
-# pytest never removes a --basetemp it was given, so each target that passes one removes it after
-# a pass (RM_BASETEMP) and keeps it, printing its path, after a failure (KEEP_BASETEMP).
-TEST_BASETEMP := /tmp/pt-$(TIMESTAMP)-$(shell echo $$RANDOM)
-RM_BASETEMP := rm -rf "$(TEST_BASETEMP)"
-KEEP_BASETEMP := echo "$(YELLOW)Test temp dir kept: $(TEST_BASETEMP)$(RESET)"
+# Pytest base temp: each pytest target makes a fresh one with mktemp (shell variable basetemp), so
+# parallel targets never share one and the cleanup only ever removes a directory this recipe made.
+# Short on purpose: pytest-redis puts its unix socket under it, and a long path fails with
+# UnixSocketTooLong (CONTRIBUTING.md). pytest never removes a --basetemp it was given, so the recipe
+# removes it in the same shell after a pass, and keeps it, printing its path, after a failure.
+override MAKE_BASETEMP := basetemp=$$(mktemp -d /tmp/pt-XXXXXXXX) || exit 1
+override KEEP_BASETEMP := echo "$(YELLOW)Test temp dir kept: $$basetemp$(RESET)"
 
 # Helper function to check if a binary exists
 define require_binary
@@ -118,23 +118,25 @@ test: test-python test-rust-unit ## Run all tests (Python + Rust)
 test-python: setup-logs ## Run Python tests only
 	@echo "$(BLUE)Running Python tests...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/python_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest $(TEST_DIR) --ignore=$(TEST_DIR)/fuzzing -q --basetemp=$(TEST_BASETEMP) --tb=short 2>&1 | tee $(LOG_TEST_DIR)/python_$(TIMESTAMP).log; then \
+	@$(MAKE_BASETEMP); \
+	if ! uv run pytest $(TEST_DIR) --ignore=$(TEST_DIR)/fuzzing -q --basetemp="$$basetemp" --tb=short 2>&1 | tee $(LOG_TEST_DIR)/python_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Python tests failed$(RESET)"; \
 		$(KEEP_BASETEMP); \
 		exit 1; \
-	fi
-	@$(RM_BASETEMP)
+	fi; \
+	rm -rf "$$basetemp"
 	@echo "$(GREEN)✓ Python tests completed$(RESET)"
 
 test-quick: setup-logs ## Run fast tests (skip slow tests)
 	@echo "$(BLUE)Running fast tests (excluding slow tests)...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/quick_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest $(TEST_DIR) --ignore=$(TEST_DIR)/fuzzing -q --tb=short -m "not slow" --basetemp=$(TEST_BASETEMP) 2>&1 | tee $(LOG_TEST_DIR)/quick_$(TIMESTAMP).log; then \
+	@$(MAKE_BASETEMP); \
+	if ! uv run pytest $(TEST_DIR) --ignore=$(TEST_DIR)/fuzzing -q --tb=short -m "not slow" --basetemp="$$basetemp" 2>&1 | tee $(LOG_TEST_DIR)/quick_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Fast tests failed$(RESET)"; \
 		$(KEEP_BASETEMP); \
 		exit 1; \
-	fi
-	@$(RM_BASETEMP)
+	fi; \
+	rm -rf "$$basetemp"
 	@echo "$(GREEN)✓ Fast tests completed$(RESET)"
 
 # --cov-fail-under mirrors the PR coverage floor in .github/workflows/ci.yml.
@@ -143,7 +145,8 @@ test-quick: setup-logs ## Run fast tests (skip slow tests)
 test-cov: setup-logs ## Run tests with coverage
 	@echo "$(BLUE)Running tests with coverage...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/cov_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest $(TEST_DIR) \
+	@$(MAKE_BASETEMP); \
+	if ! uv run pytest $(TEST_DIR) \
 		--ignore=$(TEST_DIR)/fuzzing \
 		--cov=$(PACKAGE_NAME) \
 		--cov-report=term-missing \
@@ -151,12 +154,12 @@ test-cov: setup-logs ## Run tests with coverage
 		--cov-fail-under=82 \
 		-q \
 		--tb=short \
-		--basetemp=$(TEST_BASETEMP) 2>&1 | tee $(LOG_TEST_DIR)/cov_$(TIMESTAMP).log; then \
+		--basetemp="$$basetemp" 2>&1 | tee $(LOG_TEST_DIR)/cov_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Coverage tests failed$(RESET)"; \
 		$(KEEP_BASETEMP); \
 		exit 1; \
-	fi
-	@$(RM_BASETEMP)
+	fi; \
+	rm -rf "$$basetemp"
 	@echo "$(GREEN)✓ Coverage report: reports/htmlcov/index.html$(RESET)"
 
 test-critical: test-critical-quick
@@ -164,24 +167,26 @@ test-critical: test-critical-quick
 test-critical-quick: setup-logs ## Run critical tests (skip slow ones)
 	@echo "$(BLUE)Running critical tests (excluding slow tests)...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest tests/critical/ -q -m "not slow" --basetemp=$(TEST_BASETEMP) 2>&1 | tee $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log; then \
+	@$(MAKE_BASETEMP); \
+	if ! uv run pytest tests/critical/ -q -m "not slow" --basetemp="$$basetemp" 2>&1 | tee $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Critical fast tests failed$(RESET)"; \
 		$(KEEP_BASETEMP); \
 		exit 1; \
-	fi
-	@$(RM_BASETEMP)
+	fi; \
+	rm -rf "$$basetemp"
 	@echo "$(GREEN)✓ Critical fast tests completed$(RESET)"
 
 test-critical-quiet: setup-logs ## Run critical tests (minimal output)
 	@printf "$(BLUE)critical tests...$(RESET) "
-	@if ! uv run pytest tests/critical/ -q -m "not slow" --basetemp=$(TEST_BASETEMP) --tb=no -p no:warnings > $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log 2>&1; then \
+	@$(MAKE_BASETEMP); \
+	if ! uv run pytest tests/critical/ -q -m "not slow" --basetemp="$$basetemp" --tb=no -p no:warnings > $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log 2>&1; then \
 		echo "$(YELLOW)❌ FAILED$(RESET)"; \
 		echo "$(YELLOW)See $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log$(RESET)"; \
 		tail -20 $(LOG_TEST_DIR)/critical-quick_$(TIMESTAMP).log; \
 		$(KEEP_BASETEMP); \
 		exit 1; \
-	fi
-	@$(RM_BASETEMP)
+	fi; \
+	rm -rf "$$basetemp"
 	@echo "$(GREEN)✓$(RESET)"
 
 journeys: ## User journeys: the built wheel in a fresh venv, nothing configured, no Redis (JOURNEY_CACHEKIT, JOURNEY_PYTHON)
