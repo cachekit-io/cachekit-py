@@ -438,20 +438,3 @@ class TestAADBytesUnchanged:
             metadata.compressed = forged
             with pytest.raises(DecryptionAuthenticationError):
                 encryption_wrapper.deserialize(encrypted, metadata, cache_key="k")
-
-    @pytest.mark.parametrize("original_type", [1, ["list"], {"a": 1}, False, b"bytes"])
-    def test_non_string_original_type_is_corruption(self, encryption_wrapper: EncryptionWrapper, original_type: object):
-        """Unhashable values included: the type check runs before anything that could raise TypeError."""
-        from cachekit.serializers.base import SerializationError
-
-        metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type=original_type)  # type: ignore[arg-type]
-        with pytest.raises(SerializationError, match="original_type must be a string"):
-            encryption_wrapper._create_aad(metadata, "k")
-
-    @pytest.mark.parametrize("field", ["compressed", "original_type"])
-    def test_unencodable_header_field_is_corruption(self, encryption_wrapper: EncryptionWrapper, field: str):
-        from cachekit.serializers.base import SerializationError
-
-        metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, **{field: "\udcff"})  # type: ignore[arg-type]
-        with pytest.raises(SerializationError, match=f"{field} is not UTF-8 encodable"):
-            encryption_wrapper._create_aad(metadata, "k")

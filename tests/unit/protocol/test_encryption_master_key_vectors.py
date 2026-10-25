@@ -207,7 +207,7 @@ KEYRING_FINGERPRINTS = {entry["id"]: entry["derived_key_fingerprint_hex"] for en
 @pytest.mark.parametrize("current", sorted(KEYRING_KEYS))
 class TestKeyringEntries:
     """``keyring.entries`` and ``keyring.vectors``: each entry's key, current or previous, derives the pinned
-    fingerprint once, at construction, and opens the entry its key sealed, selected by index or tried in order."""
+    fingerprint and opens the entry its key sealed, selected by fingerprint or tried in order."""
 
     def _wrapper(self, current: str) -> tuple[EncryptionWrapper, list[str]]:
         order = [current, *sorted(set(KEYRING_KEYS) - {current})]
@@ -230,7 +230,14 @@ class TestKeyringEntries:
 
         wrapper, order = self._wrapper(current)
         assert vector["key_fingerprint_hex"] == KEYRING_FINGERPRINTS[vector["encrypted_with"]]
-        metadata = SerializationMetadata.from_dict({"format": vector["format"], "compressed": vector["compressed"]})
+        metadata = SerializationMetadata.from_dict(
+            {
+                "format": vector["format"],
+                "compressed": vector["compressed"],
+                "tenant_id": KEYRING["tenant_id"],
+                "encrypted": True,
+            }
+        )
         aad = wrapper._create_aad(metadata, vector["cache_key"])
         ciphertext = bytes.fromhex(vector["ciphertext_hex"])
         plaintext = bytes.fromhex(vector["plaintext_hex"])
@@ -240,6 +247,14 @@ class TestKeyringEntries:
             plaintext
         )
         assert wrapper._keyring.decrypt(wrapper.encryptor, ciphertext, aad) == plaintext
+
+        # The SDK's own read paths get past AES-GCM too: the plaintext is raw bytes, not the serializer's
+        # container, so each read is refused only after decryption authenticated it.
+        metadata.key_fingerprint = vector["key_fingerprint_hex"]
+        with pytest.raises(EncryptionError, match="^Deserialization failed after successful decryption"):
+            wrapper.deserialize(ciphertext, metadata, cache_key=vector["cache_key"])
+        with pytest.raises(EncryptionError, match="^Deserialization failed after successful decryption"):
+            wrapper.deserialize_without_key_identity(ciphertext, metadata, cache_key=vector["cache_key"])
 
 
 @pytest.mark.parametrize("vector", MASTER_KEY_INPUT["reject_vectors"], ids=_ids("reject_vectors"))

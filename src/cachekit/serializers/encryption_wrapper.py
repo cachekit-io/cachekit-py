@@ -375,8 +375,8 @@ class EncryptionWrapper:
         # KeyringConfigurationError ("Keyring tenant key derivation failed: ...")
         # here, and the handler above would relabel it EncryptionError — a
         # SerializationError, which handle_decrypt_failure classifies as
-        # corruption and fails open. A keyring that cannot derive fingerprints
-        # would then present as silent misses plus entry-by-entry eviction (the
+        # corruption and fails open. A keyring that cannot derive its per-tenant
+        # keys would then present as silent misses plus entry-by-entry eviction (the
         # config-vs-crypto failure class). Let it propagate (taxonomy note above).
         #
         # On a read by a handler without a tenant_extractor, tenant_id comes from
@@ -690,8 +690,8 @@ class EncryptionWrapper:
                 decrypted_data = self._keyring.decrypt_at(keyring_index, self.encryptor, bytes(data), aad)
             else:
                 # Current key (keyring index 0) or fail-open no-match attempt:
-                # the cached derived tenant keys keep the hot path free of
-                # per-read HKDF derivation.
+                # the cached tenant keys, the same key as keyring entry 0 (the
+                # construction drift guard holds them equal).
                 decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
 
         except KeyringConfigurationError:
@@ -783,18 +783,13 @@ class EncryptionWrapper:
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
-            if len(self._keyring_fingerprints) == 1:
-                # Single-entry keyring: "sequential" is exactly the current key,
-                # so decrypt with the cached derived tenant keys directly.
-                decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
-            else:
-                decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), aad)
+            decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), aad)
         except KeyringConfigurationError:
-            # Config failure, NOT tamper. Propagates as KeyringConfigurationError so
-            # it takes the fail-loud path. Converting it below would record
-            # `auth_tamper` and page an operator for an attack that never happened —
-            # a bad tenant_id is a deploy bug, not an intrusion. (Short or garbled
-            # ciphertext is NOT this class: the binding keeps it tamper-class.)
+            # Config failure, NOT tamper. The tenant-bound ring raises none today
+            # (it takes no tenant and no index), but any it ever raises must take
+            # the fail-loud path: converting it below would record `auth_tamper`
+            # and page an operator for an attack that never happened. (Short or
+            # garbled ciphertext is NOT this class: the binding keeps it tamper-class.)
             raise
         except Exception as e:
             # Exhaustion of all keyring entries is an AES-GCM authentication

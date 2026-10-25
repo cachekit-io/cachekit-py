@@ -250,7 +250,8 @@ pyo3::create_exception!(
      (`KeyringIndexOutOfRange`). At EncryptionWrapper construction: a rejected\n\
      keyring (`Keyring(...)`: cap exceeded, current key in the decrypt-only\n\
      list), a previous master key below the 32-byte floor, a failure deriving\n\
-     the keyring's per-tenant keys (`Keyring.for_tenant`), and the\n\
+     the keyring's per-tenant keys or a second binding (`Keyring.for_tenant`),\n\
+     and the\n\
      keyring-entry-0 vs derive_tenant_keys fingerprint drift guard. These are\n\
      deploy, caller or build bugs: recording them as `auth_tamper` pages an\n\
      operator for an attack that never happened, and letting them become a miss\n\
@@ -277,6 +278,8 @@ pyo3::create_exception!(
 #[cfg(feature = "encryption")]
 fn decrypt_error_to_py(err: EncryptionError) -> PyErr {
     match err {
+        // KeyDerivation is unreachable from TenantKeyring (it derives at construction); the arm
+        // keeps the mapping identical to cachekit-rs's.
         EncryptionError::KeyDerivation(_) | EncryptionError::KeyringIndexOutOfRange { .. } => {
             KeyringConfigurationError::new_err(format!("Keyring decrypt failed: {}", err))
         }

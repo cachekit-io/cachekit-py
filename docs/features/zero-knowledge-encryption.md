@@ -388,8 +388,8 @@ previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
 per-key requirements as the master key). CK-framed entries carry the
 fingerprint of their HKDF-derived per-tenant encryption key, so reads select
 the exact keyring entry that wrote them — never trial decryption. Each keyring
-entry's per-tenant key is derived once, when cachekit first encrypts or decrypts
-for a tenant, so a read under a decrypt-only key runs no key derivation: a
+entry's per-tenant key is derived when cachekit builds a tenant's encryption
+state, not on each read, so a read under a decrypt-only key runs no key derivation: a
 CK-framed entry costs one AES-GCM decrypt whichever key wrote it, and an
 interop entry, which carries no fingerprint, one AES-GCM attempt per keyring
 entry tried, current key first. The keyring

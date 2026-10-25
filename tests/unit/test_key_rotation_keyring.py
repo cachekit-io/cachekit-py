@@ -884,7 +884,7 @@ def _settings_previous_keys(monkeypatch: pytest.MonkeyPatch, keys: list[bytes]) 
     monkeypatch.setattr(ew, "get_settings", lambda: stub)
 
 
-def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -> None:
+def _bind_other_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -> None:
     """Make the REAL keyring binding bind a different tenant than the wrapper
     asked for, so the fault (and its exception class) comes from Rust."""
     import cachekit.serializers.encryption_wrapper as ew
@@ -952,12 +952,12 @@ class TestConstructionFaultsFailLoudAtReadSite:
             ),
             pytest.param(lambda mp: _settings_previous_keys(mp, [K2]), "Keyring configuration invalid", id="keyring-rejected"),
             pytest.param(
-                lambda mp: _fingerprints_for_tenant(mp, lambda tenant: ""),
+                lambda mp: _bind_other_tenant(mp, lambda tenant: ""),
                 "Keyring tenant key derivation failed",
                 id="tenant-key-derivation",
             ),
             pytest.param(
-                lambda mp: _fingerprints_for_tenant(mp, lambda tenant: tenant + "-skew"),
+                lambda mp: _bind_other_tenant(mp, lambda tenant: tenant + "-skew"),
                 "invariant violation",
                 id="drift-guard",
             ),
@@ -1469,9 +1469,9 @@ class TestInteropRotation:
         finally:
             reset_settings()
 
-    def test_interop_single_key_stays_on_cached_hot_path(self, monkeypatch):
-        """No rotation configured → interop reads keep the cached tenant keys
-        (no per-read HKDF through the keyring)."""
+    def test_interop_single_key_reads_through_the_bound_keyring(self, monkeypatch):
+        """No rotation configured → an interop read is one sequential attempt on
+        the tenant-bound keyring, which runs no per-read HKDF."""
         from cachekit.config.singleton import reset_settings
 
         try:
@@ -1481,8 +1481,8 @@ class TestInteropRotation:
             keyring_spy, encryptor_spy = _instrument(wrapper)
 
             assert handler.deserialize_data(entry, cache_key="ns:app:func:f:args:x:v1") == {"v": 9}
-            assert keyring_spy.sequential_decrypt_calls == 0
-            assert encryptor_spy.decrypt_with_keys_calls == 1
+            assert keyring_spy.sequential_decrypt_calls == 1
+            assert encryptor_spy.decrypt_with_keys_calls == 0
         finally:
             reset_settings()
 
