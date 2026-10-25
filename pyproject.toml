@@ -1,5 +1,7 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+# 1.15: the 3.15+ wheel is abi3t. maturin added abi3t in 1.14, fixed building it alongside abi3 in
+# 1.14.1, and fixed its ELF PyModExport check in 1.15.0.
+requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -67,7 +69,6 @@ dependencies = [
     "pydantic-settings>=2.13.0",
     # Monitoring and observability
     "prometheus-client>=0.22.1",
-    "psutil>=7.0.0",
     # Serialization and hashing
     "blake3>=1.0.5",
     "msgpack>=1.2.1",

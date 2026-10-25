@@ -109,7 +109,7 @@ jobs:
         version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         cache-suffix: py${{ matrix.python-version }}  # setup-uv keys on lockfile hash only, not job/matrix
 
-    # pyo3 is built per interpreter (no abi3), so key the Rust cache per matrix
+    # pyo3 is built per interpreter (abi3t from 3.15), so key the Rust cache per matrix
     # leg — with one shared key the first leg to save wins and every other leg
     # restores foreign pyo3 artifacts and rebuilds anyway (cargo fingerprints
     # catch the mismatch), so the cache would thrash instead of hit.
@@ -118,6 +118,9 @@ jobs:
         key: py${{ matrix.python-version }}
 
     - name: Install dependencies
+      env:
+        # 3.15 tests the abi3t extension the release ships for 3.15+, not a per-version build.
+        MATURIN_PEP517_ARGS: ${{ matrix.python-version == '3.15' && '--features pyo3/abi3t-py315' || '' }}
       run: uv sync --python ${{ matrix.python-version }} --group dev
 
     - name: Run tests (PRs)
@@ -287,8 +290,8 @@ jobs:
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
         fail_ci_if_error: true
 
-  # Free-threaded CPython safety net. Runs the core suites on a
-  # 3.14 free-threaded build and fails if the GIL gets re-enabled, so code
+  # Free-threaded CPython safety net. Runs the core suites on the 3.14 and
+  # 3.15 free-threaded builds and fails if the GIL gets re-enabled, so code
   # whose correctness silently depended on the GIL's memory ordering cannot
   # regress unnoticed. Optional native deps without free-threaded wheels
   # (orjson, numpy, pandas, pyarrow) are dev-group-only and stay out
@@ -296,9 +299,18 @@ jobs:
   # free-threaded support — importing it re-enables the GIL — and redis-py
   # transparently falls back to its pure-Python parser.
   test-freethreaded:
-    name: Tests (Python 3.14t, GIL disabled)
+    name: Tests (Python ${{ matrix.python-version }}, GIL disabled)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.14t"
+          # 3.15t tests the abi3t extension the release ships for 3.15+, not a per-version build.
+          - python-version: "3.15t"
+            maturin-args: --features pyo3/abi3t-py315
+            extension-suffix: .abi3t.so
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -308,12 +320,16 @@ jobs:
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
-        cache-suffix: py3.14t
+        cache-suffix: py${{ matrix.python-version }}
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: py${{ matrix.python-version }}
 
     - name: Install dependencies (test group only)
-      run: uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
+      env:
+        MATURIN_PEP517_ARGS: ${{ matrix.maturin-args }}
+      run: uv sync --python ${{ matrix.python-version }} --no-default-groups --group test --no-install-package hiredis
 
     - name: Verify the GIL is actually disabled
       run: |
@@ -324,6 +340,7 @@ jobs:
         import cachekit._rust_serializer
         import redis
         assert not sys._is_gil_enabled(), 'an import re-enabled the GIL'
+        assert cachekit._rust_serializer.__file__.endswith('${{ matrix.extension-suffix }}'), cachekit._rust_serializer.__file__
         print('free-threaded build, GIL still disabled after imports')
         "
 
