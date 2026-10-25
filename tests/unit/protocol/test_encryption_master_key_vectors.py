@@ -4,8 +4,8 @@ Fixture: tests/unit/protocol/fixtures/encryption.json, vendored from
 cachekit-io/protocol @ b4ae567a402051752dabf040bd16e870657d3dec (vectors 1.5.0,
 sha256 pinned below). Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
-This file drives the ``master_key_input`` and ``keyring.configuration`` blocks;
-test_encryption_read_vectors.py drives ``aad_reject_vectors`` and ``decrypted_container``.
+This file drives the ``master_key_input`` and ``keyring`` blocks;
+test_encryption_read_vectors.py drives ``vectors`` (their AAD), ``aad_reject_vectors`` and ``decrypted_container``.
 Rows go through the SDK's own entry points, not a shared decoder; each row group names the ones it
 uses. Raw keys enter through ``EncryptionWrapper``'s ``master_key=`` and ``previous_master_keys=``
 (a bytes ``master_key=`` on ``@cache.secure`` is a TypeError, so it is not a raw-bytes entry point).
@@ -197,6 +197,49 @@ class TestRotation:
 
         assert get_all() == ACCEPT_VALUE
         assert get_user(42) == {"name": "alice", "age": 30}
+
+
+KEYRING = FIXTURE["keyring"]
+KEYRING_KEYS = {entry["id"]: bytes.fromhex(entry["master_key_hex"]) for entry in KEYRING["entries"]}
+KEYRING_FINGERPRINTS = {entry["id"]: entry["derived_key_fingerprint_hex"] for entry in KEYRING["entries"]}
+
+
+@pytest.mark.parametrize("current", sorted(KEYRING_KEYS))
+class TestKeyringEntries:
+    """``keyring.entries`` and ``keyring.vectors``: each entry's key, current or previous, derives the pinned
+    fingerprint once, at construction, and opens the entry its key sealed, selected by index or tried in order."""
+
+    def _wrapper(self, current: str) -> tuple[EncryptionWrapper, list[str]]:
+        order = [current, *sorted(set(KEYRING_KEYS) - {current})]
+        wrapper = EncryptionWrapper(
+            master_key=KEYRING_KEYS[order[0]],
+            tenant_id=KEYRING["tenant_id"],
+            previous_master_keys=[KEYRING_KEYS[key_id] for key_id in order[1:]],
+        )
+        return wrapper, order
+
+    def test_derived_fingerprints(self, current: str) -> None:
+        wrapper, order = self._wrapper(current)
+
+        assert wrapper._keyring_fingerprints == [KEYRING_FINGERPRINTS[key_id] for key_id in order]
+        assert wrapper.encryption_key_fingerprint == KEYRING_FINGERPRINTS[current]
+
+    @pytest.mark.parametrize("vector", KEYRING["vectors"], ids=lambda v: v["name"])
+    def test_sealed_entry_opens(self, current: str, vector: dict[str, Any]) -> None:
+        from cachekit.serializers.base import SerializationMetadata
+
+        wrapper, order = self._wrapper(current)
+        assert vector["key_fingerprint_hex"] == KEYRING_FINGERPRINTS[vector["encrypted_with"]]
+        metadata = SerializationMetadata.from_dict({"format": vector["format"], "compressed": vector["compressed"]})
+        aad = wrapper._create_aad(metadata, vector["cache_key"])
+        ciphertext = bytes.fromhex(vector["ciphertext_hex"])
+        plaintext = bytes.fromhex(vector["plaintext_hex"])
+
+        assert aad.hex() == vector["aad_hex"]
+        assert wrapper._keyring.decrypt_at(order.index(vector["encrypted_with"]), wrapper.encryptor, ciphertext, aad) == (
+            plaintext
+        )
+        assert wrapper._keyring.decrypt(wrapper.encryptor, ciphertext, aad) == plaintext
 
 
 @pytest.mark.parametrize("vector", MASTER_KEY_INPUT["reject_vectors"], ids=_ids("reject_vectors"))

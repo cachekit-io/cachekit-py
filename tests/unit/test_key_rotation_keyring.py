@@ -555,7 +555,7 @@ class TestRepeatRefusedAtDecoration:
 
 
 class _KeyringSpy:
-    """Delegates to the real Rust Keyring, recording every decrypt call.
+    """Delegates to the real Rust TenantKeyring, recording every decrypt call.
 
     The real keyring and encryptor are captured at construction: PyO3 extracts
     concrete pyclass types at the FFI boundary, so a Python spy object must
@@ -570,13 +570,13 @@ class _KeyringSpy:
         self.decrypt_at_indices: list[int] = []
         self.sequential_decrypt_calls = 0
 
-    def decrypt_at(self, index: int, encryptor: Any, ciphertext: bytes, tenant_id: str, aad: bytes) -> bytes:
+    def decrypt_at(self, index: int, encryptor: Any, ciphertext: bytes, aad: bytes) -> bytes:
         self.decrypt_at_indices.append(index)
-        return self._real.decrypt_at(index, self._encryptor, ciphertext, tenant_id, aad)
+        return self._real.decrypt_at(index, self._encryptor, ciphertext, aad)
 
-    def decrypt(self, encryptor: Any, ciphertext: bytes, tenant_id: str, aad: bytes) -> bytes:
+    def decrypt(self, encryptor: Any, ciphertext: bytes, aad: bytes) -> bytes:
         self.sequential_decrypt_calls += 1
-        return self._real.decrypt(self._encryptor, ciphertext, tenant_id, aad)
+        return self._real.decrypt(self._encryptor, ciphertext, aad)
 
 
 class _EncryptorSpy:
@@ -775,7 +775,7 @@ class TestDecryptErrorTaxonomy:
             ZeroKnowledgeEncryptor,
         )
 
-        keyring = Keyring(K1, [])
+        keyring = Keyring(K1, []).for_tenant(TENANT)
         encryptor = ZeroKnowledgeEncryptor()
 
         # Truncated ciphertext MUST stay tamper-class. decrypt_aes_gcm rejects on
@@ -783,19 +783,19 @@ class TestDecryptErrorTaxonomy:
         # with backend write access could silence the tamper alarm just by
         # truncating the entry — they would choose whether the alarm fires.
         with pytest.raises(ValueError) as exc_info:
-            keyring.decrypt(encryptor, b"short", TENANT, b"aad")
+            keyring.decrypt(encryptor, b"short", b"aad")
         assert not isinstance(exc_info.value, KeyringConfigurationError)
 
         # Well-formed length, garbage content: a real AES-GCM tag failure. Also
         # tamper-class.
         with pytest.raises(ValueError) as exc_info:
-            keyring.decrypt_at(0, encryptor, b"\x00" * 64, TENANT, b"aad")
+            keyring.decrypt_at(0, encryptor, b"\x00" * 64, b"aad")
         assert not isinstance(exc_info.value, KeyringConfigurationError)
 
         # Caller bug, input is our own config, not the stored bytes: single-entry
         # keyring has no index 5. This is the config side.
         with pytest.raises(KeyringConfigurationError):
-            keyring.decrypt_at(5, encryptor, b"\x00" * 64, TENANT, b"aad")
+            keyring.decrypt_at(5, encryptor, b"\x00" * 64, b"aad")
 
     def test_wrapper_does_not_relabel_config_error_as_tamper(self):
         from cachekit._rust_serializer import KeyringConfigurationError
@@ -864,8 +864,8 @@ class TestDecryptErrorTaxonomy:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
 
-            def encryption_fingerprints(self, tenant_id: str) -> list[bytes]:
-                raise ValueError("Keyring fingerprint derivation failed: simulated")
+            def for_tenant(self, tenant_id: str) -> Any:
+                raise ValueError("Keyring tenant key derivation failed: simulated")
 
         monkeypatch.setattr(ew, "Keyring", _BadKeyring)
 
@@ -885,8 +885,8 @@ def _settings_previous_keys(monkeypatch: pytest.MonkeyPatch, keys: list[bytes]) 
 
 
 def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -> None:
-    """Make the REAL keyring binding fingerprint a different tenant than the
-    wrapper asked for, so the fault (and its exception class) comes from Rust."""
+    """Make the REAL keyring binding bind a different tenant than the wrapper
+    asked for, so the fault (and its exception class) comes from Rust."""
     import cachekit.serializers.encryption_wrapper as ew
 
     real_keyring = ew.Keyring
@@ -895,8 +895,8 @@ def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -
         def __init__(self, *args: Any) -> None:
             self._real = real_keyring(*args)
 
-        def encryption_fingerprints(self, tenant_id: str) -> list[bytes]:
-            return self._real.encryption_fingerprints(tenant_for(tenant_id))
+        def for_tenant(self, tenant_id: str) -> Any:
+            return self._real.for_tenant(tenant_for(tenant_id))
 
     monkeypatch.setattr(ew, "Keyring", _Keyring)
 
@@ -953,8 +953,8 @@ class TestConstructionFaultsFailLoudAtReadSite:
             pytest.param(lambda mp: _settings_previous_keys(mp, [K2]), "Keyring configuration invalid", id="keyring-rejected"),
             pytest.param(
                 lambda mp: _fingerprints_for_tenant(mp, lambda tenant: ""),
-                "Keyring fingerprint derivation failed",
-                id="fingerprint-derivation",
+                "Keyring tenant key derivation failed",
+                id="tenant-key-derivation",
             ),
             pytest.param(
                 lambda mp: _fingerprints_for_tenant(mp, lambda tenant: tenant + "-skew"),
@@ -1495,10 +1495,31 @@ class TestDeadBindingRemoved:
             from cachekit._rust_serializer import KeyRotationState  # noqa: F401
 
     def test_keyring_exposes_no_key_material(self):
-        """FFI hygiene: the Keyring binding's public surface is construction,
-        fingerprints (safe), and the two decrypt entry points (return
-        plaintext) — nothing that hands key bytes back to Python."""
+        """FFI hygiene: the Keyring binding's public surface is construction and
+        tenant binding; the bound TenantKeyring's is fingerprints (safe) and the
+        two decrypt entry points (return plaintext) — nothing that hands key
+        bytes back to Python."""
+        from cachekit._rust_serializer import Keyring, TenantKeyring
+
+        assert {name for name in dir(Keyring) if not name.startswith("_")} == {"for_tenant"}
+        public = {name for name in dir(TenantKeyring) if not name.startswith("_")}
+        assert public == {"encryption_fingerprints", "decrypt_at", "decrypt"}
+
+    def test_for_tenant_consumes_the_keyring(self):
+        """for_tenant drops the master keys (core zeroizes them), so the keyring
+        cannot bind a second tenant: a second call is a config-class fault."""
         from cachekit._rust_serializer import Keyring
 
-        public = {name for name in dir(Keyring) if not name.startswith("_")}
-        assert public == {"encryption_fingerprints", "decrypt_at", "decrypt"}
+        keyring = Keyring(K2, [K1])
+        keyring.for_tenant(TENANT)
+        with pytest.raises(KeyringConfigurationError, match="already bound"):
+            keyring.for_tenant("another-tenant")
+
+    def test_failed_binding_also_consumes_the_keyring(self):
+        from cachekit._rust_serializer import Keyring
+
+        keyring = Keyring(K2, [K1])
+        with pytest.raises(KeyringConfigurationError, match="tenant key derivation failed"):
+            keyring.for_tenant("")
+        with pytest.raises(KeyringConfigurationError, match="already bound"):
+            keyring.for_tenant(TENANT)

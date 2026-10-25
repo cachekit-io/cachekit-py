@@ -206,6 +206,7 @@ class EncryptionWrapper:
         "fail_closed",
         "_keyring",
         "_keyring_fingerprints",
+        "_aad_prefix",
     )
 
     def __init__(
@@ -290,6 +291,13 @@ class EncryptionWrapper:
         # self.encryption_key_fingerprint, self._keyring, self._keyring_fingerprints
         self._setup_encryption(master_key, previous_master_keys)
 
+        # The AAD's head, 0x03 ‖ len(tenant_id) ‖ tenant_id, is the same on every call, so _create_aad
+        # takes it from here. tenant_id is bound at construction, like tenant_keys and _keyring. Built
+        # after _setup_encryption: its derive_tenant_keys has accepted tenant_id (a str of 1 to 1024
+        # UTF-8 bytes), so this encode cannot raise, and a bad tenant_id still fails as EncryptionError there.
+        tenant_id_bytes = self.tenant_id.encode("utf-8")
+        self._aad_prefix = b"\x03" + len(tenant_id_bytes).to_bytes(4, "big") + tenant_id_bytes
+
     def _setup_encryption(self, master_key: SecretBytes | None, previous_master_keys: list[SecretBytes] | None) -> None:
         """Setup encryption components with key derivation. Keys arrive wrapped and are unwrapped only inline."""
         # Get master key from settings if not provided
@@ -349,8 +357,10 @@ class EncryptionWrapper:
         # boundary (zeroized on drop in Rust). Re-validates cap/subset/length
         # behind the FFI for wrappers constructed with explicit parameters;
         # violations raise KeyringConfigurationError from the binding and
-        # propagate as-is (see the config-error taxonomy note above).
-        self._keyring = Keyring(master_key.get_secret_value(), [key.get_secret_value() for key in previous_master_keys])
+        # propagate as-is (see the config-error taxonomy note above). Built
+        # before derive_tenant_keys so a keyring config fault fails loud
+        # whatever the tenant; it is bound to the tenant below.
+        keyring = Keyring(master_key.get_secret_value(), [key.get_secret_value() for key in previous_master_keys])
 
         # Derive tenant-specific keys with domain separation
         try:
@@ -362,7 +372,7 @@ class EncryptionWrapper:
             raise EncryptionError(f"Failed to derive tenant keys: {e}") from e
 
         # Deliberately OUTSIDE the try above. The binding raises
-        # KeyringConfigurationError ("Keyring fingerprint derivation failed: ...")
+        # KeyringConfigurationError ("Keyring tenant key derivation failed: ...")
         # here, and the handler above would relabel it EncryptionError — a
         # SerializationError, which handle_decrypt_failure classifies as
         # corruption and fails open. A keyring that cannot derive fingerprints
@@ -378,11 +388,17 @@ class EncryptionWrapper:
         # reaches this line is a keyring/derivation disagreement in our own
         # build, never bad input.
         #
+        # for_tenant derives every entry's per-tenant key here, once, and drops
+        # the master keys; the bound ring's decrypts and fingerprints run no
+        # HKDF, so a rotation-window read costs one AES-GCM open, not a
+        # derivation as well.
+        self._keyring = keyring.for_tenant(self.tenant_id)
+
         # Python only ever holds the per-entry fingerprints of the HKDF-derived
         # per-tenant encryption keys, current key first — the exact values
         # compared against the frame's key_fingerprint metadata on decrypt
         # (never the master-key fingerprints).
-        self._keyring_fingerprints = [fp.hex() for fp in self._keyring.encryption_fingerprints(self.tenant_id)]
+        self._keyring_fingerprints = [fp.hex() for fp in self._keyring.encryption_fingerprints()]
 
         logger.info(
             f"Encryption initialized for tenant '{self.tenant_id}' "
@@ -671,7 +687,7 @@ class EncryptionWrapper:
                 # exactly the matched entry. Binding match — decrypt_at never
                 # falls back across entries, and any failure raises out of this
                 # block straight into the fail-open/fail-closed policy.
-                decrypted_data = self._keyring.decrypt_at(keyring_index, self.encryptor, bytes(data), self.tenant_id, aad)
+                decrypted_data = self._keyring.decrypt_at(keyring_index, self.encryptor, bytes(data), aad)
             else:
                 # Current key (keyring index 0) or fail-open no-match attempt:
                 # the cached derived tenant keys keep the hot path free of
@@ -680,9 +696,9 @@ class EncryptionWrapper:
 
         except KeyringConfigurationError:
             # Same taxonomy split as the sequential path below: decrypt_at raises
-            # this for a keyring index out of range or a key-derivation failure,
-            # neither of which is tamper. Propagates as a ValueError (fail-loud)
-            # instead of being recorded as `auth_tamper`.
+            # this for a keyring index out of range, which is not tamper.
+            # Propagates as a ValueError (fail-loud) instead of being recorded
+            # as `auth_tamper`.
             raise
         except Exception as e:
             # AES-GCM tag verification failed: tampered ciphertext, wrong key, or
@@ -768,12 +784,11 @@ class EncryptionWrapper:
 
         try:
             if len(self._keyring_fingerprints) == 1:
-                # Single-entry keyring: "sequential" is exactly the current key.
-                # Use the cached derived tenant keys so the no-rotation interop
-                # hot path pays no per-read HKDF derivation.
+                # Single-entry keyring: "sequential" is exactly the current key,
+                # so decrypt with the cached derived tenant keys directly.
                 decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
             else:
-                decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), self.tenant_id, aad)
+                decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), aad)
         except KeyringConfigurationError:
             # Config failure, NOT tamper. Propagates as KeyringConfigurationError so
             # it takes the fail-loud path. Converting it below would record
@@ -843,18 +858,28 @@ class EncryptionWrapper:
             >>> aad1 != aad2
             True
         """
-        # Encode components as bytes - cache_key is SECURITY CRITICAL
-        components = [
-            self.tenant_id.encode("utf-8"),
-            cache_key.encode("utf-8"),  # SECURITY: prevents ciphertext substitution attacks
-            metadata.format.value.encode("utf-8"),
-        ]
+        # The version byte and tenant_id come prebuilt in self._aad_prefix (see __init__). Each per-call
+        # component is encoded and checked in the order it always was, so a bad header raises what it always
+        # raised, and the AAD is assembled with one join at the end. No memo: `compressed` is str()-ed from
+        # the header, and True, 1 and 1.0 hash alike but encode differently, so a value-keyed memo would let
+        # a tampered header reuse another value's AAD bytes.
+        cache_key_bytes = cache_key.encode("utf-8")  # SECURITY: prevents ciphertext substitution attacks
+        format_bytes = metadata.format.value.encode("utf-8")
         # `compressed` arrives untyped from the header too: str() never raises, but a lone
         # surrogate cannot be UTF-8 encoded — corruption-class, like original_type below.
         try:
-            components.append(str(metadata.compressed).encode("utf-8"))
+            compressed_bytes = str(metadata.compressed).encode("utf-8")
         except UnicodeEncodeError as e:
             raise SerializationError("Corrupt frame header: compressed is not UTF-8 encodable") from e
+        parts = [
+            self._aad_prefix,
+            len(cache_key_bytes).to_bytes(4, "big"),
+            cache_key_bytes,
+            len(format_bytes).to_bytes(4, "big"),
+            format_bytes,
+            len(compressed_bytes).to_bytes(4, "big"),
+            compressed_bytes,
+        ]
 
         # `original_type` arrives untyped from the plaintext CK header (json.loads →
         # SerializationMetadata.from_dict passes it straight through). The AAD built from the
@@ -868,16 +893,12 @@ class EncryptionWrapper:
             raise SerializationError(f"Corrupt frame header: original_type must be a string, got {type(original_type).__name__}")
         if original_type:
             try:
-                components.append(original_type.encode("utf-8"))
+                original_type_bytes = original_type.encode("utf-8")
             except UnicodeEncodeError as e:
                 raise SerializationError("Corrupt frame header: original_type is not UTF-8 encodable") from e
+            parts += (len(original_type_bytes).to_bytes(4, "big"), original_type_bytes)
 
-        # Version byte 0x03 + length-prefixed encoding
-        aad = bytes([0x03])  # Version 0x03: includes cache_key binding
-        for component in components:
-            aad += len(component).to_bytes(4, "big") + component
-
-        return aad
+        return b"".join(parts)
 
     def _parse_aad(self, aad: bytes) -> dict[str, Optional[str]]:
         """Parse length-prefixed AAD for validation and debugging.

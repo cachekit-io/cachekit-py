@@ -382,3 +382,76 @@ class TestCacheKeyEdgeCases:
         decrypted = wrapper.deserialize(encrypted_data, metadata, cache_key=cache_key)
 
         assert decrypted == test_data
+
+
+def _reference_aad(tenant_id: str, metadata: SerializationMetadata, cache_key: str) -> bytes:
+    """The AAD builder as it stood before the tenant prefix was precomputed: every component encoded
+    on each call, the result grown with ``+=``. The bytes the current builder must still produce."""
+    components = [tenant_id.encode("utf-8"), cache_key.encode("utf-8"), metadata.format.value.encode("utf-8")]
+    components.append(str(metadata.compressed).encode("utf-8"))
+    if metadata.original_type:
+        components.append(metadata.original_type.encode("utf-8"))
+    aad = bytes([0x03])
+    for component in components:
+        aad += len(component).to_bytes(4, "big") + component
+    return aad
+
+
+class TestAADBytesUnchanged:
+    """The precomputed tenant prefix and single join build exactly the bytes the per-call builder did."""
+
+    TENANTS = ("t", "test-tenant", "tenant-ü", "租户-🔑", "t" * 1024)
+    CACHE_KEYS = ("k", "ns:app:func:m.f:args:" + "0" * 64 + ":0", "clé:ü:🔑", "x" * 10240)
+    # Values a header can carry for `compressed`: equal-but-differently-encoded numbers, strings, None.
+    COMPRESSED = (True, False, 1, 0, 1.0, 0.0, 2, "True", "true", "", None)
+    ORIGINAL_TYPES = (None, "", "dict", "numpy", "tÿpe-🔑")
+
+    @pytest.mark.parametrize("tenant_id", TENANTS)
+    def test_every_input_shape_matches_the_reference(self, master_key: bytes, tenant_id: str):
+        wrapper = EncryptionWrapper(master_key=master_key, tenant_id=tenant_id, previous_master_keys=[])
+        for cache_key in self.CACHE_KEYS:
+            for serialization_format in SerializationFormat:
+                for compressed in self.COMPRESSED:
+                    for original_type in self.ORIGINAL_TYPES:
+                        metadata = SerializationMetadata(
+                            serialization_format=serialization_format, compressed=compressed, original_type=original_type
+                        )
+                        assert wrapper._create_aad(metadata, cache_key) == _reference_aad(tenant_id, metadata, cache_key)
+
+    def test_equal_compressed_values_build_distinct_aad(self, encryption_wrapper: EncryptionWrapper):
+        """True == 1 == 1.0 in Python, with equal hashes, but each encodes differently in the header's AAD.
+        A tampered `compressed` must still change the AAD, so no memo may merge them."""
+        aads = {
+            encryption_wrapper._create_aad(
+                SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, compressed=value), "k"
+            )
+            for value in (True, 1, 1.0)
+        }
+        assert len(aads) == 3
+
+    def test_equal_compressed_values_do_not_authenticate_each_other(self, encryption_wrapper: EncryptionWrapper):
+        from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+
+        encrypted, metadata = encryption_wrapper.serialize({"v": 1}, cache_key="k")
+        assert metadata.compressed is True
+        for forged in (1, 1.0):
+            metadata.compressed = forged
+            with pytest.raises(DecryptionAuthenticationError):
+                encryption_wrapper.deserialize(encrypted, metadata, cache_key="k")
+
+    @pytest.mark.parametrize("original_type", [1, ["list"], {"a": 1}, False, b"bytes"])
+    def test_non_string_original_type_is_corruption(self, encryption_wrapper: EncryptionWrapper, original_type: object):
+        """Unhashable values included: the type check runs before anything that could raise TypeError."""
+        from cachekit.serializers.base import SerializationError
+
+        metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type=original_type)  # type: ignore[arg-type]
+        with pytest.raises(SerializationError, match="original_type must be a string"):
+            encryption_wrapper._create_aad(metadata, "k")
+
+    @pytest.mark.parametrize("field", ["compressed", "original_type"])
+    def test_unencodable_header_field_is_corruption(self, encryption_wrapper: EncryptionWrapper, field: str):
+        from cachekit.serializers.base import SerializationError
+
+        metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, **{field: "\udcff"})  # type: ignore[arg-type]
+        with pytest.raises(SerializationError, match=f"{field} is not UTF-8 encodable"):
+            encryption_wrapper._create_aad(metadata, "k")

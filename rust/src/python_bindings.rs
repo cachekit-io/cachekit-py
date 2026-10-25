@@ -233,7 +233,7 @@ use cachekit_core::{
     encryption::key_derivation::{
         derive_domain_key, derive_tenant_keys, key_fingerprint, TenantKeys,
     },
-    EncryptionError, Keyring, ZeroKnowledgeEncryptor,
+    EncryptionError, Keyring, TenantKeyring, ZeroKnowledgeEncryptor,
 };
 #[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
@@ -246,11 +246,11 @@ pyo3::create_exception!(
     "A LOCAL keyring configuration fault.\n\
      \n\
      Strictly limited to faults whose input is our own configuration or build.\n\
-     On the decrypt path: an invalid tenant_id reaching HKDF (`KeyDerivation`) and\n\
-     a keyring entry index that does not exist (`KeyringIndexOutOfRange`). At\n\
-     EncryptionWrapper construction: a rejected keyring (`Keyring(...)`: cap\n\
-     exceeded, current key in the decrypt-only list), a previous master key below\n\
-     the 32-byte floor, a keyring fingerprint derivation failure, and the\n\
+     On the decrypt path: a keyring entry index that does not exist\n\
+     (`KeyringIndexOutOfRange`). At EncryptionWrapper construction: a rejected\n\
+     keyring (`Keyring(...)`: cap exceeded, current key in the decrypt-only\n\
+     list), a previous master key below the 32-byte floor, a failure deriving\n\
+     the keyring's per-tenant keys (`Keyring.for_tenant`), and the\n\
      keyring-entry-0 vs derive_tenant_keys fingerprint drift guard. These are\n\
      deploy, caller or build bugs: recording them as `auth_tamper` pages an\n\
      operator for an attack that never happened, and letting them become a miss\n\
@@ -395,14 +395,16 @@ impl PyTenantKeys {
 /// "Key Rotation (Keyring)").
 ///
 /// Master-key material enters once at construction (config ingestion) and
-/// never leaves: the only values crossing back to Python are per-tenant
-/// fingerprints (safe to expose) and decrypted plaintext. All keyring key
-/// material zeroizes on drop inside cachekit-core, decrypt-only entries
-/// included.
+/// never leaves. The only thing this class does after construction is bind
+/// one tenant: [`for_tenant`](Self::for_tenant) derives that tenant's keys and
+/// hands back a [`PyTenantKeyring`], which decrypts with no HKDF. All keyring
+/// key material zeroizes on drop inside cachekit-core, decrypt-only entries
+/// included; binding drops the master keys at once.
 #[cfg(feature = "encryption")]
 #[pyclass(name = "Keyring")]
 pub struct PyKeyring {
-    inner: Keyring,
+    /// `None` once [`for_tenant`](Self::for_tenant) has consumed it.
+    inner: Option<Keyring>,
 }
 
 #[cfg(feature = "encryption")]
@@ -432,22 +434,57 @@ impl PyKeyring {
         let inner = Keyring::new(current, &refs).map_err(|e| {
             KeyringConfigurationError::new_err(format!("Keyring configuration invalid: {}", e))
         })?;
-        Ok(Self { inner })
+        Ok(Self { inner: Some(inner) })
     }
 
-    /// Per-entry fingerprints of the HKDF-derived per-tenant **encryption**
-    /// key, in attempt order (current key first). This is the value
-    /// cachekit-py stores as CK frame metadata, so fingerprint-based keyring
-    /// selection compares like with like. Entry count is `len()` of this list.
-    #[pyo3(name = "encryption_fingerprints")]
-    pub fn encryption_fingerprints(&self, tenant_id: &str) -> PyResult<Vec<Vec<u8>>> {
-        let fingerprints = self.inner.encryption_fingerprints(tenant_id).map_err(|e| {
+    /// Bind the keyring to `tenant_id`: derive each entry's per-tenant
+    /// encryption key once (HKDF, current key first) and return the bound ring.
+    ///
+    /// Consumes this keyring, as core's `Keyring::for_tenant` does: the master
+    /// keys are zeroized here, success or failure, and a second call raises
+    /// `KeyringConfigurationError`. A derivation failure is
+    /// `KeyringConfigurationError` too: the wrapper binds only a tenant that
+    /// `derive_tenant_keys` has already accepted, so what fails here is our
+    /// own build, never the input.
+    #[pyo3(name = "for_tenant")]
+    pub fn for_tenant(&mut self, tenant_id: &str) -> PyResult<PyTenantKeyring> {
+        let keyring = self.inner.take().ok_or_else(|| {
+            KeyringConfigurationError::new_err("Keyring is already bound to a tenant")
+        })?;
+        let inner = keyring.for_tenant(tenant_id).map_err(|e| {
             KeyringConfigurationError::new_err(format!(
-                "Keyring fingerprint derivation failed: {}",
+                "Keyring tenant key derivation failed: {}",
                 e
             ))
         })?;
-        Ok(fingerprints.into_iter().map(|fp| fp.to_vec()).collect())
+        Ok(PyTenantKeyring { inner })
+    }
+}
+
+/// Python wrapper for a keyring bound to one tenant: the derived per-tenant
+/// encryption key of each keyring entry, current key first, and no master-key
+/// material. Nothing on it runs HKDF; the keys were derived by
+/// `Keyring.for_tenant`. No accessor hands key bytes back to Python.
+#[cfg(feature = "encryption")]
+#[pyclass(name = "TenantKeyring", frozen)]
+pub struct PyTenantKeyring {
+    inner: TenantKeyring,
+}
+
+#[cfg(feature = "encryption")]
+#[pymethods]
+impl PyTenantKeyring {
+    /// Per-entry fingerprints of the derived per-tenant **encryption** key, in
+    /// attempt order (current key first). This is the value cachekit-py
+    /// stores as CK frame metadata, so fingerprint-based keyring selection
+    /// compares like with like. Entry count is `len()` of this list.
+    #[pyo3(name = "encryption_fingerprints")]
+    pub fn encryption_fingerprints(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .encryption_fingerprints()
+            .into_iter()
+            .map(|fp| fp.to_vec())
+            .collect()
     }
 
     /// Decrypt with the keyring entry at `index` (0 = current key).
@@ -457,22 +494,19 @@ impl PyKeyring {
     /// and the caller must not retry other keyring entries. This method never
     /// falls back across entries.
     ///
-    /// The out-of-range and key-derivation errors below are caller bugs /
-    /// configuration errors, unreachable when `index` comes from a match
-    /// against this keyring's own `encryption_fingerprints` (the wrapper
-    /// derives fingerprints for the same `tenant_id` at construction, so a
-    /// bad tenant fails there, not here).
+    /// An out-of-range `index` is a caller bug (`KeyringConfigurationError`),
+    /// unreachable when `index` comes from a match against this ring's own
+    /// `encryption_fingerprints`.
     #[pyo3(name = "decrypt_at")]
     pub fn decrypt_at(
         &self,
         index: usize,
         encryptor: &PyZeroKnowledgeEncryptor,
         ciphertext: &[u8],
-        tenant_id: &str,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
         self.inner
-            .decrypt_at(index, &encryptor.inner, ciphertext, tenant_id, aad)
+            .decrypt_at(index, &encryptor.inner, ciphertext, aad)
             .map_err(decrypt_error_to_py)
     }
 
@@ -482,21 +516,20 @@ impl PyKeyring {
     /// For entries WITHOUT per-entry key identity (interop mode — no CK frame,
     /// so no stored key fingerprint), per the spec's "Decrypt — without
     /// per-entry key identity" row. Only an AES-GCM authentication failure
-    /// advances to the next key; structural and configuration errors are
-    /// terminal. Exhaustion surfaces as a plain authentication failure — the
-    /// caller's existing fail-open/fail-closed policy applies, no new failure
-    /// mode. Entries WITH a stored fingerprint must use fingerprint selection
-    /// (`decrypt_at`), never this method.
+    /// advances to the next key; structural errors are terminal. Exhaustion
+    /// surfaces as a plain authentication failure — the caller's existing
+    /// fail-open/fail-closed policy applies, no new failure mode. Entries WITH
+    /// a stored fingerprint must use fingerprint selection (`decrypt_at`),
+    /// never this method.
     #[pyo3(name = "decrypt")]
     pub fn decrypt(
         &self,
         encryptor: &PyZeroKnowledgeEncryptor,
         ciphertext: &[u8],
-        tenant_id: &str,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
         self.inner
-            .decrypt(&encryptor.inner, ciphertext, tenant_id, aad)
+            .decrypt(&encryptor.inner, ciphertext, aad)
             .map_err(decrypt_error_to_py)
     }
 }
@@ -586,6 +619,7 @@ pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZeroKnowledgeEncryptor>()?;
     m.add_class::<PyTenantKeys>()?;
     m.add_class::<PyKeyring>()?;
+    m.add_class::<PyTenantKeyring>()?;
     let keyring_config_error = m.py().get_type::<KeyringConfigurationError>();
     // create_exception! sets __module__ to the bare "_rust_serializer"; without
     // this the class cannot be pickled back to a parent process, so a
