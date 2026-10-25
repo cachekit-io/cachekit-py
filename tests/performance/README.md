@@ -30,7 +30,8 @@ callgrind instructions per call for each hot path, failing at +1% (the orjson ro
 against `ir_baselines.json`. Budgets belong to the build that recorded them; on another
 interpreter, extension or C library, record a baseline on `main` first. CI runs it on every PR
 with `--base`: the PR and its base are measured on the same runner and compared with each other,
-not with the committed budgets ([In CI](../../docs/performance.md#in-ci)).
+not with the committed budgets, and `ir_report.py` posts the shards' `--report` files as one PR
+comment ([In CI](../../docs/performance.md#in-ci)).
 See [docs/performance.md](../../docs/performance.md#instruction-budgets).
 
 **Real data.** `tests/data/` holds a pinned slice of a public dataset (provenance in its README).
