@@ -438,11 +438,14 @@ exposition setup.
 <details>
 <summary><strong>Thread Safety Details</strong></summary>
 
-**Free-threaded CPython (3.14t):** the core suites run green on
-free-threaded 3.14 with the GIL verified disabled (CI job
+**Free-threaded CPython (3.15t, 3.14t):** the core suites run green on
+free-threaded 3.14 and 3.15 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
-(`gil_used = false`). Free-threaded wheels are **not yet published** and
-free-threaded builds are not officially supported — blocked upstream on
+(`gil_used = false`). **From the release after 0.24.1, 3.15t has a wheel**:
+the 3.15+ wheel is `abi3t`, so it installs on 3.15t without a Rust toolchain
+(pip 26.1+ or uv 0.11.3+). **3.14t is tested
+but has no wheel** (it builds from source). Free-threaded builds are not
+officially supported yet — blocked upstream on
 orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import;
 cachekit loads redis-py only for its Redis backend, and keeps hiredis out there,
 so redis-py uses its pure-Python parser). See
@@ -553,7 +556,7 @@ See [CONTRIBUTING.md][contributing-url] for full development guidelines.
 
 | Component | Version |
 |:----------|:--------|
-| Python | 3.10+ |
+| Python | 3.11+ |
 
 ---
 

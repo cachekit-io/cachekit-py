@@ -1,16 +1,23 @@
 # Free-Threaded CPython
 
-Status as of 2026-08: **tested on 3.14t, not yet declared**.
-(3.13t is not in the CI matrix — no claim is made for it.)
+Status as of 2026-10: **releases after 0.24.1 publish a wheel that installs on
+3.15t; 3.14t is tested with no wheel; support is not yet declared**. (3.13t is not in the CI matrix: no claim
+is made for it.)
 
 - The core test suites (`tests/unit/`, `tests/critical/`) run green on
-  free-threaded CPython 3.14 with the GIL verified disabled, gated by the
-  `test-freethreaded` CI job on every PR and push.
+  free-threaded CPython 3.14 and 3.15 with the GIL verified disabled, gated by
+  the `test-freethreaded` CI job on every PR and push.
 - The Rust extension declares free-threaded safety
   (`#[pymodule(gil_used = false)]`), so importing `cachekit._rust_serializer`
   does not force the GIL back on.
-- **No free-threaded (`cp31Nt`) wheels are published yet**, and installing
-  cachekit on a free-threaded interpreter is not officially supported. See
+- **From the release after 0.24.1, CPython 3.15 and later get one
+  free-threaded stable-ABI (`abi3t`) wheel per platform** (`cp315-abi3.abi3t`),
+  which loads on both the GIL and the free-threaded build. On 3.15t, `pip install --only-binary :all: cachekit`
+  (pip 26.1+ or uv 0.11.3+) installs cachekit and every runtime dependency
+  from wheels. See
+  [CPython 3.15+: one abi3t wheel](#cpython-315-one-abi3t-wheel).
+- **No 3.14t (`cp314t`) wheel is published**, and installing cachekit on a
+  free-threaded interpreter is not officially supported. See
   [Deferred: declared support](#deferred-declared-support--free-threaded-wheels).
 
 ## What "works only under the GIL" used to mean here
@@ -73,7 +80,8 @@ covered, plus what the free-threaded CI lane surfaced and sites added since:
 
 ## The CI safety net
 
-`.github/workflows/ci.yml` job `test-freethreaded`:
+`.github/workflows/ci.yml` job `test-freethreaded`, one leg each for 3.14t and
+3.15t:
 
 1. Installs exactly what the job runs — note the hiredis exclusion, it is
    load-bearing (see below):
@@ -81,6 +89,11 @@ covered, plus what the free-threaded CI lane surfaced and sites added since:
    ```bash
    uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
    ```
+
+   The 3.15t leg builds the extension as the release does, as abi3t, by
+   setting `MATURIN_PEP517_ARGS="--features pyo3/abi3t-py315"`, and asserts
+   that `_rust_serializer.abi3t.so` is the module it loaded. The GIL 3.15 leg
+   of the `test` job (push matrix only) builds and asserts abi3t the same way.
 
    The `test` dependency group is the core test toolchain. orjson, numpy,
    pandas and pyarrow live only in the `dev` group and the `[data]`/`[json]`
@@ -239,10 +252,91 @@ under a lock-protected queue: `tests/unit/backends/test_cachekitio_thread_share.
 expects zero failures with the GIL and without it, and 10 runs of it on 3.14t with
 the GIL off (72,000 shared-backend operations) failed none.
 
+## CPython 3.15+: one abi3t wheel
+
+From 3.15, each `build-wheels` row in `.github/workflows/release-please.yml`
+builds per-version wheels for each supported CPython below 3.15 plus one
+`cp315-abi3.abi3t-<platform>` wheel, with PyO3's `abi3t-py315` feature on
+(PEP 803). One wheel serves the GIL and the free-threaded builds of 3.15 and
+of every later CPython, so a new CPython release gets a wheel on its release
+day instead of a Rust source build. Building it needs maturin 1.15+
+(`[build-system]` in `pyproject.toml`).
+
+Installers read the compressed tag as `cp315-abi3` plus `cp315-abi3t`. On a
+GIL 3.15 every installer matches the `abi3` half, older ones included (pip 25.2
+installs it). On 3.15t only pip 26.1+ and uv 0.11.3+ match the `abi3t` half; an
+older installer there skips the wheel and builds the sdist, which needs a Rust
+toolchain, as every 3.15t install did before.
+
+On Windows the abi3t extension links `python3t.dll`, which the python.org
+installers ship with both the GIL and the free-threaded build of 3.15. A
+distribution or a frozen application (PyInstaller, cx_Freeze) that leaves
+that DLL out fails to import cachekit with "DLL load failed" on a GIL 3.15.
+
+The limited API loses version-specific fast paths, so abi3t was adopted only
+after a benchmark against per-version `cp315` / `cp315t` builds, with the rule
+fixed before measuring: abi3t ships for an interpreter only if every point's
+95% upper bound of abi3t ÷ per-version is 1.10 or less (the repo's own 10%
+serializer regression bar, `make benchmark-compare`). Otherwise 3.15 keeps
+per-version wheels. Both
+interpreters passed, so **abi3t replaces the cp315 per-version wheel**. The
+largest estimate was GIL 3.15 `verify_checksum` at 64 B: +3.7% (upper bound
++4.7%), about 6 ns per call. The largest upper bound was 3.15t
+`verify_checksum` at 1 MB: 1.060.
+
+| interp | point | per-version median ns | abi3t median ns | abi3t ÷ per-version [95% CI] | A/A noise [95% CI] | runs/arm |
+| --- | --- | --: | --: | --- | --- | --: |
+| 3.15 | compute-64B | 124 | 128 | 1.031 [1.013, 1.044] | 1.012 [0.994, 1.034] | 120 |
+| 3.15 | verify-64B | 161 | 167 | 1.037 [1.030, 1.047] | 1.008 [0.998, 1.023] | 120 |
+| 3.15 | compute-1KB | 211 | 204 | 0.967 [0.955, 0.982] | 1.014 [0.999, 1.044] | 120 |
+| 3.15 | verify-1KB | 252 | 245 | 0.970 [0.953, 0.980] | 1.019 [0.992, 1.058] | 120 |
+| 3.15 | compute-64KB | 3130 | 3117 | 0.996 [0.977, 1.011] | 1.006 [0.984, 1.031] | 120 |
+| 3.15 | verify-64KB | 3146 | 3147 | 1.000 [0.988, 1.025] | 0.997 [0.986, 1.017] | 120 |
+| 3.15 | compute-1MB | 52117 | 52474 | 1.007 [0.970, 1.038] | 1.000 [0.975, 1.039] | 120 |
+| 3.15 | verify-1MB | 53453 | 53381 | 0.999 [0.982, 1.031] | 0.997 [0.981, 1.019] | 120 |
+| 3.15 | msgpack-plain | 6720 | 6834 | 1.017 [1.010, 1.025] | 1.001 [0.996, 1.012] | 120 |
+| 3.15 | msgpack-encrypted | 13795 | 14035 | 1.017 [0.988, 1.033] | 1.008 [0.973, 1.030] | 120 |
+| 3.15t | compute-64B | 132 | 128 | 0.969 [0.956, 0.982] | 1.007 [0.985, 1.022] | 60 |
+| 3.15t | verify-64B | 170 | 169 | 0.996 [0.979, 1.013] | 1.001 [0.988, 1.021] | 60 |
+| 3.15t | compute-1KB | 203 | 205 | 1.005 [0.991, 1.020] | 1.000 [0.984, 1.015] | 60 |
+| 3.15t | verify-1KB | 249 | 240 | 0.966 [0.944, 0.976] | 1.009 [0.988, 1.018] | 60 |
+| 3.15t | compute-64KB | 3056 | 3095 | 1.013 [1.001, 1.022] | 1.003 [0.990, 1.017] | 60 |
+| 3.15t | verify-64KB | 3085 | 3103 | 1.006 [0.997, 1.026] | 1.004 [0.984, 1.014] | 60 |
+| 3.15t | compute-1MB | 49874 | 50110 | 1.005 [0.965, 1.031] | 0.996 [0.952, 1.015] | 60 |
+| 3.15t | verify-1MB | 51196 | 52680 | 1.029 [0.995, 1.060] | 1.008 [0.965, 1.044] | 60 |
+| 3.15t | msgpack-plain | 7735 | 7870 | 1.017 [1.000, 1.029] | 1.005 [0.987, 1.020] | 60 |
+| 3.15t | msgpack-encrypted | 15850 | 15970 | 1.008 [0.978, 1.031] | 1.007 [0.973, 1.025] | 60 |
+
+**Measurement conditions:** 2026-10-25, both builds from the same tree in
+`quay.io/pypa/manylinux2014_x86_64` (the image maturin-action uses for the
+x86_64 Linux row) with maturin 1.15.0, rustc 1.99.1 and the release profile;
+CPython 3.15.1 and 3.15.1t from that image; AMD Ryzen 9 5950X, 32 logical
+CPUs. Points:
+`_rust_serializer.checksum` (compute) and `verify_checksum` at the four sizes
+of `tests/performance/benchmark_checksum_ffi.py` (median per call over 201
+batches of ~200 µs), and the plain and encrypted `StandardSerializer` round
+trips of `test_encryption_overhead_msgpack` (median of 10,000 timed round
+trips). One process is one run; per-version (A), a second per-version arm (A'
+for the A/A noise check) and abi3t (B) ran in a seeded shuffled order
+(`stats_utils.balanced_order`). The estimate is the ratio of the arms' medians
+of per-run medians, with a 2,000-resample bootstrap CI over whole runs. The
+3.15 arm took 120 runs per arm: at 60 its A/A bounds exceeded 1.10 on 8
+points during a load spike, so runs were added until none did, and no point
+was excluded. The added 60 runs per arm pass on their own: abi3t ÷
+per-version upper bound at most 1.046, A/A at most 1.035.
+
+**Dependencies on 3.15t (PyPI, 2026-10-25):** every runtime dependency ships a
+`cp315t` wheel (hiredis 3.5.0, pydantic-core, msgpack, xxhash, blake3). psutil,
+which has none, was dropped from the runtime dependencies: cachekit never
+imported it. Of the optional extras, orjson 3.13.0 (`[json]`) has no `cp315t`
+wheel and builds from source; numpy 2.5.4, pandas 3.1.0 and pyarrow 26.0.0
+(`[data]`) all ship them.
+
 ## Deferred: declared support + free-threaded wheels
 
-Publishing `cp314t` wheels and declaring official free-threaded support is
-**explicitly deferred** until the
+Publishing `cp314t` wheels and declaring official free-threaded support (the
+`Programming Language :: Python :: Free Threading` classifier, which would
+also claim 3.14t) is **explicitly deferred** until the
 dependency chain allows it. Blocking as of 2026-09-29:
 
 - **orjson** — no free-threaded wheels through 3.12.0, and its build script

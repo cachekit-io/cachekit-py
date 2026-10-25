@@ -12,8 +12,7 @@ arguments (hashed as their exact base-type value).
 from __future__ import annotations
 
 import inspect
-import sys
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from pathlib import PurePosixPath
@@ -116,7 +115,7 @@ class TestTemporalValueSentinels:
 
     def test_datetime_date_and_time_round_trip(self):
         value = {
-            "dt": datetime(2026, 7, 20, 12, 0, 5, tzinfo=timezone.utc),
+            "dt": datetime(2026, 7, 20, 12, 0, 5, tzinfo=UTC),
             "d": date(2026, 7, 20),
             "t": time(12, 30, 5),
         }
@@ -181,11 +180,11 @@ class TestDoubleDotSegments:
         assert generate_interop_key(namespace, operation, [1]).startswith(f"{namespace}:{operation}:")
 
 
-class NS(str, Enum):
+class NS(str, Enum):  # noqa: UP042 - the str mixin is the case under test
     USERS = "users"
 
 
-class OP(str, Enum):
+class OP(str, Enum):  # noqa: UP042 - the str mixin is the case under test
     GET_USER = "get_user"
 
 
@@ -222,7 +221,6 @@ class TestSegmentSubclasses:
         assert (type(op), type(ns)) == (str, str)
         assert (op, ns) == ("get_user", "users")
 
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum is new in Python 3.11")
     def test_strenum_renders_its_value(self):
         from enum import StrEnum
 
@@ -413,7 +411,6 @@ class TestArgSubclasses:
     def test_lying_int_comparisons_hash_like_the_plain_value(self):
         assert args_hash([LyingCompare(300)]) == args_hash([300])
 
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum is new in Python 3.11")
     def test_strenum_hashes_like_its_value(self):
         from enum import StrEnum
 

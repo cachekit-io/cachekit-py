@@ -5,7 +5,7 @@ Comprehensive test coverage for high-performance JSON serialization.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
@@ -154,7 +154,7 @@ class TestOrjsonSerializerDataTypes:
     def test_serialize_datetime(self):
         """Test serializing datetime objects (orjson auto-converts to ISO8601)."""
         serializer = OrjsonSerializer()
-        dt = datetime(2025, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+        dt = datetime(2025, 11, 13, 12, 0, 0, tzinfo=UTC)
         data = {"timestamp": dt}
 
         serialized, _ = serializer.serialize(data)

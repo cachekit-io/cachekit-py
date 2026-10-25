@@ -820,8 +820,9 @@ class PerRequestRedisBackend:
         The clone keeps the configured ``socket_timeout`` even inside a ``with_timeout()`` window.
 
         The listener holds its one connection for the life of the process, so the connection PINGs
-        after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive (a Unix socket takes
-        no keepalive option): idle-timeout proxies keep it. On Linux a TCP or TLS connection also sets
+        after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive with the timers
+        redis-py gives the backend's connections (a Unix socket takes no keepalive option):
+        idle-timeout proxies keep it. On Linux a TCP or TLS connection also sets
         ``TCP_USER_TIMEOUT`` to 30 s, unless the backend's pool sets its own, so a peer that stops
         acknowledging the PING fails the connection and the listener reconnects. Replies stay bytes,
         whatever the backend's client decodes: events are MessagePack.
@@ -851,8 +852,11 @@ class PerRequestRedisBackend:
         if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
             kwargs["socket_keepalive"] = True
             if hasattr(socket, "TCP_USER_TIMEOUT"):  # Linux only
-                configured = kwargs.get("socket_keepalive_options") or {}
-                kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: _LISTENER_USER_TIMEOUT_MS, **configured}
+                # The options the backend's connections use: a connection resolves options left unset (no key, or
+                # redis-py 8's marker for one) to redis-py's keepalive defaults. Unconnected, it does no I/O.
+                given = {k: v for k, v in kwargs.items() if k == "socket_keepalive_options"}
+                resolved: Any = redis.Connection(**given).socket_keepalive_options
+                kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: _LISTENER_USER_TIMEOUT_MS, **resolved}
         return redis.ConnectionPool(connection_class=source.connection_class, max_connections=1, **kwargs)
 
     @asynccontextmanager

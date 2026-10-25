@@ -1,7 +1,7 @@
 """Free-threaded CPython guarantees.
 
-The CI lane `test-freethreaded` runs the core suites on a free-threaded 3.14
-build. These tests make the lane's central claim self-verifying from inside
+The CI lane `test-freethreaded` runs the core suites on free-threaded 3.14
+and 3.15 builds. These tests make the lane's central claim self-verifying from inside
 the suite: on a free-threaded interpreter, importing cachekit (including the
 Rust extension) must not re-enable the GIL. On GIL builds they skip — the
 claim is about free-threaded builds only, and the session-identity hammer

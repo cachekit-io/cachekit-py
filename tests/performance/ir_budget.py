@@ -311,31 +311,48 @@ def measure(
     return {p: median(p) for p in paths}
 
 
-def compare(budgets: dict[str, int], measured: dict[str, int], against: str = "budget") -> tuple[list[str], bool]:
-    """Report lines and whether the gate passes. A path without a budget fails: record it first.
-
-    ``against`` names what the budgets are in the report: the committed ``budget``, or the ``base``
-    checkout's figures measured in the same run (``--base``).
-    """
-    lines, ok = [], True
+def judge(budgets: dict[str, int], measured: dict[str, int]) -> list[dict[str, object]]:
+    """One row per measured path: its verdict, Ir/op, budget and delta %. A path without a budget is a FAIL
+    with neither of the last two."""
+    rows: list[dict[str, object]] = []
     for path, ir in measured.items():
         budget = budgets.get(path)
         if budget is None:
-            lines.append(f"FAIL  {path:22} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
-            ok = False
+            rows.append({"path": path, "verdict": "FAIL", "ir": ir, "budget": None, "pct": None})
             continue
         pct = (ir - budget) / budget * 100
         fail_pct, warn_pct = TOLERANCE_PCT.get(path, (FAIL_PCT, WARN_PCT))
         if pct >= fail_pct:
-            verdict, ok = "FAIL", False
+            verdict = "FAIL"
         elif pct >= warn_pct:
             verdict = "WARN"
         elif pct <= -fail_pct:
             verdict = "LOWER"  # cheaper: ratchet it down with --update if the change touched this path
         else:
             verdict = "ok"
-        lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  {against} {budget:>9,}  {pct:+.2f}%")
-    return lines, ok
+        rows.append({"path": path, "verdict": verdict, "ir": ir, "budget": budget, "pct": round(pct, 2)})
+    return rows
+
+
+def compare(budgets: dict[str, int], measured: dict[str, int], against: str = "budget") -> tuple[list[str], bool]:
+    """Report lines and whether the gate passes. A path without a budget fails: record it first.
+
+    ``against`` names what the budgets are in the report: the committed ``budget``, or the ``base``
+    checkout's figures measured in the same run (``--base``).
+    """
+    return report_lines(judge(budgets, measured), against)
+
+
+def report_lines(rows: list[dict[str, object]], against: str) -> tuple[list[str], bool]:
+    """``judge``'s rows as report lines, and whether none of them fails."""
+    lines = []
+    for row in rows:
+        verdict, path, ir, budget = row["verdict"], row["path"], row["ir"], row["budget"]
+        if budget is None:
+            lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
+        else:
+            lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  {against} {budget:>9,}  {row['pct']:+.2f}%")
+    return lines, all(row["verdict"] != "FAIL" for row in rows)
 
 
 def ratchet(budgets: dict[str, int], measured: dict[str, int], allow_increase: bool) -> dict[str, int]:
@@ -355,8 +372,11 @@ def _positive_minutes(text: str) -> float:
     return minutes
 
 
-def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: float) -> int:
+def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: float, report: Path | None = None) -> int:
     """``--base``: measure the base checkout and this one on this machine, and gate this one against it.
+
+    ``report`` also writes the verdict as JSON once there is one (``--report``), for CI to post on the pull
+    request. An environment error or a crashed run writes none, so a missing report means no verdict.
 
     Both checkouts run from absolute paths of the same length. The measured process's argv and import
     paths move its heap layout: a relative workload path against an absolute one read l1_hit 0.3% apart
@@ -391,10 +411,15 @@ def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: floa
 
     measured = measure(paths, jobs, child_timeout_s, sys.executable, WORKLOAD.resolve())
     base_figures = measure(paths, jobs, child_timeout_s, str(python), workload)
-    lines, ok = compare(base_figures, measured, against="base")
+    rows = judge(base_figures, measured)
+    lines, ok = report_lines(rows, against="base")
     print(f"main-thread Ir/op on {interpreter_key()} ({platform.python_version()}), this checkout against --base {base}")
     print("\n".join(lines + [f"new   {p:22} not on the base: nothing to compare against" for p in new]))
     print("PASS" if ok else f"FAIL: a path regressed by {FAIL_PCT}% or more against the base")
+    if report is not None:  # after the verdict is printed, so a failed write cannot hide it
+        rows += [{"path": p, "verdict": "new", "ir": None, "budget": None, "pct": None} for p in new]
+        summary = {"verdict": "PASS" if ok else "FAIL", "interpreter": interpreter_key(), "python": platform.python_version()}
+        report.write_text(json.dumps(summary | {"rows": rows}, indent=2) + "\n")
     return 0 if ok else 1
 
 
@@ -446,9 +471,17 @@ def _main() -> int:
         metavar="K/N",
         help="measure only every Nth path, starting at the Kth, so N machines can split the gate",
     )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        metavar="FILE",
+        help="with --base, also write the verdict and every path's figures to FILE as JSON (CI posts it on the PR)",
+    )
     args = parser.parse_args()
     if args.base and args.update:
-        parser.error("--update writes committed budgets; --base compares two checkouts and writes nothing")
+        parser.error("--update writes committed budgets; --base compares two checkouts and never writes them")
+    if args.report and not args.base:
+        parser.error("--report writes the --base verdict; pass --base DIR")
     paths = select_paths(args.path, args.skip, args.shard)
 
     if shutil.which("valgrind") is None:
@@ -456,7 +489,7 @@ def _main() -> int:
         return 2
     key = interpreter_key()
     if args.base:
-        return _against_base(args.base, paths, args.jobs, args.child_timeout * 60)
+        return _against_base(args.base, paths, args.jobs, args.child_timeout * 60, args.report)
     data = json.loads(BASELINES.read_text())
     entry = data["interpreters"].get(key, {"budgets": {}})
     if entry.get("python") not in (None, platform.python_version()):

@@ -1,5 +1,7 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+# 1.15: the 3.15+ wheel is abi3t. maturin added abi3t in 1.14, fixed building it alongside abi3 in
+# 1.14.1, and fixed its ELF PyModExport check in 1.15.0.
+requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -36,7 +38,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -52,7 +53,7 @@ classifiers = [
     "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     # Core Redis functionality. 4.6.0 is the oldest release on which every URL scheme creates a client:
     # redis.asyncio arrived in 4.2.0, and before 4.6.0 a unix:// connection rejects socket_connect_timeout.
@@ -67,7 +68,6 @@ dependencies = [
     "pydantic-settings>=2.13.0",
     # Monitoring and observability
     "prometheus-client>=0.22.1",
-    "psutil>=7.0.0",
     # Serialization and hashing
     "blake3>=1.0.5",
     "msgpack>=1.2.1",
@@ -113,7 +113,7 @@ include = ["LICENSE", "README.md"]
 # Ruff configuration
 [tool.ruff]
 line-length = 129
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
@@ -230,7 +230,7 @@ test = [
     # Utilities
     "faker>=20.0.0",
     "hypothesis>=6.0.0",
-    "requests>=2.33.0; python_version >= '3.10'",
+    "requests>=2.33.0",
     "psutil>=5.9.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.3",
@@ -288,8 +288,6 @@ constraint-dependencies = [
     "certifi>=2026.10.19",
     # filelock is a dev-only transitive dep (pip-audit -> cachecontrol[filecache] ->
     # filelock). 4.2.1 fixes GHSA-v4x8-3wr5-3wq8, GHSA-9vhv-jxww-xfm5 and
-    # GHSA-567q-5qvw-pf92 but needs Python 3.11+, so the floor is 3.11+ only; 3.10
-    # keeps 3.25.2 (4.1.0, the last 3.10 release, adds three more advisories).
-    # Drop the marker once requires-python >= 3.11.
-    "filelock>=4.2.1; python_version >= '3.11'",
+    # GHSA-567q-5qvw-pf92.
+    "filelock>=4.2.1",
 ]

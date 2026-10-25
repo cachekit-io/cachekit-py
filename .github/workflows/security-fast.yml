@@ -109,10 +109,10 @@ jobs:
 
     - name: Run pip-audit
       run: |
-        # No suppressions: every prior CVE is resolved at source on the py3.10+
+        # No suppressions: every prior CVE is resolved at source on the py3.11+
         # resolution. Vulnerable dev-only transitives are floored via
         # [tool.uv] constraint-dependencies; pygments/pyarrow advisories cleared
-        # by their py3.10+ fix versions. Keep this list IDENTICAL to ci.yml's
+        # by their py3.11+ fix versions. Keep this list IDENTICAL to ci.yml's
         # post-merge pip-audit so the two cannot drift.
         uv run pip-audit --desc --format json --output pip-audit-report.json
 

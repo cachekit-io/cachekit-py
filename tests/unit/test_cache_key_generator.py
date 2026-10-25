@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum, IntEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -439,7 +439,7 @@ class TestExtendedTypeNormalization:
         class Level(IntEnum):
             LOW = 1
 
-        class Mode(str, Enum):
+        class Mode(str, Enum):  # noqa: UP042 - the str mixin is the case under test
             FAST = "fast"
 
         assert type(key_generator._normalize(Level.LOW)) is int
@@ -471,7 +471,7 @@ class TestExtendedTypeNormalization:
 
     def test_datetime_utc_only(self, key_generator):
         """Datetime normalizes to ISO format (UTC required)."""
-        dt_utc = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        dt_utc = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
         result = key_generator._normalize(dt_utc)
 
         assert "2024-01-15" in result
@@ -490,8 +490,8 @@ class TestExtendedTypeNormalization:
         def func(timestamp):
             return timestamp.isoformat()
 
-        dt1 = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
-        dt2 = datetime(2024, 1, 15, 13, 0, 0, tzinfo=timezone.utc)
+        dt1 = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        dt2 = datetime(2024, 1, 15, 13, 0, 0, tzinfo=UTC)
 
         key1 = key_generator.generate_key(func, (dt1,), {})
         key2 = key_generator.generate_key(func, (dt1,), {})

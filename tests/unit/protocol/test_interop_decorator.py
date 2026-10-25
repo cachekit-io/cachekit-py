@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from contextlib import AbstractContextManager
+from datetime import UTC
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import Mock, patch
@@ -604,18 +605,17 @@ class TestInteropRejections:
                 return x
 
     def test_z_suffix_sentinel_revives(self):
-        """Regression: JS/Rust writers emit ISO-8601 with a Z designator;
-        Python 3.10's fromisoformat cannot parse it — the decoder must normalize,
-        or foreign datetime-bearing entries get evicted on read."""
+        """Regression: JS/Rust writers emit ISO-8601 with a Z designator; the
+        decoder must revive it, or foreign datetime-bearing entries get evicted on read."""
         import msgpack
 
         from cachekit.interop import decode_interop_value
 
         foreign = msgpack.packb({"__datetime__": True, "value": "2024-01-01T12:30:45.123Z"}, use_bin_type=True)
         revived = decode_interop_value(foreign)
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        assert revived == datetime(2024, 1, 1, 12, 30, 45, 123000, tzinfo=timezone.utc)
+        assert revived == datetime(2024, 1, 1, 12, 30, 45, 123000, tzinfo=UTC)
 
     def test_ck_frame_at_interop_key_is_diagnosed_and_recomputed(self, backend: DictBackend):
         """A planted CK frame is rejected with the protocol#11 diagnostic path,

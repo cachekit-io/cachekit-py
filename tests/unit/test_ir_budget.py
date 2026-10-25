@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -449,14 +450,41 @@ def test_against_base_gates_this_checkout_on_the_base_measured_in_the_same_run(t
         return {"l1_hit": 1000, "l2_hit": 1000 if on_base else 1010}
 
     monkeypatch.setattr(ir_budget, "measure", fake_measure)
-    assert ir_budget._against_base(base, ["l1_hit", "l2_hit", "file_set"], 2, 60) == 1
+    report = tmp_path / "report.json"
+    assert ir_budget._against_base(base, ["l1_hit", "l2_hit", "file_set"], 2, 60, report) == 1
     out = capsys.readouterr().out
     assert "FAIL  l2_hit" in out and "base     1,000  +1.00%" in out
     assert "new   file_set" in out  # absent from the base: reported, not measured
+    assert json.loads(report.read_text()) == {
+        "verdict": "FAIL",
+        "interpreter": ir_budget.interpreter_key(),
+        "python": platform.python_version(),
+        "rows": [
+            {"path": "l1_hit", "verdict": "ok", "ir": 1000, "budget": 1000, "pct": 0.0},
+            {"path": "l2_hit", "verdict": "FAIL", "ir": 1010, "budget": 1000, "pct": 1.0},
+            {"path": "file_set", "verdict": "new", "ir": None, "budget": None, "pct": None},
+        ],
+    }
     assert calls == [
         (("l1_hit", "l2_hit"), sys.executable, ir_budget.WORKLOAD.resolve()),
         (("l1_hit", "l2_hit"), str(base / ".venv" / "bin" / "python"), base / "tests" / "performance" / "ir_workload.py"),
     ]
+
+
+def test_against_base_writes_no_report_without_a_verdict(tmp_path, monkeypatch) -> None:
+    """CI reads a missing report as a shard with no result, so an environment error must not write one."""
+    base = _trees(tmp_path, ("l1_hit",))
+    (base / ".venv" / "bin" / "python").unlink()
+    monkeypatch.setattr(ir_budget, "WORKLOAD", tmp_path / "head" / "tests" / "performance" / "ir_workload.py")
+    assert ir_budget._against_base(base, ["l1_hit"], 2, 60, tmp_path / "report.json") == 2
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_report_needs_base(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["ir_budget.py", "--report", "r.json"])
+    with pytest.raises(SystemExit):
+        ir_budget._main()
+    assert "--report writes the --base verdict" in capsys.readouterr().err
 
 
 def test_against_base_refuses_a_base_whose_path_length_differs(tmp_path, monkeypatch, capsys) -> None:
