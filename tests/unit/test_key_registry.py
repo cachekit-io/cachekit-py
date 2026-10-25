@@ -13,7 +13,6 @@ import asyncio
 import contextvars
 import logging
 import os
-import sys
 import threading
 import time
 from enum import Enum, StrEnum
@@ -950,8 +949,7 @@ class TestNamespaceExactStr:
             ("users", None, None),
             (_StrEnumNS.USERS, None, None),
             (None, None, None),
-            # f"{member}" is "_NS.USERS" only from 3.11; on 3.10 the set name never moved.
-            (_NS.USERS, None, "_NS.USERS" if sys.version_info >= (3, 11) else None),
+            (_NS.USERS, None, "_NS.USERS"),
             # 0.20.0 shipped the registry with interop's exact-str rebind: no pre-fix set exists.
             (_NS.USERS, "get_user", None),
         ],

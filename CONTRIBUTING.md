@@ -88,7 +88,7 @@ tracked file except `CHANGELOG.md` and `.github/workflows/pr-title-lint.yml`.
 - **Linter**: Ruff (runs automatically with `make lint`)
 - **Type checker**: basedpyright (standard mode, zero errors enforced)
 - **Type hints**: Required for all public APIs
-- **Python 3.11+ compatibility**: Use `from __future__ import annotations` for modern union syntax
+- **Annotations**: Use `from __future__ import annotations`
 - **Docstrings**: Google style for public functions/classes
 - **Imports**: Absolute imports only
 

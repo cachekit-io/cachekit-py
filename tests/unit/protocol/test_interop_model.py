@@ -12,7 +12,6 @@ arguments (hashed as their exact base-type value).
 from __future__ import annotations
 
 import inspect
-import sys
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import Enum
@@ -222,7 +221,6 @@ class TestSegmentSubclasses:
         assert (type(op), type(ns)) == (str, str)
         assert (op, ns) == ("get_user", "users")
 
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum is new in Python 3.11")
     def test_strenum_renders_its_value(self):
         from enum import StrEnum
 
@@ -413,7 +411,6 @@ class TestArgSubclasses:
     def test_lying_int_comparisons_hash_like_the_plain_value(self):
         assert args_hash([LyingCompare(300)]) == args_hash([300])
 
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum is new in Python 3.11")
     def test_strenum_hashes_like_its_value(self):
         from enum import StrEnum
 
