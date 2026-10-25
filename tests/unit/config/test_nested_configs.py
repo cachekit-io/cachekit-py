@@ -128,7 +128,7 @@ class TestCircuitBreakerConfig:
 
     @pytest.mark.parametrize("field", ["failure_threshold", "success_threshold", "half_open_requests"])
     @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), 1.5, 5.0, True])
-    def test_validate_count_not_a_whole_number_at_least_one(self, field: str, bad: object) -> None:
+    def test_validate_count_not_an_int_or_numpy_integer_at_least_one(self, field: str, bad: object) -> None:
         """With a NaN or inf failure_threshold the circuit never opens; a fraction or a bool is not a count. The
         message names the field: inf or 5.0 as success_threshold once failed only the half_open_requests check."""
         config = CircuitBreakerConfig(**{field: bad})  # pyright: ignore[reportArgumentType]
@@ -145,7 +145,10 @@ class TestCircuitBreakerConfig:
         """NaN or inf could never half-open; 0 would restart spent probe cycles on every clock tick. A bool, None,
         a str, a Decimal or a complex is refused with ConfigurationError, not accepted or a bare TypeError."""
         config = CircuitBreakerConfig(recovery_timeout=bad)  # pyright: ignore[reportArgumentType]
-        with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
+        with pytest.raises(
+            ConfigurationError,
+            match="recovery_timeout must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+        ):
             config.validate()
 
     @pytest.mark.parametrize("timeout", [1, 0.5, Fraction(1, 2), 10**400])
@@ -175,7 +178,10 @@ class TestCircuitBreakerConfig:
                 with pytest.raises(ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
                     CircuitBreakerConfig(**{field: bad}).validate()
         for bad in (np.float64("nan"), np.array(30.0), np.True_, np.timedelta64(5, "s"), np.timedelta64("NaT")):
-            with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
+            with pytest.raises(
+                ConfigurationError,
+                match="recovery_timeout must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+            ):
                 CircuitBreakerConfig(recovery_timeout=bad).validate()
 
     def test_validate_half_open_requests_below_success_threshold(self) -> None:
