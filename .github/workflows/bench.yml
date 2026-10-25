@@ -5,6 +5,10 @@ name: Bench
 # their run medians into the job summary. Run it from the Actions tab to
 # refresh those figures. A PR that changes the guards or this file runs it as
 # well. Informational only: nothing here gates a merge.
+#
+# The large-payload job measures the encrypted get and set up to 1 MB under
+# glibc malloc settings, each against the default allocator, for the
+# "Large Payloads" section of docs/performance.md.
 
 on:
   workflow_dispatch:
@@ -13,6 +17,7 @@ on:
     paths:
       - tests/performance/test_production_realism.py
       - tests/performance/stats_utils.py
+      - tests/performance/large_payload_bench.py
       - .github/workflows/bench.yml
 
 permissions:
@@ -66,5 +71,61 @@ jobs:
         {
           echo '```text'
           grep -E '^[A-Z][A-Z0-9 +()=-]+$|^[A-Z].*:$|Run median|Absolute' guards.log
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  large-payload:
+    name: Large payloads (${{ matrix.setting.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each setting is the candidate arm, against the default allocator as the base arm,
+        # in interleaved fresh-process pairs (tests/performance/large_payload_bench.py ab).
+        setting:
+          - name: mmap 4 MiB + trim 16 MiB
+            args: --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216
+          - name: mmap 4 MiB only
+            args: --candidate-env MALLOC_MMAP_THRESHOLD_=4194304
+          - name: trim 16 MiB only
+            args: --candidate-env MALLOC_TRIM_THRESHOLD_=16777216
+          - name: top pad 16 MiB
+            args: --candidate-env MALLOC_TOP_PAD_=16777216
+          - name: top pad 64 MiB
+            args: --candidate-env MALLOC_TOP_PAD_=67108864
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    - name: Install dependencies
+      run: uv sync --python 3.14 --group dev
+
+    - name: Record the machine
+      run: |
+        {
+          echo '```text'
+          uv run python --version
+          ldd --version | sed -n 1p  # glibc version: the settings are glibc malloc's; sed, not head, so pipefail never sees SIGPIPE
+          lscpu | grep -E '^(Model name|CPU\(s\)):'
+          echo '```'
+          echo
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Measure
+      env:
+        SETTING_ARGS: ${{ matrix.setting.args }}
+      run: |
+        # Unquoted on purpose: SETTING_ARGS holds several --candidate-env flags.
+        # shellcheck disable=SC2086
+        uv run python tests/performance/large_payload_bench.py ab $SETTING_ARGS --pairs 30 | tee large-payload.log
+        {
+          echo '```text'
+          cat large-payload.log
           echo '```'
         } | tee -a "$GITHUB_STEP_SUMMARY"
