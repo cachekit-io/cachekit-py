@@ -30,7 +30,7 @@ import math
 import re
 import struct
 from collections.abc import Iterable
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePath
@@ -263,7 +263,7 @@ def _normalize_arg(v: object) -> object:
         # exact for pre-epoch values too), then ONE float64 division by 10^6.
         # IEEE 754 division is exactly specified, so this is bit-identical
         # across languages (spec: DateTime determinism).
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
         delta = v - epoch
         micros = (delta.days * 86400 + delta.seconds) * 10**6 + delta.microseconds
         return micros / 1_000_000.0

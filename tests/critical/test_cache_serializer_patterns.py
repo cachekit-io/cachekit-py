@@ -1,6 +1,6 @@
 """Round trips of each data shape through AutoSerializer, the type-preserving cache serializer (serializer="auto")."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -72,10 +72,10 @@ class TestAutoSerializerPatterns:
         pd.testing.assert_frame_equal(_roundtrip(df), df)
 
     def test_complex_roundtrip(self):
-        obj = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        obj = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
         result = _roundtrip(obj)
         assert result == obj
-        assert result.tzinfo == timezone.utc
+        assert result.tzinfo == UTC
 
         complex_data = {
             "datetime": datetime.now(),

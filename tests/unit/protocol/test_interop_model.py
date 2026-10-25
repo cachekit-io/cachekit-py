@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import inspect
 import sys
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from pathlib import PurePosixPath
@@ -116,7 +116,7 @@ class TestTemporalValueSentinels:
 
     def test_datetime_date_and_time_round_trip(self):
         value = {
-            "dt": datetime(2026, 7, 20, 12, 0, 5, tzinfo=timezone.utc),
+            "dt": datetime(2026, 7, 20, 12, 0, 5, tzinfo=UTC),
             "d": date(2026, 7, 20),
             "t": time(12, 30, 5),
         }
@@ -181,11 +181,11 @@ class TestDoubleDotSegments:
         assert generate_interop_key(namespace, operation, [1]).startswith(f"{namespace}:{operation}:")
 
 
-class NS(str, Enum):
+class NS(str, Enum):  # noqa: UP042 - the str mixin is the case under test
     USERS = "users"
 
 
-class OP(str, Enum):
+class OP(str, Enum):  # noqa: UP042 - the str mixin is the case under test
     GET_USER = "get_user"
 
 
