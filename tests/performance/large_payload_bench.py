@@ -34,7 +34,8 @@ shell's ``MALLOC_*``, ``GLIBC_TUNABLES`` and ``LD_PRELOAD``, so an arm runs glib
 unless its ``--*-env`` names a setting, and the header prints each arm's settings. With neither
 flag, both arms are this interpreter: an A/A run, whose verdicts show the host's noise. A full run
 makes 48 comparisons (16 cells, three metrics), so at 95% expect about two false "lower" or
-"higher" verdicts in an A/A run; on a shared host the CPU of the small shapes is the noisiest. Repeat a run before trusting a lone verdict.
+"higher" verdicts in an A/A run; on a shared host the CPU of the small shapes is the noisiest.
+Repeat a run before trusting a lone verdict.
 
 Run (from a checkout, after ``uv sync``)::
 
