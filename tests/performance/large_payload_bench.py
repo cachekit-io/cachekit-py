@@ -33,8 +33,8 @@ the harness itself never differs between them. Every measured process starts wit
 shell's ``MALLOC_*``, ``GLIBC_TUNABLES`` and ``LD_PRELOAD``, so an arm runs glibc malloc's defaults
 unless its ``--*-env`` names a setting, and the header prints each arm's settings. With neither
 flag, both arms are this interpreter: an A/A run, whose verdicts show the host's noise. A full run
-makes 48 comparisons (16 cells, three metrics), so at 95% expect about two false "lower" or "higher" verdicts in an A/A run; on a shared
-host the CPU of the small shapes is the noisiest. Repeat a run before trusting a lone verdict.
+makes 48 comparisons (16 cells, three metrics), so at 95% expect about two false "lower" or
+"higher" verdicts in an A/A run; on a shared host the CPU of the small shapes is the noisiest. Repeat a run before trusting a lone verdict.
 
 Run (from a checkout, after ``uv sync``)::
 
@@ -186,7 +186,7 @@ def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
 
 
 def allocator_env(env: dict[str, str]) -> dict[str, str]:
-    """This process's environment without anything that changes the allocator, plus ``env``.
+    """This process's environment without ``MALLOC_*``, ``GLIBC_TUNABLES`` (all of it) and ``LD_PRELOAD``, plus ``env``.
 
     An arm's allocator settings are only the ones it names: a ``MALLOC_*`` or ``GLIBC_TUNABLES``
     exported in the calling shell would otherwise reach both arms and turn the default arm into a copy
