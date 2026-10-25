@@ -156,17 +156,29 @@ elif mode == "inside":  # signal itself again at the Nth line run inside the fir
             state["armed"] = True
         return line if state["armed"] and state["lines"] < int(sys.argv[5]) else None
     sys.settrace(call)
-elif mode == "thread":  # once the main thread blocks collecting results, signal another thread, which does not wake it
+elif mode == "thread":  # once the main thread sleeps collecting results, signal another thread, which does not wake it
     import signal, threading, time
-    def collecting():  # the main thread is inside measure()'s wait() for its runs
-        frame = sys._current_frames().get(threading.main_thread().ident)
+    main = threading.main_thread()
+    def asleep():  # where the main thread is, if it sleeps in the lock acquire of a Condition.wait() under measure()'s wait()
+        top = frame = sys._current_frames().get(main.ident)
         while frame is not None and frame.f_code is not b.wait.__code__:
             frame = frame.f_back
-        return frame is not None
+        if frame is None or top.f_code is not threading.Condition.wait.__code__:
+            return None
+        stat = Path(f"/proc/self/task/{main.native_id}/stat").read_text()
+        return (top, top.f_lasti) if stat[stat.rindex(")") + 2] == "S" else None
+    def parked():
+        # A signal sent before the main thread parks runs its handler at once and proves nothing. Asleep alone
+        # also covers a wait for the GIL, but that thread takes the GIL while this one sleeps, so finding it
+        # asleep at the same instruction of the same call after a sleep proves it is blocked in the acquire.
+        seen = asleep()
+        if seen is None:
+            return False
+        time.sleep(0.02)
+        return asleep() == seen
     def signal_this_thread():
-        while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 2 or not collecting():
+        while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 2 or not parked():
             time.sleep(0.01)
-        time.sleep(0.5)  # a signal sent before the main thread parks runs its handler at once and proves nothing
         signal.pthread_kill(threading.get_ident(), int(sys.argv[3]))
     threading.Thread(target=signal_this_thread, daemon=True).start()
 b.measure(["l1_hit"], 2)
@@ -323,6 +335,7 @@ def test_a_signal_between_spawning_a_run_and_tracking_it_leaves_no_run_behind(tm
                 os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="the driver reads thread states from /proc")
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
 def test_a_signal_that_does_not_wake_the_main_thread_still_stops_the_gate(tmp_path, sig: signal.Signals) -> None:
     """The handler runs only once the main thread wakes, and a signal can arrive without waking it.
