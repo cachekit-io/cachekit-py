@@ -17,6 +17,7 @@ from pathlib import Path
 MARKER = "<!-- cachekit-instruction-budget -->"  # ci.yml's perf-ir-comment edits the bot comment that opens with it
 JOB_NAME = "Instruction budget (shard {k}/{n})"  # ci.yml's perf-ir job name
 SEVERITY = {"FAIL": 0, "WARN": 1, "new": 2, "LOWER": 3, "ok": 4}  # rows that need a look first
+CONCLUSION = {"PASS": "success", "FAIL": "failure"}  # the shard job's conclusion each verdict ends it with
 
 
 def load_report(path: Path) -> dict | None:
@@ -36,9 +37,21 @@ def _figure(value: object) -> str:
 
 def render(reports: dict[int, dict | None], shards: int, jobs: dict[str, dict], head: str, base: str, run_url: str) -> str:
     """The comment body. ``reports`` maps shard K to its report (None if it has none); ``jobs`` maps job name
-    to the job's ``html_url`` and ``conclusion``, as the GitHub jobs API lists them."""
-    missing = [k for k in range(1, shards + 1) if reports.get(k) is None]
-    present = [r for r in reports.values() if r is not None]
+    to the job's ``html_url`` and ``conclusion``, as the GitHub jobs API lists them.
+
+    A report counts only if its verdict is how its job ended. Artifacts outlive a re-run, so a re-run shard
+    that dies before uploading its placeholder leaves the earlier attempt's report in place; its job failed,
+    so an old PASS there is no result, never a pass.
+    """
+
+    def current(k: int) -> dict | None:
+        report = reports.get(k)
+        conclusion = jobs.get(JOB_NAME.format(k=k, n=shards), {}).get("conclusion")
+        return report if report and conclusion in (None, CONCLUSION[report["verdict"]]) else None
+
+    counted = {k: current(k) for k in range(1, shards + 1)}
+    missing = [k for k, r in counted.items() if r is None]
+    present = [r for r in counted.values() if r is not None]
     rows = sorted((row for r in present for row in r["rows"]), key=lambda row: (SEVERITY.get(row["verdict"], -1), row["path"]))
     if missing:
         overall = "INCOMPLETE"

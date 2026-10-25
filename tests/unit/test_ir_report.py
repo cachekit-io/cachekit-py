@@ -18,7 +18,7 @@ JOBS = {
         "html_url": f"https://github.com/o/r/actions/runs/1/job/{k}",
         "conclusion": c,
     }
-    for k, c in ((1, "success"), (2, "failure"), (3, "success"), (4, "success"))
+    for k, c in ((1, "success"), (2, "success"), (3, "success"), (4, "success"))
 }
 
 
@@ -29,6 +29,12 @@ def _report(*rows: tuple[str, str, int | None, int | None, float | None], verdic
         "python": "3.12.13",
         "rows": [{"path": p, "verdict": v, "ir": ir, "budget": b, "pct": pct} for p, v, ir, b, pct in rows],
     }
+
+
+def _jobs(*failed: int) -> dict[str, dict]:
+    """JOBS with these shards' jobs ended in failure."""
+    names = {f"Instruction budget (shard {k}/4)" for k in failed}
+    return {name: job | {"conclusion": "failure"} if name in names else job for name, job in JOBS.items()}
 
 
 def _all_ok() -> dict[int, dict | None]:
@@ -63,7 +69,7 @@ def test_a_warn_passes_and_shows_first() -> None:
 def test_a_fail_fails_and_a_new_path_has_no_figures() -> None:
     reports = _all_ok()
     reports[2] = _report(("l2_hit", "FAIL", 10_100, 10_000, 1.0), ("new_path", "new", None, None, None), verdict="FAIL")
-    body = render(reports, 4, JOBS, "aaa", "bbb", RUN)
+    body = render(reports, 4, _jobs(2), "aaa", "bbb", RUN)
     assert "### Instruction budget: FAIL" in body
     assert _rows(body)["`l2_hit`"] == "| **FAIL** | `l2_hit` | 10,100 | 10,000 | +1.00% |"
     assert _rows(body)["`new_path`"] == "| new | `new_path` | – | – | – |"
@@ -73,12 +79,25 @@ def test_a_fail_fails_and_a_new_path_has_no_figures() -> None:
 def test_a_missing_shard_is_incomplete_and_links_its_job(other: str) -> None:
     reports = _all_ok()
     reports[2] = None
+    jobs = _jobs(2)
     if other == "FAIL":
         reports[1] = _report(("l1_hit", "FAIL", 2, 1, 100.0), verdict="FAIL")
-    body = render(reports, 4, JOBS, "aaa", "bbb", RUN)
+        jobs = _jobs(1, 2)
+    body = render(reports, 4, jobs, "aaa", "bbb", RUN)
     assert "### Instruction budget: INCOMPLETE" in body
     row = "| **no result** | [Instruction budget (shard 2/4)](https://github.com/o/r/actions/runs/1/job/2) (failure) | | | |"
     assert row in body.splitlines()
+
+
+@pytest.mark.parametrize(("verdict", "conclusion"), [("PASS", "failure"), ("FAIL", "success"), ("PASS", "cancelled")])
+def test_a_report_its_job_did_not_end_with_is_no_result(verdict: str, conclusion: str) -> None:
+    """A re-run shard that dies before its upload leaves the earlier attempt's report: an old PASS must not count."""
+    reports = _all_ok()
+    reports[3] = _report(("l2_hit", "ok", 1, 1, 0.0), verdict=verdict)
+    name = "Instruction budget (shard 3/4)"
+    body = render(reports, 4, JOBS | {name: JOBS[name] | {"conclusion": conclusion}}, "aaa", "bbb", RUN)
+    assert "### Instruction budget: INCOMPLETE" in body
+    assert "`l2_hit`" not in body
 
 
 def test_a_missing_shard_without_a_listed_job_links_the_run() -> None:
