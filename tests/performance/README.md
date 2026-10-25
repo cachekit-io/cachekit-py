@@ -34,6 +34,16 @@ not with the committed budgets, and `ir_report.py` renders the shards' `--report
 comment, which CI posts ([In CI](../../docs/performance.md#in-ci)).
 See [docs/performance.md](../../docs/performance.md#instruction-budgets).
 
+**Large payloads.** Instruction counts cannot see page faults, which at 1 MB are a large share of
+an encrypted get or set. `large_payload_bench.py` reports thread CPU and minor page faults
+per op of the encrypted `@cache.io` get and set at 64 B, 1 KB, 64 KB and 1 MB, for JSON-like and
+incompressible values, each measurement in a fresh process at a sampled heap layout. Its `ab` mode
+compares two checkouts' interpreters, or one interpreter under two allocator settings, in
+interleaved process pairs (30 by default) with a bootstrap 95% CI per cell:
+`uv run python tests/performance/large_payload_bench.py ab --base <base checkout>/.venv/bin/python`.
+The `Bench` workflow runs it under glibc malloc settings
+([Large Payloads](../../docs/performance.md#large-payloads-and-glibc-malloc)).
+
 **Real data.** `tests/data/` holds a pinned slice of a public dataset (provenance in its README).
 `tests/unit/test_real_dataset.py` round-trips it, and results derived from it, through the
 serializers and the decorator's backend path on every PR (`uv run pytest tests/unit/test_real_dataset.py`).
