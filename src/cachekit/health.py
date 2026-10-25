@@ -11,7 +11,7 @@ circuit breaker) are passed to the constructor. No global registry.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Optional
 
@@ -78,7 +78,7 @@ class HealthCheckResult:
     status: HealthStatus
     components: list[ComponentHealth]
     duration_ms: float
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def is_healthy(self) -> bool:
@@ -341,7 +341,7 @@ class HealthChecker:
                     status=HealthStatus.HEALTHY,
                     message="Redis is responsive",
                     details=details,
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
             else:
                 return ComponentHealth(
@@ -349,14 +349,14 @@ class HealthChecker:
                     status=HealthStatus.UNHEALTHY,
                     message=f"Redis health check failed: {details.get('error', 'unknown')}",
                     details=details,
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ComponentHealth(
                 name="redis",
                 status=HealthStatus.UNHEALTHY,
                 message=f"Redis health check timeout after {self.timeout}s",
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
         except Exception as e:
             return ComponentHealth(
@@ -364,7 +364,7 @@ class HealthChecker:
                 status=HealthStatus.UNHEALTHY,
                 message=f"Redis health check failed: {e!s}",
                 details={"error_type": type(e).__name__},
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
 
     def _check_redis_sync(self) -> ComponentHealth:
@@ -382,7 +382,7 @@ class HealthChecker:
                     status=HealthStatus.HEALTHY,
                     message="Redis is responsive",
                     details=details,
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
             else:
                 return ComponentHealth(
@@ -390,7 +390,7 @@ class HealthChecker:
                     status=HealthStatus.UNHEALTHY,
                     message=f"Redis health check failed: {details.get('error', 'unknown')}",
                     details=details,
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
         except Exception as e:
             return ComponentHealth(
@@ -398,7 +398,7 @@ class HealthChecker:
                 status=HealthStatus.UNHEALTHY,
                 message=f"Redis health check failed: {e!s}",
                 details={"error_type": type(e).__name__},
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
 
     async def _check_connection_pool_async(self) -> ComponentHealth:
@@ -409,7 +409,7 @@ class HealthChecker:
                     name="connection_pool",
                     status=HealthStatus.DEGRADED,
                     message="Connection pool not initialized",
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
 
             stats = self._pool_manager.get_pool_statistics()
@@ -431,7 +431,7 @@ class HealthChecker:
                 status=status,
                 message=message,
                 details=stats,
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
         except Exception as e:
             return ComponentHealth(
@@ -439,7 +439,7 @@ class HealthChecker:
                 status=HealthStatus.UNHEALTHY,
                 message=f"Failed to check connection pool: {e!s}",
                 details={"error_type": type(e).__name__},
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
 
     def _check_connection_pool_sync(self) -> ComponentHealth:
@@ -450,7 +450,7 @@ class HealthChecker:
                     name="connection_pool",
                     status=HealthStatus.DEGRADED,
                     message="Connection pool not initialized",
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
 
             stats = self._pool_manager.get_pool_statistics()
@@ -472,7 +472,7 @@ class HealthChecker:
                 status=status,
                 message=message,
                 details=stats,
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
         except Exception as e:
             return ComponentHealth(
@@ -480,7 +480,7 @@ class HealthChecker:
                 status=HealthStatus.UNHEALTHY,
                 message=f"Failed to check connection pool: {e!s}",
                 details={"error_type": type(e).__name__},
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
 
     def _check_circuit_breaker(self) -> ComponentHealth:
@@ -491,7 +491,7 @@ class HealthChecker:
                     name="circuit_breaker",
                     status=HealthStatus.HEALTHY,
                     message="Circuit breaker not in use",
-                    last_check=datetime.now(timezone.utc),
+                    last_check=datetime.now(UTC),
                 )
 
             # One locked snapshot, so the state and the counters agree
@@ -522,10 +522,10 @@ class HealthChecker:
                     "failure_count": stats["failure_count"],
                     "success_count": stats["success_count"],
                     "last_failure_time": (
-                        datetime.fromtimestamp(last_failure_time, timezone.utc).isoformat() if last_failure_time else None
+                        datetime.fromtimestamp(last_failure_time, UTC).isoformat() if last_failure_time else None
                     ),
                 },
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
         except Exception as e:
             return ComponentHealth(
@@ -533,7 +533,7 @@ class HealthChecker:
                 status=HealthStatus.UNHEALTHY,
                 message=f"Failed to check circuit breaker: {e!s}",
                 details={"error_type": type(e).__name__},
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
 
     def _check_metrics_collection(self) -> ComponentHealth:
@@ -554,7 +554,7 @@ class HealthChecker:
                     "cache_operations_total": int(cache_ops_total),
                     "collectors_active": True,
                 },
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
         except Exception as e:
             return ComponentHealth(
@@ -562,7 +562,7 @@ class HealthChecker:
                 status=HealthStatus.DEGRADED,
                 message=f"Metrics collection issue: {e!s}",
                 details={"error_type": type(e).__name__},
-                last_check=datetime.now(timezone.utc),
+                last_check=datetime.now(UTC),
             )
 
     def _determine_overall_status(self, components: list[ComponentHealth]) -> HealthStatus:

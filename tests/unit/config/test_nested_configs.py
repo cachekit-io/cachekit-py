@@ -2,7 +2,7 @@
 
 Tests all 5 nested config classes:
 - L1CacheConfig: max_size_mb >= 1, defaults, frozen immutability
-- CircuitBreakerConfig: thresholds >= 1, defaults
+- CircuitBreakerConfig: int thresholds >= 1, finite recovery_timeout > 0, defaults
 - BackpressureConfig: max_concurrent >= 1
 - MonitoringConfig: boolean flags, no validation constraints
 - EncryptionConfig: master_key required if enabled, tenant mode mutual exclusivity
@@ -10,6 +10,7 @@ Tests all 5 nested config classes:
 
 from __future__ import annotations
 
+import re
 import threading
 from decimal import Decimal
 from fractions import Fraction
@@ -125,30 +126,63 @@ class TestCircuitBreakerConfig:
         config = CircuitBreakerConfig(failure_threshold=1, success_threshold=1, half_open_requests=1)
         assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
 
-    def test_validate_failure_threshold_too_small(self) -> None:
-        """Test validation fails when failure_threshold < 1."""
-        config = CircuitBreakerConfig(failure_threshold=0)
-        with pytest.raises(ConfigurationError, match="failure_threshold must be >= 1, got 0"):
+    @pytest.mark.parametrize("field", ["failure_threshold", "success_threshold", "half_open_requests"])
+    @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), 1.5, 5.0, True])
+    def test_validate_count_not_an_int_or_numpy_integer_at_least_one(self, field: str, bad: object) -> None:
+        """With a NaN or inf failure_threshold the circuit never opens; a fraction or a bool is not a count. The
+        message names the field: inf or 5.0 as success_threshold once failed only the half_open_requests check."""
+        config = CircuitBreakerConfig(**{field: bad})  # pyright: ignore[reportArgumentType]
+        with pytest.raises(
+            ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool, got {re.escape(repr(bad))}"
+        ):
             config.validate()
 
-    def test_validate_success_threshold_too_small(self) -> None:
-        """Test validation fails when success_threshold < 1."""
-        config = CircuitBreakerConfig(success_threshold=0)
-        with pytest.raises(ConfigurationError, match="success_threshold must be >= 1, got 0"):
+    @pytest.mark.parametrize(
+        "bad",
+        [0, 0.0, -1.0, float("nan"), float("inf"), float("-inf"), True, None, "30", Decimal("30"), complex(30)],
+    )
+    def test_validate_recovery_timeout_invalid(self, bad: object) -> None:
+        """NaN or inf could never half-open; 0 would restart spent probe cycles on every clock tick. A bool, None,
+        a str, a Decimal or a complex is refused with ConfigurationError, not accepted or a bare TypeError."""
+        config = CircuitBreakerConfig(recovery_timeout=bad)  # pyright: ignore[reportArgumentType]
+        with pytest.raises(
+            ConfigurationError,
+            match="recovery_timeout must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+        ):
             config.validate()
 
-    def test_validate_half_open_requests_too_small(self) -> None:
-        """Test validation fails when half_open_requests < 1."""
-        config = CircuitBreakerConfig(half_open_requests=0)
-        with pytest.raises(ConfigurationError, match="half_open_requests must be >= 1, got 0"):
-            config.validate()
+    @pytest.mark.parametrize("timeout", [1, 0.5, Fraction(1, 2), 10**400])
+    def test_validate_recovery_timeout_valid(self, timeout: object) -> None:
+        """Any real number of seconds > 0 passes, including an int past float range (no OverflowError)."""
+        config = CircuitBreakerConfig(recovery_timeout=timeout)  # pyright: ignore[reportArgumentType]
+        assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
 
-    @pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("nan"), float("inf")])
-    def test_validate_recovery_timeout_rejects_zero_negative_and_non_finite(self, bad: float) -> None:
-        """NaN or inf could never half-open; 0 would restart spent probe cycles on every clock tick."""
-        config = CircuitBreakerConfig(recovery_timeout=bad)
-        with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
-            config.validate()
+    def test_validate_numpy_values(self) -> None:
+        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or an array, a 0-d integer one
+        included, is refused with ConfigurationError."""
+        np = pytest.importorskip("numpy")
+        for timeout in (np.float64(0.5), np.float32(0.5), np.int64(30)):
+            config = CircuitBreakerConfig(
+                failure_threshold=np.int64(4),
+                success_threshold=np.int32(2),
+                recovery_timeout=timeout,
+                half_open_requests=np.int8(2),
+            )
+            assert DecoratorConfig(circuit_breaker=config).circuit_breaker is config
+        for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
+            with pytest.raises(ConfigurationError, match="failure_threshold must be an int or NumPy integer >= 1, not a bool"):
+                CircuitBreakerConfig(failure_threshold=bad).validate()
+        # np.timedelta64 is registered as Integral and Real, but has no __index__ and does not compare with a float.
+        for bad in (np.timedelta64(5, "s"), np.timedelta64(5), np.timedelta64("NaT")):
+            for field in ("failure_threshold", "success_threshold", "half_open_requests"):
+                with pytest.raises(ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
+                    CircuitBreakerConfig(**{field: bad}).validate()
+        for bad in (np.float64("nan"), np.array(30.0), np.True_, np.timedelta64(5, "s"), np.timedelta64("NaT")):
+            with pytest.raises(
+                ConfigurationError,
+                match="recovery_timeout must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+            ):
+                CircuitBreakerConfig(recovery_timeout=bad).validate()
 
     def test_validate_half_open_requests_below_success_threshold(self) -> None:
         """A cycle admits at most half_open_requests probes, so fewer than success_threshold can never close."""
@@ -198,7 +232,8 @@ class TestBackpressureConfig:
         """Below 1 nothing runs; from NaN, inf or a fraction threading.Semaphore never reaches 0, so nothing is limited."""
         config = BackpressureConfig(max_concurrent_requests=max_concurrent)  # pyright: ignore[reportArgumentType]
         with pytest.raises(
-            ConfigurationError, match=f"max_concurrent_requests must be a whole number >= 1, got {max_concurrent!r}"
+            ConfigurationError,
+            match=f"max_concurrent_requests must be an int or NumPy integer >= 1, not a bool, got {max_concurrent!r}",
         ):
             config.validate()
 
@@ -214,13 +249,20 @@ class TestBackpressureConfig:
         for timeout in (np.float64(0.5), np.int64(1)):
             config = BackpressureConfig(max_concurrent_requests=np.int64(8), queue_size=np.int32(16), timeout=timeout)
             assert DecoratorConfig(backpressure=config).backpressure is config
-        with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
-            BackpressureConfig(timeout=np.float32(0.5)).validate()
+        for bad in (np.float32(0.5), np.array(0.5), np.array(1), np.timedelta64(1, "s")):
+            with pytest.raises(ConfigurationError, match="timeout must be a number from 0 to"):
+                BackpressureConfig(timeout=bad).validate()
+        for field in ("max_concurrent_requests", "queue_size"):
+            for bad in (np.array(8), np.timedelta64(8, "s"), np.timedelta64("NaT")):
+                with pytest.raises(ConfigurationError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
+                    BackpressureConfig(**{field: bad}).validate()
 
     @pytest.mark.parametrize("queue_size", [0, -5, 1.5, float("nan"), float("inf"), True])
     def test_validate_queue_size_invalid(self, queue_size: float) -> None:
         """Below 1 every operation is rejected (each joins the queue); NaN or inf would remove the cap."""
-        with pytest.raises(ConfigurationError, match=f"queue_size must be a whole number >= 1, got {queue_size!r}"):
+        with pytest.raises(
+            ConfigurationError, match=f"queue_size must be an int or NumPy integer >= 1, not a bool, got {queue_size!r}"
+        ):
             BackpressureConfig(queue_size=queue_size).validate()  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(

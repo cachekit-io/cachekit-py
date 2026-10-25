@@ -236,26 +236,26 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux builds - must specify interpreters explicitly (manylinux has 3.8+ but we support 3.10+)
+          # Linux builds - must specify interpreters explicitly (manylinux has 3.8+ but we support 3.11+)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+            interpreter: -i python3.11 -i python3.12 -i python3.13 -i python3.14
           # macOS/Windows - must specify interpreters explicitly (auto-discovery unreliable)
           - os: macos-latest
             target: x86_64-apple-darwin
-            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+            interpreter: -i python3.11 -i python3.12 -i python3.13 -i python3.14
           - os: macos-latest
             target: aarch64-apple-darwin
-            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+            interpreter: -i python3.11 -i python3.12 -i python3.13 -i python3.14
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+            interpreter: -i python3.11 -i python3.12 -i python3.13 -i python3.14
           # aarch64 Linux cross-compilation - must specify Python versions explicitly
           # (cross containers don't have discoverable Python interpreters)
           # Uses manylinux_2_28 for modern GCC (fixes ring crate aarch64 build)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+            interpreter: -i python3.11 -i python3.12 -i python3.13 -i python3.14
             manylinux: "2_28"
     runs-on: ${{ matrix.os }}
     steps:
@@ -271,16 +271,26 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: |
-            3.10
             3.11
             3.12
             3.13
             3.14
+            3.15
 
       - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist ${{ matrix.interpreter }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          rust-toolchain: stable
+
+      # CPython 3.15 and later: one free-threaded stable-ABI (abi3t) wheel per platform. It loads on
+      # both the GIL and the free-threaded build of 3.15 and of every later CPython, so a new release
+      # gets a wheel on day one. Why abi3t over per-version wheels: docs/free-threading.md.
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i python3.15 --features pyo3/abi3t-py315
           manylinux: ${{ matrix.manylinux || 'auto' }}
           rust-toolchain: stable
 

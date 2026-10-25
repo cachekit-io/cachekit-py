@@ -10,7 +10,7 @@ This project follows a standard code of conduct. Please be respectful and profes
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.11 or higher
 - Rust 1.80 or higher
 - Redis 5.0 or higher (for testing)
 - [uv](https://github.com/astral-sh/uv) (recommended for dependency management)
@@ -88,7 +88,7 @@ tracked file except `CHANGELOG.md` and `.github/workflows/pr-title-lint.yml`.
 - **Linter**: Ruff (runs automatically with `make lint`)
 - **Type checker**: basedpyright (standard mode, zero errors enforced)
 - **Type hints**: Required for all public APIs
-- **Python 3.10+ compatibility**: Use `from __future__ import annotations` for modern union syntax
+- **Annotations**: Use `from __future__ import annotations`
 - **Docstrings**: Google style for public functions/classes
 - **Imports**: Absolute imports only
 
@@ -205,7 +205,7 @@ make journeys
 > [!CAUTION]
 > With `REDIS_URL` set, the tests erase **every database** on that server: pytest-redis runs `FLUSHALL` after each test. The suite uses only the URL's host and port and ignores its database number, so `/15` protects nothing. Point `REDIS_URL` only at a dedicated, disposable server that holds no data you need.
 
-The spawned server listens on a unix socket under pytest's base temp directory, and a socket path over about 107 characters fails every Redis test with `UnixSocketTooLong`. The `make test*` targets pass a short `--basetemp` for that reason. If your `TMPDIR` is long and you run pytest directly, pass a short base temp that no other run uses, for example `uv run pytest -n auto --basetemp=/tmp/pt-$$`. Do not reuse one fixed path across runs: pytest empties the base temp directory when a run starts, so two runs sharing it delete each other's files.
+The spawned server listens on a unix socket under pytest's base temp directory, and a socket path over about 107 characters fails every Redis test with `UnixSocketTooLong`. For that reason, `make test-python`, `test-quick`, `test-cov`, `test-critical-quick` and `test-critical-quiet` each create a fresh, short `--basetemp`. Each removes it when the tests pass, and keeps it, printing its path, when they fail. If your `TMPDIR` is long and you run pytest directly, pass a short base temp that `mktemp` makes, so no other run uses it, for example `bt=$(mktemp -d /tmp/pt-XXXXXXXX) && uv run pytest -n auto --basetemp="$bt" && rm -rf "$bt"`. pytest never removes a base temp you pass, so remove it yourself, as the `&& rm -rf` does after a passing run; after a failure, `$bt` still names the kept directory. Do not reuse a path across runs, whether fixed or built from the shell's PID: pytest empties the base temp directory when a run starts, so a run that reuses a path deletes the files of the run that had it before.
 
 **Testing the nothing-configured path.** Every test gets a Redis-backed provider from an autouse fixture in `tests/conftest.py`, so a decorator under test never sees what a user with nothing configured sees. Request the `nothing_configured` fixture to opt out: it installs the real default provider, clears `REDIS_URL` and every `CACHEKIT_*` variable in any casing, needs no Redis, and fails the test if the provider builds a backend. Add `no_redis_built` to fail on any Redis client construction. A promise about default behaviour also needs a fresh-interpreter test, as in `tests/critical/test_zero_config_fresh_interpreter.py`: its child process refuses every outbound connection, because CI serves Redis at `localhost:6379`, the address an unconfigured client would dial, and a test that only checks for a cache hit passes there either way.
 
@@ -217,7 +217,7 @@ The spawned server listens on a unix socket under pytest's base temp directory, 
 uv run --with "pandas>=3,<4" pytest tests/unit/ -m "not slow" -n auto
 ```
 
-**The nightly run.** `.github/workflows/nightly.yml` runs the suites no PR job selects, every night at 19:17 UTC. It has three independent jobs. The first runs `tests/competitive`. The second runs `tests/performance -m "performance and not slow"`, whose wall-clock numbers are reported, not asserted, and then the serializer micro-benchmarks once, untimed. The third builds the wheel on Python 3.10 and resolves it with `--resolution lowest`, so numpy, pandas and pyarrow sit at the `data` extra's floors. It then runs `tests/unit` against that wheel, not the source tree. A failed run opens or updates the "Nightly is failing" issue. To run it on demand, use **Run workflow** on the Actions page, or `gh workflow run nightly.yml`. A PR that edits the workflow file runs it too.
+**The nightly run.** `.github/workflows/nightly.yml` runs the suites no PR job selects, every night at 19:17 UTC. It has three independent jobs. The first runs `tests/competitive`. The second runs `tests/performance -m "performance and not slow"`, whose wall-clock numbers are reported, not asserted, and then the serializer micro-benchmarks once, untimed. The third builds the wheel on Python 3.11 and resolves it with `--resolution lowest`, so numpy, pandas and pyarrow sit at the `data` extra's floors. It then runs `tests/unit` against that wheel, not the source tree. A failed run opens or updates the "Nightly is failing" issue. To run it on demand, use **Run workflow** on the Actions page, or `gh workflow run nightly.yml`. A PR that edits the workflow file runs it too.
 
 **Mutation smoke.** `scripts/mutation_smoke.py` holds hand-written mutants: each is one exact string edit to a guard in `src/`, plus the tests recorded as its killers. The nightly `Mutation Smoke` workflow runs the baseline and every mutant as parallel jobs, and opens or updates a tracking issue when one fails. A mutant counts as killed only when pytest exits 1 and at least one of its recorded killers fails; a collection error, a setup or teardown error, a timeout or an unrelated failure never counts. The baseline checks that every anchor matches exactly once and that every killer passes unmutated, so a deleted or renamed killer turns the baseline red. A mutant reports `SURVIVED` only once none of its killers catch it: with two killers, weakening one leaves the other to kill it. A refactored guard reports `NOT APPLIED`. Run it locally:
 
@@ -324,8 +324,10 @@ valgrind against budgets committed in `tests/performance/ir_baselines.json`, so 
 is visible however loaded the machine is. Budgets belong to the build that recorded them; on a
 different interpreter, extension or C library, record a baseline on `main` first. Every pull
 request also runs it in CI (the `Instruction budget` jobs, CPython 3.12), against the PR's base
-measured on the same runner rather than against the committed budgets. Method, budgets and the
-CI job: [docs/performance.md](docs/performance.md#instruction-budgets).
+measured on the same runner rather than against the committed budgets. Each pull request gets one
+comment with the result, every path's figures included, updated in place on each run; pull requests
+from forks get none, and their shard logs carry the result. Method, budgets and the CI job:
+[docs/performance.md](docs/performance.md#instruction-budgets).
 
 ### Formatting Code
 

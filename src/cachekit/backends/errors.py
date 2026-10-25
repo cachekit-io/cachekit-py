@@ -13,7 +13,7 @@ from typing import Optional
 from ..hash_utils import redact_cache_key
 
 
-class BackendErrorType(str, Enum):
+class BackendErrorType(str, Enum):  # noqa: UP042 - StrEnum would change str() of members
     """Error classification for circuit breaker decisions.
 
     Inherits from str for JSON serialization and string comparisons.

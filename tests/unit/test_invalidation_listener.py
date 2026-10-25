@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Optional
 
@@ -965,6 +965,21 @@ class TestListenerPool:
         options = backend.listener_pool().connection_kwargs["socket_keepalive_options"]
         assert options == {socket.TCP_KEEPIDLE: 60, socket.TCP_USER_TIMEOUT: 30_000}
         assert backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] == {socket.TCP_KEEPIDLE: 60}
+
+    @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+    @pytest.mark.parametrize(
+        "client",
+        [lambda: redis.Redis(host="cache.example"), lambda: redis.Redis.from_url("redis://cache.example:6379/0")],
+        ids=["keywords", "url"],
+    )
+    def test_unset_keepalive_options_resolve_as_the_backends_connections_do(self, client: Callable[[], redis.Redis]) -> None:
+        """A client that sets no keepalive options leaves them unset: no key from a URL, a sentinel from keywords on
+        redis-py 8, which resolves both to its own keepalive defaults when it connects. The listener's connection keeps
+        those defaults."""
+        backend = PerRequestRedisBackend(client(), "default")
+        resolved = backend._client.connection_pool.make_connection().socket_keepalive_options
+        options = backend.listener_pool().connection_kwargs["socket_keepalive_options"]
+        assert options == {**resolved, socket.TCP_USER_TIMEOUT: 30_000}
 
     @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
     def test_source_tcp_user_timeout_wins(self) -> None:

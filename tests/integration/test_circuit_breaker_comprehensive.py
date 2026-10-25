@@ -86,7 +86,10 @@ class TestCircuitBreakerConfiguration:
             CircuitBreakerConfig(timeout_seconds=-1)
 
         # Zero would restart a spent HALF_OPEN cycle on every clock tick: no probe cap
-        with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+        with pytest.raises(
+            ValueError,
+            match="timeout_seconds must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+        ):
             CircuitBreakerConfig(timeout_seconds=0)
 
 

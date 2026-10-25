@@ -225,6 +225,43 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 - **Pass scalar arguments** (`int`, short `str`, ...) to hot `backend=None` functions, so the key memo serves them (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
 - **Batch queries:** one call that returns many items pays the overhead once
 
+### Bottleneck 3: Page Faults on Large Values
+
+**Problem:** on Linux with glibc, an encrypted get or set of a 1MB value can spend a third of its CPU or more on page faults, and an incompressible set over three quarters.
+
+**Mitigation:** set `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` together, if most cached values are around 1MB (see [Large Payloads and glibc malloc](#large-payloads-and-glibc-malloc)).
+
+## Large Payloads and glibc malloc
+
+A set holds several payload-sized buffers at once: the MessagePack output, the LZ4 output, the envelope, the ciphertext and the stored frame; a get holds as many. When they are freed, glibc hands the top of its heap back to the kernel once more than its trim threshold is free, and any buffer at or above its mmap threshold that neither a freed chunk nor the heap's free top can hold gets a fresh `mmap`. The next call takes those pages back, one page fault per 4KB. glibc raises both thresholds at run time to fit the largest `mmap`-ed buffer freed so far, so the fault count depends on every large allocation in the process and on the payload's shape: removing one buffer can raise the count for another shape.
+
+Two glibc settings, set together, removed every fault from both 1MB sets measured and cut the JSON-like get's from 632 to 252 (the random-bytes get had none):
+
+```bash
+export MALLOC_MMAP_THRESHOLD_=4194304   # 4 MiB: buffers below this come from the heap, not a fresh mmap
+export MALLOC_TRIM_THRESHOLD_=16777216  # 16 MiB: return the heap's free top to the kernel only once it exceeds this
+```
+
+Set them in the environment the process starts with, such as a container's `ENV` or a systemd unit's `Environment=`. glibc reads them once at startup, so setting `os.environ` from Python is too late. They apply to the whole process, not only to cachekit.
+
+`tests/performance/large_payload_bench.py ab` measured each setting against the default allocator, in 30 interleaved process pairs per cell, in [the `Bench` workflow's run on 2026-10-25](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618) on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC 7763, glibc 2.39, CPython 3.14.7, cachekit-core 0.7.0. The workload is `@cache.io` with encryption, L1 off and an in-process backend, so the HTTP response body a real backend allocates on every get is not in these figures. That is one more payload-sized buffer per get, and since every such buffer moves the fault count, the get columns can differ against a real backend in either direction; a set sends its value without one. The value is about 1MB of JSON-like text in a dict, or 1,000,000 random bytes. Each cell is the change in CPU per call, with the 95% CI of the paired change, and the faults per call under that setting:
+
+| Setting | 1MB JSON-like get | 1MB JSON-like set | 1MB random-bytes get | 1MB random-bytes set |
+|---|---|---|---|---|
+| Default glibc malloc | 2.03ms, 632 faults | 2.91ms, 556 faults | 0.51ms, 0 faults | 3.06ms, 1,442 faults |
+| Both: `MALLOC_MMAP_THRESHOLD_` 4 MiB and `MALLOC_TRIM_THRESHOLD_` 16 MiB | −28.5% [−32.1, −24.8], 252 faults | −33.1% [−33.4, −32.8], 0 | −0.1% [−1.3, +1.1], 0 | −77.9% [−78.3, −77.6], 0 |
+| `MALLOC_TRIM_THRESHOLD_` 16 MiB alone | +34.8% [+29.5, +40.2], 981 | +26.9% [+26.6, +27.3], 921 | +494% [+492, +496], 1,719 | +38.5% [+37.9, +39.2], 2,212 |
+| `MALLOC_TOP_PAD_` 16 MiB alone | −27.9% [−32.1, −23.5], 252 | −33.2% [−33.7, −32.7], 0 | +310% [+308, +313], 982 | −23.2% [−23.7, −22.6], 983 |
+| `MALLOC_TOP_PAD_` 64 MiB alone | −29.9% [−34.0, −25.7], 252 | −34.0% [−34.3, −33.6], 0 | −1.1% [−2.8, +0.8], 0 | −78.7% [−79.4, −77.9], 0 |
+
+The default row is the base arm of the "both" job. [A second run of that job](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618/attempts/2) agreed within about 1 point on every 1MB cell. Do not set one threshold alone: glibc stops adjusting either threshold once one is set, so the other stays at its 128KB default. `MALLOC_TRIM_THRESHOLD_` alone was slower on all four 1MB paths. `MALLOC_MMAP_THRESHOLD_` 4 MiB alone, on an Intel Xeon Platinum 8370C runner in the same run, slowed the JSON-like get by 26.6%, the random-bytes get by 80.0% and the JSON-like set by 2.3%, and sped the random-bytes set by 17.9%.
+
+The cost of setting both, on the same runner:
+- **Memory:** peak RSS per process rose by 0.2 to 1.1MB, in a single-threaded process. The trim threshold is not a cap on retained memory: it only decides when the free space at the top of a heap goes back to the kernel. `free()` never trims free chunks below a live allocation, and buffers under 4 MiB no longer get their own `mmap`, so a heap fragmented by long-lived objects can hold far more than 16 MiB of free memory, in each of the several arenas a threaded process has. Size memory limits from your own process's RSS under load, not from these settings; that was not measured here.
+- **A 64KB incompressible get took about a third longer:** +32.7% [+31.3, +34.3], 67.0μs to 88.9μs, and +32.6% in the second run, with no page faults in either arm. Both `MALLOC_TOP_PAD_` settings did the same, and also slowed 64KB sets by 4% to 6%. Every other 64B, 1KB and 64KB cell changed by 1.2% or less.
+
+So set both for a process whose cached values are mostly around 1MB, and measure your own machine first: `uv run python tests/performance/large_payload_bench.py ab --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216` runs the same comparison, and `--shapes json-1m bin-1m` narrows it to the 1MB cells. Nothing between 64KB and 1MB was measured, so where the settings start to pay off is not known. The MessagePack encoder grows its buffer to up to twice the value's size, so from about 2MB some buffers reach the 4 MiB mmap threshold and can be `mmap`-ed again once no freed chunk or free top in the heap can hold them; larger values were not measured. Free-threaded CPython (3.13t, 3.14t) allocates Python objects with its own allocator, and musl (Alpine) and macOS allocators work differently; none of them was measured.
+
 ## Performance Regression Testing
 
 Wall-clock benchmarks do not gate CI, and no test in `tests/performance/` asserts a time budget: on a shared machine the run-level bands are too wide to gate on (see [Measured Figures](#measured-figures)). The wall-clock suites below run in the default `pytest tests/` invocation, report their figures, and fail only on behaviour:
@@ -257,7 +294,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,510 | 9,796 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit | 171,656 | 164,940 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 206,514 | 196,945 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 164,952 | 163,358 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 158,029 | 156,881 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 161,736 | 155,861 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 61,705 | 62,837 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
@@ -266,7 +303,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,975,014 | 1,970,889 |
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,849,178 | 61,414,623 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,813,019 | 61,434,085 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 116,559 | 118,412 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 103,200 | 104,970 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,556 | 73,669 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 9,000 to 10,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread. The gap was about 50,000 until each label tuple's Prometheus series was bound once instead of looked up per call.
@@ -298,13 +335,14 @@ uv run python tests/performance/ir_budget.py --path serializer_arrow_usgs --path
 
 ### In CI
 
-Every pull request runs the gate in the `Instruction budget (shard K/4)` jobs of `.github/workflows/ci.yml`, on GitHub-hosted `ubuntu-latest` runners with CPython 3.12. They do not compare against the committed budgets: those belong to the machine and interpreter build that recorded them, and a CPython 3.12 patch release alone read 2.0% to 3.6% over them with no code change. Instead each job builds two checkouts side by side, the pull request (its merge commit) and its base (the base branch tip), measures both on the same runner, and fails when a path costs 1% or more above the base (2% for the orjson round trip). That is `ir_budget.py --base DIR`, which writes nothing.
+Every pull request runs the gate in the `Instruction budget (shard K/4)` jobs of `.github/workflows/ci.yml`, on GitHub-hosted `ubuntu-latest` runners with CPython 3.12. They do not compare against the committed budgets: those belong to the machine and interpreter build that recorded them, and a CPython 3.12 patch release alone read 2.0% to 3.6% over them with no code change. Instead each job builds two checkouts side by side, the pull request (its merge commit) and its base (the base branch tip), measures both on the same runner, and fails when a path costs 1% or more above the base (2% for the orjson round trip). That is `ir_budget.py --base DIR`, which never writes the committed budgets; CI adds `--report FILE`, which writes the verdict and every path's figures as JSON.
 
 - Both checkouts must sit at absolute paths of the same length, and the gate refuses a base that does not. The measured process's argv and import paths move its heap layout: a relative workload path against an absolute one read `l1_hit` 0.3% apart on identical source; at equal-length absolute paths the same pair agreed within 0.01%.
 - The two `serializer_*_usgs` paths are skipped (`--skip`): pyarrow's parquet reader can execute an instruction valgrind does not support on some CPUs, and the run then dies with SIGILL.
 - Four runners split the remaining paths (`--shard 1/4` to `--shard 4/4`), so the check takes minutes rather than half an hour.
 - A path the base does not have yet is reported as `new` and not compared.
-- CI keeps no budgets of its own, so there is nothing to re-record for it, and it ignores the committed ones entirely. They are still ratcheted on your machine with `make perf-ir-update`. A deliberate cost increase (`--update --allow-increase`, with the reason in the PR) therefore shows as a red `Instruction budget` check: the check is not part of `CI Success`, and the reviewer accepts the increase at merge. A raised committed budget cannot waive it, because a budget diff cannot tell a deliberate increase from a re-record on another interpreter or extension build, which moved one path 8.8% with no code change.
+- Each pull request carries one comment from `github-actions[bot]` with the result of its latest completed run: the overall verdict, the head and base commits measured, the interpreter, and every path's verdict, Ir/op on both sides and delta. Each run updates the same comment in place. A shard that ends without a verdict (a crash, an environment error, a timeout) shows as "no result", linked to its job, and the verdict reads `INCOMPLETE`, never `PASS`. The `Instruction budget report` job renders it from the shards' `--report` files with `tests/performance/ir_report.py`, and `Instruction budget comment` posts it: only that job can write to the pull request, and it never checks the code out. Pull requests from forks get no comment, because their token cannot write to the pull request; their shard logs still carry the result.
+- CI keeps no budgets of its own, so there is nothing to re-record for it, and it ignores the committed ones entirely. They are still ratcheted on your machine with `make perf-ir-update`. A deliberate cost increase (`--update --allow-increase`, with the reason in the PR) therefore shows as a red `Instruction budget` check and a `FAIL` in the pull request's instruction-budget comment: the check is not part of `CI Success`, and the reviewer accepts the increase at merge. A raised committed budget cannot waive it, because a budget diff cannot tell a deliberate increase from a re-record on another interpreter or extension build, which moved one path 8.8% with no code change.
 
 To reproduce a CI verdict, check the base out beside your branch at a path of the same length, run `uv sync --group dev` in both, and run the gate from your branch:
 

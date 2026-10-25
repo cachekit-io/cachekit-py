@@ -6,8 +6,8 @@ and attaches the standard wrapper API (invalidate_cache, cache_clear, cache_info
 
 from __future__ import annotations
 
-import asyncio
 import functools
+import inspect
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -27,7 +27,7 @@ def create_local_wrapper(
     """Create a locally-cached wrapper for *func* using ObjectCache.
 
     Validation and ObjectCache construction happen at decoration time.
-    The sync or async wrapper is chosen based on ``asyncio.iscoroutinefunction(func)``.
+    The sync or async wrapper is chosen based on ``inspect.iscoroutinefunction(func)``.
 
     Args:
         func: The function to wrap.
@@ -144,7 +144,7 @@ def create_local_wrapper(
 
     # --- Build sync or async wrapper ---
 
-    if asyncio.iscoroutinefunction(func):
+    if inspect.iscoroutinefunction(func):
 
         async def _fill_async(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)

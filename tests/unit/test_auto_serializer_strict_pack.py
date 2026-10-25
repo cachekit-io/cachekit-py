@@ -14,9 +14,8 @@ key, packed as a bare array before; neither could be read back. The set case now
 from __future__ import annotations
 
 import enum
-import sys
 from collections import Counter, OrderedDict, defaultdict, namedtuple
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from typing import Any
 from uuid import UUID
 
@@ -70,7 +69,7 @@ class Huge(enum.IntFlag):
     X = 2**64
 
 
-class Mood(str, enum.Enum):
+class Mood(str, enum.Enum):  # noqa: UP042 - the str mixin is the case under test
     HAPPY = "happy"
 
 
@@ -276,7 +275,7 @@ CORPUS: dict[str, Any] = {
     "hostile-float": HostileFloat(2.5),
     "hostile-bytes": HostileBytes(b"good"),
     "hostile-bytearray": HostileBytearray(b"good"),
-    "temporal-uuid": [datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc), date(2026, 1, 2), time(3, 4), UUID(int=7)],
+    "temporal-uuid": [datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC), date(2026, 1, 2), time(3, 4), UUID(int=7)],
     "sets-of-scalars": [{1, 2, 3}, frozenset({"a", "b"})],
     "scalars": [None, True, False, 0, -1, 2**63, -(2**63), 1.0, -0.0, float("inf"), "", "ü", b""],
     "deep-acyclic": [[[[[[[[(1,)]]]]]]]],
@@ -284,12 +283,13 @@ CORPUS: dict[str, Any] = {
 if np is not None:
     CORPUS["np-float64"] = [np.float64(1.5), np.float64(-0.0)]
     CORPUS["ndarray"] = {"arr": np.arange(6, dtype=np.int32).reshape(2, 3)}
-if sys.version_info >= (3, 11):
 
-    class Level(enum.StrEnum):
-        HIGH = "high"
 
-    CORPUS["strenum"] = [Level.HIGH, {Level.HIGH: Level.HIGH}]
+class Level(enum.StrEnum):
+    HIGH = "high"
+
+
+CORPUS["strenum"] = [Level.HIGH, {Level.HIGH: Level.HIGH}]
 
 
 @pytest.mark.parametrize("value", CORPUS.values(), ids=list(CORPUS))

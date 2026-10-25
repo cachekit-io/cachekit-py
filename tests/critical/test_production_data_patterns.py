@@ -464,7 +464,7 @@ class TestProductionDataPatterns:
         enterprise_datetime_data = {
             "audit_log": {
                 "created_at": now,
-                "created_at_utc": now.replace(tzinfo=datetime.timezone.utc),
+                "created_at_utc": now.replace(tzinfo=datetime.UTC),
                 "date_only": today,
                 "time_only": current_time,
             },

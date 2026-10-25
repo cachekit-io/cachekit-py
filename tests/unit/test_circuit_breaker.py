@@ -1,7 +1,9 @@
 """Unit tests for circuit breaker components."""
 
+import re
 import threading
 from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,11 +65,56 @@ class TestCircuitBreakerConfig:
         # Empty tuple is valid
         assert len(config.excluded_error_types) == 0
 
-    @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0, 0.0, -1.0])
     def test_timeout_that_never_recovers_or_never_caps_probes_is_rejected(self, timeout):
         """NaN or inf never leaves OPEN (NaN compares False, inf never elapses); <= 0 removes the probe cap."""
-        with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+        with pytest.raises(
+            ValueError,
+            match="timeout_seconds must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+        ):
             CircuitBreakerConfig(timeout_seconds=timeout)
+
+    @pytest.mark.parametrize("timeout", [True, None, "30", Decimal("30"), complex(30)])
+    def test_timeout_that_is_not_a_real_number_is_rejected(self, timeout):
+        """A bool is not a duration, and None or a str once raised a bare TypeError; all raise ValueError."""
+        with pytest.raises(
+            ValueError,
+            match="timeout_seconds must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+        ):
+            CircuitBreakerConfig(timeout_seconds=timeout)
+
+    @pytest.mark.parametrize("field", ["failure_threshold", "success_threshold", "half_open_requests"])
+    @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), 1.5, 5.0, True])
+    def test_count_that_is_not_an_int_or_numpy_integer_at_least_one_is_rejected(self, field, bad):
+        """With a NaN or inf failure_threshold the circuit never opens; a fraction or a bool is not a count."""
+        with pytest.raises(
+            ValueError, match=f"{field} must be an int or NumPy integer >= 1, not a bool, got {re.escape(repr(bad))}"
+        ):
+            CircuitBreakerConfig(**{field: bad})
+
+    def test_numpy_values(self):
+        """NumPy integers count and any NumPy real is a timeout; an integral np.float64 or any array is refused."""
+        np = pytest.importorskip("numpy")
+        config = CircuitBreakerConfig(
+            failure_threshold=np.int64(4),
+            success_threshold=np.int32(2),
+            timeout_seconds=np.float32(1.5),
+            half_open_requests=np.int8(2),
+        )
+        assert (config.failure_threshold, config.timeout_seconds) == (4, 1.5)
+        for bad in (np.float64(5.0), np.array(5), np.array(1.5), np.array([5])):
+            with pytest.raises(ValueError, match="failure_threshold must be an int or NumPy integer >= 1, not a bool"):
+                CircuitBreakerConfig(failure_threshold=bad)
+        # np.timedelta64 is registered as Integral and Real, but has no __index__ and does not compare with a float.
+        for bad in (np.timedelta64(5, "s"), np.timedelta64(5), np.timedelta64("NaT")):
+            for field in ("failure_threshold", "success_threshold", "half_open_requests"):
+                with pytest.raises(ValueError, match=f"{field} must be an int or NumPy integer >= 1, not a bool"):
+                    CircuitBreakerConfig(**{field: bad})
+            with pytest.raises(
+                ValueError,
+                match="timeout_seconds must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+            ):
+                CircuitBreakerConfig(timeout_seconds=bad)
 
 
 class TestCacheOperationMetrics:
@@ -629,7 +676,10 @@ class TestDecoratorConfiguresLiveBreaker:
         [
             ({"success_threshold": 3, "half_open_requests": 1}, r"half_open_requests \(1\) must be >= success_threshold \(3\)"),
             ({"success_threshold": 5}, r"half_open_requests \(3\) must be >= success_threshold \(5\)"),
-            ({"recovery_timeout": 0}, "recovery_timeout must be a finite number > 0"),
+            (
+                {"recovery_timeout": 0},
+                "recovery_timeout must be an int, a float, a Fraction or a NumPy integer or float, not a bool, finite and > 0",
+            ),
         ],
     )
     def test_breaker_that_cannot_recover_is_rejected_at_decoration(self, is_async, knobs, match):

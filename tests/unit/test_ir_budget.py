@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -155,6 +156,31 @@ elif mode == "inside":  # signal itself again at the Nth line run inside the fir
             state["armed"] = True
         return line if state["armed"] and state["lines"] < int(sys.argv[5]) else None
     sys.settrace(call)
+elif mode == "thread":  # once the main thread sleeps collecting results, signal another thread, which does not wake it
+    import signal, threading, time
+    main = threading.main_thread()
+    def asleep():  # where the main thread is, if it sleeps in the lock acquire of a Condition.wait() under measure()'s wait()
+        top = frame = sys._current_frames().get(main.ident)
+        while frame is not None and frame.f_code is not b.wait.__code__:
+            frame = frame.f_back
+        if frame is None or top.f_code is not threading.Condition.wait.__code__:
+            return None
+        stat = Path(f"/proc/self/task/{main.native_id}/stat").read_text()
+        return (top, top.f_lasti) if stat[stat.rindex(")") + 2] == "S" else None
+    def parked():
+        # A signal sent before the main thread parks runs its handler at once and proves nothing. Asleep alone
+        # also covers a wait for the GIL, but that thread takes the GIL while this one sleeps, so finding it
+        # asleep at the same instruction of the same call after a sleep proves it is blocked in the acquire.
+        seen = asleep()
+        if seen is None:
+            return False
+        time.sleep(0.02)
+        return asleep() == seen
+    def signal_this_thread():
+        while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 2 or not parked():
+            time.sleep(0.01)
+        signal.pthread_kill(threading.get_ident(), int(sys.argv[3]))
+    threading.Thread(target=signal_this_thread, daemon=True).start()
 b.measure(["l1_hit"], 2)
 """
 
@@ -309,6 +335,37 @@ def test_a_signal_between_spawning_a_run_and_tracking_it_leaves_no_run_behind(tm
                 os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="the driver reads thread states from /proc")
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_that_does_not_wake_the_main_thread_still_stops_the_gate(tmp_path, sig: signal.Signals) -> None:
+    """The handler runs only once the main thread wakes, and a signal can arrive without waking it.
+
+    On a free-threaded build, a lock acquire spins before it sleeps and does not look for signals while it
+    spins, so a signal that lands then is held until the thread next wakes. Under CPU load the spin is long:
+    a gate blocked without a timeout slept through about 1 signal in 10 until its 60 s runs ended. A signal
+    sent to another thread is held the same way, on any build, and this test sends it that way.
+    """
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "thread"])  # noqa: S603 (trusted: this test's files)
+    try:
+        code = gate.wait(timeout=20)  # the stub runs sleep 60 s: a gate that sleeps through the signal times out here
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        assert len(runs) >= 2, "the stub runs never started"  # a queued run can start before the pool shuts
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
+
+
 @pytest.mark.parametrize("line", range(1, 13))
 def test_a_second_signal_anywhere_inside_the_kill_leaves_no_run_behind(tmp_path, line: int) -> None:
     """The handler re-enters _kill_children() on the main thread, so nothing on that path may take a plain lock."""
@@ -449,14 +506,41 @@ def test_against_base_gates_this_checkout_on_the_base_measured_in_the_same_run(t
         return {"l1_hit": 1000, "l2_hit": 1000 if on_base else 1010}
 
     monkeypatch.setattr(ir_budget, "measure", fake_measure)
-    assert ir_budget._against_base(base, ["l1_hit", "l2_hit", "file_set"], 2, 60) == 1
+    report = tmp_path / "report.json"
+    assert ir_budget._against_base(base, ["l1_hit", "l2_hit", "file_set"], 2, 60, report) == 1
     out = capsys.readouterr().out
     assert "FAIL  l2_hit" in out and "base     1,000  +1.00%" in out
     assert "new   file_set" in out  # absent from the base: reported, not measured
+    assert json.loads(report.read_text()) == {
+        "verdict": "FAIL",
+        "interpreter": ir_budget.interpreter_key(),
+        "python": platform.python_version(),
+        "rows": [
+            {"path": "l1_hit", "verdict": "ok", "ir": 1000, "budget": 1000, "pct": 0.0},
+            {"path": "l2_hit", "verdict": "FAIL", "ir": 1010, "budget": 1000, "pct": 1.0},
+            {"path": "file_set", "verdict": "new", "ir": None, "budget": None, "pct": None},
+        ],
+    }
     assert calls == [
         (("l1_hit", "l2_hit"), sys.executable, ir_budget.WORKLOAD.resolve()),
         (("l1_hit", "l2_hit"), str(base / ".venv" / "bin" / "python"), base / "tests" / "performance" / "ir_workload.py"),
     ]
+
+
+def test_against_base_writes_no_report_without_a_verdict(tmp_path, monkeypatch) -> None:
+    """CI reads a missing report as a shard with no result, so an environment error must not write one."""
+    base = _trees(tmp_path, ("l1_hit",))
+    (base / ".venv" / "bin" / "python").unlink()
+    monkeypatch.setattr(ir_budget, "WORKLOAD", tmp_path / "head" / "tests" / "performance" / "ir_workload.py")
+    assert ir_budget._against_base(base, ["l1_hit"], 2, 60, tmp_path / "report.json") == 2
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_report_needs_base(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["ir_budget.py", "--report", "r.json"])
+    with pytest.raises(SystemExit):
+        ir_budget._main()
+    assert "--report writes the --base verdict" in capsys.readouterr().err
 
 
 def test_against_base_refuses_a_base_whose_path_length_differs(tmp_path, monkeypatch, capsys) -> None:

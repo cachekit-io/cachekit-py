@@ -35,7 +35,7 @@ targeted: the SDK rejects both the scheme and the host. CI skips this directory.
 
 ### 1. Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - uv package manager
 - cachekit SDK installed locally or from PyPI
 - Access to cachekit SaaS API (dev or prod)

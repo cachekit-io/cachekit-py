@@ -96,14 +96,14 @@ def your_function(args):
 
 - **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`:
   - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
-  - `failure_threshold` (`int`, default: `5`) - Failures within a 60 s rolling window that open the circuit; successes do not reset the count
-  - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
-  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
-  - `half_open_requests` (`int`, default: `3`) - Probe slots per half-open cycle (not a concurrency limit). Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a half-open cycle could never close
+  - `failure_threshold` (`int`, default: `5`) - Failures within a 60 s rolling window that open the circuit; successes do not reset the count; must be an int or NumPy integer `>= 1`, not a bool or a float such as `5.0`
+  - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit; must be an int or NumPy integer `>= 1`, not a bool or a float such as `5.0`
+  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be an int, a float, a `Fraction` or a NumPy integer or float, finite and `> 0`
+  - `half_open_requests` (`int`, default: `3`) - Probe slots per half-open cycle (not a concurrency limit); must be an int or NumPy integer `>= 1`, not a bool or a float such as `5.0`. Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
-  - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests; must be a whole number `>= 1`
-  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests; must be a whole number `>= 1`
+  - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests; must be an int or NumPy integer `>= 1`, not a bool or a float such as `5.0`
+  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests; must be an int or NumPy integer `>= 1`, not a bool or a float such as `5.0`
   - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up; must be from `0` to `threading.TIMEOUT_MAX`
 
 #### Monitoring Parameters
@@ -776,7 +776,7 @@ def typed_function(data: dict[str, Any]) -> str | int | None:
     return process_data(data)
 ```
 
-**Type Safety**: The library uses `from __future__ import annotations` for Python 3.10+ compatibility, enabling modern union syntax (`X | Y`) while maintaining backward compatibility.
+**Type Safety**: The library uses `from __future__ import annotations` and modern union syntax (`X | Y`).
 
 ## Monitoring and Observability
 

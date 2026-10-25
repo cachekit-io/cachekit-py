@@ -505,7 +505,6 @@ async def _until_async(predicate: Callable[[], bool], timeout: float = 5.0) -> N
         await asyncio.sleep(0.005)
 
 
-@pytest.mark.skipif(sys.version_info < (3, 11), reason="Python 3.10 cannot tell a caller's own cancellation apart")
 @pytest.mark.parametrize("mode", ASYNC_MODES)
 async def test_joined_callers_run_again_when_the_shared_call_is_cancelled_under_them(mode: str) -> None:
     """The call raised CancelledError (something else cancelled what it awaited); no joined caller was cancelled."""

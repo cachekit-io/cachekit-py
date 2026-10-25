@@ -89,6 +89,12 @@ def test_vector_names() -> None:
     assert {v["name"]: v["reader"] for v in FIXTURE["decrypted_container"]["vectors"]} == CONTAINER_READERS
 
 
+@pytest.mark.parametrize("vector", FIXTURE["vectors"], ids=lambda v: v["name"])
+def test_header_builds_the_sealed_aad(vector: dict[str, Any]) -> None:
+    """Every sealed row's inputs build its ``aad_hex`` byte for byte, with and without ``original_type``."""
+    assert _aad(_reader("default"), vector).hex() == vector["aad_hex"]
+
+
 @pytest.mark.parametrize("vector", AAD_REJECT_VECTORS, ids=lambda v: v["name"])
 class TestAadRejectVectors:
     """A ciphertext presented under one other AAD input fails authentication; cachekit-py never retries."""
