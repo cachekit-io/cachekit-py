@@ -59,6 +59,7 @@ import random
 import statistics
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,9 @@ PATHS = ("hit", "miss")
 # Ops per process and warmup calls before them: enough that the per-process mean is stable at each size.
 OPS = {"64b": (2000, 200), "1k": (2000, 200), "64k": (400, 50), "1m": (40, 10)}
 BOOTSTRAP_RESAMPLES = 10_000
+# Below this many pairs the percentile bootstrap is little more than the deltas' min and max: with 2
+# pairs, every same-sign pair (half of them under the null) prints "lower" or "higher".
+MIN_PAIRS = 10
 CHILD_TIMEOUT_S = 300
 WORDS = (
     "randomized controlled trial meditation mindfulness anxiety depression stress cortisol sleep quality "
@@ -79,14 +83,7 @@ WORDS = (
 
 
 def payload(shape: str) -> object:
-    """The cached value for a shape; seeded, so every process and arm caches the same value.
-
-    >>> len(payload("bin-1k"))
-    1024
-    >>> value = payload("json-64k")
-    >>> 65536 <= sum(len(s) for s in value["reasons"]) + 32 < 65536 + 200
-    True
-    """
+    """The cached value for a shape; seeded, so every process and arm caches the same value."""
     kind, size = shape.split("-")
     n = SIZES[size]
     rng = random.Random(7)
@@ -108,6 +105,7 @@ def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
     """Measure one shape and path in this process; returns per-op means over the measured calls."""
     import gc
     import resource
+    import threading
     import time
 
     import cachekit
@@ -175,6 +173,11 @@ def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
     expected = 0 if path == "hit" else ops
     if computed[0] - before != expected:
         raise RuntimeError(f"{shape}/{path}: body ran {computed[0] - before} times in {ops} calls, expected {expected}")
+    # RUSAGE_THREAD counts this thread only: work a background thread took over (the metrics collector
+    # moves to a worker thread under sustained load) would be missing from the figures.
+    if threading.active_count() != 1:
+        names = [t.name for t in threading.enumerate()]
+        raise RuntimeError(f"{shape}/{path}: threads {names} ran beside the measured one, so its figures miss their work")
     return {
         "cpu_us": (cpu1 - cpu0) / ops / 1000,
         "faults": (faults1 - faults0) / ops,
@@ -209,37 +212,21 @@ def spawn(python: str, env: dict[str, str], shape: str, path: str, layout: int) 
     return json.loads(done.stdout.splitlines()[-1])
 
 
-def paired_ci(deltas: list[float], seed: int = 0) -> tuple[float, float]:
-    """Percentile bootstrap 95% CI of the mean of paired deltas, resampling whole pairs.
-
-    >>> lo, hi = paired_ci([-3.0, -2.5, -3.5, -2.0, -4.0] * 6)
-    >>> lo < -3.0 < hi < 0
-    True
-    """
-    rng = random.Random(seed)
+def paired_ci(deltas: list[float]) -> tuple[float, float]:
+    """Percentile bootstrap 95% CI of the mean of paired deltas, resampling whole pairs (seeded)."""
+    rng = random.Random(0)
     k = len(deltas)
     means = sorted(statistics.fmean(rng.choices(deltas, k=k)) for _ in range(BOOTSTRAP_RESAMPLES))
     return means[int(BOOTSTRAP_RESAMPLES * 0.025)], means[int(BOOTSTRAP_RESAMPLES * 0.975) - 1]
 
 
 def verdict(ci: tuple[float, float]) -> str:
-    """ "lower" or "higher" when the CI excludes 0, else "n.s." (not significant).
-
-    >>> verdict((-2.0, -0.5)), verdict((0.1, 3.0)), verdict((-1.0, 1.0))
-    ('lower', 'higher', 'n.s.')
-    """
+    """ "lower" or "higher" when the CI excludes 0, else "n.s." (not significant)."""
     return "lower" if ci[1] < 0 else "higher" if ci[0] > 0 else "n.s."
 
 
 def parse_env(pairs: list[str]) -> dict[str, str]:
-    """``KEY=VALUE`` strings to a dict.
-
-    >>> parse_env(["MALLOC_TOP_PAD_=67108864"])
-    {'MALLOC_TOP_PAD_': '67108864'}
-    >>> parse_env(["MALLOC_TOP_PAD_"])
-    Traceback (most recent call last):
-    SystemExit: --*-env takes KEY=VALUE, got 'MALLOC_TOP_PAD_'
-    """
+    """``KEY=VALUE`` strings to a dict; SystemExit on a malformed pair."""
     env = {}
     for pair in pairs:
         key, sep, value = pair.partition("=")
@@ -249,16 +236,16 @@ def parse_env(pairs: list[str]) -> dict[str, str]:
     return env
 
 
-def at_least_two(text: str) -> int:
-    """A count of processes or pairs: one gives a bootstrap CI of zero width, so a verdict with no evidence.
+def at_least(minimum: int) -> Callable[[str], int]:
+    """An argparse type for a count of at least ``minimum``."""
 
-    >>> at_least_two("30")
-    30
-    """
-    n = int(text)
-    if n < 2:
-        raise argparse.ArgumentTypeError(f"needs at least 2, got {n}")
-    return n
+    def parse(text: str) -> int:
+        n = int(text)
+        if n < minimum:
+            raise argparse.ArgumentTypeError(f"needs at least {minimum}, got {n}")
+        return n
+
+    return parse
 
 
 def cells(args: argparse.Namespace) -> list[tuple[str, str]]:
@@ -339,10 +326,10 @@ def main() -> None:
         p.add_argument("--candidate", default=sys.executable, help="interpreter of the arm under test (default: this one)")
         p.add_argument("--candidate-env", action="append", default=[], metavar="KEY=VALUE")
         p.add_argument("--json", type=Path, help="write the figures here")
-    run_p.add_argument("--procs", type=at_least_two, default=10, help="fresh processes per cell (default: 10)")
+    run_p.add_argument("--procs", type=at_least(1), default=10, help="fresh processes per cell (default: 10)")
     ab_p.add_argument("--base", default=sys.executable, help="interpreter of the base arm (default: this one)")
     ab_p.add_argument("--base-env", action="append", default=[], metavar="KEY=VALUE")
-    ab_p.add_argument("--pairs", type=at_least_two, default=30, help="interleaved process pairs per cell (default: 30)")
+    ab_p.add_argument("--pairs", type=at_least(MIN_PAIRS), default=30, help="interleaved process pairs per cell (default: 30)")
     args = parser.parse_args()
     out = run(args) if args.mode == "run" else ab(args)
     if args.json:

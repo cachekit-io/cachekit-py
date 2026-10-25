@@ -18,6 +18,7 @@ on:
       - tests/performance/test_production_realism.py
       - tests/performance/stats_utils.py
       - tests/performance/large_payload_bench.py
+      - tests/performance/ir_budget.py
       - .github/workflows/bench.yml
 
 permissions:

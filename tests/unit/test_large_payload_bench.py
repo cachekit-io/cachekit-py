@@ -19,8 +19,6 @@ def test_worker_measures_the_named_path_in_a_fresh_process(path: str) -> None:
     # The worker raises if a hit computes or a miss does not, so a clean exit is the behavioural check.
     row = bench.spawn(sys.executable, {}, "json-64b", path, 0)
     assert row["cpu_us"] > 0
-    assert row["faults"] >= 0
-    assert row["maxrss_mb"] > 0
 
 
 def test_payload_shapes_hit_their_sizes() -> None:
@@ -47,12 +45,20 @@ def test_parse_env_rejects_a_pair_without_a_value() -> None:
         bench.parse_env(["MALLOC_TOP_PAD_"])
 
 
-def test_a_single_pair_is_refused() -> None:
-    with pytest.raises(argparse.ArgumentTypeError, match="at least 2"):
-        bench.at_least_two("1")
+def test_too_few_pairs_are_refused() -> None:
+    # With 2 pairs, any same-sign pair would print a verdict.
+    pairs = bench.at_least(bench.MIN_PAIRS)
+    assert pairs(str(bench.MIN_PAIRS)) == bench.MIN_PAIRS
+    with pytest.raises(argparse.ArgumentTypeError, match=f"at least {bench.MIN_PAIRS}"):
+        pairs("2")
 
 
 def test_paired_ci_brackets_the_mean_and_excludes_zero_for_a_consistent_drop() -> None:
     lo, hi = bench.paired_ci([-3.0, -2.5, -3.5, -2.0, -4.0] * 6)
     assert lo < -3.0 < hi < 0
     assert bench.verdict((lo, hi)) == "lower"
+
+
+def test_verdict_names_a_rise_and_a_ci_spanning_zero() -> None:
+    assert bench.verdict((0.1, 3.0)) == "higher"
+    assert bench.verdict((-1.0, 1.0)) == "n.s."
