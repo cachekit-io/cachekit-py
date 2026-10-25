@@ -7,8 +7,9 @@ hold them, and the AUTH or HELLO arguments, as locals. So the error must reach n
 ``__context__`` or ``original_exception``. Nor may a cachekit frame on it hold the client, the pool, a pipeline, the raw URL
 or a config whose repr shows it.
 
-Each operation fails against a loopback server speaking just enough RESP: it refuses the password (AUTH, or HELLO on RESP3) with
-WRONGPASS, or completes the handshake and drops the connection on the first command. Every frame is walked, third-party ones included.
+Each operation fails against a loopback server speaking just enough RESP: it refuses the password (AUTH, or HELLO on
+RESP3) with WRONGPASS, or completes the handshake and drops the connection on the first command. Every frame is walked,
+third-party ones included.
 
 An interrupt raised while redis-py is mid-call (``KeyboardInterrupt``, the ``SystemExit`` a worker-timeout signal raises) is
 not a failure cachekit classifies: it propagates as itself, through redis-py's frames, so it must reach none of them holding
@@ -72,8 +73,8 @@ class _FakeRedis:
     ``refusing``: AUTH, or the HELLO that carries the password on RESP3 (redis-py 8's default), is answered with WRONGPASS.
     Otherwise the handshake (HELLO, AUTH, PING, CLIENT, SELECT) succeeds and any other command drops the connection
     unanswered, except those ``serving`` answers; ``dropped_before_auth`` names any it dropped before the password was
-    accepted. With ``hold``, a command about to fail sets ``holding`` and waits for
-    ``hold`` first, so the client's call is in flight until the test lets it fail.
+    accepted. With ``hold``, a command about to fail sets ``holding`` and waits for ``hold`` first, so the client's call
+    is in flight until the test lets it fail.
     """
 
     def __init__(
@@ -109,7 +110,8 @@ class _FakeRedis:
                     conn.sendall(b"-WRONGPASS invalid username-password pair or user is disabled.\r\n")
                 elif name == b"HELLO":
                     authenticated = True
-                    # A real server's reply cut to the fields redis-py reads: a map, in the protocol asked for.
+                    # A real server's reply cut to the fields redis-py reads: a RESP3 map (redis-py sends HELLO only on
+                    # RESP3) whose proto echoes the version asked for.
                     conn.sendall(b"%%3\r\n+server\r\n+redis\r\n+version\r\n+7.4.0\r\n+proto\r\n:%s\r\n" % command[1])
                 elif name in (b"AUTH", b"CLIENT", b"SELECT"):
                     authenticated |= name == b"AUTH"
