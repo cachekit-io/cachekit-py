@@ -111,6 +111,17 @@ def test_a_shard_a_partial_rerun_skipped_keeps_its_report() -> None:
     assert "### Instruction budget: PASS" in render(_all_ok(), 4, JOBS | {name: rerun}, "aaa", "bbb", RUN)
 
 
+@pytest.mark.parametrize(("verdict", "conclusion"), [("PASS", "failure"), ("FAIL", "success"), ("PASS", "cancelled")])
+def test_a_report_its_job_did_not_end_with_is_no_result(verdict: str, conclusion: str) -> None:
+    """A post-job step can fail a shard after it uploaded PASS: that shard has no result, not a pass."""
+    reports = _all_ok()
+    reports[3] = _report(("l2_hit", "ok", 1, 1, 0.0), verdict=verdict)
+    name = "Instruction budget (shard 3/4)"
+    body = render(reports, 4, JOBS | {name: JOBS[name] | {"conclusion": conclusion}}, "aaa", "bbb", RUN)
+    assert "### Instruction budget: INCOMPLETE" in body
+    assert "`l2_hit`" not in body
+
+
 @pytest.mark.parametrize("drop", ["started_at", "report_at"])
 def test_a_report_with_no_upload_or_start_time_is_no_result(drop: str) -> None:
     name = "Instruction budget (shard 1/4)"

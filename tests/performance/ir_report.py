@@ -18,6 +18,7 @@ MARKER = "<!-- cachekit-instruction-budget -->"  # ci.yml's perf-ir-comment edit
 JOB_NAME = "Instruction budget (shard {k}/{n})"  # ci.yml's perf-ir job name
 SEVERITY = {"FAIL": 0, "WARN": 1, "new": 2, "LOWER": 3, "ok": 4}  # rows that need a look first
 ARTIFACT = "perf-ir-report-{k}"  # ci.yml's name for shard K's uploaded report
+CONCLUSION = {"PASS": "success", "FAIL": "failure"}  # the shard job's conclusion each verdict ends it with
 
 
 def load_report(path: Path) -> dict | None:
@@ -40,7 +41,8 @@ def render(reports: dict[int, dict | None], shards: int, jobs: dict[str, dict], 
     to the job's ``html_url``, ``conclusion`` and ``started_at`` as the GitHub jobs API lists them, plus
     ``report_at``, when its shard's report artifact was uploaded.
 
-    A report counts only if it was uploaded after its job started. Artifacts outlive a re-run, so a re-run
+    A report counts only if it was uploaded after its job started and its verdict is how that job ended (a
+    post-job step can still fail a shard that wrote PASS). Artifacts outlive a re-run, so a re-run
     shard that dies before uploading leaves the earlier attempt's report behind, uploaded before the re-run
     started. A partial re-run lists the shards it skipped with their original start times, so their reports
     still count.
@@ -48,8 +50,10 @@ def render(reports: dict[int, dict | None], shards: int, jobs: dict[str, dict], 
 
     def current(k: int) -> dict | None:
         job = jobs.get(JOB_NAME.format(k=k, n=shards), {})
-        started, uploaded = job.get("started_at"), job.get("report_at")
-        return reports.get(k) if started and uploaded and uploaded >= started else None  # same-format UTC timestamps
+        report, started, uploaded = reports.get(k), job.get("started_at"), job.get("report_at")
+        if report is None or not (started and uploaded and uploaded >= started):  # same-format UTC timestamps
+            return None
+        return report if job.get("conclusion") == CONCLUSION[report["verdict"]] else None
 
     counted = {k: current(k) for k in range(1, shards + 1)}
     missing = [k for k, r in counted.items() if r is None]
