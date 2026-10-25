@@ -287,8 +287,7 @@ jobs:
 
       # CPython 3.15 and later: one free-threaded stable-ABI (abi3t) wheel per platform. It loads on
       # both the GIL and the free-threaded build of 3.15 and of every later CPython, so a new release
-      # gets a wheel on day one. Benchmarked against per-version cp315/cp315t builds before adopting
-      # it: every point within the repo's 10% regression bar (docs/free-threading.md).
+      # gets a wheel on day one. Why abi3t over per-version wheels: docs/free-threading.md.
       - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
         with:
           target: ${{ matrix.target }}

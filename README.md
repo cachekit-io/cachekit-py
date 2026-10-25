@@ -441,8 +441,9 @@ exposition setup.
 **Free-threaded CPython (3.15t, 3.14t):** the core suites run green on
 free-threaded 3.14 and 3.15 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
-(`gil_used = false`). **3.15t has a published wheel**: the 3.15+ wheel is
-`abi3t`, so it installs on 3.15t without a Rust toolchain. **3.14t is tested
+(`gil_used = false`). **From the release after 0.24.1, 3.15t has a wheel**:
+the 3.15+ wheel is `abi3t`, so it installs on 3.15t without a Rust toolchain
+(pip 26.1+ or uv 0.11.3+). **3.14t is tested
 but has no wheel** (it builds from source). Free-threaded builds are not
 officially supported yet — blocked upstream on
 orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import;

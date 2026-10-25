@@ -1,7 +1,7 @@
 # Free-Threaded CPython
 
-Status as of 2026-10: **a 3.15t wheel is published; 3.14t is tested with no
-wheel; support is not yet declared**. (3.13t is not in the CI matrix: no claim
+Status as of 2026-10: **releases after 0.24.1 publish a wheel that installs on
+3.15t; 3.14t is tested with no wheel; support is not yet declared**. (3.13t is not in the CI matrix: no claim
 is made for it.)
 
 - The core test suites (`tests/unit/`, `tests/critical/`) run green on
@@ -10,9 +10,9 @@ is made for it.)
 - The Rust extension declares free-threaded safety
   (`#[pymodule(gil_used = false)]`), so importing `cachekit._rust_serializer`
   does not force the GIL back on.
-- **CPython 3.15 and later get one free-threaded stable-ABI (`abi3t`) wheel
-  per platform** (`cp315-abi3.abi3t`), which loads on both the GIL and the
-  free-threaded build. On 3.15t, `pip install --only-binary :all: cachekit`
+- **From the release after 0.24.1, CPython 3.15 and later get one
+  free-threaded stable-ABI (`abi3t`) wheel per platform** (`cp315-abi3.abi3t`),
+  which loads on both the GIL and the free-threaded build. On 3.15t, `pip install --only-binary :all: cachekit`
   installs cachekit and every runtime dependency from wheels. See
   [CPython 3.15+: one abi3t wheel](#cpython-315-one-abi3t-wheel).
 - **No 3.14t (`cp314t`) wheel is published**, and installing cachekit on a
@@ -258,8 +258,19 @@ builds per-version wheels for 3.10 to 3.14 plus one
 `cp315-abi3.abi3t-<platform>` wheel, with PyO3's `abi3t-py315` feature on
 (PEP 803). One wheel serves the GIL and the free-threaded builds of 3.15 and
 of every later CPython, so a new CPython release gets a wheel on its release
-day instead of a Rust source build. Installing it needs pip 26.1+ or uv 0.11.3+;
-building it needs maturin 1.15+ (`[build-system]` in `pyproject.toml`).
+day instead of a Rust source build. Building it needs maturin 1.15+
+(`[build-system]` in `pyproject.toml`).
+
+Installers read the compressed tag as `cp315-abi3` plus `cp315-abi3t`. On a
+GIL 3.15 every installer matches the `abi3` half, older ones included (pip 25.2
+installs it). On 3.15t only pip 26.1+ and uv 0.11.3+ match the `abi3t` half; an
+older installer there skips the wheel and builds the sdist, which needs a Rust
+toolchain, as every 3.15t install did before.
+
+On Windows the abi3t extension links `python3t.dll`, which the python.org
+installers ship with both the GIL and the free-threaded build of 3.15. A
+distribution or a frozen application (PyInstaller, cx_Freeze) that leaves
+that DLL out fails to import cachekit with "DLL load failed" on a GIL 3.15.
 
 The limited API loses version-specific fast paths, so abi3t was adopted only
 after a benchmark against per-version `cp315` / `cp315t` builds, with the rule
@@ -268,8 +279,9 @@ fixed before measuring: abi3t ships for an interpreter only if every point's
 serializer regression bar, `make benchmark-compare`). Otherwise 3.15 keeps
 per-version wheels (with or without an extra abi3t wheel for 3.15t). Both
 interpreters passed, so **abi3t replaces the cp315 per-version wheel**. The
-worst point was GIL 3.15 `verify_checksum` at 64 B: +3.7% (upper bound +4.7%),
-about 6 ns per call.
+largest estimate was GIL 3.15 `verify_checksum` at 64 B: +3.7% (upper bound
++4.7%), about 6 ns per call. The largest upper bound was 3.15t
+`verify_checksum` at 1 MB: 1.060.
 
 | interp | point | per-version median ns | abi3t median ns | abi3t ÷ per-version [95% CI] | A/A noise [95% CI] | runs/arm |
 | --- | --- | --: | --: | --- | --- | --: |
@@ -298,7 +310,7 @@ about 6 ns per call.
 `quay.io/pypa/manylinux2014_x86_64` (the image maturin-action uses for the
 x86_64 Linux row) with maturin 1.15.0, rustc 1.99.1 and the release profile;
 CPython 3.15.1 and 3.15.1t from that image; AMD Ryzen 9 5950X, 32 logical
-CPUs, on a shared host whose load average was 22-37 throughout. Points:
+CPUs. Points:
 `_rust_serializer.checksum` (compute) and `verify_checksum` at the four sizes
 of `tests/performance/benchmark_checksum_ffi.py` (median per call over 201
 batches of ~200 µs), and the plain and encrypted `StandardSerializer` round
@@ -308,7 +320,9 @@ for the A/A noise check) and abi3t (B) ran in a seeded shuffled order
 (`stats_utils.balanced_order`). The estimate is the ratio of the arms' medians
 of per-run medians, with a 2,000-resample bootstrap CI over whole runs. The
 3.15 arm took 120 runs per arm: at 60 its A/A bounds exceeded 1.10 on 8
-points during a load spike, so runs were added until none did.
+points during a load spike, so runs were added until none did, and no point
+was excluded. The added 60 runs per arm pass on their own: abi3t ÷
+per-version upper bound at most 1.046, A/A at most 1.035.
 
 **Dependencies on 3.15t (PyPI, 2026-10-25):** every runtime dependency ships a
 `cp315t` wheel (hiredis 3.5.0, pydantic-core, msgpack, xxhash, blake3). psutil,
