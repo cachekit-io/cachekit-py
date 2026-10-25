@@ -10,11 +10,15 @@ from pathlib import Path
 import pytest
 
 from tests.performance import ir_budget, ir_report
-from tests.performance.ir_report import MARKER, load_report, render
+from tests.performance.ir_report import MARKER, load_report, load_reports, render
 
 RUN = "https://github.com/o/r/actions/runs/1"
 JOBS = {
-    f"Instruction budget (shard {k}/4)": {"html_url": f"https://github.com/o/r/actions/runs/1/job/{k}", "conclusion": c}
+    f"Instruction budget (shard {k}/4)": {
+        "html_url": f"https://github.com/o/r/actions/runs/1/job/{k}",
+        "conclusion": c,
+        "run_attempt": 1,
+    }
     for k, c in ((1, "success"), (2, "failure"), (3, "success"), (4, "success"))
 }
 
@@ -84,16 +88,28 @@ def test_a_missing_shard_without_a_listed_job_links_the_run() -> None:
     assert body.count(f"]({RUN}) |") == 4
 
 
-@pytest.mark.parametrize("text", ["", "{", "[]", '{"verdict": "WARN", "rows": []}', '{"verdict": "PASS"}'])
-def test_a_report_ir_budget_did_not_write_is_no_report(tmp_path, text: str) -> None:
+@pytest.mark.parametrize("text", ["", "{"])
+def test_a_missing_or_truncated_report_is_no_report(tmp_path, text: str) -> None:
     (tmp_path / "r.json").write_text(text)
     assert load_report(tmp_path / "r.json") is None
     assert load_report(tmp_path / "absent.json") is None
 
 
+def test_a_report_from_an_earlier_attempt_is_no_result(tmp_path) -> None:
+    """A re-run shard that ends without a report leaves the earlier attempt's artifact behind; it must not count."""
+    for k in range(1, 5):
+        (tmp_path / f"ir-report-{k}-1.json").write_text(json.dumps(_report((f"p{k}", "ok", 1, 1, 0.0))))
+    jobs = {name: job | {"run_attempt": 2 if name.endswith("(shard 3/4)") else 1} for name, job in JOBS.items()}
+    reports = load_reports(tmp_path, 4, jobs)
+    assert reports[3] is None and all(reports[k] for k in (1, 2, 4))
+    assert "### Instruction budget: INCOMPLETE" in render(reports, 4, jobs, "aaa", "bbb", RUN)
+    assert load_reports(tmp_path, 4, {}) == dict.fromkeys(range(1, 5))  # no job listed: no attempt to trust
+
+
 def test_the_footnote_states_the_gate_thresholds() -> None:
     body = render(_all_ok(), 4, JOBS, "aaa", "bbb", RUN)
     assert f"+{ir_budget.FAIL_PCT:g}% or more" in body
+    assert set(ir_budget.TOLERANCE_PCT) == {"serializer_orjson"}  # the footnote names no other exception
     assert f"(+{ir_budget.TOLERANCE_PCT['serializer_orjson'][0]:g}% for `serializer_orjson`)" in body
 
 
@@ -101,21 +117,20 @@ def test_ci_names_the_marker_and_the_shard_jobs() -> None:
     """The comment job finds its comment by this marker, and a missing shard is linked by its job name."""
     ci = (Path(__file__).parents[2] / ".github" / "workflows" / "ci.yml").read_text()
     assert f"marker='{MARKER}'" in ci
-    assert "name: Instruction budget (shard ${{ matrix.shard }}/4)" in ci
-    assert ir_report.JOB_NAME.format(k="${{ matrix.shard }}", n=4) in ci
+    assert "name: " + ir_report.JOB_NAME.format(k="${{ matrix.shard }}", n=4) in ci
 
 
 def test_the_cli_renders_shard_files(tmp_path) -> None:
-    """As CI runs it: system python, one ir-report-K.json per shard, jobs as JSON lines."""
+    """As CI runs it: system python, one ir-report-K-ATTEMPT.json per shard, jobs as JSON lines."""
     reports = tmp_path / "reports"
     reports.mkdir()
     for k in (1, 3, 4):
-        (reports / f"ir-report-{k}.json").write_text(json.dumps(_report((f"p{k}", "ok", 1, 1, 0.0))))
+        (reports / f"ir-report-{k}-1.json").write_text(json.dumps(_report((f"p{k}", "ok", 1, 1, 0.0))))
     jobs = tmp_path / "jobs.jsonl"
     jobs.write_text("".join(json.dumps({"name": n} | j) + "\n" for n, j in JOBS.items()))
     script = Path(ir_report.__file__)
     args = ["--reports", reports, "--shards", "4", "--jobs", jobs, "--head", "aaa", "--base", "bbb", "--run-url", RUN]
     cmd = [sys.executable, str(script), *map(str, args)]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout  # noqa: S603 (trusted: this repo's script)
-    assert out == render({k: load_report(reports / f"ir-report-{k}.json") for k in range(1, 5)}, 4, JOBS, "aaa", "bbb", RUN)
+    assert out == render(load_reports(reports, 4, JOBS), 4, JOBS, "aaa", "bbb", RUN)
     assert "### Instruction budget: INCOMPLETE" in out and "shard 2/4" in out

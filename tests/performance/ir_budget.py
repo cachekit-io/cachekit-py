@@ -340,12 +340,16 @@ def compare(budgets: dict[str, int], measured: dict[str, int], against: str = "b
     ``against`` names what the budgets are in the report: the committed ``budget``, or the ``base``
     checkout's figures measured in the same run (``--base``).
     """
+    return report_lines(judge(budgets, measured), against)
+
+
+def report_lines(rows: list[dict[str, object]], against: str) -> tuple[list[str], bool]:
+    """``judge``'s rows as report lines, and whether none of them fails."""
     lines = []
-    rows = judge(budgets, measured)
     for row in rows:
         verdict, path, ir, budget = row["verdict"], row["path"], row["ir"], row["budget"]
         if budget is None:
-            lines.append(f"FAIL  {path:22} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
+            lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
         else:
             lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  {against} {budget:>9,}  {row['pct']:+.2f}%")
     return lines, all(row["verdict"] != "FAIL" for row in rows)
@@ -407,13 +411,12 @@ def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: floa
 
     measured = measure(paths, jobs, child_timeout_s, sys.executable, WORKLOAD.resolve())
     base_figures = measure(paths, jobs, child_timeout_s, str(python), workload)
-    lines, ok = compare(base_figures, measured, against="base")
-    if report:
-        rows = judge(base_figures, measured) + [
-            {"path": p, "verdict": "new", "ir": None, "budget": None, "pct": None} for p in new
-        ]
-        verdict = {"verdict": "PASS" if ok else "FAIL", "interpreter": interpreter_key(), "python": platform.python_version()}
-        report.write_text(json.dumps(verdict | {"rows": rows}, indent=2) + "\n")
+    rows = judge(base_figures, measured)
+    lines, ok = report_lines(rows, against="base")
+    if report is not None:
+        rows += [{"path": p, "verdict": "new", "ir": None, "budget": None, "pct": None} for p in new]
+        summary = {"verdict": "PASS" if ok else "FAIL", "interpreter": interpreter_key(), "python": platform.python_version()}
+        report.write_text(json.dumps(summary | {"rows": rows}, indent=2) + "\n")
     print(f"main-thread Ir/op on {interpreter_key()} ({platform.python_version()}), this checkout against --base {base}")
     print("\n".join(lines + [f"new   {p:22} not on the base: nothing to compare against" for p in new]))
     print("PASS" if ok else f"FAIL: a path regressed by {FAIL_PCT}% or more against the base")

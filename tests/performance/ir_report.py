@@ -20,14 +20,22 @@ SEVERITY = {"FAIL": 0, "WARN": 1, "new": 2, "LOWER": 3, "ok": 4}  # rows that ne
 
 
 def load_report(path: Path) -> dict | None:
-    """A shard's report, or None when it is missing or not one ``ir_budget.py --report`` wrote."""
+    """A shard's report, or None when it has none (or a truncated one)."""
     try:
-        report = json.loads(path.read_text())
+        return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    if not isinstance(report, dict) or report.get("verdict") not in ("PASS", "FAIL") or not isinstance(report.get("rows"), list):
-        return None
-    return report
+
+
+def load_reports(directory: Path, shards: int, jobs: dict[str, dict]) -> dict[int, dict | None]:
+    """Each shard's report from its latest attempt. Artifacts outlive a re-run, so a re-run shard that ends
+    without a report would leave the earlier attempt's in place: a report counts only if its attempt is the
+    one its job last ran (``ir-report-K-ATTEMPT.json``)."""
+    reports: dict[int, dict | None] = {}
+    for k in range(1, shards + 1):
+        attempt = jobs.get(JOB_NAME.format(k=k, n=shards), {}).get("run_attempt")
+        reports[k] = load_report(directory / f"ir-report-{k}-{attempt}.json") if attempt else None
+    return reports
 
 
 def _figure(value: object) -> str:
@@ -36,7 +44,7 @@ def _figure(value: object) -> str:
 
 def render(reports: dict[int, dict | None], shards: int, jobs: dict[str, dict], head: str, base: str, run_url: str) -> str:
     """The comment body. ``reports`` maps shard K to its report (None if it has none); ``jobs`` maps job name
-    to the job's ``html_url`` and ``conclusion``, as the GitHub jobs API lists them."""
+    to the job's ``html_url``, ``conclusion`` and ``run_attempt``, as the GitHub jobs API lists them."""
     missing = [k for k in range(1, shards + 1) if reports.get(k) is None]
     present = [r for r in reports.values() if r is not None]
     rows = sorted((row for r in present for row in r["rows"]), key=lambda row: (SEVERITY.get(row["verdict"], -1), row["path"]))
@@ -78,15 +86,15 @@ def render(reports: dict[int, dict | None], shards: int, jobs: dict[str, dict], 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--reports", type=Path, required=True, help="directory holding each shard's ir-report-K.json")
+    parser.add_argument("--reports", type=Path, required=True, help="directory holding each shard's ir-report-K-ATTEMPT.json")
     parser.add_argument("--shards", type=int, required=True)
     parser.add_argument("--jobs", type=Path, required=True, help="this run's jobs, one JSON object per line")
     parser.add_argument("--head", required=True)
     parser.add_argument("--base", required=True)
     parser.add_argument("--run-url", required=True)
     args = parser.parse_args()
-    reports = {k: load_report(args.reports / f"ir-report-{k}.json") for k in range(1, args.shards + 1)}
     jobs = {job["name"]: job for job in map(json.loads, args.jobs.read_text().splitlines()) if job}
+    reports = load_reports(args.reports, args.shards, jobs)
     sys.stdout.write(render(reports, args.shards, jobs, args.head, args.base, args.run_url))
     return 0
 
