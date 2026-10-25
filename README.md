@@ -503,6 +503,7 @@ info = expensive_func.cache_info()
 | [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
 | [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
 | [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
+| [Write-Behind][write-behind-url] | Opt-in `write_behind=True`: a miss returns before its L2 write lands |
 
 ---
 
@@ -594,6 +595,7 @@ MIT License - see [LICENSE][license-file-url] for details.
 [reference-caching-url]: docs/features/reference-caching.md
 [rust-serialization-url]: docs/features/rust-serialization.md
 [ssrf-url]: docs/features/ssrf-protection.md
+[write-behind-url]: docs/features/write-behind.md
 [contributing-url]: CONTRIBUTING.md
 [license-file-url]: LICENSE
 [github-url]: https://github.com/cachekit-io/cachekit-py

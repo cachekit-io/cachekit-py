@@ -21,6 +21,7 @@ from .. import invalidation, l1_cache
 from .._rust_serializer import HitCounter
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
+    CacheHandlerStrategy,
     CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -67,6 +68,8 @@ from .orchestrator import FeatureOrchestrator
 from .single_flight import AsyncFlights, ThreadFlights
 from .stats_context import reset_current_function_stats, set_current_function_stats
 from .tenant_context import TenantContextExtractor
+from .write_behind import Entry, WriteBehind
+from .write_behind import cancel as _cancel_writes
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -728,6 +731,7 @@ def create_cache_wrapper(
     # Performance features
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
+    write_behind: bool = False,
     fast_mode: bool = False,
     l1_enabled: bool = True,
     backend: Any = None,
@@ -784,6 +788,8 @@ def create_cache_wrapper(
                         failure or key-fingerprint mismatch instead of silently recomputing.
         refresh_ttl_on_get: Refresh TTL on cache hit
         ttl_refresh_threshold: Refresh when TTL below this fraction
+        write_behind: Return a miss once its value is serialized and in L1, and write L2 from a bounded
+                     background writer (decorators/write_behind.py). No effect without a backend.
         fast_mode: Disable monitoring for maximum performance
         l1_enabled: Enable L1 in-memory cache. With encryption=True, L1 stores encrypted bytes
                    (decryption at read time only). Both L1+L2 support any combination with encryption
@@ -838,6 +844,7 @@ def create_cache_wrapper(
         integrity_checking = config.integrity_checking
         refresh_ttl_on_get = config.refresh_ttl_on_get
         ttl_refresh_threshold = config.ttl_refresh_threshold
+        write_behind = config.write_behind
         # config.backend None is an explicit L1-only request; UNSET leaves the backend to resolve at first call.
         if backend is None and config.backend is None:
             _l1_only_mode = True
@@ -1718,6 +1725,13 @@ def create_cache_wrapper(
         """
         if _l1_cache is None:  # never registered without one
             return
+        # Queued write-behind writes of the key (tenant-blind, as the event is) would land after the
+        # other process's delete. Not waited out: this is the listener thread, and a send in progress
+        # races that delete as a synchronous write would.
+        if key is None:
+            _cancel_deferred(lambda _entry: True, whole_function=True, wait=False)
+        else:
+            _cancel_deferred(lambda entry: entry[1] == key, whole_function=False, wait=False)
         if key is not None:
             _l1_cache.invalidate(key)
         else:
@@ -1772,6 +1786,77 @@ def create_cache_wrapper(
     _refresh_failed_warn = _WarnThrottle()  # a background refresh raised
     _refresh_skipped_warn = _WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
     _refresh_unstarted_warn = _WarnThrottle()  # the refresh thread or task could not be started
+    _deferred_write_warn = _WarnThrottle()  # a write-behind L2 write failed
+
+    def _warn_deferred_write(cache_key: str, reason: str) -> None:
+        """Log a failed write-behind write: a throttled WARNING, DEBUG between. The caller returned long
+        ago with the value in its L1, so this line and the `set` metric are the only signals."""
+        failures = _deferred_write_warn.claim()
+        if not failures:
+            _logger.debug("Deferred L2 write failed for %s: %s", redact_cache_key(cache_key), reason)
+            return
+        _logger.warning(
+            "Deferred L2 write failed in function %s (%d since the last warning); other processes miss the key "
+            "until it is written again. Latest key %s: %s",
+            redact_cache_key(function_identifier),
+            failures,
+            redact_cache_key(cache_key),
+            reason,
+        )
+
+    # write_behind=True: a miss's L2 write leaves the caller's path (decorators/write_behind.py). None when
+    # off, so the off path runs exactly as before.
+    _write_behind = (
+        WriteBehind(lambda entry, exc: _warn_deferred_write(entry[1], redact_error_for_log(exc)), group=_registry_id)
+        if write_behind and not _l1_only_mode
+        else None
+    )
+
+    def _send_deferred(cache_key: str, envelope: bytes, twin: str | None, handler: CacheHandlerStrategy) -> None:
+        """A write-behind miss write, on the writer's thread in the caller's context: the backend write
+        store_result would have made, then what the miss path does after a stored one.
+
+        The key is recorded again after the L2 write, because _invalidate_key relies on every write
+        recording after its L2 set; the caller's own record came before it. Breaker accounting stays
+        with the caller, as today: a failed L2 write never counted toward it. The `set` metric times
+        the backend write alone, the caller having serialized.
+        """
+        start = time.perf_counter()
+        if _stale_ttl is not None:
+            stored = handler.set(cache_key, envelope, ttl, stale_ttl=_stale_ttl)
+        else:
+            stored = handler.set(cache_key, envelope, ttl)
+        duration_ms = (time.perf_counter() - start) * 1000
+        if stored:
+            get_logger().cache_stored(cache_key, ttl)
+            _record(cache_key, twin)
+            _track_and_record(cache_key)
+        else:
+            _warn_deferred_write(cache_key, "the backend refused or failed the write (logged above)")
+        if features.collect_stats:
+            features.record_cache_operation(
+                operation="set",
+                namespace=namespace or "default",
+                success=bool(stored),
+                duration_ms=duration_ms,
+                serializer="rust",
+            )
+
+    def _defer_write(cache_key: str, twin: str | None, envelope: bytes) -> bool:
+        """Hand a miss's serialized value to the writer. False if it refused: the caller writes it now."""
+        handler = operation_handler.cache_handler
+        assert _write_behind is not None and handler is not None  # noqa: S101 - only on the miss path, write_behind on
+        send = functools.partial(_send_deferred, cache_key, envelope, twin, handler)
+        return _write_behind.submit((_l2_scope(), cache_key), len(envelope), send)
+
+    def _cancel_deferred(match: Callable[[Entry], bool], *, whole_function: bool, wait: bool = True) -> None:
+        """Before an invalidation's deletes: drop matching queued writes and wait out matching sends.
+
+        Every writer that can hold them, not only this wrapper's: a sibling decoration of this function
+        (same registry id) has its own writer, and this wrapper may have none. A whole-function match
+        stays within this function's writers; an exact-key match reaches every writer in the process.
+        """
+        _cancel_writes(match, group=_registry_id if whole_function else None, wait=wait)
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
@@ -2312,7 +2397,18 @@ def create_cache_wrapper(
             try:
                 # Store using operation handler (pass args/kwargs for tenant extraction)
                 # Returns serialized bytes for L1 cache storage
-                outcome = operation_handler.store_result(cache_key, result, ttl, args, kwargs, stale_ttl=_stale_ttl)
+                # With write-behind, store_result hands the serialized bytes to the writer instead of writing
+                # them, and the L1 put below follows the hand-off as it follows a write: an invalidation
+                # landing between the two leaves the same state either way.
+                outcome = operation_handler.store_result(
+                    cache_key,
+                    result,
+                    ttl,
+                    args,
+                    kwargs,
+                    stale_ttl=_stale_ttl,
+                    defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
+                )
                 set_duration_ms = (time.perf_counter() - set_start) * 1000
 
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
@@ -2323,7 +2419,8 @@ def create_cache_wrapper(
                 # Record successful cache set
                 features.record_success(probe_cycle)
 
-                if features.collect_stats:
+                # A deferred write records its own `set` sample when it lands (_send_deferred).
+                if features.collect_stats and not outcome.deferred:
                     features.record_cache_operation(
                         operation="set",
                         namespace=namespace or "default",
@@ -3016,13 +3113,17 @@ def create_cache_wrapper(
         try:
             serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
 
-            # Store in Redis with TTL
-            stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                cache_key,
-                serialized_data,
-                ttl=ttl,
-                stale_ttl=_stale_ttl,
-            )
+            # Write-behind (unlocked path only: the locked path's write must land inside its lock, or
+            # waiters re-read before L2 holds the value and recompute). A refusal writes here, as without it.
+            deferred = _write_behind is not None and _defer_write(cache_key, twin_key, serialized_data)
+            stored = False  # a deferred write is not stored yet: the writer tracks it once it lands
+            if not deferred:
+                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                    cache_key,
+                    serialized_data,
+                    ttl=ttl,
+                    stale_ttl=_stale_ttl,
+                )
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
@@ -3033,7 +3134,7 @@ def create_cache_wrapper(
             # Record successful cache set
             features.record_success(probe_cycle)
 
-            if features.collect_stats:
+            if features.collect_stats and not deferred:
                 features.record_cache_operation(
                     operation="set",
                     namespace=namespace or "default",
@@ -3177,13 +3278,16 @@ def create_cache_wrapper(
         fallback is never announced: peers evicting their L1 would re-read the L2 entries it
         could not reach.
         """
+        # The calling tenant's write-behind writes: dropped if queued, waited out if being sent, so no
+        # write made before this call lands after its deletes.
+        scope = _l2_scope()
+        _cancel_deferred(lambda entry: entry[0] == scope, whole_function=True)
         if not _is_trackable():
             _local_invalidate_all()
             return
         try:
             with _watch_records() as watch:  # opened before the snapshot: later records are watched
                 snap = set(_cached_keys)  # this process's view, taken before the drain
-                scope = _l2_scope()
                 mine = {entry for entry in snap if entry[0] == scope}
                 deleted = _backend.drain_tracked(_registry_id, {key for _, key in mine})  # type: ignore[union-attr]
                 if _legacy_registry_id is not None:
@@ -3214,10 +3318,15 @@ def create_cache_wrapper(
 
         Untrack BEFORE the delete: every write path calls _put_l1, which re-tracks the key, after
         its L2 set, so a concurrent write landing after the delete can never be left in L2 untracked.
+        A write-behind write records the key again once it lands (_send_deferred), so the same holds.
         A delete that does not return normally, whatever it raises, re-tracks the key, so a later
         no-args invalidate_cache() retries it.
+
+        First of all, the key's write-behind write is dropped if queued and waited out if being sent:
+        the delete is then ordered behind every write made before this call.
         """
         entry = (_l2_scope(), cache_key)
+        _cancel_deferred(entry.__eq__, whole_function=False)
         _cached_keys.discard(entry)
         outcome = InvalidationOutcome.NO_L2 if _l1_only_mode else InvalidationOutcome.FAILED
         try:

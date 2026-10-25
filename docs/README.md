@@ -61,6 +61,7 @@ Choose how data is stored:
 | [Reference Caching](features/reference-caching.md) | `@cache.local()` for non-serializable objects |
 | [Rust Serialization](features/rust-serialization.md) | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
 | [SSRF Protection](features/ssrf-protection.md) | URL allowlisting for the CachekitIO backend |
+| [Write-Behind](features/write-behind.md) | Opt-in `write_behind=True`: a miss returns before its L2 write lands |
 
 ## Architecture & Reference
 

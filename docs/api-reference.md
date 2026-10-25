@@ -68,6 +68,7 @@ from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, Backpres
     # Performance features
     refresh_ttl_on_get=False,
     ttl_refresh_threshold=0.5,
+    write_behind=False,
     # Nested configuration groups (see sections below for details)
     l1=L1CacheConfig(enabled=True),
     circuit_breaker=CircuitBreakerConfig(enabled=True),
@@ -90,6 +91,7 @@ def your_function(args):
 
 - **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on async L2 hits when below threshold, in the background (no extra round trip on the hit). On CachekitIO the threshold is checked against the hit's remaining freshness; see [CachekitIO TTL inspection](backends/cachekitio.md#ttl-inspection-async-only)
 - **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Minimum remaining TTL fraction (0.0–1.0) to trigger refresh
+- **`write_behind`** (`bool`, default: `False`; set by no preset; any non-bool raises `ConfigurationError`) - Return a miss once its value is serialized and in L1; the L2 write follows on a bounded background writer. Until it lands, other processes miss the key, a process killed first loses it, and a write queued before another process's invalidation can land after it, so do not use it for values that must not outlive an invalidation. The async distributed-lock path and a sync miss's streaming write stay synchronous. See [Write-Behind](features/write-behind.md)
 - **`l1`** (`L1CacheConfig`, default: `L1CacheConfig()`) - L1 in-memory cache configuration
 
 #### Reliability Parameters
