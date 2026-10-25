@@ -387,7 +387,12 @@ The keyring has one **current** master key
 previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
 per-key requirements as the master key). CK-framed entries carry the
 fingerprint of their HKDF-derived per-tenant encryption key, so reads select
-the exact keyring entry that wrote them — never trial decryption. The keyring
+the exact keyring entry that wrote them — never trial decryption. Each keyring
+entry's per-tenant key is derived once, when cachekit first encrypts or decrypts
+for a tenant, so a read under a decrypt-only key runs no key derivation: a
+CK-framed entry costs one AES-GCM decrypt whichever key wrote it, and an
+interop entry, which carries no fingerprint, one AES-GCM attempt per keyring
+entry tried, current key first. The keyring
 alone does not make a single-deploy swap zero-miss: use the [three-phase key
 rotation runbook](https://docs.cachekit.io/concepts/key-rotation/) for scheduled
 rotation, including its [Before You
