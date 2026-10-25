@@ -8,14 +8,14 @@
         "l2_hit_async_metrics": 161736,
         "minimal_l1_hit": 10510,
         "miss": 206514,
-        "secure_l1_hit": 164952,
+        "secure_l1_hit": 158029,
         "serializer_arrow": 1975014,
         "serializer_arrow_usgs": 61849178,
         "serializer_auto": 68870,
         "serializer_auto_usgs": 61813019,
         "serializer_default": 61705,
         "serializer_default_records": 1441598,
-        "serializer_encrypted": 116559,
+        "serializer_encrypted": 103200,
         "serializer_orjson": 23679
       },
       "python": "3.12.12"
@@ -28,14 +28,14 @@
         "l2_hit_async_metrics": 155861,
         "minimal_l1_hit": 9796,
         "miss": 196945,
-        "secure_l1_hit": 163358,
+        "secure_l1_hit": 156881,
         "serializer_arrow": 1970889,
         "serializer_arrow_usgs": 61414623,
         "serializer_auto": 69929,
         "serializer_auto_usgs": 61434085,
         "serializer_default": 62837,
         "serializer_default_records": 1442386,
-        "serializer_encrypted": 118412,
+        "serializer_encrypted": 104970,
         "serializer_orjson": 23775
       },
       "python": "3.14.3"

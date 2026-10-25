@@ -263,7 +263,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,510 | 9,796 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit | 171,656 | 164,940 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 206,514 | 196,945 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 164,952 | 163,358 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 158,029 | 156,881 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 161,736 | 155,861 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 61,705 | 62,837 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
@@ -272,7 +272,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,975,014 | 1,970,889 |
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,849,178 | 61,414,623 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,813,019 | 61,434,085 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 116,559 | 118,412 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 103,200 | 104,970 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,556 | 73,669 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 9,000 to 10,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread. The gap was about 50,000 until each label tuple's Prometheus series was bound once instead of looked up per call.
