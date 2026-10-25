@@ -481,6 +481,11 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
+    # A report that reads as "no result" until the gate writes its verdict over it. It is always uploaded, so
+    # a re-run shard that ends without a verdict replaces the earlier attempt's report instead of leaving it.
+    - name: Start with no verdict
+      run: echo '{}' > "$RUNNER_TEMP/ir-report-${{ matrix.shard }}.json"
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
         fetch-depth: 2  # the merge commit and its first parent
@@ -512,17 +517,17 @@ jobs:
       working-directory: ${{ runner.temp }}/ir/head
       run: |
         .venv/bin/python tests/performance/ir_budget.py --base ../base --shard ${{ matrix.shard }}/4 \
-          --skip serializer_arrow_usgs --skip serializer_auto_usgs --report "$RUNNER_TEMP/ir-report-${{ matrix.shard }}-${{ github.run_attempt }}.json"
+          --skip serializer_arrow_usgs --skip serializer_auto_usgs --report "$RUNNER_TEMP/ir-report-${{ matrix.shard }}.json"
 
-    # The verdict, PASS or FAIL, for perf-ir-report. A shard with no verdict uploads nothing.
+    # The verdict, PASS or FAIL, for perf-ir-report, or the placeholder if the gate wrote none.
     - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       if: always()
       with:
         name: perf-ir-report-${{ matrix.shard }}
-        path: ${{ runner.temp }}/ir-report-${{ matrix.shard }}-${{ github.run_attempt }}.json
-        if-no-files-found: ignore
+        path: ${{ runner.temp }}/ir-report-${{ matrix.shard }}.json
+        if-no-files-found: error
         retention-days: 7
-        overwrite: true  # a re-run attempt replaces its shard's report; the file name says which attempt wrote it
+        overwrite: true  # a re-run attempt replaces its shard's report
 
   # The shards' verdicts as one PR comment, so a FAIL or WARN does not hide in four job logs. Two jobs keep
   # the write token away from repository code: this one renders the comment with read-only scopes (actions:
@@ -550,7 +555,7 @@ jobs:
       with:
         pattern: perf-ir-report-*
         path: ${{ runner.temp }}/reports
-        merge-multiple: true  # one file per shard, ir-report-K-ATTEMPT.json, in one directory
+        merge-multiple: true  # one file per shard, ir-report-K.json, in one directory
 
     - name: Render the comment
       id: render
@@ -559,7 +564,7 @@ jobs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-          --jq '.jobs[] | {name, html_url, conclusion, run_attempt}' > "$RUNNER_TEMP/jobs.jsonl"
+          --jq '.jobs[] | {name, html_url, conclusion}' > "$RUNNER_TEMP/jobs.jsonl"
         delimiter="EOF_$(openssl rand -hex 16)"
         {
           echo "body<<$delimiter"
