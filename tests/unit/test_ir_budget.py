@@ -333,7 +333,7 @@ def test_a_signal_that_does_not_wake_the_main_thread_still_stops_the_gate(tmp_pa
     try:
         code = gate.wait(timeout=20)  # the stub runs sleep 60 s: a gate that sleeps through the signal times out here
         runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
-        assert len(runs) == 2, "the stub runs never started"
+        assert len(runs) >= 2, "the stub runs never started"  # a queued run can start before the pool shuts
         deadline = time.monotonic() + 5
         while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
             time.sleep(0.05)
