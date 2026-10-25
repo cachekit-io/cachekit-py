@@ -29,7 +29,9 @@ Modes:
 The arms are interpreters (``--base`` / ``--candidate``, each from its own checkout's environment)
 and environment settings (``--base-env`` / ``--candidate-env``, repeatable ``KEY=VALUE``), so the same
 command compares two builds or one build under two allocator settings. Both arms run this file, so
-the harness itself never differs between them. With neither flag, both arms are this interpreter:
+the harness itself never differs between them. Every measured process starts without the calling
+shell's ``MALLOC_*`` and ``GLIBC_TUNABLES`` settings, so an arm runs glibc's defaults unless its
+``--*-env`` names a setting, and the header prints each arm's settings. With neither flag, both arms are this interpreter:
 an A/A run, whose verdicts show the host's noise. A full run makes 48 comparisons (16 cells, three
 metrics), so at 95% expect about two false "lower" or "higher" verdicts in an A/A run; on a shared
 host the CPU of the small shapes is the noisiest. Repeat a run before trusting a lone verdict.
@@ -183,11 +185,21 @@ def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
 # --- driver -------------------------------------------------------------------------------------------
 
 
+def allocator_env(env: dict[str, str]) -> dict[str, str]:
+    """This process's environment without its glibc malloc settings, plus ``env``.
+
+    An arm's allocator settings are only the ones it names: a ``MALLOC_*`` exported in the calling
+    shell would otherwise reach both arms and turn the default arm into a copy of the tuned one.
+    """
+    inherited = {k: v for k, v in os.environ.items() if not k.startswith("MALLOC_") and k != "GLIBC_TUNABLES"}
+    return {**inherited, **env}
+
+
 def spawn(python: str, env: dict[str, str], shape: str, path: str, layout: int) -> dict[str, Any]:
     """One measurement in a fresh process (``-I``: no script directory or user site on its path)."""
     cmd = [python, "-I", "-B", str(Path(__file__).resolve()), "worker", shape, path, str(layout)]
     done = subprocess.run(  # noqa: S603 (trusted: interpreter paths the operator passed)
-        cmd, env={**os.environ, **env}, capture_output=True, text=True, timeout=CHILD_TIMEOUT_S, check=False
+        cmd, env=allocator_env(env), capture_output=True, text=True, timeout=CHILD_TIMEOUT_S, check=False
     )
     if done.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} exited {done.returncode}:\n{done.stderr[-2000:]}")
@@ -263,7 +275,9 @@ METRICS = (("cpu_us", "CPU us/op"), ("faults", "faults/op"), ("maxrss_mb", "max 
 
 def run(args: argparse.Namespace) -> dict:
     env, lays, out = parse_env(args.candidate_env), layouts(), {}
-    print(f"{args.candidate} {env or ''}  {args.procs} processes per cell; fault range is min-max over processes")
+    print(
+        f"{args.candidate}  allocator: {env or 'glibc defaults'}  {args.procs} processes per cell; fault range is min-max over processes"
+    )
     print(f"{'shape':9} {'path':4} {'CPU us/op':>10} {'faults/op':>10} {'fault range':>12} {'max RSS MB':>11}")
     for shape, path in cells(args):
         rows = [spawn(args.candidate, env, shape, path, lays[i % len(lays)]) for i in range(args.procs)]
@@ -283,7 +297,9 @@ def ab(args: argparse.Namespace) -> dict:
         imported = {arm: spawn(python, env, "json-64b", "hit", 0)["cachekit"] for arm, (python, env) in arms.items()}
         if imported["base"] == imported["candidate"]:
             raise SystemExit(f"--base and --candidate both import {imported['base']}: that compares a build with itself")
-    print(f"base {arms['base']}  candidate {arms['candidate']}  {args.pairs} pairs per cell")
+    for arm, (python, env) in arms.items():
+        print(f"{arm:9} {python}  allocator: {env or 'glibc defaults'}")
+    print(f"{args.pairs} pairs per cell")
     print("per metric: base mean, mean paired delta (% of base) [bootstrap 95% CI] verdict")
     for shape, path in cells(args):
         got: dict[str, list[dict]] = {"base": [], "candidate": []}

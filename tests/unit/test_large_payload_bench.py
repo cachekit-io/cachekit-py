@@ -13,6 +13,7 @@ import pytest
 from tests.performance import large_payload_bench as bench
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="the worker counts faults with Linux's RUSAGE_THREAD")
 @pytest.mark.parametrize("path", bench.PATHS)
 def test_worker_measures_the_named_path_in_a_fresh_process(path: str) -> None:
     # The worker raises if a hit computes or a miss does not, so a clean exit is the behavioural check.
@@ -30,6 +31,14 @@ def test_payload_shapes_hit_their_sizes() -> None:
             assert len(value) == bench.SIZES[size]
         else:
             assert bench.SIZES[size] <= sum(map(len, value["reasons"])) + 32 < bench.SIZES[size] + 200
+
+
+def test_an_arm_drops_the_calling_shells_allocator_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exported settings reaching the default arm would make a tuned-vs-default A/B tuned-vs-tuned.
+    monkeypatch.setenv("MALLOC_MMAP_THRESHOLD_", "4194304")
+    monkeypatch.setenv("GLIBC_TUNABLES", "glibc.malloc.trim_threshold=16777216")
+    assert not any(k.startswith("MALLOC_") or k == "GLIBC_TUNABLES" for k in bench.allocator_env({}))
+    assert bench.allocator_env({"MALLOC_TOP_PAD_": "1"})["MALLOC_TOP_PAD_"] == "1"
 
 
 def test_parse_env_rejects_a_pair_without_a_value() -> None:

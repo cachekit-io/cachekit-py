@@ -245,7 +245,7 @@ Two glibc settings, set together, removed every fault from both 1MB sets measure
 
 ```bash
 export MALLOC_MMAP_THRESHOLD_=4194304   # 4 MiB: buffers below this come from the heap, not a fresh mmap
-export MALLOC_TRIM_THRESHOLD_=16777216  # 16 MiB: keep up to this much free heap instead of returning it
+export MALLOC_TRIM_THRESHOLD_=16777216  # 16 MiB: return the heap's free top to the kernel only once it exceeds this
 ```
 
 Set them in the environment the process starts with, such as a container's `ENV` or a systemd unit's `Environment=`. glibc reads them once at startup, so setting `os.environ` from Python is too late. They apply to the whole process, not only to cachekit.
@@ -263,7 +263,7 @@ Set them in the environment the process starts with, such as a container's `ENV`
 The default row is the base arm of the "both" job. [A second run of that job](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618/attempts/2) agreed within about 1 point on every 1MB cell. Do not set one threshold alone: glibc stops adjusting either threshold once one is set, so the other stays at its 128KB default. `MALLOC_TRIM_THRESHOLD_` alone was slower on all four 1MB paths. `MALLOC_MMAP_THRESHOLD_` 4 MiB alone, on an Intel Xeon Platinum 8370C runner in the same run, slowed the JSON-like get by 26.6%, the random-bytes get by 80.0% and the JSON-like set by 2.3%, and sped the random-bytes set by 17.9%.
 
 The cost of setting both, on the same runner:
-- **Memory:** peak RSS per process rose by 0.2 to 1.1MB, in a single-threaded process. glibc can keep up to 16 MiB of freed memory in each of its arenas, and a process with many threads has several, so a threaded server can keep more; that was not measured.
+- **Memory:** peak RSS per process rose by 0.2 to 1.1MB, in a single-threaded process. The trim threshold is not a cap on retained memory: it only decides when the free space at the top of a heap goes back to the kernel. Free chunks below a live allocation are never trimmed, and buffers under 4 MiB no longer get their own `mmap`, so a heap fragmented by long-lived objects can hold far more than 16 MiB of free memory, in each of the several arenas a threaded process has. Size memory limits from your own process's RSS under load, not from these settings; that was not measured here.
 - **A 64KB incompressible get took about a third longer:** +32.7% [+31.3, +34.3], 67.0μs to 88.9μs, and +32.6% in the second run, with no page faults in either arm. Both `MALLOC_TOP_PAD_` settings did the same, and also slowed 64KB sets by 4% to 6%. Every other 64B, 1KB and 64KB cell changed by 1.2% or less.
 
 So set both for a process whose cached values are mostly around 1MB, and measure your own machine first: `uv run python tests/performance/large_payload_bench.py ab --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216` runs the same comparison, and `--shapes json-1m bin-1m` narrows it to the 1MB cells. Nothing between 64KB and 1MB was measured, so where the settings start to pay off is not known. The MessagePack encoder grows its buffer to up to twice the value's size, so from about 2MB some buffers reach the 4 MiB mmap threshold and are `mmap`-ed on every call again; larger values were not measured. Free-threaded CPython (3.13t, 3.14t) allocates Python objects with its own allocator, and musl (Alpine) and macOS allocators work differently; none of them was measured.
