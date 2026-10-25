@@ -216,8 +216,10 @@ exclude_lines = [
 # Core test toolchain — everything tests/unit + tests/critical need on ANY
 # interpreter, including free-threaded CPython: the free-threaded CI lane
 # installs ONLY this group. A dep may live here only if it ships
-# free-threaded wheels or builds cleanly from source on 3.14t; deps that
-# don't (orjson, numpy, pandas, pyarrow) stay in dev below.
+# free-threaded wheels or builds cleanly from source on 3.14t and 3.15t.
+# orjson stays in dev below because it ships no free-threaded wheels;
+# numpy, pandas and pyarrow (the [data] extra) stay in dev because the
+# free-threaded lane does not exercise [data] yet.
 test = [
     "fakeredis>=2.21.0",
     "pytest>=7.0.0",
