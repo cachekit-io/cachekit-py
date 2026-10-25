@@ -155,6 +155,13 @@ elif mode == "inside":  # signal itself again at the Nth line run inside the fir
             state["armed"] = True
         return line if state["armed"] and state["lines"] < int(sys.argv[5]) else None
     sys.settrace(call)
+elif mode == "thread":  # once both runs started, signal a thread that is not the main one, which does not wake it
+    import signal, threading, time
+    def signal_this_thread():
+        while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 2:
+            time.sleep(0.05)
+        signal.pthread_kill(threading.get_ident(), int(sys.argv[3]))
+    threading.Thread(target=signal_this_thread, daemon=True).start()
 b.measure(["l1_hit"], 2)
 """
 
@@ -307,6 +314,36 @@ def test_a_signal_between_spawning_a_run_and_tracking_it_leaves_no_run_behind(tm
             pid = int(f.read_text() if f.name == "spawned" else f.name) if f.exists() else 0
             if pid and _alive(pid):
                 os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_that_does_not_wake_the_main_thread_still_stops_the_gate(tmp_path, sig: signal.Signals) -> None:
+    """The handler runs only once the main thread wakes, and a signal can arrive without waking it.
+
+    On a free-threaded build, a lock acquire spins before it sleeps and does not look for signals while it
+    spins, so a signal that lands then is held until the thread next wakes. Under CPU load the spin is long:
+    a gate blocked without a timeout slept through about 1 signal in 10 until its 60 s runs ended. A signal
+    sent to another thread is held the same way, on any build, and this test sends it that way.
+    """
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "thread"])  # noqa: S603 (trusted: this test's files)
+    try:
+        code = gate.wait(timeout=20)  # the stub runs sleep 60 s: a gate that sleeps through the signal times out here
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        assert len(runs) == 2, "the stub runs never started"
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
 
 
 @pytest.mark.parametrize("line", range(1, 13))
