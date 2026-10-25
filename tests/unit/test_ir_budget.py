@@ -155,11 +155,17 @@ elif mode == "inside":  # signal itself again at the Nth line run inside the fir
             state["armed"] = True
         return line if state["armed"] and state["lines"] < int(sys.argv[5]) else None
     sys.settrace(call)
-elif mode == "thread":  # once both runs started, signal a thread that is not the main one, which does not wake it
+elif mode == "thread":  # once the main thread blocks collecting results, signal another thread, which does not wake it
     import signal, threading, time
+    def collecting():  # the main thread is inside measure()'s wait() for its runs
+        frame = sys._current_frames().get(threading.main_thread().ident)
+        while frame is not None and frame.f_code is not b.wait.__code__:
+            frame = frame.f_back
+        return frame is not None
     def signal_this_thread():
-        while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 2:
-            time.sleep(0.05)
+        while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 2 or not collecting():
+            time.sleep(0.01)
+        time.sleep(0.5)  # a signal sent before the main thread parks runs its handler at once and proves nothing
         signal.pthread_kill(threading.get_ident(), int(sys.argv[3]))
     threading.Thread(target=signal_this_thread, daemon=True).start()
 b.measure(["l1_hit"], 2)
