@@ -967,6 +967,16 @@ class TestListenerPool:
         assert backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] == {socket.TCP_KEEPIDLE: 60}
 
     @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+    def test_client_built_from_keywords_keeps_its_keepalive_options(self) -> None:
+        """A ``Redis(host=...)`` client leaves the options unset, which redis-py 8 marks with a sentinel and resolves to
+        its own keepalive defaults when it connects: the listener's connection keeps them."""
+        backend = PerRequestRedisBackend(redis.Redis(host="cache.example"), "default")
+        resolved = backend._client.connection_pool.make_connection().socket_keepalive_options
+        clone = backend.listener_pool()
+        assert clone.connection_kwargs["socket_keepalive_options"] == {**resolved, socket.TCP_USER_TIMEOUT: 30_000}
+        assert isinstance(clone.make_connection(), redis.Connection)
+
+    @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
     def test_source_tcp_user_timeout_wins(self) -> None:
         backend = self._backend("redis://cache.example:6379/0")
         backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: 5_000}

@@ -20,7 +20,7 @@ import socket
 import threading
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, Optional, TypeVar
@@ -851,8 +851,12 @@ class PerRequestRedisBackend:
         if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
             kwargs["socket_keepalive"] = True
             if hasattr(socket, "TCP_USER_TIMEOUT"):  # Linux only
-                configured = kwargs.get("socket_keepalive_options") or {}
-                kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: _LISTENER_USER_TIMEOUT_MS, **configured}
+                configured: Any = kwargs.get("socket_keepalive_options")
+                if configured is not None and not isinstance(configured, Mapping):
+                    # redis-py 8 marks options a Redis(host=...) client leaves unset; a connection resolves the mark to
+                    # redis-py's keepalive defaults. Unconnected, it does no I/O.
+                    configured = redis.Connection(socket_keepalive_options=configured).socket_keepalive_options
+                kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: _LISTENER_USER_TIMEOUT_MS, **(configured or {})}
         return redis.ConnectionPool(connection_class=source.connection_class, max_connections=1, **kwargs)
 
     @asynccontextmanager
