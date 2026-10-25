@@ -324,8 +324,10 @@ valgrind against budgets committed in `tests/performance/ir_baselines.json`, so 
 is visible however loaded the machine is. Budgets belong to the build that recorded them; on a
 different interpreter, extension or C library, record a baseline on `main` first. Every pull
 request also runs it in CI (the `Instruction budget` jobs, CPython 3.12), against the PR's base
-measured on the same runner rather than against the committed budgets. Method, budgets and the
-CI job: [docs/performance.md](docs/performance.md#instruction-budgets).
+measured on the same runner rather than against the committed budgets. Each pull request gets one
+comment with the result, every path's figures included, updated in place on each run; pull requests
+from forks get none, and their shard logs carry the result. Method, budgets and the CI job:
+[docs/performance.md](docs/performance.md#instruction-budgets).
 
 ### Formatting Code
 

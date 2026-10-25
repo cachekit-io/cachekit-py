@@ -505,6 +505,11 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
+    # A report that reads as "no result" until the gate writes its verdict over it. It is always uploaded, so
+    # a re-run shard that ends without a verdict replaces the earlier attempt's report instead of leaving it.
+    - name: Start with no verdict
+      run: echo '{}' > "$RUNNER_TEMP/ir-report-${{ matrix.shard }}.json"
+
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
         fetch-depth: 2  # the merge commit and its first parent
@@ -536,7 +541,90 @@ jobs:
       working-directory: ${{ runner.temp }}/ir/head
       run: |
         .venv/bin/python tests/performance/ir_budget.py --base ../base --shard ${{ matrix.shard }}/4 \
-          --skip serializer_arrow_usgs --skip serializer_auto_usgs
+          --skip serializer_arrow_usgs --skip serializer_auto_usgs --report "$RUNNER_TEMP/ir-report-${{ matrix.shard }}.json"
+
+    # The verdict, PASS or FAIL, for perf-ir-report, or the placeholder if the gate wrote none.
+    - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      if: always()
+      with:
+        name: perf-ir-report-${{ matrix.shard }}
+        path: ${{ runner.temp }}/ir-report-${{ matrix.shard }}.json
+        if-no-files-found: error
+        retention-days: 7
+        overwrite: true  # a re-run attempt replaces its shard's report
+
+  # The shards' verdicts as one PR comment, so a FAIL or WARN does not hide in four job logs. Two jobs keep
+  # the write token away from repository code: this one renders the comment with read-only scopes (actions:
+  # read lists the shard jobs and their artifacts, to link a shard that left no report and to drop a report
+  # an earlier attempt left behind), and perf-ir-comment, which never checks
+  # out the repository, posts it. Fork PRs are skipped: their token cannot write to the PR. A cancelled run
+  # (a newer push) posts nothing, so it cannot overwrite the newer run's comment.
+  perf-ir-report:
+    name: Instruction budget report
+    needs: perf-ir
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      body: ${{ steps.render.outputs.body }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        fetch-depth: 2  # the merge commit the shards measured, and its parents
+        persist-credentials: false
+
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        pattern: perf-ir-report-*
+        path: ${{ runner.temp }}/reports
+        merge-multiple: true  # one file per shard, ir-report-K.json, in one directory
+
+    - name: Render the comment
+      id: render
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+          --jq '.jobs[] | {name, html_url, conclusion, started_at}' > "$RUNNER_TEMP/jobs.jsonl"
+        gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+          --jq '.artifacts[] | {name, created_at}' > "$RUNNER_TEMP/artifacts.jsonl"
+        delimiter="EOF_$(openssl rand -hex 16)"
+        {
+          echo "body<<$delimiter"
+          python3 tests/performance/ir_report.py --reports "$RUNNER_TEMP/reports" --shards 4 --jobs "$RUNNER_TEMP/jobs.jsonl" \
+            --artifacts "$RUNNER_TEMP/artifacts.jsonl" --head "$(git rev-parse HEAD^2)" --base "$(git rev-parse HEAD^1)" --run-url "$RUN_URL"
+          echo "$delimiter"
+        } >> "$GITHUB_OUTPUT"
+
+  perf-ir-comment:
+    name: Instruction budget comment
+    needs: perf-ir-report
+    if: ${{ !cancelled() && needs.perf-ir-report.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write  # enough for a PR's issue comments
+    steps:
+    - name: Post or update the PR comment
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BODY: ${{ needs.perf-ir-report.outputs.body }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        # The marker ir_report.py opens the body with. Only the bot's own comment is edited, whoever copies it.
+        marker='<!-- cachekit-instruction-budget -->'
+        ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+          --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
+        id=${ids%%$'\n'*}
+        if [[ -n "$id" ]]; then
+          jq -n --arg body "$BODY" '{body: $body}' | gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input - > /dev/null
+        else
+          jq -n --arg body "$BODY" '{body: $body}' | gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - > /dev/null
+        fi
 
   # Version sync + dependency CVE scan (push to main only)
   post-merge:
