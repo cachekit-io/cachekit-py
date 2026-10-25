@@ -37,7 +37,8 @@ def test_an_arm_drops_the_calling_shells_allocator_settings(monkeypatch: pytest.
     # Exported settings reaching the default arm would make a tuned-vs-default A/B tuned-vs-tuned.
     monkeypatch.setenv("MALLOC_MMAP_THRESHOLD_", "4194304")
     monkeypatch.setenv("GLIBC_TUNABLES", "glibc.malloc.trim_threshold=16777216")
-    assert not any(k.startswith("MALLOC_") or k == "GLIBC_TUNABLES" for k in bench.allocator_env({}))
+    monkeypatch.setenv("LD_PRELOAD", "libjemalloc.so.2")
+    assert not any(k.startswith("MALLOC_") or k in ("GLIBC_TUNABLES", "LD_PRELOAD") for k in bench.allocator_env({}))
     assert bench.allocator_env({"MALLOC_TOP_PAD_": "1"})["MALLOC_TOP_PAD_"] == "1"
 
 

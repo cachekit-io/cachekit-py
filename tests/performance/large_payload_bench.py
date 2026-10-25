@@ -30,10 +30,10 @@ The arms are interpreters (``--base`` / ``--candidate``, each from its own check
 and environment settings (``--base-env`` / ``--candidate-env``, repeatable ``KEY=VALUE``), so the same
 command compares two builds or one build under two allocator settings. Both arms run this file, so
 the harness itself never differs between them. Every measured process starts without the calling
-shell's ``MALLOC_*`` and ``GLIBC_TUNABLES`` settings, so an arm runs glibc's defaults unless its
-``--*-env`` names a setting, and the header prints each arm's settings. With neither flag, both arms are this interpreter:
-an A/A run, whose verdicts show the host's noise. A full run makes 48 comparisons (16 cells, three
-metrics), so at 95% expect about two false "lower" or "higher" verdicts in an A/A run; on a shared
+shell's ``MALLOC_*``, ``GLIBC_TUNABLES`` and ``LD_PRELOAD``, so an arm runs glibc malloc's defaults
+unless its ``--*-env`` names a setting, and the header prints each arm's settings. With neither
+flag, both arms are this interpreter: an A/A run, whose verdicts show the host's noise. A full run
+makes 48 comparisons (16 cells, three metrics), so at 95% expect about two false "lower" or "higher" verdicts in an A/A run; on a shared
 host the CPU of the small shapes is the noisiest. Repeat a run before trusting a lone verdict.
 
 Run (from a checkout, after ``uv sync``)::
@@ -186,12 +186,14 @@ def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
 
 
 def allocator_env(env: dict[str, str]) -> dict[str, str]:
-    """This process's environment without its glibc malloc settings, plus ``env``.
+    """This process's environment without anything that changes the allocator, plus ``env``.
 
-    An arm's allocator settings are only the ones it names: a ``MALLOC_*`` exported in the calling
-    shell would otherwise reach both arms and turn the default arm into a copy of the tuned one.
+    An arm's allocator settings are only the ones it names: a ``MALLOC_*`` or ``GLIBC_TUNABLES``
+    exported in the calling shell would otherwise reach both arms and turn the default arm into a copy
+    of the tuned one, and an ``LD_PRELOAD``-ed jemalloc or tcmalloc would replace glibc malloc in both.
     """
-    inherited = {k: v for k, v in os.environ.items() if not k.startswith("MALLOC_") and k != "GLIBC_TUNABLES"}
+    dropped = ("GLIBC_TUNABLES", "LD_PRELOAD")
+    inherited = {k: v for k, v in os.environ.items() if not k.startswith("MALLOC_") and k not in dropped}
     return {**inherited, **env}
 
 
@@ -275,9 +277,8 @@ METRICS = (("cpu_us", "CPU us/op"), ("faults", "faults/op"), ("maxrss_mb", "max 
 
 def run(args: argparse.Namespace) -> dict:
     env, lays, out = parse_env(args.candidate_env), layouts(), {}
-    print(
-        f"{args.candidate}  allocator: {env or 'glibc defaults'}  {args.procs} processes per cell; fault range is min-max over processes"
-    )
+    print(f"{args.candidate}  allocator: {env or 'glibc defaults'}  {args.procs} processes per cell")
+    print("fault range is min-max over processes")
     print(f"{'shape':9} {'path':4} {'CPU us/op':>10} {'faults/op':>10} {'fault range':>12} {'max RSS MB':>11}")
     for shape, path in cells(args):
         rows = [spawn(args.candidate, env, shape, path, lays[i % len(lays)]) for i in range(args.procs)]
