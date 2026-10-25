@@ -42,7 +42,7 @@ Choose how data is stored:
 | [Serializer Overview](serializers/README.md) | Decision matrix |
 | [Default (MessagePack)](serializers/default.md) | Cross-language, general-purpose |
 | [Auto (Python types)](serializers/auto.md) | Preserves sets, datetime, UUID, NumPy |
-| [OrjsonSerializer](serializers/orjson.md) | Fast JSON (2-5x faster) |
+| [OrjsonSerializer](serializers/orjson.md) | JSON-native, human-readable |
 | [ArrowSerializer](serializers/arrow.md) | DataFrames (columnar, exact round trip) |
 | [Encryption](serializers/encryption.md) | AES-256-GCM wrapper |
 | [Pydantic Models](serializers/pydantic.md) | Caching Pydantic objects |

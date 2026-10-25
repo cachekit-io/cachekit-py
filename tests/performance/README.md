@@ -175,8 +175,11 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 ## Figures
 
 These tests print figures and assert behaviour; none of them is a source for a timing. Quote a
-timing only from [docs/performance.md, Measured Figures](../../docs/performance.md#measured-figures),
-which dates each one and names the guard that produced it. Instruction budgets come from
+timing only from docs/performance.md's tables, which date each figure and name the guard or
+script that produced it: the [GitHub-Hosted Runner](../../docs/performance.md#github-hosted-runner) table,
+the [Large Payloads](../../docs/performance.md#large-payloads-and-glibc-malloc) table for encrypted 1MB
+gets and sets under glibc malloc settings, and [Measured Figures](../../docs/performance.md#measured-figures)
+for the raw `L1Cache.get` lookup, which the hosted run does not time. Instruction budgets come from
 `ir_baselines.json`, and memory bounds from the docstrings of `test_large_object_memory.py`.
 
 ---

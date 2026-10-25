@@ -14,9 +14,9 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 |-----------|-------|----------|
 | [StandardSerializer](default.md) | Fast | General Python objects, cross-language SDK interop |
 | [AutoSerializer](auto.md) | Fast | Python-only — preserves tuples, sets, frozensets, UUID, NumPy, top-level DataFrame/Series |
-| [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
+| [OrjsonSerializer](orjson.md) | Fast | JSON-heavy APIs, cross-language interop, human-readable |
 | [ArrowSerializer](arrow.md) | — | pandas/polars DataFrames, any size |
-| [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer, which picks its decoder by inspecting the bytes) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
+| [EncryptionWrapper](encryption.md) | Adds encrypt/decrypt | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps StandardSerializer, OrjsonSerializer or ArrowSerializer (not AutoSerializer, which picks its decoder by inspecting the bytes) and is not itself a `serializer=` value; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
 | [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
 
 > **OrjsonSerializer** requires the `[json]` extra: `pip install 'cachekit[json]'` (or `uv add 'cachekit[json]'`).
@@ -29,9 +29,9 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 |----------|----------------------|--------|
 | General Python objects | StandardSerializer | Broad type support, cross-language safe |
 | Python-only with type preservation | AutoSerializer | Preserves tuples, sets, frozensets, UUID, NumPy |
-| JSON-heavy data | OrjsonSerializer | 2-5x faster than stdlib json |
+| JSON-heavy data | OrjsonSerializer | JSON-native, Rust-backed |
 | API response caching | OrjsonSerializer | JSON-native, human-readable |
-| Web session data | OrjsonSerializer | Fast JSON, cross-language |
+| Web session data | OrjsonSerializer | JSON-native, cross-language |
 | DataFrames, any size | ArrowSerializer | Columnar and exact; StandardSerializer refuses DataFrames |
 | Mixed object types | StandardSerializer | Broad type support |
 | Real-time data pipelines | ArrowSerializer | Columnar Arrow IPC |
@@ -244,7 +244,7 @@ def get_user_data_v2(user_id):
 ## Serializer Pages
 
 - [StandardSerializer (MessagePack)](default.md) — General-purpose, handles all Python types
-- [OrjsonSerializer](orjson.md) — JSON-optimized, 2-5x faster than stdlib json
+- [OrjsonSerializer](orjson.md) — JSON-optimized, Rust-backed
 - [ArrowSerializer](arrow.md) — DataFrame-optimized columnar format
 - [Encryption Wrapper](encryption.md) — Wraps StandardSerializer, OrjsonSerializer or ArrowSerializer for zero-knowledge caching
 - [Caching Pydantic Models](pydantic.md) — Patterns and pitfalls for Pydantic model caching

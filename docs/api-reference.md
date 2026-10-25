@@ -420,7 +420,7 @@ Does your app need multi-language cache access (PHP/JS/Java/etc)?
     │       └─ Example: @cache(serializer="arrow")
     │
     └─ JSON API responses / JSON-heavy workloads?
-        └─ Use OrjsonSerializer (2-5x faster than stdlib json)
+        └─ Use OrjsonSerializer (JSON-native, human-readable)
         └─ Example: @cache(serializer="orjson")
 ```
 
@@ -509,7 +509,7 @@ Use OrjsonSerializer for JSON-heavy workloads and APIs. Requires the `[json]` ex
 from cachekit import cache
 from cachekit.serializers import OrjsonSerializer
 
-# OrjsonSerializer for JSON APIs (2-5x faster than stdlib json)
+# OrjsonSerializer for JSON APIs (JSON-native, human-readable)
 @cache(serializer="orjson", ttl=900, backend=None)
 def fetch_api_response(endpoint: str):
     return {
