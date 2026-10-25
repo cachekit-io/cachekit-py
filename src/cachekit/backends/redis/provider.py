@@ -820,8 +820,9 @@ class PerRequestRedisBackend:
         The clone keeps the configured ``socket_timeout`` even inside a ``with_timeout()`` window.
 
         The listener holds its one connection for the life of the process, so the connection PINGs
-        after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive, with the backend's
-        connections' timers (a Unix socket takes no keepalive option): idle-timeout proxies keep it. On Linux a TCP or TLS connection also sets
+        after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive with the timers
+        redis-py gives the backend's connections (a Unix socket takes no keepalive option):
+        idle-timeout proxies keep it. On Linux a TCP or TLS connection also sets
         ``TCP_USER_TIMEOUT`` to 30 s, unless the backend's pool sets its own, so a peer that stops
         acknowledging the PING fails the connection and the listener reconnects. Replies stay bytes,
         whatever the backend's client decodes: events are MessagePack.
