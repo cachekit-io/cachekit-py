@@ -413,13 +413,13 @@ def _against_base(base: Path, paths: list[str], jobs: int, child_timeout_s: floa
     base_figures = measure(paths, jobs, child_timeout_s, str(python), workload)
     rows = judge(base_figures, measured)
     lines, ok = report_lines(rows, against="base")
-    if report is not None:
-        rows += [{"path": p, "verdict": "new", "ir": None, "budget": None, "pct": None} for p in new]
-        summary = {"verdict": "PASS" if ok else "FAIL", "interpreter": interpreter_key(), "python": platform.python_version()}
-        report.write_text(json.dumps(summary | {"rows": rows}, indent=2) + "\n")
     print(f"main-thread Ir/op on {interpreter_key()} ({platform.python_version()}), this checkout against --base {base}")
     print("\n".join(lines + [f"new   {p:22} not on the base: nothing to compare against" for p in new]))
     print("PASS" if ok else f"FAIL: a path regressed by {FAIL_PCT}% or more against the base")
+    if report is not None:  # after the verdict is printed, so a failed write cannot hide it
+        rows += [{"path": p, "verdict": "new", "ir": None, "budget": None, "pct": None} for p in new]
+        summary = {"verdict": "PASS" if ok else "FAIL", "interpreter": interpreter_key(), "python": platform.python_version()}
+        report.write_text(json.dumps(summary | {"rows": rows}, indent=2) + "\n")
     return 0 if ok else 1
 
 

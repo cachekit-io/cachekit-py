@@ -88,8 +88,8 @@ def test_a_missing_shard_without_a_listed_job_links_the_run() -> None:
     assert body.count(f"]({RUN}) |") == 4
 
 
-@pytest.mark.parametrize("text", ["", "{"])
-def test_a_missing_or_truncated_report_is_no_report(tmp_path, text: str) -> None:
+@pytest.mark.parametrize("text", ["", "{", "[]", "{}", '{"verdict": "WARN", "rows": []}', '{"verdict": "PASS"}'])
+def test_a_report_ir_budget_did_not_write_is_no_report(tmp_path, text: str) -> None:
     (tmp_path / "r.json").write_text(text)
     assert load_report(tmp_path / "r.json") is None
     assert load_report(tmp_path / "absent.json") is None

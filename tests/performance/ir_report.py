@@ -20,11 +20,14 @@ SEVERITY = {"FAIL": 0, "WARN": 1, "new": 2, "LOWER": 3, "ok": 4}  # rows that ne
 
 
 def load_report(path: Path) -> dict | None:
-    """A shard's report, or None when it has none (or a truncated one)."""
+    """A shard's report, or None when it is missing or not one ``ir_budget.py --report`` wrote."""
     try:
-        return json.loads(path.read_text())
+        report = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+    if not isinstance(report, dict) or report.get("verdict") not in ("PASS", "FAIL") or not isinstance(report.get("rows"), list):
+        return None
+    return report
 
 
 def load_reports(directory: Path, shards: int, jobs: dict[str, dict]) -> dict[int, dict | None]:
