@@ -1,19 +1,16 @@
 """Thread CPU and minor page faults per op of the encrypted ``@cache.io`` get and set, up to 1 MB.
 
-At 1 MB the encrypted path can spend half its CPU on page faults: each 4 KiB page the allocator
-hands back to the kernel and then takes again costs a fault, about 256 per MB. Under glibc's
-default malloc that can happen on every call. A set or a get holds several payload-sized buffers
-at once; when they are freed, glibc trims the top of the heap back to the kernel once more than its trim
-threshold is free, and allocates any buffer at or above its mmap threshold with a fresh ``mmap``.
-Both thresholds move at run time (glibc raises them to the size of the largest ``mmap``-ed buffer
-freed so far), so the fault count depends on every payload-sized allocation in the process, not on
-any one of them: removing one buffer can raise the count on another payload. Instruction counts
-(``ir_budget.py``) cannot see any of this. So this harness reports minor faults (``getrusage``
-``ru_minflt``, this thread only) beside thread CPU for every figure, runs each measurement in a fresh
-process, and samples the heap layouts ``ir_budget.py`` uses (``LAYOUTS``).
+At 1 MB, page faults on payload-sized buffers are a large share of an encrypted call's CPU under
+glibc's default malloc, and the count depends on every large allocation in the process, so removing
+one buffer can raise it for another payload shape (docs/performance.md, "Large Payloads and glibc
+malloc", has the mechanism and the measured figures). Instruction counts (``ir_budget.py``) cannot
+see faults. So this harness reports minor faults (``getrusage`` ``ru_minflt``, this thread only)
+beside thread CPU for every figure, runs each measurement in a fresh process, and samples the heap
+layouts ``ir_budget.py`` uses (``LAYOUTS``).
 
 The workload is ``@cache.io`` with ``EncryptionConfig(enabled=True, single_tenant_mode=True)``, L1
-off, and an in-process backend, so no transport is measured:
+off, and an in-process backend, so no transport is measured: a real backend also allocates the
+response body on every get, which is not in these figures.
 
   hit    every call is an L2 hit: get, decrypt, deserialize
   miss   every call misses: get, compute, serialize, encrypt, set (the backend discards the value)
@@ -35,8 +32,7 @@ command compares two builds or one build under two allocator settings. Both arms
 the harness itself never differs between them. With neither flag, both arms are this interpreter:
 an A/A run, whose verdicts show the host's noise. A full run makes 48 comparisons (16 cells, three
 metrics), so at 95% expect about two false "lower" or "higher" verdicts in an A/A run; on a shared
-host the CPU of the small shapes is the noisiest. Trust a lone CPU verdict at 64 B to 64 KB only
-with ``make perf-ir`` agreeing.
+host the CPU of the small shapes is the noisiest. Repeat a run before trusting a lone verdict.
 
 Run (from a checkout, after ``uv sync``)::
 
@@ -46,8 +42,8 @@ Run (from a checkout, after ``uv sync``)::
       --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216
 
 ``--shapes`` and ``--paths`` narrow a run (for example ``--shapes json-1m bin-1m``); ``--json FILE``
-writes the figures, every process's included. Each process is a few hundred milliseconds of work
-after the import, so a full A/B at 30 pairs (8 shapes, 2 paths) takes 20 to 40 minutes. Linux only
+writes the figures, every process's included. A full A/B at 30 pairs (8 shapes, 2 paths, 960
+processes) took about 14 minutes on a GitHub-hosted ``ubuntu-latest`` runner. Linux only
 (``RUSAGE_THREAD``).
 """
 
@@ -61,12 +57,13 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 SIZES = {"64b": 64, "1k": 1024, "64k": 65536, "1m": 1_000_000}
 KINDS = ("json", "bin")
 SHAPES = tuple(f"{kind}-{size}" for kind in KINDS for size in SIZES)
 PATHS = ("hit", "miss")
-# Ops per process and warmup calls before them: about 0.1-0.3 s of measured work per process.
+# Ops per process and warmup calls before them: enough that the per-process mean is stable at each size.
 OPS = {"64b": (2000, 200), "1k": (2000, 200), "64k": (400, 50), "1m": (40, 10)}
 BOOTSTRAP_RESAMPLES = 10_000
 CHILD_TIMEOUT_S = 300
@@ -104,12 +101,11 @@ def payload(shape: str) -> object:
 # --- one process: one shape, one path ---------------------------------------------------------------
 
 
-def worker(shape: str, path: str, layout: int) -> dict[str, float]:
+def worker(shape: str, path: str, layout: int) -> dict[str, Any]:
     """Measure one shape and path in this process; returns per-op means over the measured calls."""
     import gc
     import resource
     import time
-    from typing import Any
 
     import cachekit
     import cachekit.backends.cachekitio as ckio
@@ -117,7 +113,7 @@ def worker(shape: str, path: str, layout: int) -> dict[str, float]:
     from cachekit.config import EncryptionConfig
 
     sys.setswitchinterval(1e6)  # the main thread keeps the GIL unless the code releases it
-    shift = [object() for _ in range(layout)]  # held: moves where every later allocation lands
+    _shift = [object() for _ in range(layout)]  # noqa: F841 (held: moves where every later allocation lands)
 
     class Backend:
         def __init__(self) -> None:
@@ -146,8 +142,6 @@ def worker(shape: str, path: str, layout: int) -> dict[str, float]:
         computed[0] += 1
         return value
 
-    body.__module__ = "bench"
-    body.__qualname__ = "large_payload"
     # @cache.io always builds a CachekitIOBackend; swap the class for the in-process one while it does.
     real, ckio.CachekitIOBackend = ckio.CachekitIOBackend, lambda api_key=None: Backend()
     try:
@@ -174,7 +168,6 @@ def worker(shape: str, path: str, layout: int) -> dict[str, float]:
     expected = 0 if path == "hit" else ops
     if computed[0] - before != expected:
         raise RuntimeError(f"{shape}/{path}: body ran {computed[0] - before} times in {ops} calls, expected {expected}")
-    del shift
     return {
         "cpu_us": (cpu1 - cpu0) / ops / 1000,
         "faults": (faults1 - faults0) / ops,
@@ -186,7 +179,7 @@ def worker(shape: str, path: str, layout: int) -> dict[str, float]:
 # --- driver -------------------------------------------------------------------------------------------
 
 
-def spawn(python: str, env: dict[str, str], shape: str, path: str, layout: int) -> dict[str, float]:
+def spawn(python: str, env: dict[str, str], shape: str, path: str, layout: int) -> dict[str, Any]:
     """One measurement in a fresh process (``-I``: no script directory or user site on its path)."""
     cmd = [python, "-I", "-B", str(Path(__file__).resolve()), "worker", shape, path, str(layout)]
     done = subprocess.run(  # noqa: S603 (trusted: interpreter paths the operator passed)
@@ -224,6 +217,9 @@ def parse_env(pairs: list[str]) -> dict[str, str]:
 
     >>> parse_env(["MALLOC_TOP_PAD_=67108864"])
     {'MALLOC_TOP_PAD_': '67108864'}
+    >>> parse_env(["MALLOC_TOP_PAD_"])
+    Traceback (most recent call last):
+    SystemExit: --*-env takes KEY=VALUE, got 'MALLOC_TOP_PAD_'
     """
     env = {}
     for pair in pairs:
@@ -232,6 +228,18 @@ def parse_env(pairs: list[str]) -> dict[str, str]:
             raise SystemExit(f"--*-env takes KEY=VALUE, got {pair!r}")
         env[key] = value
     return env
+
+
+def at_least_two(text: str) -> int:
+    """A count of processes or pairs: one gives a bootstrap CI of zero width, so a verdict with no evidence.
+
+    >>> at_least_two("30")
+    30
+    """
+    n = int(text)
+    if n < 2:
+        raise argparse.ArgumentTypeError(f"needs at least 2, got {n}")
+    return n
 
 
 def cells(args: argparse.Namespace) -> list[tuple[str, str]]:
@@ -265,7 +273,12 @@ def run(args: argparse.Namespace) -> dict:
 
 def ab(args: argparse.Namespace) -> dict:
     arms = {"base": (args.base, parse_env(args.base_env)), "candidate": (args.candidate, parse_env(args.candidate_env))}
-    lays, rng, out = layouts(), random.Random(args.seed), {}
+    lays, rng, out = layouts(), random.Random(0), {}
+    if args.base != args.candidate:
+        # Two interpreters that import the same cachekit make a silent A/A run.
+        imported = {arm: spawn(python, env, "json-64b", "hit", 0)["cachekit"] for arm, (python, env) in arms.items()}
+        if imported["base"] == imported["candidate"]:
+            raise SystemExit(f"--base and --candidate both import {imported['base']}: that compares a build with itself")
     print(f"base {arms['base']}  candidate {arms['candidate']}  {args.pairs} pairs per cell")
     print("per metric: base mean, mean paired delta (% of base) [bootstrap 95% CI] verdict")
     for shape, path in cells(args):
@@ -304,11 +317,10 @@ def main() -> None:
         p.add_argument("--candidate", default=sys.executable, help="interpreter of the arm under test (default: this one)")
         p.add_argument("--candidate-env", action="append", default=[], metavar="KEY=VALUE")
         p.add_argument("--json", type=Path, help="write the figures here")
-    run_p.add_argument("--procs", type=int, default=10, help="fresh processes per cell (default: 10)")
+    run_p.add_argument("--procs", type=at_least_two, default=10, help="fresh processes per cell (default: 10)")
     ab_p.add_argument("--base", default=sys.executable, help="interpreter of the base arm (default: this one)")
     ab_p.add_argument("--base-env", action="append", default=[], metavar="KEY=VALUE")
-    ab_p.add_argument("--pairs", type=int, default=30, help="interleaved process pairs per cell (default: 30)")
-    ab_p.add_argument("--seed", type=int, default=0, help="seeds the per-pair arm order")
+    ab_p.add_argument("--pairs", type=at_least_two, default=30, help="interleaved process pairs per cell (default: 30)")
     args = parser.parse_args()
     out = run(args) if args.mode == "run" else ab(args)
     if args.json:

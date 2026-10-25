@@ -235,13 +235,13 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 **Problem:** on Linux with glibc, an encrypted get or set of a 1MB value can spend a third of its CPU or more on page faults, and an incompressible set over three quarters.
 
-**Mitigation:** set `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` together, if most cached values are hundreds of KB or more (see [Large Payloads and glibc malloc](#large-payloads-and-glibc-malloc)).
+**Mitigation:** set `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` together, if most cached values are around 1MB (see [Large Payloads and glibc malloc](#large-payloads-and-glibc-malloc)).
 
 ## Large Payloads and glibc malloc
 
 A set holds several payload-sized buffers at once: the MessagePack output, the LZ4 output, the envelope, the ciphertext and the stored frame; a get holds as many. When they are freed, glibc hands the top of its heap back to the kernel once more than its trim threshold is free, and it serves any buffer at or above its mmap threshold with a fresh `mmap`. The next call takes those pages back, one page fault per 4KB. glibc raises both thresholds at run time to fit the largest `mmap`-ed buffer freed so far, so the fault count depends on every large allocation in the process and on the payload's shape: removing one buffer can raise the count for another shape.
 
-Two glibc settings, set together, removed every fault on three of the four 1MB paths measured:
+Two glibc settings, set together, removed every fault from both 1MB sets measured and cut the JSON-like get's from 632 to 252 (the random-bytes get had none):
 
 ```bash
 export MALLOC_MMAP_THRESHOLD_=4194304   # 4 MiB: buffers below this come from the heap, not a fresh mmap
@@ -250,7 +250,7 @@ export MALLOC_TRIM_THRESHOLD_=16777216  # 16 MiB: keep up to this much free heap
 
 Set them in the environment the process starts with, such as a container's `ENV` or a systemd unit's `Environment=`. glibc reads them once at startup, so setting `os.environ` from Python is too late. They apply to the whole process, not only to cachekit.
 
-`tests/performance/large_payload_bench.py ab` measured each setting against the default allocator, in 30 interleaved process pairs per cell, in [the `Bench` workflow's run on 2026-10-25](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618) on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC 7763, glibc 2.39, CPython 3.14.7, cachekit-core 0.7.0. The workload is `@cache.io` with encryption, L1 off and an in-process backend, with about 1MB of JSON-like text in a dict, or 1,000,000 random bytes. Each cell is the change in CPU per call, with the 95% CI of the paired change, and the faults per call under that setting:
+`tests/performance/large_payload_bench.py ab` measured each setting against the default allocator, in 30 interleaved process pairs per cell, in [the `Bench` workflow's run on 2026-10-25](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618) on a GitHub-hosted `ubuntu-latest` runner: AMD EPYC 7763, glibc 2.39, CPython 3.14.7, cachekit-core 0.7.0. The workload is `@cache.io` with encryption, L1 off and an in-process backend, so the HTTP response body a real backend allocates on every get is not in these figures. The value is about 1MB of JSON-like text in a dict, or 1,000,000 random bytes. Each cell is the change in CPU per call, with the 95% CI of the paired change, and the faults per call under that setting:
 
 | Setting | 1MB JSON-like get | 1MB JSON-like set | 1MB random-bytes get | 1MB random-bytes set |
 |---|---|---|---|---|
@@ -260,13 +260,13 @@ Set them in the environment the process starts with, such as a container's `ENV`
 | `MALLOC_TOP_PAD_` 16 MiB alone | −27.9% [−32.1, −23.5], 252 | −33.2% [−33.7, −32.7], 0 | +310% [+308, +313], 982 | −23.2% [−23.7, −22.6], 983 |
 | `MALLOC_TOP_PAD_` 64 MiB alone | −29.9% [−34.0, −25.7], 252 | −34.0% [−34.3, −33.6], 0 | −1.1% [−2.8, +0.8], 0 | −78.7% [−79.4, −77.9], 0 |
 
-The default row is the base arm of the "both" job. [A second run of that job](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618/attempts/2) agreed within 1 point on every 1MB cell. Setting only one threshold is worse than setting neither: glibc stops adjusting either threshold once one is set, so the other stays at its 128KB default. `MALLOC_MMAP_THRESHOLD_` 4 MiB alone ran on an Intel Xeon Platinum 8370C runner in the same run, and slowed the 1MB JSON-like get by 26.6% and the random-bytes get by 80.0%.
+The default row is the base arm of the "both" job. [A second run of that job](https://github.com/cachekit-io/cachekit-py/actions/runs/40159568618/attempts/2) agreed within about 1 point on every 1MB cell. Do not set one threshold alone: glibc stops adjusting either threshold once one is set, so the other stays at its 128KB default. `MALLOC_TRIM_THRESHOLD_` alone was slower on all four 1MB paths. `MALLOC_MMAP_THRESHOLD_` 4 MiB alone, on an Intel Xeon Platinum 8370C runner in the same run, slowed the JSON-like get by 26.6%, the random-bytes get by 80.0% and the JSON-like set by 2.3%, and sped the random-bytes set by 17.9%.
 
 The cost of setting both, on the same runner:
-- **Memory:** peak RSS per process rose by 0.2 to 1.1MB. glibc keeps up to 16 MiB of freed memory per arena instead of returning it, so a process whose threads have each held large values can keep more.
+- **Memory:** peak RSS per process rose by 0.2 to 1.1MB, in a single-threaded process. glibc can keep up to 16 MiB of freed memory in each of its arenas, and a process with many threads has several, so a threaded server can keep more; that was not measured.
 - **A 64KB incompressible get took about a third longer:** +32.7% [+31.3, +34.3], 67.0μs to 88.9μs, and +32.6% in the second run, with no page faults in either arm. Both `MALLOC_TOP_PAD_` settings did the same, and also slowed 64KB sets by 4% to 6%. Every other 64B, 1KB and 64KB cell changed by 1.2% or less.
 
-So set both for a process whose cached values are mostly hundreds of KB or more, and measure your own mix first: `uv run python tests/performance/large_payload_bench.py ab --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216` runs the same comparison on your machine, and `--shapes` narrows it to your sizes. Only 1MB was measured above 64KB. The MessagePack encoder grows its buffer to up to twice the value's size, so from about 2MB some buffers reach the 4 MiB mmap threshold and are `mmap`-ed on every call again; larger values were not measured. musl (Alpine) and macOS allocators work differently and were not measured.
+So set both for a process whose cached values are mostly around 1MB, and measure your own machine first: `uv run python tests/performance/large_payload_bench.py ab --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216` runs the same comparison, and `--shapes json-1m bin-1m` narrows it to the 1MB cells. Nothing between 64KB and 1MB was measured, so where the settings start to pay off is not known. The MessagePack encoder grows its buffer to up to twice the value's size, so from about 2MB some buffers reach the 4 MiB mmap threshold and are `mmap`-ed on every call again; larger values were not measured. Free-threaded CPython (3.13t, 3.14t) allocates Python objects with its own allocator, and musl (Alpine) and macOS allocators work differently; none of them was measured.
 
 ## Performance Regression Testing
 

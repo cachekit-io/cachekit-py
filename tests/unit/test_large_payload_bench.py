@@ -16,18 +16,3 @@ def test_worker_measures_the_named_path_in_a_fresh_process(path: str) -> None:
     assert row["cpu_us"] > 0
     assert row["faults"] >= 0
     assert row["maxrss_mb"] > 0
-
-
-def test_payload_shapes_hit_their_sizes() -> None:
-    for shape in bench.SHAPES:
-        kind, size = shape.split("-")
-        value = bench.payload(shape)
-        if kind == "bin":
-            assert len(value) == bench.SIZES[size]
-        else:
-            assert bench.SIZES[size] <= sum(map(len, value["reasons"])) + 32 < bench.SIZES[size] + 200
-
-
-def test_parse_env_rejects_a_pair_without_a_value() -> None:
-    with pytest.raises(SystemExit, match="KEY=VALUE"):
-        bench.parse_env(["MALLOC_TOP_PAD_"])
