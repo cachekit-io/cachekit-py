@@ -27,9 +27,15 @@ pub struct HitCounter {
 impl HitCounter {
     /// Count one hit and stamp it with the current wall-clock time.
     pub fn hit(&self) {
+        self.hit_at(now_ns());
+    }
+
+    /// Count one hit stamped `ns` nanoseconds after the Unix epoch. The tests pass fixed stamps
+    /// rather than read the wall clock, which Miri's default isolation refuses.
+    fn hit_at(&self, ns: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         // fetch_max, not store: of two racing hits, the later stamp stays whichever lands last.
-        self.last_hit_ns.fetch_max(now_ns(), Ordering::Relaxed);
+        self.last_hit_ns.fetch_max(ns, Ordering::Relaxed);
     }
 
     /// Zero the count and forget the latest hit.
@@ -120,10 +126,11 @@ mod tests {
         let counter = HitCounter::default();
         assert_eq!(counter.count(), 0);
         assert!(counter.last_hit().is_none());
-        counter.hit();
-        counter.hit();
+        counter.hit_at(2 * NANOS_PER_SEC);
+        counter.hit_at(NANOS_PER_SEC);
         assert_eq!(counter.count(), 2);
-        assert!(counter.last_hit().is_some());
+        // The later stamp stays although it landed first.
+        assert_eq!(counter.last_hit(), Some(2.0));
         counter.reset();
         assert_eq!(counter.count(), 0);
         assert!(counter.last_hit().is_none());
@@ -133,15 +140,17 @@ mod tests {
     fn concurrent_hits_are_all_counted() {
         let counter = HitCounter::default();
         std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
-                    for _ in 0..10_000 {
-                        counter.hit();
+            for thread in 0..8 {
+                let counter = &counter;
+                scope.spawn(move || {
+                    for i in 1..=10_000 {
+                        counter.hit_at(thread * 10_000 + i);
                     }
                 });
             }
         });
         assert_eq!(counter.count(), 80_000);
+        assert_eq!(counter.last_hit(), Some(ns_to_seconds(80_000)));
     }
 
     #[test]
