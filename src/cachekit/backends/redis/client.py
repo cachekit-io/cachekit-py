@@ -2,7 +2,7 @@
 
 This module centralizes ALL Redis connection concerns:
 - Connection pool management (global singleton with configurable size)
-- Thread-local sync client caching (a sync request reuses its thread's client)
+- Thread-local sync client caching
 - Client factory functions (sync/async)
 
 Architecture:

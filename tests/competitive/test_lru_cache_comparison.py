@@ -350,7 +350,7 @@ class TestLruCacheComparison:
         for single-process use (comparable order of magnitude).
 
         Note: cachekit adds overhead for decorator infrastructure, so may be
-        slower than raw lru_cache but still sub-microsecond.
+        slower than raw lru_cache.
         """
 
         # lru_cache baseline

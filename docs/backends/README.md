@@ -123,7 +123,7 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - Your application runs on a single machine
 
 **Use [RedisBackend](redis.md) when**:
-- Cache is shared across multiple processes (one network round trip per L1 miss)
+- Cache is shared across multiple processes
 - You need persistence options
 - You're building a typical web application
 - You require multi-process or distributed caching
@@ -132,7 +132,7 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - Hot in-memory caching with very high throughput
 - Simple key-value caching without persistence needs
 - Existing Memcached infrastructure you want to reuse
-- Read-heavy workloads where one network round trip per L1 miss is acceptable
+- Read-heavy workloads where a network round trip on each L1 miss is acceptable ([not measured here](../performance.md#not-measured-here))
 
 **Use [CachekitIOBackend](cachekitio.md) when** *(closed beta — [request access](https://cachekit.io))*:
 - You want managed, zero-ops distributed caching

@@ -101,7 +101,7 @@ class HealthChecker:
 
     Supports multiple checking levels:
     - PING: Redis connectivity only (PING + INFO)
-    - BASIC: Ping + connection info
+    - BASIC: the PING check + connection-pool and circuit-breaker state
     - FULL: All components + detailed stats
 
     Dependencies are explicitly injected:

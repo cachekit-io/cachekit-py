@@ -68,7 +68,7 @@ class TestAiocacheComparison:
         """
         CLAIM: cachekit has L1 (in-process) + L2 (Redis) dual-layer cache.
 
-        This is TRUE. L1 hits skip the network round trip every aiocache L2 hit pays.
+        This is TRUE.
 
         Architecture:
         - L1 (in-process): no network round trip
