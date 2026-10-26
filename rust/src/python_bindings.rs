@@ -115,8 +115,9 @@ fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesVi
     buffer_view(py, obj, false)
 }
 
-/// `bytes_view`, plus: with `copy_other_formats`, a buffer whose format is not `B` or `c` is
-/// copied as its raw bytes (what `bytes(obj)` reads) instead of raising `BufferError`.
+/// `bytes_view`, plus: with `copy_other_formats`, an input that `bytes_view` would refuse with
+/// `BufferError` (a format other than `B`/`c`, or an exporter that refuses the export) is read
+/// as `bytes(obj)` reads it, instead of raising.
 fn buffer_view<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
@@ -128,20 +129,17 @@ fn buffer_view<'py>(
         let len = b.as_bytes().len();
         return Ok(BytesView::Borrowed(b.clone(), 0, len));
     }
-    let export = PyUntypedBuffer::get(obj)?;
+    let falls_back = |err: &PyErr| copy_other_formats && err.is_instance_of::<PyBufferError>(py);
+    let export = match PyUntypedBuffer::get(obj) {
+        Ok(export) => export,
+        Err(err) if falls_back(&err) => return bytes_copy(obj),
+        Err(err) => return Err(err),
+    };
     let buf = match export.as_typed::<u8>() {
         Ok(buf) => buf,
         // `export` is still held while bytes(obj) copies, so an exporter that discards its
-        // storage on release cannot do so between the format check and the copy. bytes(obj)
-        // is a fresh, immutable object, so borrowing it is sound.
-        Err(err) if copy_other_formats && err.is_instance_of::<PyBufferError>(py) => {
-            let copy = py
-                .get_type::<PyBytes>()
-                .call1((obj,))?
-                .cast_into::<PyBytes>()?;
-            let len = copy.as_bytes().len();
-            return Ok(BytesView::Borrowed(copy, 0, len));
-        }
+        // storage on release cannot do so between the format check and the copy.
+        Err(err) if falls_back(&err) => return bytes_copy(obj),
         Err(err) => return Err(err),
     };
     // Interned: a plain "obj" would build a new str on every call, which costs a small
@@ -156,6 +154,17 @@ fn buffer_view<'py>(
         }
     }
     Ok(BytesView::Owned(buf.to_vec(py)?))
+}
+
+/// `bytes(obj)`, borrowed: it is a fresh, immutable object, so borrowing it is sound.
+fn bytes_copy<'py>(obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    let copy = obj
+        .py()
+        .get_type::<PyBytes>()
+        .call1((obj,))?
+        .cast_into::<PyBytes>()?;
+    let len = copy.as_bytes().len();
+    Ok(BytesView::Borrowed(copy, 0, len))
 }
 
 /// Reject a MessagePack document that nests deeper than `max_depth` (every array or map
@@ -178,8 +187,10 @@ pub fn check_msgpack_structure_py(
 
 /// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
 /// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
-/// touches the Python heap). It does not pin how a caller uses that view: that `retrieve` and
-/// the decrypt bindings pass `as_slice()` on without copying it is held by review of their code.
+/// touches the Python heap). It covers `retrieve` and `check_msgpack_structure`, and the
+/// `B`/`c` buffers the decrypt bindings read through `ciphertext_view`; that function's
+/// `bytes(obj)` fallback for other inputs is outside it. It does not pin how a caller uses the
+/// view: that the callers pass `as_slice()` on without copying it is held by review of their code.
 #[pyfunction]
 #[pyo3(name = "_bytes_view_borrows")]
 pub fn bytes_view_borrows_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -279,10 +290,11 @@ use cachekit_core::{
 #[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
 
-/// The decrypt bindings' ciphertext: `bytes_view`, except that a buffer whose format is not
-/// `B` or `c` (a signed-byte `memoryview.cast('b')`, say) is read as its raw bytes, exactly as
-/// the `bytes(data)` coercion these bindings replaced read it. Without this, such a view of an
-/// authentic frame would fail before authentication and surface as tampering.
+/// The decrypt bindings' ciphertext: `bytes_view`, except that an input it would refuse with
+/// `BufferError` (a signed-byte `memoryview.cast('b')`, say) is read as `bytes(obj)` reads it,
+/// exactly as the `bytes(data)` coercion these bindings replaced read it. Without this, such a
+/// view of an authentic frame would fail before authentication and surface as tampering.
+/// `retrieve` and `check_msgpack_structure` keep the strict `bytes_view` on purpose.
 #[cfg(feature = "encryption")]
 fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
     buffer_view(py, obj, true)
@@ -389,10 +401,10 @@ impl PyZeroKnowledgeEncryptor {
 
     /// Decrypt data with keys that never leave Rust memory
     ///
-    /// `ciphertext` is any buffer-protocol object (`bytes`, `bytearray`, `memoryview`, ...), read
-    /// as its raw bytes the way `bytes(ciphertext)` reads it. Immutable `bytes`, or a read-only
-    /// view of it such as `SerializationWrapper.unwrap` returns, is read without a copy; any
-    /// other buffer is copied first.
+    /// `ciphertext` is any object `bytes(ciphertext)` accepts (`bytes`, `bytearray`, a
+    /// `memoryview`, ...), and decrypts as `bytes(ciphertext)` would. Immutable `bytes`, or a
+    /// read-only `B`/`c` view of it such as `SerializationWrapper.unwrap` returns for a `bytes`
+    /// frame, is read without a copy; any other input is copied first.
     #[pyo3(name = "decrypt_with_keys")]
     pub fn decrypt_with_keys(
         &self,

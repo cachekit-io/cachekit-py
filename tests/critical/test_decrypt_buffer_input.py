@@ -1,15 +1,20 @@
 """
 CRITICAL PATH TEST: the AES-GCM decrypt bindings read buffer-protocol ciphertext without a copy.
 
-``decrypt_with_keys``, ``TenantKeyring.decrypt_at`` and ``TenantKeyring.decrypt`` take the
-ciphertext through the same ``bytes_view`` helper as ``ByteStorage.retrieve``: a read-only
-``memoryview`` of ``bytes`` (what ``SerializationWrapper.unwrap_metadata`` returns) is borrowed,
-and any other buffer (a ``bytearray``, a view of one, a spoofed exporter) is copied, because the
-module runs without a GIL on free-threaded builds and only immutable ``bytes`` is safe to borrow.
+``decrypt_with_keys``, ``TenantKeyring.decrypt_at`` and ``TenantKeyring.decrypt`` read their
+ciphertext through ``ciphertext_view``: the ``bytes_view`` helper ``ByteStorage.retrieve`` uses,
+plus a ``bytes(obj)`` fallback for an input ``bytes_view`` refuses with ``BufferError`` (a
+signed-byte ``memoryview.cast('b')``, say), so the bindings accept what the ``bytes(data)``
+coercion they replaced accepted. ``retrieve`` and ``check_msgpack_structure`` stay strict on
+purpose. Through ``bytes_view``, a read-only ``B``/``c`` ``memoryview`` of ``bytes`` (what
+``SerializationWrapper.unwrap_metadata`` returns for a ``bytes`` frame) is borrowed, and any other
+buffer (a ``bytearray``, a view of one, a spoofed exporter) is copied, because the module runs
+without a GIL on free-threaded builds and only immutable ``bytes`` is safe to borrow.
 
-``_bytes_view_borrows`` pins what ``bytes_view`` decides for an input. It does not pin how a
-binding uses that view: that the bindings pass it to the cipher without copying it is held by
-review of ``rust/src/python_bindings.rs``. The tracemalloc test pins only the Python side.
+``_bytes_view_borrows`` pins what ``bytes_view`` decides for an input; the fallback is outside
+it and is pinned only by the round-trip matrix and the wrapper tests below. The probe does not pin
+how a binding uses the view: that the bindings pass it to the cipher without copying it is held
+by review of ``rust/src/python_bindings.rs``. The tracemalloc test pins only the Python side.
 """
 
 from __future__ import annotations
@@ -125,6 +130,25 @@ def test_signed_byte_exporter_that_discards_on_release_still_decrypts(method: st
             self.data = bytearray(len(self.data))
 
     assert decrypt(DiscardOnRelease(ct)) == PLAINTEXT
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_exporter_that_refuses_its_buffer_decrypts_through_bytes(method: str) -> None:
+    """An object whose ``__buffer__`` raises ``BufferError`` but which ``bytes()`` still reads
+    (through ``__bytes__``) decrypts, as it did under the ``bytes(data)`` coercion."""
+    if sys.version_info < (3, 12):
+        pytest.skip("__buffer__ protocol requires Python 3.12+")
+    decrypt, sealing_key = METHODS[method]
+    ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(sealing_key, TENANT))
+
+    class RefusesExport:
+        def __buffer__(self, flags: int) -> memoryview:
+            raise BufferError("no export")
+
+        def __bytes__(self) -> bytes:
+            return ct
+
+    assert decrypt(RefusesExport()) == PLAINTEXT
 
 
 def test_wrapper_read_paths_decrypt_a_signed_byte_frame_view() -> None:
