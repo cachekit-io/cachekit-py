@@ -4,7 +4,7 @@
 
 Auto-detects and optimizes:
 - NumPy arrays (NUMPY_RAW format, zero-copy)
-- Pandas DataFrames (columnar format, 60%+ faster than pickle)
+- Pandas DataFrames (columnar format)
 - Pandas Series (metadata preservation)
 - datetime/date/time (ISO-8601)
 - UUID (string representation)
