@@ -72,7 +72,7 @@ class TestAiocacheComparison:
 
         Architecture:
         - L1 (in-process): no network round trip
-        - L1 miss → L2 (Redis): one network round trip
+        - L1 miss → L2 (Redis): one or more network round trips
         - L2 miss → Call function
         """
 

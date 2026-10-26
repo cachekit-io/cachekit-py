@@ -479,7 +479,7 @@ def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[i
 _serializer_cache_lock = threading.RLock()
 _serializer_cache: dict[str, type] = {}
 
-# Pre-create serializer instances so repeat lookups skip instantiation
+# Cache serializer instances, created on first lookup, so repeat lookups skip instantiation
 _serializer_instance_cache = {}
 _serializer_instance_lock = threading.RLock()
 

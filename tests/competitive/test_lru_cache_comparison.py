@@ -342,50 +342,6 @@ class TestLruCacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_performance_baseline_comparison(self):
-        """
-        CLAIM: cachekit L1-only mode is comparable to lru_cache.
-
-        This validates the baseline claim that L1-only mode is fast enough
-        for single-process use (comparable order of magnitude).
-
-        Note: cachekit adds overhead for decorator infrastructure, so may be
-        slower than raw lru_cache.
-        """
-
-        # lru_cache baseline
-        @lru_cache(maxsize=128)
-        def lru_func(x: int) -> int:
-            return x * 2
-
-        # cachekit L1-only
-        @cache(backend=None, ttl=300)
-        def cache_func(x: int) -> int:
-            return x * 2
-
-        # Warmup
-        lru_func(1)
-        cache_func(1)
-
-        # Measure lru_cache (L1 hit)
-        start = time.perf_counter()
-        for _ in range(1000):
-            lru_func(1)
-        lru_time = (time.perf_counter() - start) / 1000
-
-        # Measure cachekit L1-only (L1 hit)
-        start = time.perf_counter()
-        for _ in range(1000):
-            cache_func(1)
-        cache_time = (time.perf_counter() - start) / 1000
-
-        # Both should be in microseconds (not milliseconds)
-        assert lru_time < 1000  # < 1 microsecond
-        assert cache_time < 1000  # < 1 microsecond
-
-        # Cache time will be higher due to decorator overhead, but both
-        # should be sub-microsecond for practical performance
-
 
 class TestCompetitiveClaimsEvidence:
     """Document evidence for competitive claims."""

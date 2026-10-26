@@ -75,12 +75,8 @@ class TestOrjsonSerializerDocClaims:
         result2 = get_api_response("/users/123")
         assert result1 == result2, "Cached result must match original"
 
-    def test_orjson_performance_claim(self):
+    def test_orjson_roundtrip(self):
         """OrjsonSerializer round-trips JSON data."""
-        # This is a smoke test - actual speedup varies based on data size, complexity, and system load
-        # Microbenchmarks are inherently flaky and don't prove real-world performance
-        # For rigorous benchmarks, see tests/benchmarks/test_serializer_benchmarks.py
-
         serializer = OrjsonSerializer()
         data = {"key": "value", "number": 42, "list": [1, 2, 3]}
 

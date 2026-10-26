@@ -1679,7 +1679,7 @@ def create_cache_wrapper(
             # keys start ns: or func:, so this key never equals one. CachekitIO files it in its default namespace.
             return f"{_registry_hash}-{namespace or 'default'}:{custom_key}"
         # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.
-        # Minimal key generation - no string formatting overhead
+        # Minimal key construction for fast_mode
         from ..hash_utils import cache_key_hash
 
         return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
