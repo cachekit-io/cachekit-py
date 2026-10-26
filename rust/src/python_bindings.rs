@@ -5,10 +5,8 @@
 
 use cachekit_core::byte_storage::ByteStorageError;
 use cachekit_core::{check_msgpack_structure, ByteStorage};
-use pyo3::buffer::PyBuffer;
-#[cfg(feature = "encryption")]
-use pyo3::exceptions::PyBufferError;
-use pyo3::exceptions::PyValueError;
+use pyo3::buffer::{PyBuffer, PyUntypedBuffer};
+use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -114,13 +112,38 @@ impl BytesView<'_> {
 /// proof in `borrowable_offset`, whose payoff is that the borrow is an ORDINARY SLICE of that
 /// `bytes`: bounds-checked by Rust, no `unsafe`, nothing for a stale comment to misstate.
 fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    buffer_view(py, obj, false)
+}
+
+/// `bytes_view`, plus: with `copy_other_formats`, a buffer whose format is not `B` or `c` is
+/// copied as its raw bytes (what `bytes(obj)` reads) instead of raising `BufferError`.
+fn buffer_view<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    copy_other_formats: bool,
+) -> PyResult<BytesView<'py>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
         // The real length, never `len()`: that calls a subclass's `__len__`, which can lie and
         // make `as_slice` panic (too long) or truncate the input (too short).
         let len = b.as_bytes().len();
         return Ok(BytesView::Borrowed(b.clone(), 0, len));
     }
-    let buf = PyBuffer::<u8>::get(obj)?;
+    let export = PyUntypedBuffer::get(obj)?;
+    let buf = match export.as_typed::<u8>() {
+        Ok(buf) => buf,
+        // `export` is still held while bytes(obj) copies, so an exporter that discards its
+        // storage on release cannot do so between the format check and the copy. bytes(obj)
+        // is a fresh, immutable object, so borrowing it is sound.
+        Err(err) if copy_other_formats && err.is_instance_of::<PyBufferError>(py) => {
+            let copy = py
+                .get_type::<PyBytes>()
+                .call1((obj,))?
+                .cast_into::<PyBytes>()?;
+            let len = copy.as_bytes().len();
+            return Ok(BytesView::Borrowed(copy, 0, len));
+        }
+        Err(err) => return Err(err),
+    };
     // Interned: a plain "obj" would build a new str on every call, which costs a small
     // decrypt more than the bytes() copy this borrow replaces.
     let base = obj
@@ -128,7 +151,7 @@ fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesVi
         .ok()
         .and_then(|base| base.cast_into::<PyBytes>().ok());
     if let Some(base) = base {
-        if let Some(off) = borrowable_offset(&buf, &base) {
+        if let Some(off) = borrowable_offset(buf, &base) {
             return Ok(BytesView::Borrowed(base, off, buf.item_count()));
         }
     }
@@ -262,18 +285,7 @@ use zeroize::Zeroizing;
 /// authentic frame would fail before authentication and surface as tampering.
 #[cfg(feature = "encryption")]
 fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
-    match bytes_view(py, obj) {
-        Err(err) if err.is_instance_of::<PyBufferError>(py) => {
-            // bytes(obj) is a fresh, immutable copy, so borrowing it is sound.
-            let copy = py
-                .get_type::<PyBytes>()
-                .call1((obj,))?
-                .cast_into::<PyBytes>()?;
-            let len = copy.as_bytes().len();
-            Ok(BytesView::Borrowed(copy, 0, len))
-        }
-        view => view,
-    }
+    buffer_view(py, obj, true)
 }
 
 #[cfg(feature = "encryption")]

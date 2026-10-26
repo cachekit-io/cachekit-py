@@ -103,6 +103,30 @@ def test_non_buffer_input_is_refused(method: str) -> None:
         decrypt("not a buffer")
 
 
+@pytest.mark.parametrize("method", METHODS)
+def test_signed_byte_exporter_that_discards_on_release_still_decrypts(method: str) -> None:
+    """The raw-bytes fallback copies while the first export is still held: an exporter that
+    discards its storage when an export is released must not lose it between the format check
+    and the copy (bytes(data) acquired it once, so it decrypted)."""
+    if sys.version_info < (3, 12):
+        pytest.skip("__buffer__ protocol requires Python 3.12+")
+    decrypt, sealing_key = METHODS[method]
+    ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(sealing_key, TENANT))
+
+    class DiscardOnRelease:
+        def __init__(self, data: bytes) -> None:
+            self.data = bytearray(data)
+
+        def __buffer__(self, flags: int) -> memoryview:
+            return memoryview(self.data).cast("b")
+
+        def __release_buffer__(self, view: memoryview) -> None:
+            view.release()
+            self.data = bytearray(len(self.data))
+
+    assert decrypt(DiscardOnRelease(ct)) == PLAINTEXT
+
+
 def test_wrapper_read_paths_decrypt_a_signed_byte_frame_view() -> None:
     """A signed-byte view of an authentic frame keeps its ``b`` format through ``unwrap_metadata``;
     every wrapper read path still decrypts it, as it did when the wrapper coerced with bytes()."""
