@@ -32,7 +32,7 @@ def _read_version(relpath: str, pattern: str) -> str:
     """The version ``pattern`` captures in ``relpath``; fails by file name when there is no match."""
     match = re.search(pattern, (REPO_ROOT / relpath).read_text(encoding="utf-8"), re.MULTILINE)
     if match is None:
-        pytest.fail(f"{relpath}: no cachekit-core version found (pattern {pattern!r})")
+        pytest.fail(f"{relpath}: no cachekit-core version found (pattern {pattern!r}). {_MOVE_TOGETHER}")
     return match[1]
 
 
