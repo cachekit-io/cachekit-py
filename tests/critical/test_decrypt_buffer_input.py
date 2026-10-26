@@ -5,8 +5,8 @@ CRITICAL PATH TEST: the AES-GCM decrypt bindings read buffer-protocol ciphertext
 ciphertext through ``ciphertext_view``. Exact ``bytes`` and exact ``memoryview``, the shapes a
 read hands the wrapper, go through the ``bytes_view`` helper ``ByteStorage.retrieve`` uses: a
 read-only ``B``/``c`` ``memoryview`` of ``bytes`` (what ``SerializationWrapper.unwrap_metadata``
-returns for a ``bytes`` frame) is borrowed, and a view of a ``bytearray``, a strided view or a
-spoofed exporter is copied, because the module runs without a GIL on free-threaded builds and only
+returns for a ``bytes`` frame) is borrowed, and a view of a ``bytearray`` or a strided view is
+copied, because the module runs without a GIL on free-threaded builds and only
 immutable ``bytes`` is safe to borrow. A ``memoryview`` of another format, and every other input
 (a ``bytes`` subclass, a ``bytearray``, a custom exporter), is read by ``bytes(obj)`` itself, so
 it decrypts exactly as it did under the ``bytes(data)`` coercion the bindings replaced.
@@ -25,9 +25,17 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+import msgpack
 import pytest
 
-from cachekit._rust_serializer import Keyring, ZeroKnowledgeEncryptor, _bytes_view_borrows, derive_tenant_keys
+from cachekit._rust_serializer import (
+    ByteStorage,
+    Keyring,
+    ZeroKnowledgeEncryptor,
+    _bytes_view_borrows,
+    check_msgpack_structure,
+    derive_tenant_keys,
+)
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 from cachekit.serializers.wrapper import SerializationWrapper
 from tests.utils.tracemalloc_isolation import measure_in_subprocess
@@ -105,7 +113,8 @@ def test_tampered_buffer_input_still_fails_authentication(method: str) -> None:
 
 
 @pytest.mark.parametrize("method", METHODS)
-def test_non_buffer_input_is_refused(method: str) -> None:
+def test_input_bytes_rejects_raises_type_error(method: str) -> None:
+    """An input ``bytes()`` itself rejects (a ``str``) raises ``TypeError``, as it did before."""
     decrypt, _ = METHODS[method]
     with pytest.raises(TypeError):
         decrypt("not a buffer")
@@ -232,9 +241,13 @@ class TestBorrowVersusCopy:
         assert not _bytes_view_borrows(memoryview(b"c-i-p-h-e-r")[::2])
 
     def test_bytes_subclass_with_lying_len_reads_real_length(self) -> None:
-        """The borrowed length comes from the object's real size, never from ``__len__``: a
-        subclass that over-reports would panic the slice (an abort), and one that under-reports
-        would truncate the ciphertext into an authentication failure."""
+        """``bytes_view`` borrows a ``bytes`` subclass at its real size, never its ``__len__``.
+        ``ByteStorage.retrieve`` and ``check_msgpack_structure`` slice that borrow: a length that
+        over-reports would panic the slice (an abort), and one that under-reports would truncate
+        the input. The decrypt bindings take the ``bytes(obj)`` route for a subclass instead."""
+        payload = b"lying-len-envelope" * 50
+        envelope = ByteStorage("msgpack").store(payload, None)
+        doc = msgpack.packb({"k": [1, 2, 3]})
         ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(CURRENT, TENANT))
 
         class Long(bytes):
@@ -245,9 +258,12 @@ class TestBorrowVersusCopy:
             def __len__(self) -> int:
                 return 1
 
-        for liar in (Long(ct), Short(ct)):
-            assert _bytes_view_borrows(liar)
-            assert _decrypt_with_keys(liar) == PLAINTEXT
+        for liar in (Long, Short):
+            assert _bytes_view_borrows(liar(envelope))
+            assert ByteStorage("msgpack").retrieve(liar(envelope))[0] == payload
+            check_msgpack_structure(liar(doc), 8)
+            # The bytes() route: a subclass is not exact bytes, so bytes_view never sees it.
+            assert _decrypt_with_keys(liar(ct)) == PLAINTEXT
 
     def test_spoofed_obj_is_copied(self) -> None:
         """An exporter whose ``.obj`` names a decoy ``bytes`` fails the containment proof."""

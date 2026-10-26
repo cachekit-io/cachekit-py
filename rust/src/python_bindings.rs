@@ -280,7 +280,8 @@ fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<By
     }
 }
 
-/// `bytes(obj)`, borrowed: it is a fresh, immutable object, so borrowing it is sound.
+/// `bytes(obj)`, borrowed: the result is immutable (possibly shared, when `__bytes__` returns an
+/// existing object), so borrowing it is sound.
 #[cfg(feature = "encryption")]
 fn bytes_copy<'py>(obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
     let copy = obj
