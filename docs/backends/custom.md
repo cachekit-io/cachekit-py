@@ -145,7 +145,7 @@ def api_cached_function():
 - Microservices with dedicated cache service
 
 **Characteristics**:
-- Network latency: ~10–100ms per operation (network dependent)
+- Network latency: one HTTP request per operation, which depends on your network, region and service ([not measured here](../performance.md#not-measured-here))
 - Works across process/machine boundaries
 - Requires HTTP endpoint availability
 - Good for distributed systems
@@ -209,7 +209,7 @@ class DynamoDBBackend:
 **Characteristics**:
 - Serverless (pay per request)
 - Automatic TTL support via DynamoDB TTL attribute
-- Slower than Redis (~100–500ms)
+- One DynamoDB API request per operation, which depends on your region ([not measured here](../performance.md#not-measured-here))
 - Good for low-traffic applications
 
 ---

@@ -89,8 +89,7 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
     """Get cached serializer instance by name with configurable integrity checking (thread-safe).
 
     Uses double-checked locking for fast-path performance (lock-free reads
-    after first instantiation). This eliminates 625μs overhead from repeated
-    serializer instantiation.
+    after first instantiation). This avoids repeated serializer instantiation.
 
     Args:
         name: Serializer name ("default", "std", "auto", "pythonic", "arrow", "orjson")

@@ -76,7 +76,7 @@ class TestOrjsonSerializerDocClaims:
         assert result1 == result2, "Cached result must match original"
 
     def test_orjson_performance_claim(self):
-        """README.md:148 - OrjsonSerializer must be "2-5x faster than stdlib json"."""
+        """OrjsonSerializer round-trips JSON data (a smoke test: it times nothing)."""
         # This is a smoke test - actual speedup varies based on data size, complexity, and system load
         # Microbenchmarks are inherently flaky and don't prove real-world performance
         # For rigorous benchmarks, see tests/benchmarks/test_serializer_benchmarks.py

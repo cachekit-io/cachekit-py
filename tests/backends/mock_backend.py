@@ -281,7 +281,7 @@ class MockBackendProvider:
 
     Matches RedisBackendProvider pattern exactly.
     - Singleton shared store (expensive to setup, shared across requests)
-    - Per-request wrapper (cheap ~50ns, tenant-scoped)
+    - Per-request wrapper (cheap, tenant-scoped)
 
     Example:
         .. code-block:: python
@@ -303,7 +303,7 @@ class MockBackendProvider:
         self._store: dict[str, tuple[bytes, int | None]] = {}
 
     def get_backend(self) -> PerRequestMockBackend:
-        """Get per-request backend wrapper (cheap: ~50ns).
+        """Get per-request backend wrapper (cheap: one small object).
 
         Extracts tenant_id from ContextVar and creates tenant-scoped wrapper.
 
@@ -316,7 +316,7 @@ class MockBackendProvider:
         # Extract tenant from ContextVar (matches production)
         tenant_id = mock_tenant_context.get()
 
-        # Create per-request wrapper (cheap: ~50ns)
+        # Create per-request wrapper (cheap: one small object)
         # Fail-fast validation happens in PerRequestMockBackend.__init__
         return PerRequestMockBackend(self._store, tenant_id)
 

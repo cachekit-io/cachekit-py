@@ -96,11 +96,11 @@ class BaseBackend(Protocol):
 |---------|---------|-------------|---------------|-----|---------|
 | **L1 (In-Memory)** | 0.91μs per `backend=None` hit with a scalar argument the key memo holds ([measured](../performance.md#github-hosted-runner)); with a backend, a hit also deserializes | No | No | No | No |
 | **[File](file.md)** | set = fsync + a scan of every entry, so slow on a large cache; get waits on a concurrent set ([cost model](file.md#performance-characteristics)) | Yes (disk) | Format shared; one writer process | Yes | File locks |
-| **[Redis](redis.md)** | 1–7ms | Yes (RDB/AOF) | Yes | Yes | Yes |
-| **[Memcached](memcached.md)** | 1–5ms | No | Yes | Yes (max 30d) | No |
+| **[Redis](redis.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Yes (RDB/AOF) | Yes | Yes | Yes |
+| **[Memcached](memcached.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | No | Yes | Yes (max 30d) | No |
 | **[CachekitIO](cachekitio.md)** | 42–45ms p50 hit, measured from MEL ([varies by vantage](cachekitio.md#characteristics)) | Yes | Yes | Yes | Yes |
-| **[HTTP (custom)](custom.md)** | 10–100ms | Varies | Yes | Varies | Varies |
-| **[DynamoDB (custom)](custom.md)** | 100–500ms | Yes | Yes | Yes | No |
+| **[HTTP (custom)](custom.md)** | One HTTP request per operation, plus whatever your service does ([not measured here](../performance.md#not-measured-here)) | Varies | Yes | Varies | Varies |
+| **[DynamoDB (custom)](custom.md)** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes | No |
 
 **TTL inspection/refresh** (`refresh_ttl_on_get` sliding expiration, via the
 `TTLInspectableBackend` protocol): supported by **File**, **Redis**, and **CachekitIO**.
@@ -123,7 +123,7 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - Your application runs on a single machine
 
 **Use [RedisBackend](redis.md) when**:
-- You need sub-10ms latency with shared cache
+- You need a cache shared across processes, at one network round trip per operation
 - Cache is shared across multiple processes
 - You need persistence options
 - You're building a typical web application
@@ -133,7 +133,7 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - Hot in-memory caching with very high throughput
 - Simple key-value caching without persistence needs
 - Existing Memcached infrastructure you want to reuse
-- Read-heavy workloads where sub-5ms latency is sufficient
+- Read-heavy workloads where one network round trip per read is acceptable
 
 **Use [CachekitIOBackend](cachekitio.md) when** *(closed beta — [request access](https://cachekit.io))*:
 - You want managed, zero-ops distributed caching
@@ -403,11 +403,11 @@ these still resolve a backend with nothing configured, and get Redis at
 |---------|---------|----------|-------|
 | **L1 (In-Memory)** | 0.91μs per `backend=None` hit with a scalar argument the key memo holds ([measured](../performance.md#github-hosted-runner)) | Repeated calls in same process | Process-local only |
 | **File** | set = fsync, flat in cache size, except eviction, rejection and the 30 s rescan, which scan the directory; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
-| **Redis** | 1-7ms | Shared cache across pods | Recommended production backend |
+| **Redis** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Shared cache across pods | Recommended production backend |
 | **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
-| **HTTP API** | 10-100ms | Custom cloud services | Network dependent |
-| **DynamoDB** | 100-500ms | Serverless, low-traffic | High availability |
-| **Memcached** | 1-5ms | Alternative to Redis | No persistence |
+| **HTTP API** | One HTTP request per operation | Custom cloud services | Network dependent |
+| **DynamoDB** | One DynamoDB API request per operation | Serverless, low-traffic | High availability |
+| **Memcached** | One network round trip per operation | Alternative to Redis | No persistence |
 
 ---
 

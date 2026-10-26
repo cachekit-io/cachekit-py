@@ -326,9 +326,9 @@ Redis error → Logged: a failed read is a miss, a failed write skips L2 only, a
 ```
 
 ### Performance Impact
-- **CLOSED state**: ~10ns overhead per call (state check)
-- **OPEN state**: <1ns overhead per call (returns immediately)
-- **HALF_OPEN state**: Normal L2 backend latency (~2-50ms)
+- **CLOSED state**: one state check per call, with no published timing ([not measured here](../performance.md#not-measured-here))
+- **OPEN state**: L2 is skipped, so a call pays no backend round trip
+- **HALF_OPEN state**: calls that reach L2 pay its normal round trip
 
 ---
 

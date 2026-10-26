@@ -2,7 +2,7 @@
 
 This module centralizes ALL Redis connection concerns:
 - Connection pool management (global singleton with configurable size)
-- Thread-local client caching (eliminates ~1-2ms overhead per request)
+- Thread-local client caching (no client creation per request)
 - Client factory functions (sync/async)
 
 Architecture:
@@ -211,8 +211,8 @@ def get_cached_redis_client() -> redis.Redis:
     """Get a thread-local cached synchronous Redis client.
 
     This provides the performance benefits of thread affinity by caching
-    Redis client instances per-thread. Eliminates ~1-2ms overhead of
-    repeated client creation in hot code paths.
+    Redis client instances per-thread. Avoids repeated client creation
+    in hot code paths.
 
     THREAD SAFETY: Each thread gets its own cached client instance via
     threading.local() storage, ensuring thread safety without locks.

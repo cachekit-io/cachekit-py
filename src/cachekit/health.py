@@ -100,9 +100,9 @@ class HealthChecker:
     """Performs health checks on Redis cache system components.
 
     Supports multiple checking levels:
-    - PING: Fast ping-only check (~1ms)
-    - BASIC: Ping + connection info (~5ms)
-    - FULL: All components + detailed stats (~50ms)
+    - PING: Ping only (one round trip)
+    - BASIC: Ping + connection info
+    - FULL: All components + detailed stats
 
     Dependencies are explicitly injected:
     - pool_manager: Optional pool for checking connection stats

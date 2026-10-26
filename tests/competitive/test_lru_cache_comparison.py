@@ -344,7 +344,7 @@ class TestLruCacheComparison:
 
     def test_performance_baseline_comparison(self):
         """
-        CLAIM: cachekit L1-only mode (~50ns) is comparable to lru_cache.
+        CLAIM: cachekit L1-only mode is comparable to lru_cache.
 
         This validates the baseline claim that L1-only mode is fast enough
         for single-process use (comparable order of magnitude).
@@ -414,7 +414,7 @@ class TestCompetitiveClaimsEvidence:
         EVIDENCE:
 
         Single-process apps:
-        - Same ~50ns performance (in-memory L1 cache)
+        - In-memory L1 cache, like lru_cache
         - Type preservation via MessagePack (not just in-memory)
         - TTL support (lru_cache only has maxsize)
         - Prometheus metrics built-in

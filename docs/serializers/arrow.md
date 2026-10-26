@@ -53,7 +53,7 @@ def get_large_dataset(date: str):
 
 # Automatic round-trip with pandas DataFrame
 df = get_large_dataset("2024-01-01")  # Cache miss: loads CSV
-df = get_large_dataset("2024-01-01")  # Cache hit: fast retrieval (~1ms)
+df = get_large_dataset("2024-01-01")  # Cache hit: no CSV load
 ```
 
 ## Return Format Options

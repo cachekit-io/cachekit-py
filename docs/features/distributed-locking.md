@@ -352,8 +352,8 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 
 ### Performance Impact
 - **Lock already held**: Waiters poll for up to `blocking_timeout` (5 s) — fixed 0.1 s interval on Redis, exponential backoff + jitter on CachekitIO
-- **Lock acquisition**: <10ms (Redis SET NX operation)
-- **Lock release**: <5ms (Redis DEL operation)
+- **Lock acquisition**: one backend round trip per attempt (`SET NX` on Redis)
+- **Lock release**: one backend round trip
 - **Waiting cost**: Function execution cost saved * (pods_waiting - 1)
 
 **Example**: 1000 pods, 3s function call, 999 waiting

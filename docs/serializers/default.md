@@ -16,8 +16,7 @@ The registry aliases for this serializer are `"default"` and `"std"` (`"auto"` i
 - Binary data (`bytes`)
 
 **Performance characteristics:**
-- Serialization: Fast (< 1ms for typical objects)
-- Deserialization: Fast (< 1ms for typical objects)
+- Serialization and deserialization: no published timing ([not measured here](../performance.md#not-measured-here)); the [instruction budgets](../performance.md#instruction-budgets) count their instructions
 - Memory overhead: Low
 - Network overhead: Compact binary format
 

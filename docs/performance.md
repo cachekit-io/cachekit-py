@@ -218,7 +218,7 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 ### Bottleneck 2: Decorator Overhead
 
-**Problem:** every decorated call pays for its cache key and the decorator's bookkeeping: 0.906μs per L1-only hit on the hosted EPYC 7763 when the key memo holds the call's key, and several times that when the memo does not take the call, so its key is built every time.
+**Problem:** every decorated call pays for its cache key and the decorator's bookkeeping: 0.906μs per L1-only hit on the hosted EPYC 7763 when the key memo holds the call's key, and more when the memo does not take the call, so its key is built every time.
 
 **Mitigations:**
 - **This is acceptable** for any function slow enough to be worth caching

@@ -901,7 +901,7 @@ def create_cache_wrapper(
     use_enable_structured_logging = enable_structured_logging and not fast_mode
 
     # Initialize handler components
-    # Pre-compute function hash at decoration time (50-200μs savings)
+    # Pre-compute function hash at decoration time, so no call recomputes it
     from ..hash_utils import blake3_hash, function_hash
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
@@ -1679,7 +1679,7 @@ def create_cache_wrapper(
             # keys start ns: or func:, so this key never equals one. CachekitIO files it in its default namespace.
             return f"{_registry_hash}-{namespace or 'default'}:{custom_key}"
         # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.
-        # Minimal key generation - no string formatting overhead (10-50μs savings)
+        # Minimal key generation - no string formatting overhead
         from ..hash_utils import cache_key_hash
 
         return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))

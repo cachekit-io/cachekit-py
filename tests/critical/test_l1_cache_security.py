@@ -48,7 +48,7 @@ class TestL1CacheSecurity(RedisIsolationMixin):
         """CRITICAL: DecoratorConfig.secure() enables L1 cache storing encrypted bytes.
 
         Architecture: L1 stores encrypted bytes, providing both security and performance.
-        Decryption happens at read time only. ~50ns L1 hits vs 2-7ms Redis.
+        Decryption happens at read time only. An L1 hit skips the Redis round trip.
         Both L1 and L2 store encrypted bytes when encryption enabled.
         """
         secure_config = DecoratorConfig.secure(master_key="0" * 64)  # Dummy key for config check
@@ -72,8 +72,8 @@ class TestL1CacheSecurity(RedisIsolationMixin):
         assert result1["call"] == 1
         assert call_count == 1
 
-        # Second call - L1 cache hit (encrypted bytes, sub-microsecond)
-        # L1 enabled by secure() preset, stores encrypted bytes (security) at ~50ns latency (performance)
+        # Second call - L1 cache hit (encrypted bytes, decrypted on read)
+        # L1 enabled by secure() preset, stores encrypted bytes (security) and skips the Redis round trip (performance)
         result2 = get_sensitive_data(1)
         assert result2 == result1
         assert result2["call"] == 1
@@ -148,7 +148,7 @@ class TestL1CacheSecurity(RedisIsolationMixin):
         # Verify DecoratorConfig.secure() preset configuration
         secure_config = DecoratorConfig.secure(master_key=master_key)
         assert secure_config.encryption.enabled is True, "Encryption must be enabled"
-        assert secure_config.l1.enabled is True, "L1 cache enabled (stores encrypted bytes, ~50ns hits)"
+        assert secure_config.l1.enabled is True, "L1 cache enabled (stores encrypted bytes)"
 
         # Both layers store encrypted bytes (encrypt-at-rest everywhere)
         # Security maintained, performance optimized
@@ -208,7 +208,7 @@ class TestL1CacheSecurity(RedisIsolationMixin):
         assert call_count_a == 1
         assert call_count_b == 1
 
-        # Cached calls - both should hit L1 (encrypted bytes, ~50ns latency)
+        # Cached calls - both should hit L1 (encrypted bytes)
         result_a2 = get_data_a(1)
         result_b2 = get_data_b(1)
 

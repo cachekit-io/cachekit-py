@@ -70,7 +70,7 @@ backend = FileBackend(config)
 - Multi-process web servers (gunicorn, uWSGI) — use Redis instead
 - Distributed systems — use Redis or Memcached
 - High-concurrency scenarios — file locking overhead becomes limiting
-- Applications requiring sub-1ms latency — use L1-only cache
+- Hot paths where a disk read per L1 miss is too slow — use L1-only cache
 
 ## Characteristics
 

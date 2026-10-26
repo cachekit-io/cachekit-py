@@ -778,7 +778,7 @@ To time encryption per serializer on your own machine: `pytest tests/performance
 
 ### Key Derivation (Per-Tenant)
 ```
-Per-tenant key derivation: 50-100μs (HKDF operation)
+Per-tenant key derivation: one HKDF operation
 Cached after first use: No additional overhead
 ```
 
@@ -810,7 +810,7 @@ count toward the breaker either.
 def get_data():
     # L1 cache enabled: stores encrypted bytes (security + performance)
     # No plaintext in memory: encryption at rest in both L1 and L2
-    # Decryption only at read time (< 1ms exposure)
+    # Decryption only at read time
     return fetch_data()  # illustrative - fetch_data not defined
 ```
 
