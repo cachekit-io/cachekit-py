@@ -4,7 +4,7 @@ CRITICAL PATH TEST: Encrypted-at-Rest Architecture for L1/L2 Backend Abstraction
 Validates encryption architecture:
 - L1 cache stores encrypted bytes (not plaintext objects)
 - L2 backend stores encrypted bytes
-- Decryption happens at read time only (< 1ms plaintext exposure)
+- Decryption happens at read time only; the returned value is plaintext
 
 Tests all valid caching combinations (L1+L2, L1-only, L2-only) with encryption.
 """
@@ -73,7 +73,7 @@ class TestEncryptedAtRestArchitecture(RedisIsolationMixin):
         assert result1["ssn"] == "123-45-6789"
         assert call_count == 1
 
-        # Second call - should hit L1 cache (fast, ~50ns)
+        # Second call - should hit L1 cache (no Redis round trip)
         # L1 stores encrypted bytes, decrypts at read time
         result2 = get_sensitive_data(1)
         assert result2["ssn"] == "123-45-6789"

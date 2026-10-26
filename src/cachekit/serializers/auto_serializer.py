@@ -619,7 +619,7 @@ class AutoSerializer:
             pd = sys.modules.get("pandas")
             if pd is not None and isinstance(obj, pd.DataFrame):
                 if self._arrow_serializer is not None:
-                    # Use ArrowSerializer for 50-100x faster DataFrame serialization
+                    # Use ArrowSerializer for columnar DataFrame serialization
                     # (its metadata already reflects its own configured codec)
                     return self._arrow_serializer.serialize(obj)
                 # Fallback to msgpack columnar format

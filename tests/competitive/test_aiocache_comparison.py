@@ -68,11 +68,11 @@ class TestAiocacheComparison:
         """
         CLAIM: cachekit has L1 (in-process) + L2 (Redis) dual-layer cache.
 
-        This is TRUE. L1 hits are ~50ns, much faster than aiocache L2 hits.
+        This is TRUE.
 
         Architecture:
-        - L1 (in-process): ~50ns latency
-        - L1 miss → L2 (Redis): ~2-7ms latency
+        - L1 (in-process): no network round trip
+        - L1 miss → L2 (Redis): one or more network round trips
         - L2 miss → Call function
         """
 
@@ -84,7 +84,7 @@ class TestAiocacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-        # Second call - L1 hit (fast, ~50ns)
+        # Second call - L1 hit (no network round trip)
         result = get_data(1)
         assert result == "value_1"
 
@@ -206,8 +206,8 @@ class TestCompetitiveEvidenceAiocache:
 
         Multi-pod apps - cachekit's L1+L2 beats aiocache's L2-only.
 
-        aiocache: Every hit requires Redis network roundtrip (~2-7ms)
-        cachekit: L1 hits are ~50ns (80-140x faster)
+        aiocache: Every hit requires a Redis network round trip
+        cachekit: L1 hits stay in process, with no round trip
         """
 
         @cache(ttl=300)  # L1+L2 enabled
@@ -218,7 +218,7 @@ class TestCompetitiveEvidenceAiocache:
         result = get_data(1)
         assert result == "value_1"
 
-        # Second call hits L1 (fast, ~50ns)
+        # Second call hits L1 (no network round trip)
         result = get_data(1)
         assert result == "value_1"
 

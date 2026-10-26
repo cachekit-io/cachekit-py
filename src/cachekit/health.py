@@ -45,8 +45,8 @@ class HealthStatus(Enum):
 class HealthLevel(Enum):
     """Health check depth levels."""
 
-    PING = "ping"  # Just Redis ping (fastest)
-    BASIC = "basic"  # Ping + connection count
+    PING = "ping"  # Redis PING + INFO (fastest)
+    BASIC = "basic"  # PING level + connection-pool and circuit-breaker state
     FULL = "full"  # All components + detailed stats
 
 
@@ -100,9 +100,9 @@ class HealthChecker:
     """Performs health checks on Redis cache system components.
 
     Supports multiple checking levels:
-    - PING: Fast ping-only check (~1ms)
-    - BASIC: Ping + connection info (~5ms)
-    - FULL: All components + detailed stats (~50ms)
+    - PING: Redis connectivity only (PING + INFO)
+    - BASIC: the PING check + connection-pool and circuit-breaker state
+    - FULL: All components + detailed stats
 
     Dependencies are explicitly injected:
     - pool_manager: Optional pool for checking connection stats
@@ -130,7 +130,7 @@ class HealthChecker:
         self._cache_duration_seconds = 10.0
 
     def quick_ping(self) -> bool:
-        """Fast health check - just Redis ping.
+        """Fast health check - Redis PING + INFO.
 
         Returns:
             True if Redis is responding, False otherwise
@@ -168,7 +168,7 @@ class HealthChecker:
         components.append(redis_health)
 
         if level == HealthLevel.PING:
-            # Fast path: just redis ping
+            # Fast path: Redis PING + INFO
             overall_status = self._determine_overall_status(components)
             duration_ms = (time.time() - start_time) * 1000
             result = HealthCheckResult(
@@ -252,7 +252,7 @@ class HealthChecker:
         components.append(redis_health)
 
         if level == HealthLevel.PING:
-            # Fast path: just redis ping
+            # Fast path: Redis PING + INFO
             overall_status = self._determine_overall_status(components)
             duration_ms = (time.time() - start_time) * 1000
             result = HealthCheckResult(

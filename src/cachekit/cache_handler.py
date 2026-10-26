@@ -464,7 +464,7 @@ def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[i
 
 # Import caching for serializer modules
 #
-# PERFORMANCE OPTIMIZATION: Dynamic imports are expensive (~100μs per import)
+# PERFORMANCE OPTIMIZATION: Dynamic imports are expensive
 # which matters significantly for a caching library called frequently.
 #
 # THREAD SAFETY: Multiple threads importing the same serializer simultaneously
@@ -479,7 +479,7 @@ def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[i
 _serializer_cache_lock = threading.RLock()
 _serializer_cache: dict[str, type] = {}
 
-# Pre-create serializer instances to eliminate 625μs overhead
+# Cache serializer instances, created on first lookup, so repeat lookups skip instantiation
 _serializer_instance_cache = {}
 _serializer_instance_lock = threading.RLock()
 
@@ -509,7 +509,7 @@ def _get_cached_serializer_class(serializer_name: str, import_path: str):
             return _serializer_cache[cache_key]
 
         # Import the module and get the class
-        # This is the expensive operation we're caching (~100μs per dynamic import)
+        # This is the expensive operation we're caching
         try:
             module_path, class_name = import_path.rsplit(".", 1)
             module = __import__(module_path, fromlist=[class_name])
