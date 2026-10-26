@@ -101,8 +101,7 @@ class BackendProviderInterface:
 class DefaultCacheClientProvider(CacheClientProvider):
     """Default Redis client provider with thread-local caching for performance.
 
-    Uses get_cached_redis_client() to provide thread affinity optimization,
-    eliminating ~1-2ms overhead per request in high-frequency scenarios.
+    Uses get_cached_redis_client() to provide thread affinity optimization.
     """
 
     def get_sync_client(self):

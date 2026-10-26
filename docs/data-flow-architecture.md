@@ -121,7 +121,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  2. Thread affinity optimization (95%+ thread-local cache hit rate)         │
 │  3. redis_client.get(cache_key) → bytes or None                             │
 │                                                                             │
-│  Network latency: ~1-2ms (typical for Redis)                                │
+│  Cost: one network round trip to Redis                                      │
 │                                                                             │
 │  ┌──────────────────────────────┐    ┌─────────────────────────┐            │
 │  │ L2 HIT → Deserialize         │    │ L2 MISS → Execute       │            │
@@ -148,7 +148,6 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  │   if data.startswith(b"NUMPY_RAW"):                        │             │
 │  │     • Parse dtype + shape from header                      │             │
 │  │     • np.frombuffer(raw_bytes).reshape(shape)              │             │
-│  │     • ~0.5ms for 10KB array                                │             │
 │  └────────────────────────────────────────────────────────────┘             │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────┐             │
@@ -162,8 +161,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  │   5. Size validation                                       │             │
 │  │     ↓                                                      │             │
 │  │   MessagePack unpack → Python object                       │             │
-│  │     • General objects: ~1-3ms                              │             │
-│  │     • DataFrames: ~2-5ms (column-wise reconstruction)      │             │
+│  │     • DataFrames: column-wise reconstruction               │             │
 │  └────────────────────────────────────────────────────────────┘             │
 │                                                                             │
 │  Result: Python object fully reconstructed                                  │
@@ -243,8 +241,6 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  │ Path 1: NumPy ULTRA-OPTIMIZED (Skip Rust!)                 │             │
 │  │   # Direct binary format (no compression overhead)         │             │
 │  │   b"NUMPY_RAW" + dtype + shape + arr.tobytes()             │             │
-│  │   • ~0.5ms for 10KB array                                  │             │
-│  │   • Saves ~8ms vs Rust layer                               │             │
 │  └────────────────────────────────────────────────────────────┘             │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────┐             │
@@ -254,7 +250,6 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  │   3. Object columns → MessagePack                          │             │
 │  │   4. Pack to MessagePack                                   │             │
 │  │   5. ByteStorage.store() → LZ4 + xxHash3-64                │             │
-│  │   • ~2-5ms for 1K rows                                     │             │
 │  └────────────────────────────────────────────────────────────┘             │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────┐             │
@@ -269,7 +264,6 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  │           original_size, format                            │             │
 │  │         }                                                  │             │
 │  │      d. Serialize envelope with MessagePack                │             │
-│  │   • ~1-3ms for small dict                                  │             │
 │  └────────────────────────────────────────────────────────────┘             │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
@@ -287,7 +281,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  • If ttl: redis_client.set(cache_key, serialized_data, ex=ttl)             │
 │  • If not ttl: redis_client.set(cache_key, serialized_data)                 │
 │                                                                             │
-│  Network latency: ~1-2ms (typical for Redis)                                │
+│  Cost: one network round trip to Redis                                      │
 │                                                                             │
 │  write_behind=True (opt-in): the serialized bytes go to the function's      │
 │  writer (decorators/write_behind.py) instead, and a writer thread sends     │
@@ -421,7 +415,7 @@ def get_user(user_id: int, include_profile: bool = True):
 ### Blake2b Hashing Algorithm
 
 **Why Blake2b?**
-- **Fast**: 2-3x faster than SHA-256
+- **Fast**: designed for speed in software
 - **Secure**: Cryptographically secure (unlike xxHash)
 - **Compact**: 16-byte digest = 32 hex characters
 - **Collision-resistant**: Suitable for cache key deduplication
@@ -470,7 +464,7 @@ def _blake2b_pickle_hash(args, kwargs):
 │ L2 Backend (Pluggable Storage Layer)    │
 │ • RedisBackend                          │
 │ • CachekitIOBackend (HTTPS, managed)    │
-│ • Network call (~1-2ms latency)         │
+│ • One network round trip per operation  │
 │ • Bytes-based protocol (BaseBackend)    │
 │ • Persistent across process restarts    │
 └─────────────────────────────────────────┘
@@ -612,7 +606,7 @@ cachekit v0.1.0 uses only:
 import numpy as np
 
 def _serialize_numpy(self, arr: np.ndarray) -> bytes:
-    # Skip Rust ByteStorage entirely (saves ~8ms)
+    # Skip Rust ByteStorage entirely
 
     # Binary format: [header][dtype][shape][raw_bytes]
     # Illustrative pseudocode showing the conceptual structure

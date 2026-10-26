@@ -16,7 +16,7 @@ response body on every get, which is not in these figures.
   miss   every call misses: get, compute, serialize, encrypt, set (the backend discards the value)
 
 Shapes are ``<kind>-<size>``: ``json`` is JSON-like text in a dict (LZ4 compresses it about 2.7x),
-``bin`` is random bytes (incompressible), at 64 B, 1 KB, 64 KB and 1 MB (1,000,000 bytes).
+``bin`` is random bytes (incompressible), at 64 B, 512 B, 1 KB, 64 KB and 1 MB (1,000,000 bytes).
 
 Modes:
 
@@ -33,7 +33,7 @@ the harness itself never differs between them. Every measured process starts wit
 shell's ``MALLOC_*``, ``GLIBC_TUNABLES`` and ``LD_PRELOAD``, so an arm runs glibc malloc's defaults
 unless its ``--*-env`` names a setting, and the header prints each arm's settings. With neither
 flag, both arms are this interpreter: an A/A run, whose verdicts show the host's noise. A full run
-makes 48 comparisons (16 cells, three metrics), so at 95% expect about two false "lower" or
+makes 60 comparisons (20 cells, three metrics), so at 95% expect about three false "lower" or
 "higher" verdicts in an A/A run; on a shared host the CPU of the small shapes is the noisiest.
 Repeat a run before trusting a lone verdict.
 
@@ -45,7 +45,7 @@ Run (from a checkout, after ``uv sync``)::
       --candidate-env MALLOC_MMAP_THRESHOLD_=4194304 --candidate-env MALLOC_TRIM_THRESHOLD_=16777216
 
 ``--shapes`` and ``--paths`` narrow a run (for example ``--shapes json-1m bin-1m``); ``--json FILE``
-writes the figures, every process's included. A full A/B at 30 pairs (8 shapes, 2 paths, 960
+writes the figures, every process's included. A 30-pair A/B of 8 shapes and 2 paths (960
 processes) took about 14 minutes on a GitHub-hosted ``ubuntu-latest`` runner. Linux only
 (``RUSAGE_THREAD``).
 """
@@ -63,12 +63,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-SIZES = {"64b": 64, "1k": 1024, "64k": 65536, "1m": 1_000_000}
+SIZES = {"64b": 64, "512b": 512, "1k": 1024, "64k": 65536, "1m": 1_000_000}
 KINDS = ("json", "bin")
 SHAPES = tuple(f"{kind}-{size}" for kind in KINDS for size in SIZES)
 PATHS = ("hit", "miss")
 # Ops per process and warmup calls before them: enough that the per-process mean is stable at each size.
-OPS = {"64b": (2000, 200), "1k": (2000, 200), "64k": (400, 50), "1m": (40, 10)}
+OPS = {"64b": (2000, 200), "512b": (2000, 200), "1k": (2000, 200), "64k": (400, 50), "1m": (40, 10)}
 BOOTSTRAP_RESAMPLES = 10_000
 # Below this many pairs the percentile bootstrap is little more than the deltas' min and max: with 2
 # pairs, every same-sign pair (half of them under the null) prints "lower" or "higher".

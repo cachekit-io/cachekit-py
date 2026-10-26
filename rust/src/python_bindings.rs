@@ -6,9 +6,14 @@
 use cachekit_core::byte_storage::ByteStorageError;
 use cachekit_core::{check_msgpack_structure, ByteStorage};
 use pyo3::buffer::PyBuffer;
+#[cfg(feature = "encryption")]
+use pyo3::exceptions::PyBufferError;
 use pyo3::exceptions::PyValueError;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+#[cfg(feature = "encryption")]
+use pyo3::types::PyMemoryView;
 
 pyo3::create_exception!(
     _rust_serializer,
@@ -112,11 +117,16 @@ impl BytesView<'_> {
 /// `bytes`: bounds-checked by Rust, no `unsafe`, nothing for a stale comment to misstate.
 fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
-        return Ok(BytesView::Borrowed(b.clone(), 0, b.len()?));
+        // The real length, never `len()`: that calls a subclass's `__len__`, which can lie and
+        // make `as_slice` panic (too long) or truncate the input (too short).
+        let len = b.as_bytes().len();
+        return Ok(BytesView::Borrowed(b.clone(), 0, len));
     }
     let buf = PyBuffer::<u8>::get(obj)?;
+    // Interned: a plain "obj" would build a new str on every call, which costs a small
+    // decrypt more than the bytes() copy this borrow replaces.
     let base = obj
-        .getattr("obj")
+        .getattr(intern!(py, "obj"))
         .ok()
         .and_then(|base| base.cast_into::<PyBytes>().ok());
     if let Some(base) = base {
@@ -143,6 +153,19 @@ pub fn check_msgpack_structure_py(
     check_msgpack_structure(view.as_slice(), max_depth).map_err(|what| {
         PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
     })
+}
+
+/// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
+/// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
+/// touches the Python heap). It covers `retrieve` and `check_msgpack_structure`, and the exact
+/// `bytes` and `B`/`c` `memoryview` inputs the decrypt bindings read through `ciphertext_view`;
+/// that function's `bytes(obj)` route for every other input is outside it. It does not pin how a
+/// caller uses the view: that the callers pass `as_slice()` on without copying it is held by
+/// review of their code.
+#[pyfunction]
+#[pyo3(name = "_bytes_view_borrows")]
+pub fn bytes_view_borrows_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(matches!(bytes_view(py, obj)?, BytesView::Borrowed(..)))
 }
 
 #[pymethods]
@@ -237,6 +260,38 @@ use cachekit_core::{
 };
 #[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
+
+/// The decrypt bindings' ciphertext: exact `bytes` and exact `memoryview`, the shapes a read
+/// hands the wrapper, go through `bytes_view` (borrowed when the storage is immutable `bytes`).
+/// Every other input (a `bytes` subclass, a `bytearray`, a custom exporter) is read by
+/// `bytes(obj)` itself, so it gets exactly the semantics of the `bytes(data)` coercion these
+/// bindings replaced: `__bytes__` first, then a single export. `retrieve` and
+/// `check_msgpack_structure` keep the strict `bytes_view` on purpose.
+#[cfg(feature = "encryption")]
+fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    if !(obj.is_exact_instance_of::<PyBytes>() || obj.is_exact_instance_of::<PyMemoryView>()) {
+        return bytes_copy(obj);
+    }
+    match bytes_view(py, obj) {
+        // A memoryview of a format other than `B`/`c` (a signed-byte cast, say). bytes() reads
+        // the buffer the view already holds, so the object under it sees no second export.
+        Err(err) if err.is_instance_of::<PyBufferError>(py) => bytes_copy(obj),
+        view => view,
+    }
+}
+
+/// `bytes(obj)`, borrowed: the result is immutable (possibly shared, when `__bytes__` returns an
+/// existing object), so borrowing it is sound.
+#[cfg(feature = "encryption")]
+fn bytes_copy<'py>(obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    let copy = obj
+        .py()
+        .get_type::<PyBytes>()
+        .call1((obj,))?
+        .cast_into::<PyBytes>()?;
+    let len = copy.as_bytes().len();
+    Ok(BytesView::Borrowed(copy, 0, len))
+}
 
 #[cfg(feature = "encryption")]
 pyo3::create_exception!(
@@ -338,17 +393,24 @@ impl PyZeroKnowledgeEncryptor {
     }
 
     /// Decrypt data with keys that never leave Rust memory
+    ///
+    /// `ciphertext` is any object `bytes(ciphertext)` accepts (`bytes`, `bytearray`, a
+    /// `memoryview`, ...), and decrypts as `bytes(ciphertext)` would. Immutable `bytes`, or a
+    /// read-only `B`/`c` view of it such as `SerializationWrapper.unwrap` returns for a `bytes`
+    /// frame, is read without a copy; any other input is copied first.
     #[pyo3(name = "decrypt_with_keys")]
     pub fn decrypt_with_keys(
         &self,
-        ciphertext: &[u8],
+        py: Python<'_>,
+        ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
         tenant_keys: &PyTenantKeys,
     ) -> PyResult<Vec<u8>> {
         let encryption_key = &tenant_keys.inner.encryption_key;
+        let ciphertext = ciphertext_view(py, ciphertext)?;
 
         self.inner
-            .decrypt_aes_gcm(ciphertext, encryption_key, aad)
+            .decrypt_aes_gcm(ciphertext.as_slice(), encryption_key, aad)
             .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
     }
 
@@ -500,16 +562,20 @@ impl PyTenantKeyring {
     /// An out-of-range `index` is a caller bug (`KeyringConfigurationError`),
     /// unreachable when `index` comes from a match against this ring's own
     /// `encryption_fingerprints`.
+    ///
+    /// `ciphertext` takes the same buffers as `decrypt_with_keys`, read the same way.
     #[pyo3(name = "decrypt_at")]
     pub fn decrypt_at(
         &self,
+        py: Python<'_>,
         index: usize,
         encryptor: &PyZeroKnowledgeEncryptor,
-        ciphertext: &[u8],
+        ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
+        let ciphertext = ciphertext_view(py, ciphertext)?;
         self.inner
-            .decrypt_at(index, &encryptor.inner, ciphertext, aad)
+            .decrypt_at(index, &encryptor.inner, ciphertext.as_slice(), aad)
             .map_err(decrypt_error_to_py)
     }
 
@@ -524,15 +590,19 @@ impl PyTenantKeyring {
     /// fail-open/fail-closed policy applies, no new failure mode. Entries WITH
     /// a stored fingerprint must use fingerprint selection (`decrypt_at`),
     /// never this method.
+    ///
+    /// `ciphertext` takes the same buffers as `decrypt_with_keys`, read the same way.
     #[pyo3(name = "decrypt")]
     pub fn decrypt(
         &self,
+        py: Python<'_>,
         encryptor: &PyZeroKnowledgeEncryptor,
-        ciphertext: &[u8],
+        ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
+        let ciphertext = ciphertext_view(py, ciphertext)?;
         self.inner
-            .decrypt(&encryptor.inner, ciphertext, aad)
+            .decrypt(&encryptor.inner, ciphertext.as_slice(), aad)
             .map_err(decrypt_error_to_py)
     }
 }

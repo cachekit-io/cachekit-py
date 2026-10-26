@@ -4,7 +4,7 @@ TDD RED Phase: These tests verify the switch from Blake3 (32-byte) to xxHash3-64
 
 The xxHash3-64 algorithm provides:
 - 64-bit (8-byte) checksums for corruption detection
-- 10x faster than Blake3 for integrity checking (not security)
+- A fast non-cryptographic hash for integrity checking (not security)
 - Same detection quality for accidental corruption (bit flips, truncation)
 
 Note: Blake3 is still used in hash_utils.py for cache keys (security-relevant).

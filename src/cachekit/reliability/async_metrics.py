@@ -341,7 +341,7 @@ class AsyncMetricsCollector:
     """High-performance metrics collector with sync/async modes.
 
     Features:
-    - Sync mode: Direct Prometheus calls for low-frequency operations (≤4μs per op)
+    - Sync mode: Direct Prometheus calls for low-frequency operations
     - Async mode: Non-blocking batched updates for high-frequency scenarios
     - Automatic mode detection based on usage patterns
     - Zero-copy thread communication with memory pools

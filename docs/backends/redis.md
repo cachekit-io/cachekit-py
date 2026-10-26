@@ -70,7 +70,6 @@ Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is
 ## When to Use
 
 **Use RedisBackend when**:
-- You need sub-10ms latency with shared cache
 - Cache is shared across multiple processes or pods
 - You need persistence options (RDB/AOF)
 - You're building a typical web application
@@ -83,7 +82,7 @@ Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is
 
 ## Characteristics
 
-- Network latency: ~1–7ms per operation
+- Network latency: one round trip per operation, which depends on your network and region ([not measured here](../performance.md#not-measured-here))
 - Automatic TTL support (Redis `SET … EX`)
 - Connection pooling built-in
 - Supports large values (up to Redis limits)

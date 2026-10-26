@@ -77,7 +77,7 @@ cache key, so an entry moved under another prefix fails authentication. See
 ## When to Use
 
 **Use MemcachedBackend when**:
-- Hot in-memory caching with sub-millisecond reads
+- Hot in-memory caching
 - Shared cache across multiple processes/pods (like Redis but simpler)
 - High-throughput read-heavy workloads
 - Applications already using Memcached infrastructure
@@ -90,7 +90,7 @@ cache key, so an entry moved under another prefix fails authentication. See
 
 ## Characteristics
 
-- Latency: 1–5ms per operation (network-dependent)
+- Latency: one network round trip per operation, which depends on your network and region ([not measured here](../performance.md#not-measured-here))
 - Throughput: Very high (multi-threaded C server)
 - TTL support: Yes (max 30 days); `refresh_ttl` yes (via `touch`), `get_ttl` no
 - Cross-process: Yes (shared across pods)

@@ -152,7 +152,7 @@ class TestSecurePreset:
         assert config.encryption.enabled is True
         assert config.encryption.master_key == "a" * 64
 
-        # L1 enabled (stores encrypted bytes for ~50ns hits vs 2-7ms Redis)
+        # L1 enabled (stores encrypted bytes; a hit skips the Redis round trip)
         assert config.l1.enabled is True
 
         # All protections enabled
