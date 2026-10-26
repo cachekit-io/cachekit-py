@@ -4,7 +4,7 @@ CRITICAL PATH TEST: Encrypted-at-Rest Architecture for L1/L2 Backend Abstraction
 Validates encryption architecture:
 - L1 cache stores encrypted bytes (not plaintext objects)
 - L2 backend stores encrypted bytes
-- Decryption happens at read time only
+- Decryption happens at read time only; the returned value is plaintext
 
 Tests all valid caching combinations (L1+L2, L1-only, L2-only) with encryption.
 """

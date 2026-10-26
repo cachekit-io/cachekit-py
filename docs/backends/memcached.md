@@ -77,7 +77,7 @@ cache key, so an entry moved under another prefix fails authentication. See
 ## When to Use
 
 **Use MemcachedBackend when**:
-- Hot in-memory caching shared across processes
+- Hot in-memory caching
 - Shared cache across multiple processes/pods (like Redis but simpler)
 - High-throughput read-heavy workloads
 - Applications already using Memcached infrastructure

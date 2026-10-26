@@ -363,7 +363,7 @@ result = critical_function()  # Works even if Redis is offline
 |:-------------|:------:|:------|
 | Connection pooling | **50%** improvement | cachekit focuses here |
 | Network calls | One round trip per L2 operation | Accepted tradeoff |
-| Serialization | No published timing ([not measured here](performance.md#not-measured-here)) | Already fast enough |
+| Serialization | No published timing; the [instruction budgets](performance.md#instruction-budgets) count its instructions | Already fast enough |
 | SIMD hashing | 0.077% improvement | Removed (not worth it) |
 
 ---
@@ -373,7 +373,7 @@ result = critical_function()  # Works even if Redis is offline
 > [!WARNING]
 > **Don't Fight the Network**
 >
-> Every L2 operation pays a network round trip, which depends on your network and region ([not measured here](performance.md#not-measured-here)). The default serializer is already optimized.
+> With a networked L2 backend, every L1 miss pays a network round trip, which depends on your network and region ([not measured here](performance.md#not-measured-here)). The default serializer is already optimized.
 
 ```python
 @cache  # Default serializer is perfect - optimize elsewhere

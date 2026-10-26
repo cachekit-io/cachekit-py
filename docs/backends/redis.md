@@ -70,8 +70,7 @@ Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is
 ## When to Use
 
 **Use RedisBackend when**:
-- You need a cache shared across processes, at one network round trip per operation
-- Cache is shared across multiple processes or pods
+- Cache is shared across multiple processes or pods (one network round trip per L1 miss)
 - You need persistence options (RDB/AOF)
 - You're building a typical web application
 - You require distributed caching

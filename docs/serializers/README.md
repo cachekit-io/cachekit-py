@@ -237,7 +237,7 @@ def get_user_data_v2(user_id):
 4. **Version your cache namespaces** - Makes serializer migrations safer
 5. **Expect a cold cache when changing serializers** - Keys change identity, so the function's working set recomputes once
 6. **Monitor serialization metrics** - Track time spent in serialize/deserialize
-7. **Consider network latency** - With an L2 backend, every read also pays a network round trip, which no serializer choice removes
+7. **Consider network latency** - With a networked L2 backend, every L1 miss also pays a network round trip, which no serializer choice removes
 
 ---
 

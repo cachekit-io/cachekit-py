@@ -509,7 +509,7 @@ def _get_cached_serializer_class(serializer_name: str, import_path: str):
             return _serializer_cache[cache_key]
 
         # Import the module and get the class
-        # This is the expensive operation we're caching (a dynamic import)
+        # This is the expensive operation we're caching
         try:
             module_path, class_name = import_path.rsplit(".", 1)
             module = __import__(module_path, fromlist=[class_name])

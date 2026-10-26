@@ -901,7 +901,7 @@ def create_cache_wrapper(
     use_enable_structured_logging = enable_structured_logging and not fast_mode
 
     # Initialize handler components
-    # Pre-compute function hash at decoration time, so no call recomputes it
+    # Pre-compute function hash at decoration time
     from ..hash_utils import blake3_hash, function_hash
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")

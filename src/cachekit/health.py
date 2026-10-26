@@ -100,7 +100,7 @@ class HealthChecker:
     """Performs health checks on Redis cache system components.
 
     Supports multiple checking levels:
-    - PING: Ping only (one round trip)
+    - PING: Redis connectivity only (PING + INFO)
     - BASIC: Ping + connection info
     - FULL: All components + detailed stats
 

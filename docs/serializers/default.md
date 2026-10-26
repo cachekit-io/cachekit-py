@@ -16,7 +16,7 @@ The registry aliases for this serializer are `"default"` and `"std"` (`"auto"` i
 - Binary data (`bytes`)
 
 **Performance characteristics:**
-- Serialization and deserialization: no published timing ([not measured here](../performance.md#not-measured-here)); the [instruction budgets](../performance.md#instruction-budgets) count their instructions
+- Serialization and deserialization: no published timing; the [instruction budgets](../performance.md#instruction-budgets) count their instructions
 - Memory overhead: Low
 - Network overhead: Compact binary format
 
