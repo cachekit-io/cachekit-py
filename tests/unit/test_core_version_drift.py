@@ -39,7 +39,7 @@ def _read_version(relpath: str, pattern: str) -> str:
 @pytest.mark.parametrize(
     ("relpath", "pattern"),
     [
-        ("rust/fuzz/Cargo.toml", r'^\[dependencies\.cachekit_storage\]\n(?:[^\[\n].*\n)*?version = "=([^"]+)"'),
+        ("rust/fuzz/Cargo.toml", r'^\[dependencies\.cachekit_storage\]\n(?:[^\[\n].*\n|\n)*?version = "=([^"]+)"'),
         ("rust/fuzz/Cargo.lock", _LOCK_ENTRY),
         ("docs/free-threading.md", r"^\| Rust extension \(`rust/src/`, cachekit-core ([0-9][^)]*)\) \|"),
     ],
