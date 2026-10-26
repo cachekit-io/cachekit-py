@@ -11,7 +11,7 @@ This project follows a standard code of conduct. Please be respectful and profes
 ### Prerequisites
 
 - Python 3.11 or higher
-- Rust 1.80 or higher
+- Rust 1.91 or later (new releases support the latest stable Rust)
 - Redis 5.0 or higher (for testing)
 - [uv](https://github.com/astral-sh/uv) (recommended for dependency management)
 - pytest-redis 3.0+ (automatically installed with `uv sync`)
