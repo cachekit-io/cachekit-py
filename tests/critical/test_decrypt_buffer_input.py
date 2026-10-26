@@ -48,6 +48,9 @@ INPUTS = {
     "unwrap_memoryview_slice": _frame_view,
     "memoryview_of_bytearray": lambda ct: memoryview(bytearray(ct)),
     "readonly_view_of_bytearray": lambda ct: memoryview(bytearray(ct)).toreadonly(),
+    # Not a B/c buffer, so it is read as raw bytes, as the replaced bytes(data) coercion read it.
+    "signed_byte_view": lambda ct: memoryview(ct).cast("b"),
+    "signed_byte_view_of_bytearray": lambda ct: memoryview(bytearray(ct)).cast("b"),
 }
 
 
@@ -98,6 +101,26 @@ def test_non_buffer_input_is_refused(method: str) -> None:
     decrypt, _ = METHODS[method]
     with pytest.raises(TypeError):
         decrypt("not a buffer")
+
+
+def test_wrapper_read_paths_decrypt_a_signed_byte_frame_view() -> None:
+    """A signed-byte view of an authentic frame keeps its ``b`` format through ``unwrap_metadata``;
+    every wrapper read path still decrypts it, as it did when the wrapper coerced with bytes()."""
+    writer = EncryptionWrapper(master_key=RETIRED, tenant_id=TENANT, previous_master_keys=[])
+    ciphertext, meta = writer.serialize({"v": 7}, cache_key=KEY)
+    frame = SerializationWrapper.wrap(ciphertext, meta.to_dict(), "encrypted")
+    current = EncryptionWrapper(master_key=RETIRED, tenant_id=TENANT, previous_master_keys=[])
+    rotated = EncryptionWrapper(master_key=CURRENT, tenant_id=TENANT, previous_master_keys=[RETIRED])
+
+    reads = {
+        "decrypt_with_keys": lambda view, m: current.deserialize(view, m, cache_key=KEY),
+        "decrypt_at": lambda view, m: rotated.deserialize(view, m, cache_key=KEY),
+        "decrypt": lambda view, m: rotated.deserialize_without_key_identity(view, m, cache_key=KEY),
+    }
+    for name, read in reads.items():
+        view, metadata, _ = SerializationWrapper.unwrap_metadata(memoryview(frame).cast("b"))
+        assert isinstance(view, memoryview) and view.format == "b"
+        assert read(view, metadata) == {"v": 7}, name
 
 
 class TestBorrowVersusCopy:

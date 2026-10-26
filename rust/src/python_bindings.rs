@@ -6,6 +6,8 @@
 use cachekit_core::byte_storage::ByteStorageError;
 use cachekit_core::{check_msgpack_structure, ByteStorage};
 use pyo3::buffer::PyBuffer;
+#[cfg(feature = "encryption")]
+use pyo3::exceptions::PyBufferError;
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -254,6 +256,26 @@ use cachekit_core::{
 #[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
 
+/// The decrypt bindings' ciphertext: `bytes_view`, except that a buffer whose format is not
+/// `B` or `c` (a signed-byte `memoryview.cast('b')`, say) is read as its raw bytes, exactly as
+/// the `bytes(data)` coercion these bindings replaced read it. Without this, such a view of an
+/// authentic frame would fail before authentication and surface as tampering.
+#[cfg(feature = "encryption")]
+fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    match bytes_view(py, obj) {
+        Err(err) if err.is_instance_of::<PyBufferError>(py) => {
+            // bytes(obj) is a fresh, immutable copy, so borrowing it is sound.
+            let copy = py
+                .get_type::<PyBytes>()
+                .call1((obj,))?
+                .cast_into::<PyBytes>()?;
+            let len = copy.as_bytes().len();
+            Ok(BytesView::Borrowed(copy, 0, len))
+        }
+        view => view,
+    }
+}
+
 #[cfg(feature = "encryption")]
 pyo3::create_exception!(
     _rust_serializer,
@@ -355,10 +377,10 @@ impl PyZeroKnowledgeEncryptor {
 
     /// Decrypt data with keys that never leave Rust memory
     ///
-    /// `ciphertext` is a byte buffer: `bytes`, `bytearray`, `memoryview` or any other buffer of
-    /// format `B` or `c` (any other format raises `BufferError`). Immutable `bytes`, or a
-    /// read-only view of it such as `SerializationWrapper.unwrap` returns, is read without a
-    /// copy; any other buffer is copied first.
+    /// `ciphertext` is any buffer-protocol object (`bytes`, `bytearray`, `memoryview`, ...), read
+    /// as its raw bytes the way `bytes(ciphertext)` reads it. Immutable `bytes`, or a read-only
+    /// view of it such as `SerializationWrapper.unwrap` returns, is read without a copy; any
+    /// other buffer is copied first.
     #[pyo3(name = "decrypt_with_keys")]
     pub fn decrypt_with_keys(
         &self,
@@ -368,8 +390,7 @@ impl PyZeroKnowledgeEncryptor {
         tenant_keys: &PyTenantKeys,
     ) -> PyResult<Vec<u8>> {
         let encryption_key = &tenant_keys.inner.encryption_key;
-        // bytes_view borrows immutable `bytes` (or a proven window onto it) and copies the rest.
-        let ciphertext = bytes_view(py, ciphertext)?;
+        let ciphertext = ciphertext_view(py, ciphertext)?;
 
         self.inner
             .decrypt_aes_gcm(ciphertext.as_slice(), encryption_key, aad)
@@ -525,7 +546,7 @@ impl PyTenantKeyring {
     /// unreachable when `index` comes from a match against this ring's own
     /// `encryption_fingerprints`.
     ///
-    /// `ciphertext` takes the same byte buffers as `decrypt_with_keys`, read the same way.
+    /// `ciphertext` takes the same buffers as `decrypt_with_keys`, read the same way.
     #[pyo3(name = "decrypt_at")]
     pub fn decrypt_at(
         &self,
@@ -535,7 +556,7 @@ impl PyTenantKeyring {
         ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
-        let ciphertext = bytes_view(py, ciphertext)?;
+        let ciphertext = ciphertext_view(py, ciphertext)?;
         self.inner
             .decrypt_at(index, &encryptor.inner, ciphertext.as_slice(), aad)
             .map_err(decrypt_error_to_py)
@@ -553,7 +574,7 @@ impl PyTenantKeyring {
     /// a stored fingerprint must use fingerprint selection (`decrypt_at`),
     /// never this method.
     ///
-    /// `ciphertext` takes the same byte buffers as `decrypt_with_keys`, read the same way.
+    /// `ciphertext` takes the same buffers as `decrypt_with_keys`, read the same way.
     #[pyo3(name = "decrypt")]
     pub fn decrypt(
         &self,
@@ -562,7 +583,7 @@ impl PyTenantKeyring {
         ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
-        let ciphertext = bytes_view(py, ciphertext)?;
+        let ciphertext = ciphertext_view(py, ciphertext)?;
         self.inner
             .decrypt(&encryptor.inner, ciphertext.as_slice(), aad)
             .map_err(decrypt_error_to_py)
