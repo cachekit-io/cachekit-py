@@ -7,6 +7,7 @@ use cachekit_core::byte_storage::ByteStorageError;
 use cachekit_core::{check_msgpack_structure, ByteStorage};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -115,8 +116,10 @@ fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesVi
         return Ok(BytesView::Borrowed(b.clone(), 0, b.len()?));
     }
     let buf = PyBuffer::<u8>::get(obj)?;
+    // Interned: a plain "obj" would build a new str on every call, which costs a small
+    // decrypt more than the bytes() copy this borrow replaces.
     let base = obj
-        .getattr("obj")
+        .getattr(intern!(py, "obj"))
         .ok()
         .and_then(|base| base.cast_into::<PyBytes>().ok());
     if let Some(base) = base {
@@ -143,6 +146,15 @@ pub fn check_msgpack_structure_py(
     check_msgpack_structure(view.as_slice(), max_depth).map_err(|what| {
         PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
     })
+}
+
+/// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins the
+/// borrow-versus-copy branch that `retrieve` and the decrypt bindings take, which tracemalloc
+/// cannot see (a Rust-side copy never touches the Python heap).
+#[pyfunction]
+#[pyo3(name = "_bytes_view_borrows")]
+pub fn bytes_view_borrows_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(matches!(bytes_view(py, obj)?, BytesView::Borrowed(..)))
 }
 
 #[pymethods]
@@ -338,17 +350,23 @@ impl PyZeroKnowledgeEncryptor {
     }
 
     /// Decrypt data with keys that never leave Rust memory
+    ///
+    /// `ciphertext` is any buffer-protocol object; `bytes_view` borrows it without a copy when
+    /// its storage is immutable `bytes` (the memoryview `SerializationWrapper.unwrap` returns)
+    /// and copies anything else.
     #[pyo3(name = "decrypt_with_keys")]
     pub fn decrypt_with_keys(
         &self,
-        ciphertext: &[u8],
+        py: Python<'_>,
+        ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
         tenant_keys: &PyTenantKeys,
     ) -> PyResult<Vec<u8>> {
         let encryption_key = &tenant_keys.inner.encryption_key;
+        let ciphertext = bytes_view(py, ciphertext)?;
 
         self.inner
-            .decrypt_aes_gcm(ciphertext, encryption_key, aad)
+            .decrypt_aes_gcm(ciphertext.as_slice(), encryption_key, aad)
             .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
     }
 
@@ -500,16 +518,20 @@ impl PyTenantKeyring {
     /// An out-of-range `index` is a caller bug (`KeyringConfigurationError`),
     /// unreachable when `index` comes from a match against this ring's own
     /// `encryption_fingerprints`.
+    ///
+    /// `ciphertext` is any buffer-protocol object, read as `decrypt_with_keys` reads it.
     #[pyo3(name = "decrypt_at")]
     pub fn decrypt_at(
         &self,
+        py: Python<'_>,
         index: usize,
         encryptor: &PyZeroKnowledgeEncryptor,
-        ciphertext: &[u8],
+        ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
+        let ciphertext = bytes_view(py, ciphertext)?;
         self.inner
-            .decrypt_at(index, &encryptor.inner, ciphertext, aad)
+            .decrypt_at(index, &encryptor.inner, ciphertext.as_slice(), aad)
             .map_err(decrypt_error_to_py)
     }
 
@@ -524,15 +546,19 @@ impl PyTenantKeyring {
     /// fail-open/fail-closed policy applies, no new failure mode. Entries WITH
     /// a stored fingerprint must use fingerprint selection (`decrypt_at`),
     /// never this method.
+    ///
+    /// `ciphertext` is any buffer-protocol object, read as `decrypt_with_keys` reads it.
     #[pyo3(name = "decrypt")]
     pub fn decrypt(
         &self,
+        py: Python<'_>,
         encryptor: &PyZeroKnowledgeEncryptor,
-        ciphertext: &[u8],
+        ciphertext: &Bound<'_, PyAny>,
         aad: &[u8],
     ) -> PyResult<Vec<u8>> {
+        let ciphertext = bytes_view(py, ciphertext)?;
         self.inner
-            .decrypt(&encryptor.inner, ciphertext, aad)
+            .decrypt(&encryptor.inner, ciphertext.as_slice(), aad)
             .map_err(decrypt_error_to_py)
     }
 }

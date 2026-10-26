@@ -63,6 +63,8 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_bindings::check_msgpack_structure_py,
         m
     )?)?;
+    // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
+    m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 
     // Add encryption functionality if feature is enabled
     #[cfg(feature = "encryption")]
