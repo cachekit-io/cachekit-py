@@ -22,6 +22,7 @@ the Python side.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -85,7 +86,7 @@ METHODS = {
 
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("make_input", INPUTS.values(), ids=INPUTS.keys())
-def test_decrypt_round_trips_every_buffer_input(method: str, make_input: Any) -> None:
+def test_decrypt_round_trips_every_buffer_input(method: str, make_input: Callable[[bytes], object]) -> None:
     decrypt, sealing_key = METHODS[method]
     ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(sealing_key, TENANT))
 
@@ -176,7 +177,7 @@ EXPORTERS = {
 
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("make_exporter", EXPORTERS.values(), ids=EXPORTERS.keys())
-def test_other_inputs_decrypt_exactly_as_bytes_reads_them(method: str, make_exporter: Any) -> None:
+def test_other_inputs_decrypt_exactly_as_bytes_reads_them(method: str, make_exporter: Callable[[bytes], object]) -> None:
     """Anything but exact ``bytes`` or ``memoryview`` is read by ``bytes(obj)`` itself, once: no
     format probe first, so an exporter that wipes on release or allows one export at a time, or
     one ``bytes()`` reads through ``__bytes__``, decrypts as it did under ``bytes(data)``."""
