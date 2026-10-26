@@ -679,20 +679,22 @@ class EncryptionWrapper:
             # NOTE: If cache_key doesn't match the one used during encryption,
             # the AAD will be different and AES-GCM authentication will fail.
             # This is the SECURITY mechanism that detects ciphertext substitution.
-            # `unwrap` may hand us a memoryview; the AES-GCM binding requires owned bytes, and an
-            # encrypted value can never be zero-copy anyway (decrypt reads the whole ciphertext
-            # into an owned buffer), so coercing here costs nothing the cipher wasn't already paying.
+            # Pass `data` as-is: for a v3 frame held as `bytes`, `unwrap` hands us a read-only
+            # memoryview of it, which the decrypt bindings borrow without a copy (a bytes(data)
+            # here would copy the whole ciphertext before the cipher makes its own working
+            # copy). A legacy frame arrives as `bytes`; a frame held in a mutable buffer, such
+            # as a bytearray, is copied inside the binding.
             if keyring_index is not None and keyring_index > 0:
                 # Decrypt-only keyring entry (rotation-window read): decrypt with
                 # exactly the matched entry. Binding match — decrypt_at never
                 # falls back across entries, and any failure raises out of this
                 # block straight into the fail-open/fail-closed policy.
-                decrypted_data = self._keyring.decrypt_at(keyring_index, self.encryptor, bytes(data), aad)
+                decrypted_data = self._keyring.decrypt_at(keyring_index, self.encryptor, data, aad)
             else:
                 # Current key (keyring index 0) or fail-open no-match attempt:
                 # the cached tenant keys, the same key as keyring entry 0 (the
                 # construction drift guard holds them equal).
-                decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
+                decrypted_data = self.encryptor.decrypt_with_keys(data, aad, self.tenant_keys)
 
         except KeyringConfigurationError:
             # Same taxonomy split as the sequential path below: decrypt_at raises
@@ -783,7 +785,7 @@ class EncryptionWrapper:
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
-            decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), aad)
+            decrypted_data = self._keyring.decrypt(self.encryptor, data, aad)
         except KeyringConfigurationError:
             # Config failure, NOT tamper. The tenant-bound ring raises none today
             # (it takes no tenant and no index), but any it ever raises must take
