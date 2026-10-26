@@ -83,12 +83,16 @@ Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is
 ## Characteristics
 
 - Network latency: one round trip per operation, which depends on your network and region ([not measured here](../performance.md#not-measured-here))
-- Automatic TTL support (Redis `EXPIRE`)
+- Automatic TTL support (Redis `SET … EX`)
 - Connection pooling built-in
 - Supports large values (up to Redis limits)
 - Cross-process: Yes (shared across pods)
 - Persistence: Yes (RDB/AOF, server-configured)
 - Distributed locking: Yes
+
+## ACL Permissions
+
+Every cache write, with or without a TTL, is a Redis `SET`: a write with a TTL sends `SET key value EX ttl`. A restricted ACL user needs `+set`; `+setex` alone is not enough. Releases up to 0.24.1 sent `SETEX` for TTL writes, so an ACL user granted `+setex` but not `+set` got TTL writes through on those releases and, after upgrading, has every Redis write refused with `NOPERM`: cachekit logs a backend error and nothing reaches Redis. The calling process still caches the result in its own L1 (when enabled), but other processes, and this one once its L1 entry is gone, miss and run the function. Grant `+set` (it is part of `+@write` and `+@string`) before upgrading.
 
 ## Whole-Function Invalidation Across Processes
 
