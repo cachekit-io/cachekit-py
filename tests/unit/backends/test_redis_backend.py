@@ -440,7 +440,7 @@ class _FakeRedis:
     def register_script(self, script: str) -> Script:
         return Script(self, script)
 
-    def set(self, name: str, value: bytes, nx: bool = False, px: int | None = None) -> bool | None:
+    def set(self, name: str, value: bytes, nx: bool = False, px: int | None = None, ex: int | None = None) -> bool | None:
         if nx and self.nx_entered is not None:
             self.nx_entered.set()
         if nx and self.block_nx is not None:
@@ -458,9 +458,6 @@ class _FakeRedis:
         if nx and self.nx_done is not None:
             self.nx_done.set()
         return result
-
-    def setex(self, name: str, _ttl: int, value: bytes) -> bool:
-        return bool(self.set(name, value))
 
     def get(self, name: str) -> bytes | None:
         with self._mutex:

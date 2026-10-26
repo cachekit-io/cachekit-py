@@ -238,11 +238,10 @@ class TestRedisBackendSet:
             backend.set("test:key", b"test_value")
 
             mock_client.set.assert_called_once_with("test:key", b"test_value")
-            mock_client.setex.assert_not_called()
 
     @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
     def test_set_with_ttl(self):
-        """set() should use SETEX command with TTL."""
+        """set() should use SET with EX for TTL."""
         with patch("cachekit.backends.redis.backend.DIContainer") as mock_container_class:
             mock_container_instance = Mock()
             mock_container_class.return_value = mock_container_instance
@@ -254,8 +253,7 @@ class TestRedisBackendSet:
             backend = RedisBackend()
             backend.set("test:key", b"test_value", ttl=60)
 
-            mock_client.setex.assert_called_once_with("test:key", 60, b"test_value")
-            mock_client.set.assert_not_called()
+            mock_client.set.assert_called_once_with("test:key", b"test_value", ex=60)
 
     @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
     def test_set_with_zero_ttl(self):
@@ -271,9 +269,8 @@ class TestRedisBackendSet:
             backend = RedisBackend()
             backend.set("test:key", b"test_value", ttl=0)
 
-            # TTL=0 should use SET (not SETEX)
+            # TTL=0 should use SET without EX
             mock_client.set.assert_called_once_with("test:key", b"test_value")
-            mock_client.setex.assert_not_called()
 
     @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
     def test_set_wraps_redis_exceptions(self):
@@ -282,7 +279,7 @@ class TestRedisBackendSet:
             mock_container_instance = Mock()
             mock_container_class.return_value = mock_container_instance
             mock_client = Mock()
-            mock_client.setex.side_effect = redis.TimeoutError("Timeout")
+            mock_client.set.side_effect = redis.TimeoutError("Timeout")
             mock_provider = Mock()
             mock_provider.get_sync_client.return_value = mock_client
             mock_container_instance.get.return_value = mock_provider

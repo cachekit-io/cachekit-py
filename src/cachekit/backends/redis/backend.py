@@ -188,8 +188,8 @@ class RedisBackend:
         with _ClearedOnInterrupt():
             try:
                 if ttl is not None and ttl > 0:
-                    # Use SETEX for TTL (combines SET + EXPIRE atomically)
-                    self._get_client().setex(key, ttl, value)
+                    # SET with EX sets value and expiry atomically
+                    self._get_client().set(key, value, ex=ttl)
                 else:
                     # Use SET without expiry
                     self._get_client().set(key, value)

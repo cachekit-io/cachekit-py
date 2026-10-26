@@ -284,7 +284,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  RedisBackend internal flow:                                                │
 │  • Get Redis client from CacheClientProvider                                │
-│  • If ttl: redis_client.setex(cache_key, ttl, serialized_data)              │
+│  • If ttl: redis_client.set(cache_key, serialized_data, ex=ttl)             │
 │  • If not ttl: redis_client.set(cache_key, serialized_data)                 │
 │                                                                             │
 │  Network latency: ~1-2ms (typical for Redis)                                │

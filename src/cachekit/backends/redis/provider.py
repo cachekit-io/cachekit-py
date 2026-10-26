@@ -360,7 +360,7 @@ class PerRequestRedisBackend:
         with _ClearedOnInterrupt():
             try:
                 if ttl is not None and ttl > 0:
-                    self._client.setex(scoped_key, ttl, value)
+                    self._client.set(scoped_key, value, ex=ttl)
                 else:
                     self._client.set(scoped_key, value)
                 return
