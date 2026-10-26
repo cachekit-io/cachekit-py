@@ -70,7 +70,7 @@ fn now_ns() -> u64 {
 /// compares with a `time.time()` reading taken just before or after it in the right order.
 #[allow(clippy::cast_precision_loss)]
 fn ns_to_seconds(ns: u64) -> f64 {
-    if ns % NANOS_PER_SEC == 0 {
+    if ns.is_multiple_of(NANOS_PER_SEC) {
         (ns / NANOS_PER_SEC) as f64
     } else {
         ns as f64 / 1e9
