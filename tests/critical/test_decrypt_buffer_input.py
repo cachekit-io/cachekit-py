@@ -2,19 +2,21 @@
 CRITICAL PATH TEST: the AES-GCM decrypt bindings read buffer-protocol ciphertext without a copy.
 
 ``decrypt_with_keys``, ``TenantKeyring.decrypt_at`` and ``TenantKeyring.decrypt`` read their
-ciphertext through ``ciphertext_view``: the ``bytes_view`` helper ``ByteStorage.retrieve`` uses,
-plus a ``bytes(obj)`` fallback for an input ``bytes_view`` refuses with ``BufferError`` (a
-signed-byte ``memoryview.cast('b')``, say), so the bindings accept what the ``bytes(data)``
-coercion they replaced accepted. ``retrieve`` and ``check_msgpack_structure`` stay strict on
-purpose. Through ``bytes_view``, a read-only ``B``/``c`` ``memoryview`` of ``bytes`` (what
-``SerializationWrapper.unwrap_metadata`` returns for a ``bytes`` frame) is borrowed, and any other
-buffer (a ``bytearray``, a view of one, a spoofed exporter) is copied, because the module runs
-without a GIL on free-threaded builds and only immutable ``bytes`` is safe to borrow.
+ciphertext through ``ciphertext_view``. Exact ``bytes`` and exact ``memoryview``, the shapes a
+read hands the wrapper, go through the ``bytes_view`` helper ``ByteStorage.retrieve`` uses: a
+read-only ``B``/``c`` ``memoryview`` of ``bytes`` (what ``SerializationWrapper.unwrap_metadata``
+returns for a ``bytes`` frame) is borrowed, and a view of a ``bytearray``, a strided view or a
+spoofed exporter is copied, because the module runs without a GIL on free-threaded builds and only
+immutable ``bytes`` is safe to borrow. A ``memoryview`` of another format, and every other input
+(a ``bytes`` subclass, a ``bytearray``, a custom exporter), is read by ``bytes(obj)`` itself, so
+it decrypts exactly as it did under the ``bytes(data)`` coercion the bindings replaced.
+``retrieve`` and ``check_msgpack_structure`` stay strict on purpose.
 
-``_bytes_view_borrows`` pins what ``bytes_view`` decides for an input; the fallback is outside
-it and is pinned only by the round-trip matrix and the wrapper tests below. The probe does not pin
-how a binding uses the view: that the bindings pass it to the cipher without copying it is held
-by review of ``rust/src/python_bindings.rs``. The tracemalloc test pins only the Python side.
+``_bytes_view_borrows`` pins what ``bytes_view`` decides for an input; the ``bytes(obj)`` route is
+outside it and is pinned by the round-trip matrix and the parity and wrapper tests below. The
+probe does not pin how a binding uses the view: that the bindings pass it to the cipher without
+copying it is held by review of ``rust/src/python_bindings.rs``. The tracemalloc test pins only
+the Python side.
 """
 
 from __future__ import annotations
@@ -108,47 +110,82 @@ def test_non_buffer_input_is_refused(method: str) -> None:
         decrypt("not a buffer")
 
 
+class _DiscardOnRelease:
+    """Signed-byte exporter that wipes its storage whenever an export is released."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = bytearray(data)
+
+    def __buffer__(self, flags: int) -> memoryview:
+        return memoryview(self.data).cast("b")
+
+    def __release_buffer__(self, view: memoryview) -> None:
+        view.release()
+        self.data = bytearray(len(self.data))
+
+
+class _SingleExport:
+    """Signed-byte exporter that refuses a second export while one is active."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data, self.active = bytearray(data), False
+
+    def __buffer__(self, flags: int) -> memoryview:
+        if self.active:
+            raise BufferError("one export at a time")
+        self.active = True
+        return memoryview(self.data).cast("b")
+
+    def __release_buffer__(self, view: memoryview) -> None:
+        view.release()
+        self.active = False
+
+
+class _RefusesExport:
+    """Refuses its buffer, but ``bytes()`` reads it through ``__bytes__``."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def __buffer__(self, flags: int) -> memoryview:
+        raise BufferError("no export")
+
+    def __bytes__(self) -> bytes:
+        return self.data
+
+
+class _BytesWithDunder(bytes):
+    """A ``bytes`` subclass whose ``__bytes__`` holds the ciphertext; ``bytes()`` prefers it."""
+
+    def __new__(cls, data: bytes) -> _BytesWithDunder:
+        obj = super().__new__(cls, b"\x00" * len(data))
+        obj.ciphertext = data  # type: ignore[attr-defined]
+        return obj
+
+    def __bytes__(self) -> bytes:
+        return self.ciphertext  # type: ignore[attr-defined]
+
+
+EXPORTERS = {
+    "discard_on_release": _DiscardOnRelease,
+    "single_export": _SingleExport,
+    "refuses_export": _RefusesExport,
+    "bytes_subclass_with_dunder_bytes": _BytesWithDunder,
+}
+
+
 @pytest.mark.parametrize("method", METHODS)
-def test_signed_byte_exporter_that_discards_on_release_still_decrypts(method: str) -> None:
-    """The raw-bytes fallback copies while the first export is still held: an exporter that
-    discards its storage when an export is released must not lose it between the format check
-    and the copy (bytes(data) acquired it once, so it decrypted)."""
-    if sys.version_info < (3, 12):
+@pytest.mark.parametrize("make_exporter", EXPORTERS.values(), ids=EXPORTERS.keys())
+def test_other_inputs_decrypt_exactly_as_bytes_reads_them(method: str, make_exporter: Any) -> None:
+    """Anything but exact ``bytes`` or ``memoryview`` is read by ``bytes(obj)`` itself, once: no
+    format probe first, so an exporter that wipes on release or allows one export at a time, or
+    one ``bytes()`` reads through ``__bytes__``, decrypts as it did under ``bytes(data)``."""
+    if sys.version_info < (3, 12) and make_exporter is not _BytesWithDunder:
         pytest.skip("__buffer__ protocol requires Python 3.12+")
     decrypt, sealing_key = METHODS[method]
     ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(sealing_key, TENANT))
 
-    class DiscardOnRelease:
-        def __init__(self, data: bytes) -> None:
-            self.data = bytearray(data)
-
-        def __buffer__(self, flags: int) -> memoryview:
-            return memoryview(self.data).cast("b")
-
-        def __release_buffer__(self, view: memoryview) -> None:
-            view.release()
-            self.data = bytearray(len(self.data))
-
-    assert decrypt(DiscardOnRelease(ct)) == PLAINTEXT
-
-
-@pytest.mark.parametrize("method", METHODS)
-def test_exporter_that_refuses_its_buffer_decrypts_through_bytes(method: str) -> None:
-    """An object whose ``__buffer__`` raises ``BufferError`` but which ``bytes()`` still reads
-    (through ``__bytes__``) decrypts, as it did under the ``bytes(data)`` coercion."""
-    if sys.version_info < (3, 12):
-        pytest.skip("__buffer__ protocol requires Python 3.12+")
-    decrypt, sealing_key = METHODS[method]
-    ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(sealing_key, TENANT))
-
-    class RefusesExport:
-        def __buffer__(self, flags: int) -> memoryview:
-            raise BufferError("no export")
-
-        def __bytes__(self) -> bytes:
-            return ct
-
-    assert decrypt(RefusesExport()) == PLAINTEXT
+    assert decrypt(make_exporter(ct)) == PLAINTEXT
 
 
 def test_wrapper_read_paths_decrypt_a_signed_byte_frame_view() -> None:
