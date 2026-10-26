@@ -679,9 +679,11 @@ class EncryptionWrapper:
             # NOTE: If cache_key doesn't match the one used during encryption,
             # the AAD will be different and AES-GCM authentication will fail.
             # This is the SECURITY mechanism that detects ciphertext substitution.
-            # `unwrap` hands us a read-only memoryview of the frame; the decrypt bindings take it
-            # as-is and borrow it without a copy (a bytes(data) here would copy the whole
-            # ciphertext before the cipher makes its own working copy).
+            # Pass `data` as-is: for a v3 frame held as `bytes`, `unwrap` hands us a read-only
+            # memoryview of it, which the decrypt bindings borrow without a copy (a bytes(data)
+            # here would copy the whole ciphertext before the cipher makes its own working
+            # copy). A legacy frame arrives as `bytes`; a frame held in a mutable buffer, such
+            # as a bytearray, is copied inside the binding.
             if keyring_index is not None and keyring_index > 0:
                 # Decrypt-only keyring entry (rotation-window read): decrypt with
                 # exactly the matched entry. Binding match — decrypt_at never

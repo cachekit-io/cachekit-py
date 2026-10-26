@@ -113,7 +113,10 @@ impl BytesView<'_> {
 /// `bytes`: bounds-checked by Rust, no `unsafe`, nothing for a stale comment to misstate.
 fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
-        return Ok(BytesView::Borrowed(b.clone(), 0, b.len()?));
+        // The real length, never `len()`: that calls a subclass's `__len__`, which can lie and
+        // make `as_slice` panic (too long) or truncate the input (too short).
+        let len = b.as_bytes().len();
+        return Ok(BytesView::Borrowed(b.clone(), 0, len));
     }
     let buf = PyBuffer::<u8>::get(obj)?;
     // Interned: a plain "obj" would build a new str on every call, which costs a small
@@ -148,9 +151,10 @@ pub fn check_msgpack_structure_py(
     })
 }
 
-/// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins the
-/// borrow-versus-copy branch that `retrieve` and the decrypt bindings take, which tracemalloc
-/// cannot see (a Rust-side copy never touches the Python heap).
+/// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
+/// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
+/// touches the Python heap). It does not pin how a caller uses that view: that `retrieve` and
+/// the decrypt bindings pass `as_slice()` on without copying it is held by review of their code.
 #[pyfunction]
 #[pyo3(name = "_bytes_view_borrows")]
 pub fn bytes_view_borrows_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -351,9 +355,10 @@ impl PyZeroKnowledgeEncryptor {
 
     /// Decrypt data with keys that never leave Rust memory
     ///
-    /// `ciphertext` is any buffer-protocol object; `bytes_view` borrows it without a copy when
-    /// its storage is immutable `bytes` (the memoryview `SerializationWrapper.unwrap` returns)
-    /// and copies anything else.
+    /// `ciphertext` is a byte buffer: `bytes`, `bytearray`, `memoryview` or any other buffer of
+    /// format `B` or `c` (any other format raises `BufferError`). Immutable `bytes`, or a
+    /// read-only view of it such as `SerializationWrapper.unwrap` returns, is read without a
+    /// copy; any other buffer is copied first.
     #[pyo3(name = "decrypt_with_keys")]
     pub fn decrypt_with_keys(
         &self,
@@ -363,6 +368,7 @@ impl PyZeroKnowledgeEncryptor {
         tenant_keys: &PyTenantKeys,
     ) -> PyResult<Vec<u8>> {
         let encryption_key = &tenant_keys.inner.encryption_key;
+        // bytes_view borrows immutable `bytes` (or a proven window onto it) and copies the rest.
         let ciphertext = bytes_view(py, ciphertext)?;
 
         self.inner
@@ -519,7 +525,7 @@ impl PyTenantKeyring {
     /// unreachable when `index` comes from a match against this ring's own
     /// `encryption_fingerprints`.
     ///
-    /// `ciphertext` is any buffer-protocol object, read as `decrypt_with_keys` reads it.
+    /// `ciphertext` takes the same byte buffers as `decrypt_with_keys`, read the same way.
     #[pyo3(name = "decrypt_at")]
     pub fn decrypt_at(
         &self,
@@ -547,7 +553,7 @@ impl PyTenantKeyring {
     /// a stored fingerprint must use fingerprint selection (`decrypt_at`),
     /// never this method.
     ///
-    /// `ciphertext` is any buffer-protocol object, read as `decrypt_with_keys` reads it.
+    /// `ciphertext` takes the same byte buffers as `decrypt_with_keys`, read the same way.
     #[pyo3(name = "decrypt")]
     pub fn decrypt(
         &self,

@@ -6,6 +6,10 @@ ciphertext through the same ``bytes_view`` helper as ``ByteStorage.retrieve``: a
 ``memoryview`` of ``bytes`` (what ``SerializationWrapper.unwrap_metadata`` returns) is borrowed,
 and any other buffer (a ``bytearray``, a view of one, a spoofed exporter) is copied, because the
 module runs without a GIL on free-threaded builds and only immutable ``bytes`` is safe to borrow.
+
+``_bytes_view_borrows`` pins what ``bytes_view`` decides for an input. It does not pin how a
+binding uses that view: that the bindings pass it to the cipher without copying it is held by
+review of ``rust/src/python_bindings.rs``. The tracemalloc test pins only the Python side.
 """
 
 from __future__ import annotations
@@ -117,6 +121,24 @@ class TestBorrowVersusCopy:
 
     def test_strided_view_is_copied(self) -> None:
         assert not _bytes_view_borrows(memoryview(b"c-i-p-h-e-r")[::2])
+
+    def test_bytes_subclass_with_lying_len_reads_real_length(self) -> None:
+        """The borrowed length comes from the object's real size, never from ``__len__``: a
+        subclass that over-reports would panic the slice (an abort), and one that under-reports
+        would truncate the ciphertext into an authentication failure."""
+        ct = ZeroKnowledgeEncryptor().encrypt_with_keys(PLAINTEXT, AAD, derive_tenant_keys(CURRENT, TENANT))
+
+        class Long(bytes):
+            def __len__(self) -> int:
+                return 1_000_000
+
+        class Short(bytes):
+            def __len__(self) -> int:
+                return 1
+
+        for liar in (Long(ct), Short(ct)):
+            assert _bytes_view_borrows(liar)
+            assert _decrypt_with_keys(liar) == PLAINTEXT
 
     def test_spoofed_obj_is_copied(self) -> None:
         """An exporter whose ``.obj`` names a decoy ``bytes`` fails the containment proof."""
