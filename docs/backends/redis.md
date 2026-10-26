@@ -76,7 +76,7 @@ Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is
 - You require distributed caching
 
 **When NOT to use**:
-- Sub-millisecond latency requirements — use L1 cache only
+- Latency budgets that cannot absorb a network round trip per read — use L1 cache only
 - Offline or air-gapped environments without a Redis instance
 - Single-process scripts where [FileBackend](file.md) is simpler
 

@@ -86,7 +86,7 @@ class TestL1CacheSecurity(RedisIsolationMixin):
 
         Architecture: L1 cache stores encrypted bytes when encryption is enabled.
         Decryption happens at read time only, providing both security and performance.
-        Users can enable L1+encryption explicitly for sub-microsecond cache hits.
+        Users can enable L1+encryption explicitly to serve hits from process memory, without a backend round trip.
         """
         master_key = setup_encryption_master_key
         call_count = 0

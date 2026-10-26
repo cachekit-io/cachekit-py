@@ -227,7 +227,8 @@ waits on: the read, the lock `POST`, and the write. Two steps are trimmed:
   executor has already been shut down, the release is sent inline on the event
   loop's thread instead, one blocking round trip, so the lock is still released.
 
-The Redis backend keeps both steps: its release is one Redis round trip.
+The Redis backend keeps both steps: its release is one Redis round trip once the
+release script is cached on the server.
 
 ### TTL Shorter Than Compute Time
 ```python
@@ -353,7 +354,7 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 ### Performance Impact
 - **Lock already held**: Waiters poll for up to `blocking_timeout` (5 s) — fixed 0.1 s interval on Redis, exponential backoff + jitter on CachekitIO
 - **Lock acquisition**: one backend round trip per attempt (`SET NX` on Redis)
-- **Lock release**: one backend round trip
+- **Lock release**: one backend round trip (`DELETE …/lock` on CachekitIO; on Redis, once the release script is cached on the server)
 - **Waiting cost**: Function execution cost saved * (pods_waiting - 1)
 
 **Example**: 1000 pods, 3s function call, 999 waiting

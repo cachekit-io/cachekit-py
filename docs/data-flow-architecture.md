@@ -621,7 +621,6 @@ def _serialize_numpy(self, arr: np.ndarray) -> bytes:
 **Why Skip Rust?**
 - NumPy arrays already binary-efficient
 - Random data doesn't compress well
-- **Result: 8ms → 0.5ms**
 
 #### Path 2: General Objects (MessagePack + Rust)
 

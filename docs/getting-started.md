@@ -361,10 +361,10 @@ result = critical_function()  # Works even if Redis is offline
 
 | Optimization | Impact | Focus |
 |:-------------|:------:|:------|
-| Connection pooling | **50%** improvement | cachekit focuses here |
+| Connection pooling | No published timing | cachekit focuses here |
 | Network calls | One round trip per L2 operation | Accepted tradeoff |
-| Serialization | No published timing; the [instruction budgets](performance.md#instruction-budgets) count its instructions | Already fast enough |
-| SIMD hashing | 0.077% improvement | Removed (not worth it) |
+| Serialization | No published timing; the [instruction budgets](performance.md#instruction-budgets) count its instructions | Instruction budget gated in CI |
+| SIMD hashing | No published timing | Removed |
 
 ---
 
