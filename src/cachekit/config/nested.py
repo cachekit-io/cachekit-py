@@ -393,7 +393,7 @@ class EncryptionConfig:
 
         Single-tenant encryption:
 
-        >>> master_key = 'a' * 64  # 32 bytes hex-encoded
+        >>> master_key = secret_key  # 32 bytes hex-encoded
         >>> single = EncryptionConfig(enabled=True, master_key=master_key, single_tenant_mode=True)
         >>> single.validate()  # No error = valid
 
@@ -406,14 +406,14 @@ class EncryptionConfig:
 
         Must specify tenant mode (single or multi):
 
-        >>> EncryptionConfig(enabled=True, master_key='a'*64).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
+        >>> EncryptionConfig(enabled=True, master_key=secret_key).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
         cachekit.config.validation.ConfigurationError: Encryption requires explicit tenant mode...
 
         The key is hex, never bytes:
 
-        >>> EncryptionConfig(enabled=True, master_key=bytes(32), single_tenant_mode=True)
+        >>> EncryptionConfig(enabled=True, master_key=secret_key_bytes, single_tenant_mode=True)
         Traceback (most recent call last):
             ...
         TypeError: master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes.

@@ -65,14 +65,14 @@ def cache(
             True
 
         Intent-based secure (security-critical with encryption; L1 holds ciphertext):
-            >>> config = DecoratorConfig.secure(master_key="a" * 64, ttl=600)
+            >>> config = DecoratorConfig.secure(master_key=secret_key, ttl=600)
             >>> config.encryption.enabled
             True
             >>> config.l1.enabled
             True
 
         Secure refuses L1-only mode — raw objects cannot be ciphertext:
-            >>> @cache.secure(master_key="a" * 64, backend=None)  # doctest: +IGNORE_EXCEPTION_DETAIL
+            >>> @cache.secure(master_key=secret_key, backend=None)  # doctest: +IGNORE_EXCEPTION_DETAIL
             ... def leaks_plaintext() -> str:
             ...     return "pii"
             Traceback (most recent call last):

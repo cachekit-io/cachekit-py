@@ -89,10 +89,10 @@ class CachekitConfig(RedactingSettings):
         Master key is masked in repr for security:
 
         >>> from pydantic import SecretStr
-        >>> secure = CachekitConfig(master_key=SecretStr("deadbeef" * 8))
+        >>> secure = CachekitConfig(master_key=SecretStr(secret_key))
         >>> "REDACTED" in repr(secure)
         True
-        >>> "deadbeef" not in repr(secure)
+        >>> secret_key not in repr(secure)
         True
 
         Key rotation: decrypt-only previous master keys (comma-separated hex via
@@ -100,18 +100,18 @@ class CachekitConfig(RedactingSettings):
         key readable — and are masked in repr like master_key:
 
         >>> rotated = CachekitConfig(
-        ...     master_key=SecretStr("bb" * 32),
-        ...     previous_master_keys=[SecretStr("aa" * 32)],
+        ...     master_key=SecretStr(secret_key),
+        ...     previous_master_keys=[SecretStr(old_secret_key)],
         ... )
         >>> len(rotated.previous_master_keys)
         1
-        >>> "aa" * 32 not in repr(rotated)
+        >>> old_secret_key not in repr(rotated)
         True
 
         More than 3 previous keys is rejected at load — never truncated:
 
         >>> CachekitConfig(
-        ...     previous_master_keys=[SecretStr(f"{i:02x}" * 32) for i in range(1, 5)],
+        ...     previous_master_keys=[SecretStr(f"{i:02x}" + secret_key[2:]) for i in range(1, 5)],
         ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
@@ -121,8 +121,8 @@ class CachekitConfig(RedactingSettings):
         (forward-only rotation — re-promotion risks AES-GCM nonce reuse):
 
         >>> CachekitConfig(
-        ...     master_key=SecretStr("aa" * 32),
-        ...     previous_master_keys=[SecretStr("aa" * 32)],
+        ...     master_key=SecretStr(secret_key),
+        ...     previous_master_keys=[SecretStr(secret_key)],
         ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...

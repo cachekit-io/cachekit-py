@@ -635,7 +635,7 @@ class CacheSerializationHandler:
         >>> import os
         >>> from cachekit.config.singleton import reset_settings
         >>> reset_settings()  # Clear cached settings
-        >>> os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32-byte hex key
+        >>> os.environ["CACHEKIT_MASTER_KEY"] = secret_key  # 32-byte hex key
         >>> handler = CacheSerializationHandler(
         ...     serializer_name="default",
         ...     encryption=True,
