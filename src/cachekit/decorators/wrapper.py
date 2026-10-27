@@ -2400,10 +2400,11 @@ def create_cache_wrapper(
 
         Returns the value and its serialized envelope, as _backed_miss_async does, so a caller that
         shared this trip can decode its own copy. The envelope is None when there is none: a hit read
-        through the mmap fast path, a failed L2 read (the function then ran uncached), or a value the
-        store produced no bytes for (the serializer rejected it, it was streamed to the backend, or the
-        write raised). Runs once per concurrent miss on a key in this process (_thread_flights, in
-        _sync_shared_miss).
+        through the mmap fast path, a value the store produced no bytes for (the serializer rejected
+        it, or it was streamed to the backend), or an error raised past the read path's own handling
+        (the function then ran uncached). A backend that fails a read or write does not get here: the
+        cache handler reports a miss and a failed store, so the trip still shares its envelope. Runs
+        once per concurrent miss on a key in this process (_thread_flights, in _sync_shared_miss).
         """
         # Try to get cached value with optional TTL refresh
         start_time = time.perf_counter()

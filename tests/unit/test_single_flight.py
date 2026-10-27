@@ -36,6 +36,7 @@ import time_machine
 
 from cachekit import cache
 from cachekit import object_cache as object_cache_module
+from cachekit.backends.errors import BackendError
 from cachekit.config.nested import L1CacheConfig
 from cachekit.decorators import single_flight
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
@@ -862,6 +863,36 @@ def test_sync_backed_herd_makes_one_trip(waiting: list[int]) -> None:
 
     assert results == [{"x": 1}] * HERD
     assert backend.requests == single_backend.requests == ["get", "set"]  # no lock: the sync path takes none
+
+
+def test_sync_backed_herd_shares_one_trip_while_the_backend_is_down(waiting: list[int]) -> None:
+    """A read that fails reads as a miss and a write that fails still leaves the serialized value, so
+    a herd on a backend that is down still runs the function once and makes one read and one write."""
+
+    class _Down(_Backend):
+        def get(self, key: str) -> bytes | None:
+            self.requests.append("get")
+            raise BackendError("down")
+
+        def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+            self.requests.append("set")
+            raise BackendError("down")
+
+    runs = 0
+
+    def compute(x: int) -> dict[str, int]:
+        nonlocal runs
+        runs += 1
+        _until(lambda: waiting[0] == HERD - 1)
+        return {"x": x}
+
+    backend = _Down()
+    results = _thread_herd(_decorator("backed", backend)(compute))
+
+    assert runs == 1
+    assert results == [{"x": 1}] * HERD
+    assert len({id(r) for r in results}) == HERD
+    assert backend.requests == ["get", "set"]
 
 
 def test_sync_backed_recheck_shares_a_value_a_trip_stored_after_the_callers_l1_lookup(

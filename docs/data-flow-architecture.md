@@ -197,8 +197,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  copy of its result. A trip with no serialized value to share sends each of │
 │  them on its own trip afterwards: an unserializable value; for async, a     │
 │  lock release that failed after the locked work finished; for sync, an      │
-│  mmap-path hit, a failed L2 read, a streamed value or a write that raised.  │
-│  In L1-only mode it is the function call.                                   │
+│  mmap-path hit or a streamed value. In L1-only mode it is the function      │
+│  call.                                                                      │
 │                                                                             │
 │  lock_key = f"{cache_key}:lock"                                             │
 │  redis_lock = redis_client.lock(lock_key, timeout=30, blocking_timeout=5)   │
