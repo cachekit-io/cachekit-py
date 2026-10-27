@@ -359,7 +359,7 @@ Each checksum is an 8-byte digest, plus one pass over the payload on each write 
 | `AutoSerializer`, pandas DataFrames with pyarrow installed, and `ArrowSerializer` | The checksum, then the Arrow IPC data | No change: Arrow always checks |
 | `OrjsonSerializer` | The checksum, then the JSON | Plain JSON |
 
-Where the switch drops the LZ4 envelope, an entry gets larger only when LZ4 saved more than the envelope's overhead of about 25 to 30 bytes; every other entry gets smaller, by up to that overhead: the full amount for a payload under 64 bytes (which is never compressed) or one LZ4 cannot shrink, less where LZ4 saved some. Measure on your own payloads before you trade that.
+Where the switch drops the LZ4 envelope, an entry gets larger only when LZ4 saved more than the envelope's overhead of about 25 to 30 bytes; otherwise it stays the same size or gets smaller. Measure on your own payloads before you trade that.
 
 ### Security
 
