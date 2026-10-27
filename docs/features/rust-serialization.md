@@ -51,7 +51,7 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically whenever integrity checking is on (the default; `@cache.secure` forces it on for a serializer named by string, while a serializer instance you pass keeps its own setting); it has no separate switch. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
+ByteStorage LZ4 compression of serialized envelopes (MessagePack: StandardSerializer and AutoSerializer) runs automatically whenever integrity checking is on (the default; `@cache.secure` forces it on for a serializer named by string, while a serializer instance you pass keeps its own setting); it has no separate switch. A payload under 64 bytes is not run through the compressor: ByteStorage writes it as one uncompressed LZ4 literal block, which any LZ4 decoder reads, so a small value is stored at its own size plus the envelope's overhead. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
 
 ---
 

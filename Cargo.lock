@@ -198,9 +198,9 @@ checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
 name = "cachekit-core"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bc8d8f44d0c6e6b7951f4ca9cc826357a087caee20c8dbc9cf022284464ac52"
+checksum = "101672176881ef05b17e8399476eb6fc2082e6a5c33788c84c9bb4d1a8d512d7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -895,9 +895,6 @@ name = "lz4_flex"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90071f8077f8e40adfc4b7fe9cd495ce316263f19e75c2211eeff3fdf475a3d9"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "memchr"
@@ -1697,12 +1694,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "typenum"
