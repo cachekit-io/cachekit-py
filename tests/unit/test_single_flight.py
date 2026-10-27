@@ -776,8 +776,9 @@ def _until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
         time.sleep(0.005)
 
 
-def _thread_herd(fn: Callable[[int], Any]) -> list[Any]:
-    """Call fn(1) from HERD threads at once; each slot holds the value or the exception raised."""
+def _thread_herd(fn: Callable[[int], Any], caught: Callable[[], object] | None = None) -> list[Any]:
+    """Call fn(1) from HERD threads at once; each slot holds the value or the exception raised.
+    ``caught`` runs in a worker once it has caught an exception."""
     results: list[Any] = [None] * HERD
     barrier = threading.Barrier(HERD)
 
@@ -787,6 +788,8 @@ def _thread_herd(fn: Callable[[int], Any]) -> list[Any]:
             results[i] = fn(1)
         except Exception as e:
             results[i] = e
+            if caught is not None:
+                caught()
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(HERD)]
     for t in threads:
@@ -1178,16 +1181,45 @@ def test_sync_joined_callers_take_their_own_trip_after_an_mmap_hit(tmp_path: Any
 
 
 @pytest.mark.parametrize("mode", SYNC_MODES)
-def test_sync_failure_traceback_stays_one_callers(mode: str, waiting: list[int]) -> None:
-    """Each waiting thread raises from the saved traceback, so frames never pile up across threads."""
+def test_sync_failure_traceback_stays_one_callers(mode: str, waiting: list[int], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each waiting thread raises from the saved traceback, so frames never pile up across threads.
+
+    Every caller raises the one shared exception. Two callers unwinding at the same moment can
+    splice their frames into each other's chain (on a free-threaded build especially), so the
+    callers here raise one at a time: a token passes from the starter, as it settles the call,
+    to each waiter as it leaves its wait, and back once the caller's worker has caught the
+    exception. A pile-up would still grow the chain by one caller's frames per waiter."""
     error = RuntimeError("upstream down")
+    token = threading.Lock()
+    flight_type = single_flight._Flight  # pyright: ignore[reportPrivateUsage] - the waiting fixture's
+
+    class _OneRaiseAtATime(flight_type):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+            settled = self.settled
+
+            class _Settled:
+                def release(self) -> None:  # the starter settling: it raises on, holding the token
+                    token.acquire()
+                    settled.release()
+
+                def __enter__(self) -> object:
+                    return settled.__enter__()
+
+                def __exit__(self, *exc: object) -> None:  # a waiter leaving its wait, to raise
+                    token.acquire()
+                    settled.__exit__(*exc)
+
+            self.settled = _Settled()  # type: ignore[assignment]
+
+    monkeypatch.setattr(single_flight, "_Flight", _OneRaiseAtATime)
 
     @_decorator(mode)
     def compute(x: int) -> int:
         _until(lambda: waiting[0] == HERD - 1)
         raise error
 
-    results = _thread_herd(compute)
+    results = _thread_herd(compute, caught=token.release)
     assert all(r is error for r in results)
     assert len(traceback.extract_tb(error.__traceback__)) < 15
 
