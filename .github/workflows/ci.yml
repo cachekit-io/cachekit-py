@@ -533,7 +533,7 @@ jobs:
     - name: Pick the base
       id: base
       env:
-        HEAD_REF: release-please--forced-check  # temporary: force release mode
+        HEAD_REF: ${{ github.head_ref }}
       run: bash .github/scripts/perf-ir-base.sh
 
     - name: Build the PR and its base
@@ -588,7 +588,7 @@ jobs:
     - name: Pick the base
       id: base
       env:
-        HEAD_REF: release-please--forced-check  # temporary: force release mode
+        HEAD_REF: ${{ github.head_ref }}
       run: bash .github/scripts/perf-ir-base.sh
 
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
