@@ -676,7 +676,7 @@ class AutoSerializer:
 
                 * ``[xxh3][ARROW1]`` and ``[xxh3][NUMPY_RAW]`` — routed only when that prefix
                   matches the body's digest (``_checksummed_prefix``). LZ4 emits literals
-                  verbatim, so a value that merely CONTAINS either magic lands it at envelope
+                  verbatim, so a value that merely CONTAINS either magic can land it at envelope
                   offset 8; the digest check disambiguates a real prefix from that collision.
                   It is not authentication — the digest is unkeyed.
                 * bare ``NUMPY_RAW`` at offset 0 — verifies NOTHING. Legacy bare ``[ARROW1]``

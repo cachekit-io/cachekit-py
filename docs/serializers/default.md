@@ -77,7 +77,7 @@ StandardSerializer can be referenced by alias when configuring serializers:
 ## Compression and Integrity
 
 StandardSerializer automatically handles:
-- **LZ4 compression** — shrinks repetitive or record-heavy payloads; a very small value grows by the envelope's fixed overhead (about 25 bytes)
+- **LZ4 compression** — shrinks repetitive or record-heavy payloads of 64 bytes or more; a smaller value is stored uncompressed and grows by the envelope's fixed overhead (about 25 to 30 bytes)
 - **xxHash3-64 checksums** — integrity verification on deserialization
 
 Both are handled by the Rust ByteStorage layer and are on by default. With `integrity_checking=False` (as `@cache.minimal` sets) the serializer writes plain MessagePack instead: no compression, no checksum.
