@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Pick the commit the instruction-budget gate measures a pull request against, and
 # write it to $GITHUB_OUTPUT as `sha` (what to build) and `label` (how the comment
-# names it). Run from a checkout of the PR merge commit with its first parent.
+# names it). CI runs it once per workflow run, in job perf-ir-base, and the shards
+# and the comment both read its outputs, so they always name the same commit. Run
+# from a checkout of the PR merge commit with its first parent.
 #
 # A feature PR is measured against its base, the merge commit's first parent. A
 # release PR (head branch release-please--*) is rebased onto main on every push,
