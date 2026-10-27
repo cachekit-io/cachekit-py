@@ -515,7 +515,7 @@ jobs:
     - name: Pick the base
       id: base
       env:
-        HEAD_REF: ${{ github.head_ref }}
+        HEAD_REF: release-please--forced-check  # temporary: force release mode
       run: bash .github/scripts/perf-ir-base.sh
 
   perf-ir:
