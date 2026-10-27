@@ -995,24 +995,24 @@ def test_sync_backed_joiner_of_an_interrupted_trip_is_admitted_afresh(
         return real_admit(self)
 
     monkeypatch.setattr(CircuitBreaker, "admit", counting_admit)
-    results: list[Any] = []
+    results: dict[str, Any] = {}  # by caller: the joiner can finish before the starter records its interrupt
 
-    def call() -> None:
+    def call(caller: str) -> None:
         try:
-            results.append(fn(1))
+            results[caller] = fn(1)
         except _Interrupt as e:
-            results.append(e)
+            results[caller] = e
 
-    starter = threading.Thread(target=call)
+    starter = threading.Thread(target=call, args=("starter",))
     starter.start()
     _until(lambda: runs == 1)
-    joiner = threading.Thread(target=call)
+    joiner = threading.Thread(target=call, args=("joiner",))
     joiner.start()
     starter.join(5)
     joiner.join(5)
 
-    assert isinstance(results[0], _Interrupt)
-    assert results[1:] == [{"x": 1}]
+    assert isinstance(results["starter"], _Interrupt)
+    assert results["joiner"] == {"x": 1}
     assert runs == 2
     assert len(admits) == 3  # the starter, the joiner, and the joiner's own trip
 
