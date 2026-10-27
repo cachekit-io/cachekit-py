@@ -488,7 +488,8 @@ jobs:
   # committed budgets were recorded on one machine and interpreter build, and instruction counts
   # move with both, so CI never compares against them: it builds the PR (the merge commit checked
   # out here) and its base (that commit's first parent, the base branch tip) side by side and
-  # gates the PR's figures against the base's, measured on the same runner in the same job.
+  # gates the PR's figures against the base's, measured on the same runner in the same job. A
+  # release-please PR is measured against the last release tag instead (.github/scripts/perf-ir-base.sh).
   # Both trees sit at paths of equal length, which the gate requires: path length moves the
   # measured process's heap layout. The two USGS real-data paths are skipped: pyarrow's parquet
   # reader can hit an instruction valgrind does not support on some CPUs. Four shards split the
@@ -529,10 +530,18 @@ jobs:
         sudo apt-get install -y -q --no-install-recommends valgrind
         valgrind --version
 
+    - name: Pick the base
+      id: base
+      env:
+        HEAD_REF: ${{ github.head_ref }}
+      run: bash .github/scripts/perf-ir-base.sh
+
     - name: Build the PR and its base
+      env:
+        BASE_SHA: ${{ steps.base.outputs.sha }}
       run: |
         git worktree add --detach "$RUNNER_TEMP/ir/head" HEAD
-        git worktree add --detach "$RUNNER_TEMP/ir/base" HEAD^1
+        git worktree add --detach "$RUNNER_TEMP/ir/base" "$BASE_SHA"
         for tree in head base; do
           (cd "$RUNNER_TEMP/ir/$tree" && uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev --reinstall-package cachekit)
         done
@@ -576,6 +585,12 @@ jobs:
         fetch-depth: 2  # the merge commit the shards measured, and its parents
         persist-credentials: false
 
+    - name: Pick the base
+      id: base
+      env:
+        HEAD_REF: ${{ github.head_ref }}
+      run: bash .github/scripts/perf-ir-base.sh
+
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
       with:
         pattern: perf-ir-report-*
@@ -587,6 +602,7 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        BASE_LABEL: ${{ steps.base.outputs.label }}
       run: |
         gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
           --jq '.jobs[] | {name, html_url, conclusion, started_at}' > "$RUNNER_TEMP/jobs.jsonl"
@@ -596,7 +612,7 @@ jobs:
         {
           echo "body<<$delimiter"
           python3 tests/performance/ir_report.py --reports "$RUNNER_TEMP/reports" --shards 4 --jobs "$RUNNER_TEMP/jobs.jsonl" \
-            --artifacts "$RUNNER_TEMP/artifacts.jsonl" --head "$(git rev-parse HEAD^2)" --base "$(git rev-parse HEAD^1)" --run-url "$RUN_URL"
+            --artifacts "$RUNNER_TEMP/artifacts.jsonl" --head "$(git rev-parse HEAD^2)" --base "$BASE_LABEL" --run-url "$RUN_URL"
           echo "$delimiter"
         } >> "$GITHUB_OUTPUT"
 
