@@ -203,7 +203,12 @@ class L1Cache:
         For a second lookup within one call, such as the single-flight re-check after a miss, which
         the call's first lookup already counted. An expired entry reads as absent and is left for
         ``get`` or ``put`` to remove.
+
+        It runs the fork take-over first, as ``put`` does: a wrapper's first call in a child forked
+        without at-fork hooks can reach it before any put, holding the single-flight map's lock.
         """
+        if self._before_store is not None:
+            self._before_store()
         s = self._state
         with s.lock:
             entry = s.cache.get(key)

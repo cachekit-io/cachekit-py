@@ -895,21 +895,9 @@ def test_sync_backed_herd_shares_one_trip_while_the_backend_is_down(waiting: lis
     assert backend.requests == ["get", "set"]
 
 
-def test_sync_backed_recheck_shares_a_value_a_trip_stored_after_the_callers_l1_lookup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A trip that settles between a caller's L1 lookup and its flight lookup left its envelope in
-    L1: the caller decodes that and makes no backend request. Another caller's call is made here,
-    on the same thread, just before the caller looks for a call in flight."""
-    runs = 0
-
-    def compute(x: int) -> dict[str, int]:
-        nonlocal runs
-        runs += 1
-        return {"x": x}
-
-    backend = _Backend()
-    fn = _decorator("backed", backend)(compute)
+def _settle_another_trip_first(monkeypatch: pytest.MonkeyPatch, fn: Callable[[int], Any]) -> None:
+    """Make fn's next flight lookup run another caller's whole trip on key 1 first, on this thread:
+    a trip that settles between the caller's own L1 lookup and its flight lookup."""
     real_run = ThreadFlights.run
     lookups = 0
 
@@ -921,17 +909,15 @@ def test_sync_backed_recheck_shares_a_value_a_trip_stored_after_the_callers_l1_l
         return real_run(self, *args)
 
     monkeypatch.setattr(ThreadFlights, "run", run_after_another_trip)
-    before = fn.cache_info()
-    assert fn(1) == {"x": 1}
-    after = fn.cache_info()
-
-    assert runs == 1
-    assert backend.requests == ["get", "set"]  # the other trip's: the re-check found its L1 entry
-    assert (after.misses - before.misses, after.l1_hits - before.l1_hits, after.l2_hits - before.l2_hits) == (1, 1, 0)
 
 
-def test_sync_backed_recheck_with_l1_off_takes_its_own_trip(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With L1 off there is nothing to re-check under the flight map's lock: the caller reads L2 itself."""
+@pytest.mark.parametrize("l1_enabled", [True, False], ids=["l1-on", "l1-off"])
+def test_sync_backed_recheck_after_a_trip_settled_since_the_callers_l1_lookup(
+    l1_enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With L1 on, the re-check finds the envelope that trip left in L1: the caller decodes it and
+    makes no backend request. With L1 off there is nothing to re-check under the flight map's lock,
+    so the caller reads L2 itself."""
     runs = 0
 
     def compute(x: int) -> dict[str, int]:
@@ -940,21 +926,95 @@ def test_sync_backed_recheck_with_l1_off_takes_its_own_trip(monkeypatch: pytest.
         return {"x": x}
 
     backend = _Backend()
-    fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"sf-{uuid.uuid4().hex}")(compute)
-    real_run = ThreadFlights.run
-    lookups = 0
-
-    def run_after_another_trip(self: ThreadFlights, *args: Any) -> Any:
-        nonlocal lookups
-        lookups += 1
-        if lookups == 1:
-            assert fn(1) == {"x": 1}
-        return real_run(self, *args)
-
-    monkeypatch.setattr(ThreadFlights, "run", run_after_another_trip)
+    fn = cache(backend=backend, ttl=60, l1_enabled=l1_enabled, namespace=f"sf-{uuid.uuid4().hex}")(compute)
+    _settle_another_trip_first(monkeypatch, fn)
+    before = fn.cache_info()
     assert fn(1) == {"x": 1}
+    after = fn.cache_info()
+
     assert runs == 1
-    assert backend.requests == ["get", "set", "get"]  # its own L2 read hit what the other trip stored
+    counts = (after.misses - before.misses, after.l1_hits - before.l1_hits, after.l2_hits - before.l2_hits)
+    if l1_enabled:
+        assert backend.requests == ["get", "set"]  # the other trip's: the re-check found its L1 entry
+        assert counts == (1, 1, 0)
+    else:
+        assert backend.requests == ["get", "set", "get"]  # its own L2 read hit what the other trip stored
+        assert counts == (1, 0, 1)
+
+
+def test_sync_backed_recheck_hit_hands_its_half_open_probe_slot_back(
+    live_breakers: list[CircuitBreaker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller the re-check answers never waited on a call, so on_join never ran for it: it hands its
+    probe slot back afterwards. The pair of calls leaves the slots one call leaves."""
+    single_fn = _decorator("backed")(lambda x: {"x": x})
+    fn = _decorator("backed")(lambda x: {"x": x})
+    single_breaker, breaker = live_breakers
+
+    with time_machine.travel(1_000_000.0, tick=False) as clock:
+        for each in live_breakers:
+            for _ in range(each.config.failure_threshold):
+                each.record_failure()
+        clock.shift(timedelta(seconds=single_breaker.config.timeout_seconds + 1))
+
+        assert single_fn(1) == {"x": 1}
+        _settle_another_trip_first(monkeypatch, fn)
+        assert fn(1) == {"x": 1}
+
+        assert breaker.state == single_breaker.state == CircuitState.HALF_OPEN
+        assert _free_probe_slots(breaker) == _free_probe_slots(single_breaker) > 0
+
+
+def test_sync_backed_joiner_of_an_interrupted_trip_is_admitted_afresh(
+    live_breakers: list[CircuitBreaker], monkeypatch: pytest.MonkeyPatch, waiting: list[int]
+) -> None:
+    """A starter ended by a non-Exception did not fail, so its joiner runs its own trip. The joiner
+    handed its probe slot back when it joined, so that trip asks the breaker again."""
+
+    class _Interrupt(BaseException):
+        pass
+
+    runs = 0
+
+    def compute(x: int) -> dict[str, int]:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            _until(lambda: waiting[0] == 1)  # the joiner waits on this call
+            raise _Interrupt
+        return {"x": x}
+
+    fn = _decorator("backed")(compute)
+    (breaker,) = live_breakers
+    admits: list[int] = []
+    real_admit = CircuitBreaker.admit
+
+    def counting_admit(self: CircuitBreaker) -> int | None:
+        if self is breaker:
+            admits.append(1)
+        return real_admit(self)
+
+    monkeypatch.setattr(CircuitBreaker, "admit", counting_admit)
+    results: list[Any] = []
+
+    def call() -> None:
+        try:
+            results.append(fn(1))
+        except _Interrupt as e:
+            results.append(e)
+
+    starter = threading.Thread(target=call)
+    starter.start()
+    _until(lambda: runs == 1)
+    joiner = threading.Thread(target=call)
+    joiner.start()
+    starter.join(5)
+    joiner.join(5)
+
+    assert isinstance(results[0], _Interrupt)
+    assert results[1:] == [{"x": 1}]
+    assert runs == 2
+    assert len(admits) == 3  # the starter, the joiner, and the joiner's own trip
 
 
 def test_sync_backed_flight_identity_carries_the_backend_key_prefix() -> None:
@@ -1355,13 +1415,16 @@ async def test_async_flights_keep_out_a_call_that_ran_past_a_forget_before_its_i
 
 
 def test_l1_peek_reads_an_entry_without_counting_it_or_moving_it() -> None:
-    """The backed re-check's L1 read: the caller's own lookup already counted its miss."""
-    l1 = L1Cache(namespace=f"sf-{uuid.uuid4().hex}")
+    """The backed re-check's L1 read: the caller's own lookup already counted its miss. Like put, it
+    runs the fork take-over first, since a wrapper's first call in a child can reach it before any put."""
+    take_overs: list[int] = []
+    l1 = L1Cache(namespace=f"sf-{uuid.uuid4().hex}", before_store=lambda: take_overs.append(1))
     l1.put("a", b"A", redis_ttl=60)
     l1.put("b", b"B", redis_ttl=60)
     stats = l1.get_stats()
 
     assert (l1.peek("a"), l1.peek("missing")) == (b"A", None)
+    assert len(take_overs) == 4  # two puts, two peeks
     assert (l1.get_stats()["hits"], l1.get_stats()["misses"]) == (stats["hits"], stats["misses"])
     assert list(l1._state.cache) == ["a", "b"]  # pyright: ignore[reportPrivateUsage] - not moved in LRU order
 
