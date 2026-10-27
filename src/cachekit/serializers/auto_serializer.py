@@ -676,7 +676,7 @@ class AutoSerializer:
 
                 * ``[xxh3][ARROW1]`` and ``[xxh3][NUMPY_RAW]`` — routed only when that prefix
                   matches the body's digest (``_checksummed_prefix``). LZ4 emits literals
-                  verbatim, so a value that merely CONTAINS either magic lands it at envelope
+                  verbatim, so a value that merely CONTAINS either magic can land it at envelope
                   offset 8; the digest check disambiguates a real prefix from that collision.
                   It is not authentication — the digest is unkeyed.
                 * bare ``NUMPY_RAW`` at offset 0 — verifies NOTHING. Legacy bare ``[ARROW1]``
@@ -1203,7 +1203,7 @@ class AutoSerializer:
         """True iff ``data`` is ``[8-byte xxHash3-64][magic...]`` and the digest matches the body.
 
         One gate for both self-checksummed formats (Arrow, NumPy). It disambiguates a real
-        prefix from an LZ4 literal collision — a value that merely CONTAINS ``magic`` lands it at
+        prefix from an LZ4 literal collision — a value that merely CONTAINS ``magic`` can land it at
         envelope offset 8 — and is not authentication: the digest is unkeyed. ``memoryview``
         avoids the full-body copy ``data[8:]`` would make on every read of a large frame.
         """

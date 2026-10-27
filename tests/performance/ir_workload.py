@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any
 
 FILE_SET_ENTRIES = 1000
+# ByteStorage.store() inputs. 40 B is under cachekit-core's 64 B literals-only LZ4 threshold, which
+# every serializer path's input clears (the smallest, serializer_default's msgpack, is 79 B). The
+# 64 KiB input is address-like text, so the encoder finds many short matches rather than one run.
+BYTE_STORAGE_PAYLOADS = {
+    "byte_storage_store_40b": b"cachekit" * 5,
+    "byte_storage_store_64k": b"".join(b"%d,user-%d@example.com;" % (i, i) for i in range(4000))[:65536],
+}
 _scratch_dirs: list[str] = []  # removed before exit; the removal costs the same at both loop sizes
 
 
@@ -142,6 +149,13 @@ def build_workload(path: str) -> Callable[[], object]:
         for i in range(FILE_SET_ENTRIES):
             backend.set(f"entry:{i}", payload)
         return lambda: backend.set("entry:0", payload)
+
+    if path in BYTE_STORAGE_PAYLOADS:
+        # ByteStorage.store() alone: LZ4, xxHash3-64 and the envelope, with no serializer around it.
+        from cachekit._rust_serializer import ByteStorage
+
+        storage, payload = ByteStorage("msgpack"), BYTE_STORAGE_PAYLOADS[path]
+        return lambda: storage.store(payload, None)
 
     def roundtrip(serializer: Any, obj: object, **key: str) -> Callable[[], object]:
         def op() -> object:

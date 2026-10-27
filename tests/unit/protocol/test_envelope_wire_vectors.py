@@ -73,7 +73,7 @@ pytestmark = pytest.mark.unit
 
 CARGO_LOCK = Path(__file__).parents[3] / "Cargo.lock"
 # The cachekit-core release whose publish job ran core's allocation probe (docstring item 6).
-PROBE_VERIFIED_CORE_VERSION = "0.7.1"
+PROBE_VERIFIED_CORE_VERSION = "0.7.2"
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "wire-format.json"
 FIXTURE_SHA256 = "806de79dca2e0e6b221b8ec191526207d32f9fe5d88597098dd2549427b4993c"  # pragma: allowlist secret
