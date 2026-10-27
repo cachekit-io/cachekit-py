@@ -66,9 +66,10 @@ def _envelope_with_magic_at_offset_8(s: AutoSerializer, magic: bytes) -> tuple[b
     routes look for it, with the value, its stored bytes and their metadata.
 
     LZ4 emits literals verbatim, so a value that contains the magic carries it into the envelope, but
-    the offset it lands at depends on the block layout: a literal run of 15 bytes or more takes extra
-    length bytes, and whether the run is that long depends on what the compressor matches. So the
-    prefix length is read off the stored bytes rather than assumed.
+    the offset it lands at depends on the block layout. Under 64 B the writer stores the whole input as
+    one literal block, and a literal run of 15 bytes or more gains a length byte; from 64 B up,
+    lz4_flex's matches decide the run length. So the prefix length is read off the stored bytes rather
+    than assumed.
     """
     for prefix_len in range(9):
         value = b"x" * prefix_len + magic + b"z" * 20
@@ -458,13 +459,12 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
     def test_an_envelope_whose_bytes_contain_arrow_magic_is_not_hijacked(self, metadata_present: bool) -> None:
         """The structural Arrow route must authenticate, not sniff. LZ4 emits literals verbatim, so
         caching a value that contains ``ARROW1`` can land the magic at envelope offset 8 of a valid,
-        checksum-intact entry (``_envelope_with_magic_at_offset_8`` finds one), and a bare ``data[8:14] == b"ARROW1"`` test handed that healthy entry
+        checksum-intact entry, and a bare ``data[8:14] == b"ARROW1"`` test handed that healthy entry
         to the Arrow decoder, which called it corrupt — a false miss on every read, deterministic on
         recompute, so it never self-heals. No pyarrow needed: the collision is in the ByteStorage writer."""
         s = AutoSerializer()
         value, data, meta = _envelope_with_magic_at_offset_8(s, b"ARROW1")
-        assert data[8:14] == b"ARROW1", "this test needs the magic collision it guards against"
-        assert xxhash.xxh3_64_digest(data[8:]) != data[:8], "...and those bytes must not be a real Arrow checksum"
+        assert xxhash.xxh3_64_digest(data[8:]) != data[:8], "the colliding bytes must not be a real Arrow checksum"
         meta.original_type = None
 
         assert s.deserialize(data, meta if metadata_present else None) == value
@@ -472,14 +472,13 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
     @pytest.mark.parametrize("metadata_present", [True, False])
     def test_an_envelope_whose_bytes_contain_numpy_magic_is_not_hijacked(self, metadata_present: bool) -> None:
         """The NUMPY_RAW twin of the Arrow case above, and strictly worse before the fix: the numpy
-        arm had no digest gate at all, so ``b"xxNUMPY_RAW..."`` — a checksum-intact envelope, header
+        arm had no digest gate at all, so a value containing ``NUMPY_RAW`` — a checksum-intact envelope, header
         ``"msgpack"`` and correct — was handed to the numpy decoder on every read, which took the
         envelope's first 8 bytes for a digest, failed it, and raised. A permanent miss on a healthy
         key, with a backend write per call. Both magics now go through one ``_checksummed_prefix``."""
         s = AutoSerializer()
         value, data, meta = _envelope_with_magic_at_offset_8(s, b"NUMPY_RAW")
-        assert data[8:17] == b"NUMPY_RAW", "this test needs the magic collision it guards against"
-        assert xxhash.xxh3_64_digest(data[8:]) != data[:8], "...and those bytes must not be a real NumPy checksum"
+        assert xxhash.xxh3_64_digest(data[8:]) != data[:8], "the colliding bytes must not be a real NumPy checksum"
         assert meta.original_type == "msgpack"
 
         assert s.deserialize(data, meta if metadata_present else None) == value

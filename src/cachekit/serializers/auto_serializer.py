@@ -1203,7 +1203,7 @@ class AutoSerializer:
         """True iff ``data`` is ``[8-byte xxHash3-64][magic...]`` and the digest matches the body.
 
         One gate for both self-checksummed formats (Arrow, NumPy). It disambiguates a real
-        prefix from an LZ4 literal collision — a value that merely CONTAINS ``magic`` lands it at
+        prefix from an LZ4 literal collision — a value that merely CONTAINS ``magic`` can land it at
         envelope offset 8 — and is not authentication: the digest is unkeyed. ``memoryview``
         avoids the full-body copy ``data[8:]`` would make on every read of a large frame.
         """
