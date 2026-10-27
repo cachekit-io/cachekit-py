@@ -85,8 +85,8 @@ def refuse_current_key_in_previous_keys(master_key: SecretStr | None, previous_m
     past the check. A master key that is not hex is not this check's concern: it fails loudly at its own validation.
     Decoded keys stay temporaries, never locals (CWE-532).
 
-    >>> refuse_current_key_in_previous_keys(SecretStr("aa" * 32), [SecretStr("bb" * 32)])
-    >>> refuse_current_key_in_previous_keys(SecretStr("aa" * 32), [SecretStr("AA" * 32)])
+    >>> refuse_current_key_in_previous_keys(SecretStr(secret_key), [SecretStr(old_secret_key)])
+    >>> refuse_current_key_in_previous_keys(SecretStr(secret_key), [SecretStr(secret_key.upper())])
     Traceback (most recent call last):
     ...
     ValueError: master_key must not appear in previous_master_keys: ...

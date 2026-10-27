@@ -132,7 +132,7 @@ class EncryptionWrapper:
     Examples:
         Basic encryption/decryption roundtrip with cache_key binding (AAD v0x03):
 
-        >>> wrapper = EncryptionWrapper(master_key=b"a" * 32, tenant_id="test-tenant")
+        >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="test-tenant")
         >>> data = {"user_id": 123, "secret": "password"}
         >>> cache_key = "users:123:profile"
         >>> encrypted, metadata = wrapper.serialize(data, cache_key=cache_key)
@@ -160,14 +160,14 @@ class EncryptionWrapper:
         A serializer that picks its format by sniffing the bytes is refused:
 
         >>> from cachekit.serializers import AutoSerializer
-        >>> EncryptionWrapper(serializer=AutoSerializer(), master_key=b"a" * 32)  # doctest: +IGNORE_EXCEPTION_DETAIL
+        >>> EncryptionWrapper(serializer=AutoSerializer(), master_key=secret_key_bytes)  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
         ConfigurationError: Encryption requires a serializer that decodes one fixed format after decryption ...
 
         Encryption is always enabled (no opt-out):
 
-        >>> EncryptionWrapper(master_key=b"a" * 32).is_encryption_enabled
+        >>> EncryptionWrapper(master_key=secret_key_bytes).is_encryption_enabled
         True
 
         Key rotation: an entry written under a retired master key stays readable
@@ -175,10 +175,10 @@ class EncryptionWrapper:
         CACHEKIT_PREVIOUS_MASTER_KEYS). Selection is by exact fingerprint match
         of the HKDF-derived per-tenant encryption key — never trial decryption:
 
-        >>> writer = EncryptionWrapper(master_key=b"x" * 32, tenant_id="test-tenant", previous_master_keys=[])
+        >>> writer = EncryptionWrapper(master_key=old_secret_key_bytes, tenant_id="test-tenant", previous_master_keys=[])
         >>> enc, meta = writer.serialize({"pin": 1234}, cache_key="users:1:pin")
         >>> rotated = EncryptionWrapper(
-        ...     master_key=b"y" * 32, tenant_id="test-tenant", previous_master_keys=[b"x" * 32]
+        ...     master_key=secret_key_bytes, tenant_id="test-tenant", previous_master_keys=[old_secret_key_bytes]
         ... )
         >>> rotated.deserialize(enc, meta, cache_key="users:1:pin")
         {'pin': 1234}
@@ -190,7 +190,7 @@ class EncryptionWrapper:
         never classify a misconfigured keyring as corruption or a miss:
 
         >>> EncryptionWrapper(
-        ...     master_key=b"y" * 32, tenant_id="test-tenant", previous_master_keys=[b"y" * 32]
+        ...     master_key=secret_key_bytes, tenant_id="test-tenant", previous_master_keys=[secret_key_bytes]
         ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
@@ -441,7 +441,7 @@ class EncryptionWrapper:
         Examples:
             Serialize with encryption enabled:
 
-            >>> wrapper = EncryptionWrapper(master_key=b"a" * 32, tenant_id="acme-corp")
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="acme-corp")
             >>> encrypted, meta = wrapper.serialize({"api_key": "secret"}, cache_key="config:api")
             >>> meta.encrypted
             True
@@ -550,7 +550,7 @@ class EncryptionWrapper:
         Examples:
             Successful roundtrip with matching cache_key:
 
-            >>> wrapper = EncryptionWrapper(master_key=b"b" * 32, tenant_id="tenant-1")
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="tenant-1")
             >>> original = {"items": [1, 2, 3], "total": 6}
             >>> enc_data, enc_meta = wrapper.serialize(original, cache_key="cart:user:42")
             >>> wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")
@@ -566,7 +566,7 @@ class EncryptionWrapper:
             Tenant mismatch raises TenantMismatchError, a DecryptionAuthenticationError
             (tamper-class) whose message names neither tenant:
 
-            >>> other_wrapper = EncryptionWrapper(master_key=b"b" * 32, tenant_id="tenant-2")
+            >>> other_wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="tenant-2")
             >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")
             Traceback (most recent call last):
                 ...
@@ -752,11 +752,11 @@ class EncryptionWrapper:
             A value encrypted under a retired key remains readable without any
             stored key identity, as long as the key is retained decrypt-only:
 
-            >>> writer = EncryptionWrapper(master_key=b"o" * 32, tenant_id="t-interop", previous_master_keys=[])
+            >>> writer = EncryptionWrapper(master_key=old_secret_key_bytes, tenant_id="t-interop", previous_master_keys=[])
             >>> enc, meta = writer.serialize({"v": 7}, cache_key="ns:interop:k")
             >>> meta.key_fingerprint = None  # interop entries store no frame metadata
             >>> rotated = EncryptionWrapper(
-            ...     master_key=b"p" * 32, tenant_id="t-interop", previous_master_keys=[b"o" * 32]
+            ...     master_key=secret_key_bytes, tenant_id="t-interop", previous_master_keys=[old_secret_key_bytes]
             ... )
             >>> rotated.deserialize_without_key_identity(enc, meta, cache_key="ns:interop:k")
             {'v': 7}
@@ -830,7 +830,7 @@ class EncryptionWrapper:
             AAD starts with version byte 0x03:
 
             >>> from cachekit.serializers.base import SerializationFormat, SerializationMetadata
-            >>> wrapper = EncryptionWrapper(master_key=b"c" * 32, tenant_id="demo")
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="demo")
             >>> meta = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, compressed=True)
             >>> aad = wrapper._create_aad(meta, cache_key="session:abc123")
             >>> aad[0] == 0x03  # Version byte
@@ -914,7 +914,7 @@ class EncryptionWrapper:
             Parse valid AAD v0x03:
 
             >>> from cachekit.serializers.base import SerializationFormat, SerializationMetadata
-            >>> wrapper = EncryptionWrapper(master_key=b"d" * 32, tenant_id="acme")
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="acme")
             >>> meta = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, compressed=False)
             >>> aad = wrapper._create_aad(meta, "orders:12345")
             >>> result = wrapper._parse_aad(aad)
@@ -983,7 +983,7 @@ class EncryptionWrapper:
         """Always True — EncryptionWrapper requires encryption.
 
         Examples:
-            >>> wrapper = EncryptionWrapper(master_key=b"e" * 32)
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes)
             >>> wrapper.is_encryption_enabled
             True
         """
@@ -996,7 +996,7 @@ class EncryptionWrapper:
         Returns True if AES-NI or equivalent CPU instructions are available.
 
         Examples:
-            >>> wrapper = EncryptionWrapper(master_key=b"f" * 32)
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes)
             >>> isinstance(wrapper.hardware_acceleration_enabled, bool)
             True
         """
@@ -1010,7 +1010,7 @@ class EncryptionWrapper:
         Examples:
             Encryption enabled - full info:
 
-            >>> wrapper = EncryptionWrapper(master_key=b"g" * 32, tenant_id="prod-tenant")
+            >>> wrapper = EncryptionWrapper(master_key=secret_key_bytes, tenant_id="prod-tenant")
             >>> info = wrapper.get_encryption_info()
             >>> info["enabled"]
             True

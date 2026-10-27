@@ -473,7 +473,7 @@ class DecoratorConfig:
             TypeError: If master_key is bytes: pass ``key.hex()``.
 
         Example:
-            >>> config = DecoratorConfig.secure(master_key="a" * 64)
+            >>> config = DecoratorConfig.secure(master_key=secret_key)
             >>> config.ttl
             600
             >>> config.encryption.enabled
@@ -663,10 +663,10 @@ class DecoratorConfig:
                 refuses a ``backend=`` beside the returned config too.
 
         Example:
-            >>> config = DecoratorConfig.io(api_key="ck_test_key")  # pragma: allowlist secret
+            >>> config = DecoratorConfig.io(api_key=api_key)
             >>> config.ttl
             3600
-            >>> DecoratorConfig.io(api_key="ck_test_key", ttl=300).ttl  # pragma: allowlist secret
+            >>> DecoratorConfig.io(api_key=api_key, ttl=300).ttl
             300
         """
         api_key = hide_any_secret(api_key)  # passed down wrapped, a bytes key too (CWE-532)
