@@ -292,10 +292,10 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 11,619 | 10,911 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,510 | 9,796 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 171,656 | 164,940 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 206,514 | 196,945 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 189,435 | 182,313 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 223,970 | 214,220 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 158,029 | 156,881 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 161,736 | 155,861 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 179,300 | 173,152 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 61,705 | 62,837 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,441,598 | 1,442,386 |
 | `serializer_auto` | `AutoSerializer` round trip | 68,870 | 69,929 |

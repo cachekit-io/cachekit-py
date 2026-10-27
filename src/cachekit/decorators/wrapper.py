@@ -1873,11 +1873,50 @@ def create_cache_wrapper(
 
     # In-process single-flight for misses (single_flight): concurrent misses on one key share one
     # call. Keyed by (cache key,) in L1-only mode, and by (L2 scope, tenant, cache key) in backed
-    # mode, where it holds the whole trip after the L1 miss. The sync backed path does not use it.
+    # mode, where it holds the whole trip after the L1 miss, sync and async alike.
     _flights = AsyncFlights()
     _thread_flights = ThreadFlights()
     # Multi-tenant encryption: the cache key carries no tenant, so the backed-mode flight key does.
     _flight_tenant_extractor = serialization_handler.tenant_extractor if serialization_handler.encryption else None
+
+    def _flight_tenant(args: tuple[Any, ...], kwargs: dict[str, Any], cache_key: str) -> str | None:
+        """The caller's tenant for a backed-mode flight key under multi-tenant encryption, or None
+        when it cannot be extracted: that caller's miss is not shared."""
+        assert _flight_tenant_extractor is not None  # noqa: S101 - multi-tenant encryption only
+        try:
+            return _flight_tenant_extractor.extract(args, kwargs)
+        except Exception as e:
+            _logger.debug(
+                "Tenant not extracted for %s, so its miss is not shared: %s",
+                redact_cache_key(cache_key),
+                redact_error_for_log(e),
+            )
+            return None
+
+    def _decode_shared(
+        envelope: bytes | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[bool, Any]:
+        """A joined backed-mode caller's own copy of the trip's envelope, decoded as an L1 hit would be:
+        every caller gets its own object, and the decrypt checks bind to this caller's tenant.
+
+        (False, None) when there is no envelope or it does not decode for this caller, who then takes
+        its own trip, unshared: its probe slot went back on joining, so it is admitted afresh.
+        """
+        if envelope is not None:
+            try:
+                value = operation_handler.serialization_handler.deserialize_data(envelope, cache_key, args, kwargs)
+            except KeyringConfigurationError:
+                raise  # a LOCAL keyring config fault: see the L1 guard in _sync_call
+            except Exception as e:
+                _logger.debug(
+                    "Shared miss envelope not decoded for %s, taking its own trip: %s",
+                    redact_cache_key(cache_key),
+                    redact_error_for_log(e),
+                )
+            else:
+                _stats.record_l1_hit()
+                return True, value
+        return False, None
 
     def _forget_flights(cache_keys: list[str] | None) -> None:
         """For an invalidation of these keys (all, for None): a read that starts after it never joins
@@ -2280,181 +2319,262 @@ def create_cache_wrapper(
                 invalidation.start_listener(_backend)
             twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
 
-            # Continue with the rest of the sync wrapper logic...
-            # Try to get cached value with optional TTL refresh
-            start_time = time.perf_counter()
-            try:
-                refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
-
-                # Use operation handler for all cache access (uses backend internally).
-                # A freshness-capable backend (CachekitIO) always takes the freshness
-                # read — not just when SWR is configured — so every hit carries the
-                # server's staleness label; a stale hit is served
-                # immediately and (with SWR active) revalidated on a background daemon
-                # thread below. The freshness path drops refresh_ttl, which is a
-                # documented no-op on the sync path anyway (StandardCacheHandler.get),
-                # and skips the mmap fast path (CachekitIO is not buffer-readable).
-                _sync_l2_stale = False
-                _sync_l2_fresh_for: int | None = None
-                if _l2_freshness_capable():
-                    _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, args, kwargs)
-                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
-                    _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
-                    _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
-                else:
-                    cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
-
-                duration = time.perf_counter() - start_time
-
-                if cached_result is not None:
-                    # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
-                    result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
-                    features.record_success(probe_cycle)
-
-                    # Record cache hit with structured logging
-                    features.log_cache_operation(
-                        operation="get",
-                        key=cache_key,
-                        namespace=namespace or "default",
-                        serializer="rust",
-                        duration_ms=duration * 1000,
-                        hit=True,
-                        ttl=ttl,
-                    )
-
-                    # Also record statistics if enabled
-                    if features.collect_stats:
-                        features.record_cache_operation(
-                            operation="get",
-                            namespace=namespace or "default",
-                            serializer="rust",
-                            success=True,
-                            duration_ms=duration * 1000,
-                            size_bytes=size_bytes,
-                        )
-
-                    # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
-                    # + remaining-freshness bound, as on the async path.
-                    _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
-
-                    # Record L2 hit with latency for cache_info()
-                    duration_ms = duration * 1000
-                    _stats.record_l2_hit(duration_ms)
-
-                    # SWR: stale hit — serve now, revalidate on a daemon thread.
-                    # Gated on _l2_swr_active: without a configured stale window this
-                    # decorator serves the mixed-reader hit but owns no revalidation.
-                    # Not in a child forked without at-fork hooks, where a thread can hang in
-                    # Thread.start(): stale is served until it hard-expires, then a miss recomputes.
-                    if _sync_l2_stale and _l2_swr_active and not l1_cache._forked_without_hooks():
-                        _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
-
-                    return result
-            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                # Both propagate from get_cached_value* and must reach the caller: a
-                # fail-closed tamper failure (raised only when encryption.fail_closed=True;
-                # the metric and error log were recorded there), and a LOCAL keyring config
-                # fault (same contract as the L1 guard above). The generic clause below
-                # would log either as a cache error, count it on the breaker, and recompute
-                # uncached on every call.
-                raise
-            except Exception as e:
-                # Cache GET failed - execute function without caching
-                get_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_get",
-                    cycle=probe_cycle,
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=get_duration_ms,
-                    serializer="rust",
-                )
-                return _uncached_result(func(*args, **kwargs))
-
-            # CACHE MISS - Execute function and cache result
-            # Note: Sync wrappers don't support distributed locking (backend protocol is async-only)
-            # For thundering herd protection, use async decorators instead
-            # Record miss for cache_info()
-            _stats.record_miss()
-
-            # Execute the original function. Its exception is not a backend failure, so it is
-            # never counted, and the function never reruns for it: rerunning it for a BackendError
-            # it raised would repeat its side effects. An admitted HALF_OPEN probe does hand its
-            # slot to the next call instead of holding it until the cycle expires. probe_cycle
-            # confines that to a slot this call took: a call admitted while CLOSED, or by an
-            # ended cycle, gives the current cycle nothing back.
-            try:
-                result = func(*args, **kwargs)
-            except Exception:
-                features.release_probe(probe_cycle)
-                raise
-
-            # Serialize and cache the result. The `set` sample times serialization plus the store,
-            # the same span as the async write: store_result serializes, and the clock stops when it
-            # returns, before the L1 put and the key-registry write.
-            set_start = time.perf_counter()
-            try:
-                # Store using operation handler (pass args/kwargs for tenant extraction)
-                # Returns serialized bytes for L1 cache storage
-                # With write-behind, store_result hands the serialized bytes to the writer instead of writing
-                # them, and the L1 put below follows the hand-off as it follows a write: an invalidation
-                # landing between the two leaves the same state either way.
-                outcome = operation_handler.store_result(
-                    cache_key,
-                    result,
-                    ttl,
-                    args,
-                    kwargs,
-                    stale_ttl=_stale_ttl,
-                    defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
-                )
-                set_duration_ms = (time.perf_counter() - set_start) * 1000
-
-                # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
-                if outcome.stored:
-                    _track_and_record(cache_key)
-
-                # Record successful cache set
-                features.record_success(probe_cycle)
-
-                # A deferred write records its own `set` sample when it lands (_send_deferred).
-                if features.collect_stats and not outcome.deferred:
-                    features.record_cache_operation(
-                        operation="set",
-                        namespace=namespace or "default",
-                        success=True,
-                        duration_ms=set_duration_ms,
-                        serializer="rust",
-                    )
-
-            except (InteropError, KeyringConfigurationError):
-                # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts),
-                # or a LOCAL keyring config fault, which a cold key first hits on this
-                # write (see the L2 read): fail loud, never "computed but silently
-                # never cached".
-                raise
-            except Exception as e:
-                # Caching failed but function succeeded - return result anyway
-                set_duration_ms = (time.perf_counter() - set_start) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_set",
-                    cycle=probe_cycle,
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=set_duration_ms,
-                    serializer="rust",
-                )
-
-            return result
+            return _sync_shared_miss(cache_key, args, kwargs, probe_cycle, twin_key)
 
         finally:
             # The one reset, as in async_wrapper: every exit restores the caller's context here,
             # an interrupt included, which no `except Exception` above sees. A token resets once:
             # a second reset raises RuntimeError, so no path may also reset by hand.
             reset_current_function_stats(token)
+
+    def _sync_shared_miss(
+        cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any], probe_cycle: int, twin_key: str | None
+    ) -> Any:
+        """_sync_call's backed miss: every concurrent miss on this key in this process shares one trip
+        (single_flight), on the async path's terms (see _async_call). The flight key carries the backend's
+        key prefix and, in multi-tenant encryption, the caller's tenant; a caller whose tenant cannot be
+        extracted shares nothing. A joined caller makes no backend request, records no backend outcome,
+        hands its HALF_OPEN probe slot straight back and decodes its own copy of the trip's envelope.
+        Kept out of _sync_call, so a call that ends there (an L1 hit, a breaker rejection) never pays
+        for the closures below.
+        """
+        tenant = "" if _flight_tenant_extractor is None else _flight_tenant(args, kwargs, cache_key)
+        if tenant is None:
+            return _backed_miss_sync(cache_key, args, kwargs, probe_cycle, twin_key)[0]
+        slot_returned = False
+
+        def _return_probe_slot() -> None:
+            nonlocal slot_returned
+            if not slot_returned:
+                slot_returned = True
+                features.release_probe(probe_cycle)
+
+        def _start_trip() -> tuple[Any, bytes | None]:
+            if slot_returned:  # joined a call that was interrupted under it: its slot went back
+                return _own_trip_sync(cache_key, args, kwargs, twin_key)
+            return _backed_miss_sync(cache_key, args, kwargs, probe_cycle, twin_key)
+
+        (result, envelope), joined = _thread_flights.run(
+            (_l2_scope(), tenant, cache_key),
+            _start_trip,
+            functools.partial(_peek_l1, cache_key) if _l1_cache else _found_nothing,
+            _return_probe_slot,
+        )
+        if not joined:
+            return result
+        _return_probe_slot()  # a value the re-check found is shared without a join
+        decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
+        return value if decoded else _own_trip_sync(cache_key, args, kwargs, twin_key)[0]
+
+    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | None]]:
+        """The sync backed flight's re-check (ThreadFlights.run): the L1 entry a trip that settled since
+        the caller's own L1 lookup left, as the envelope a joined caller decodes. Never an L2 read: it
+        runs under the flight map's lock."""
+        assert _l1_cache is not None  # noqa: S101 - passed only with L1 on
+        envelope = _l1_cache.peek(cache_key)
+        return bool(envelope), (None, envelope)
+
+    def _found_nothing() -> tuple[bool, tuple[None, None]]:
+        """The re-check with L1 off: no entry to peek."""
+        return False, (None, None)
+
+    def _own_trip_sync(
+        cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any], twin_key: str | None
+    ) -> tuple[Any, bytes | None]:
+        """_own_trip for a sync function."""
+        cycle = features.admit()
+        if cycle is None:
+            _log_breaker_rejection(cache_key)
+            return _uncached_result(func(*args, **kwargs)), None
+        return _backed_miss_sync(cache_key, args, kwargs, cycle, twin_key)
+
+    def _backed_miss_sync(
+        cache_key: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        probe_cycle: int,
+        twin_key: str | None,
+    ) -> tuple[Any, bytes | None]:
+        """One sync backed-mode trip after an L1 miss: L2 read, function, write. No distributed lock:
+        the backend lock protocol is async-only.
+
+        Returns the value and its serialized envelope, as _backed_miss_async does, so a caller that
+        shared this trip can decode its own copy. The envelope is None when there is none: a hit read
+        through the mmap fast path, a failed L2 read (the function then ran uncached), or a value the
+        store produced no bytes for (the serializer rejected it, it was streamed to the backend, or the
+        write raised). Runs once per concurrent miss on a key in this process (_thread_flights, in
+        _sync_shared_miss).
+        """
+        # Try to get cached value with optional TTL refresh
+        start_time = time.perf_counter()
+        try:
+            refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
+
+            # Use operation handler for all cache access (uses backend internally).
+            # A freshness-capable backend (CachekitIO) always takes the freshness
+            # read — not just when SWR is configured — so every hit carries the
+            # server's staleness label; a stale hit is served
+            # immediately and (with SWR active) revalidated on a background daemon
+            # thread below. The freshness path drops refresh_ttl, which is a
+            # documented no-op on the sync path anyway (StandardCacheHandler.get),
+            # and skips the mmap fast path (CachekitIO is not buffer-readable).
+            _sync_l2_stale = False
+            _sync_l2_fresh_for: int | None = None
+            if _l2_freshness_capable():
+                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, args, kwargs)
+                cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
+            else:
+                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
+
+            duration = time.perf_counter() - start_time
+
+            if cached_result is not None:
+                # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
+                result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
+                features.record_success(probe_cycle)
+
+                # Record cache hit with structured logging
+                features.log_cache_operation(
+                    operation="get",
+                    key=cache_key,
+                    namespace=namespace or "default",
+                    serializer="rust",
+                    duration_ms=duration * 1000,
+                    hit=True,
+                    ttl=ttl,
+                )
+
+                # Also record statistics if enabled
+                if features.collect_stats:
+                    features.record_cache_operation(
+                        operation="get",
+                        namespace=namespace or "default",
+                        serializer="rust",
+                        success=True,
+                        duration_ms=duration * 1000,
+                        size_bytes=size_bytes,
+                    )
+
+                # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
+                # + remaining-freshness bound, as on the async path.
+                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
+
+                # Record L2 hit with latency for cache_info()
+                duration_ms = duration * 1000
+                _stats.record_l2_hit(duration_ms)
+
+                # SWR: stale hit — serve now, revalidate on a daemon thread.
+                # Gated on _l2_swr_active: without a configured stale window this
+                # decorator serves the mixed-reader hit but owns no revalidation.
+                # Not in a child forked without at-fork hooks, where a thread can hang in
+                # Thread.start(): stale is served until it hard-expires, then a miss recomputes.
+                if _sync_l2_stale and _l2_swr_active and not l1_cache._forked_without_hooks():
+                    _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
+
+                return result, cached_data
+        except (DecryptionAuthenticationError, KeyringConfigurationError):
+            # Both propagate from get_cached_value* and must reach the caller: a
+            # fail-closed tamper failure (raised only when encryption.fail_closed=True;
+            # the metric and error log were recorded there), and a LOCAL keyring config
+            # fault (same contract as the L1 guard in _sync_call). The generic clause below
+            # would log either as a cache error, count it on the breaker, and recompute
+            # uncached on every call.
+            raise
+        except Exception as e:
+            # Cache GET failed - execute function without caching
+            get_duration_ms = (time.perf_counter() - start_time) * 1000
+            features.handle_cache_error(
+                error=e,
+                operation="cache_get",
+                cycle=probe_cycle,
+                cache_key=cache_key or "unknown",
+                namespace=namespace or "default",
+                duration_ms=get_duration_ms,
+                serializer="rust",
+            )
+            return _uncached_result(func(*args, **kwargs)), None
+
+        # CACHE MISS - Execute function and cache result. No distributed lock (the backend lock
+        # protocol is async-only), so across processes nothing dedups this run; within this one,
+        # concurrent misses on the key share this trip (_sync_shared_miss).
+        # Record miss for cache_info()
+        _stats.record_miss()
+
+        # Execute the original function. Its exception is not a backend failure, so it is
+        # never counted, and the function never reruns for it: rerunning it for a BackendError
+        # it raised would repeat its side effects. An admitted HALF_OPEN probe does hand its
+        # slot to the next call instead of holding it until the cycle expires. probe_cycle
+        # confines that to a slot this call took: a call admitted while CLOSED, or by an
+        # ended cycle, gives the current cycle nothing back.
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            features.release_probe(probe_cycle)
+            raise
+
+        # Serialize and cache the result. The `set` sample times serialization plus the store,
+        # the same span as the async write: store_result serializes, and the clock stops when it
+        # returns, before the L1 put and the key-registry write.
+        envelope: bytes | None = None  # stays None if the store produced no bytes: nothing to share
+        set_start = time.perf_counter()
+        try:
+            # Store using operation handler (pass args/kwargs for tenant extraction)
+            # Returns serialized bytes for L1 cache storage
+            # With write-behind, store_result hands the serialized bytes to the writer instead of writing
+            # them, and the L1 put below follows the hand-off as it follows a write: an invalidation
+            # landing between the two leaves the same state either way.
+            outcome = operation_handler.store_result(
+                cache_key,
+                result,
+                ttl,
+                args,
+                kwargs,
+                stale_ttl=_stale_ttl,
+                defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
+            )
+            envelope = outcome.envelope
+            set_duration_ms = (time.perf_counter() - set_start) * 1000
+
+            # Also store in L1 cache for fast subsequent access (using serialized bytes)
+            _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
+            if outcome.stored:
+                _track_and_record(cache_key)
+
+            # Record successful cache set
+            features.record_success(probe_cycle)
+
+            # A deferred write records its own `set` sample when it lands (_send_deferred).
+            if features.collect_stats and not outcome.deferred:
+                features.record_cache_operation(
+                    operation="set",
+                    namespace=namespace or "default",
+                    success=True,
+                    duration_ms=set_duration_ms,
+                    serializer="rust",
+                )
+
+        except (InteropError, KeyringConfigurationError):
+            # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts),
+            # or a LOCAL keyring config fault, which a cold key first hits on this
+            # write (see the L2 read): fail loud, never "computed but silently
+            # never cached".
+            raise
+        except Exception as e:
+            # Caching failed but function succeeded - return result anyway
+            set_duration_ms = (time.perf_counter() - set_start) * 1000
+            features.handle_cache_error(
+                error=e,
+                operation="cache_set",
+                cycle=probe_cycle,
+                cache_key=cache_key or "unknown",
+                namespace=namespace or "default",
+                duration_ms=set_duration_ms,
+                serializer="rust",
+            )
+
+        return result, envelope
 
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -2684,18 +2804,10 @@ def create_cache_wrapper(
             # the caller's tenant: callers never share another prefix's or tenant's trip, value or
             # exception. A caller whose tenant cannot be extracted shares nothing. The join comes
             # after admission and backend resolution: a joined caller makes no backend request,
-            # records no backend outcome and hands its HALF_OPEN probe slot straight back.
-            tenant: str | None = ""
-            if _flight_tenant_extractor is not None:
-                try:
-                    tenant = _flight_tenant_extractor.extract(args, kwargs)
-                except Exception as e:
-                    _logger.debug(
-                        "Tenant not extracted for %s, so its miss is not shared: %s",
-                        redact_cache_key(cache_key),
-                        redact_error_for_log(e),
-                    )
-                    tenant = None
+            # records no backend outcome, hands its HALF_OPEN probe slot straight back and decodes
+            # its own copy of the trip's envelope (_decode_shared). The sync path does the same
+            # (_sync_shared_miss).
+            tenant = "" if _flight_tenant_extractor is None else _flight_tenant(args, kwargs, cache_key)
             if tenant is None:
                 return (await _backed_miss_async(cache_key, args, kwargs, probe_cycle, twin_key))[0]
             admitted_cycle, slot_returned = probe_cycle, False
@@ -2714,25 +2826,8 @@ def create_cache_wrapper(
             (result, envelope), joined = await _flights.run((_l2_scope(), tenant, cache_key), _start_trip, _return_probe_slot)
             if not joined:
                 return result
-            # A joined caller decodes its own copy of the trip's envelope, as an L1 hit would: every
-            # backed-mode caller gets its own object, and the decrypt checks bind to this caller's
-            # tenant. Without an envelope, or when it does not decode for this caller, it takes its
-            # own trip, unshared: its probe slot went back on joining, so it is admitted afresh.
-            if envelope is not None:
-                try:
-                    value = operation_handler.serialization_handler.deserialize_data(envelope, cache_key, args, kwargs)
-                except KeyringConfigurationError:
-                    raise  # a LOCAL keyring config fault: see the L1 guard above
-                except Exception as e:
-                    _logger.debug(
-                        "Shared miss envelope not decoded for %s, taking its own trip: %s",
-                        redact_cache_key(cache_key),
-                        redact_error_for_log(e),
-                    )
-                else:
-                    _stats.record_l1_hit()
-                    return value
-            return (await _own_trip(cache_key, args, kwargs, twin_key))[0]
+            decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
+            return value if decoded else (await _own_trip(cache_key, args, kwargs, twin_key))[0]
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
@@ -2797,9 +2892,9 @@ def create_cache_wrapper(
         """One async backed-mode trip after an L1 miss: L2 read, distributed lock, function, write.
 
         Returns the value and its serialized envelope (None when there is none: a failed
-        serialization, an mmap-path hit, a lock release that failed after the body), so a caller
-        that shared this trip can decode its own copy. Runs once per concurrent miss on a key in
-        this process (_flights, in async_wrapper).
+        serialization, or a lock release that failed after the locked work finished; the async L2
+        read has no mmap fast path), so a caller that shared this trip can decode its own copy. Runs
+        once per concurrent miss on a key in this process (_flights, in _async_call).
         """
         assert _backend is not None  # noqa: S101 - async_wrapper resolves it before any trip
         # Try to get from Redis cache (always measure time for L2 latency tracking)

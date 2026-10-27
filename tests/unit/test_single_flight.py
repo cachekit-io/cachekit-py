@@ -2,10 +2,12 @@
 
 Without this, every caller that missed a key ran the function: in L1-only mode and under
 ``@cache.local()`` on the cold path and past ``ttl``, and in backed mode, where each caller also
-made its own L2 read and waited on the distributed lock, which dedups only across processes.
+made its own L2 read and, when async, waited on the distributed lock, which dedups only across
+processes.
 
-Async: ``@cache(backend=None)``, ``@cache.local()`` and backed mode. Sync: ``@cache(backend=None)``
-and ``@cache.local()``; the sync backed path takes no lock and is not coalesced.
+Async and sync alike: ``@cache(backend=None)``, ``@cache.local()`` and backed mode. The sync backed
+path takes no distributed lock, so across processes nothing dedups it; within one, its misses share
+one trip as the async ones do.
 
 Semantics pinned here: a joined caller gets the starter's object in L1-only mode and under
 ``@cache.local()``, and its own decoded copy in backed mode. It counts as an L1 hit in
@@ -38,14 +40,14 @@ from cachekit.config.nested import L1CacheConfig
 from cachekit.decorators import single_flight
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
 from cachekit.decorators.tenant_context import ContextVarExtractor
-from cachekit.l1_cache import get_l1_cache_manager
+from cachekit.l1_cache import L1Cache, get_l1_cache_manager
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitState
 
 pytestmark = pytest.mark.unit
 
 HERD = 20
 ASYNC_MODES = ("l1_only", "local", "backed")
-SYNC_MODES = ("l1_only", "local")
+SYNC_MODES = ("l1_only", "local", "backed")
 
 _scope: contextvars.ContextVar[str] = contextvars.ContextVar("_scope", default="")
 MASTER_KEY = "61" * 32
@@ -811,8 +813,13 @@ def test_sync_cold_herd_runs_the_function_once(mode: str, waiting: list[int]) ->
 
     assert runs == 1
     assert results == [{"x": 1}] * HERD
-    assert all(r is results[0] for r in results)
-    assert (after.misses - before.misses, after.hits - before.hits) == (1, HERD - 1)
+    if mode == "backed":
+        assert len({id(r) for r in results}) == HERD  # each caller decodes its own copy, as an L1 hit does
+    else:
+        assert all(r is results[0] for r in results)
+    # cache_info(): the call that ran the function is the miss; every joined caller is an L1 hit.
+    assert after.misses - before.misses == 1
+    assert (after.hits - before.hits, after.l1_hits - before.l1_hits, after.l2_hits - before.l2_hits) == (HERD - 1, HERD - 1, 0)
 
 
 @pytest.mark.parametrize("mode", SYNC_MODES)
@@ -829,12 +836,254 @@ def test_sync_failure_raises_in_every_caller_and_pins_nothing(mode: str, waiting
             raise error
         return {"x": x}
 
+    before = compute.cache_info()
     results = _thread_herd(compute)
+    after = compute.cache_info()
 
     assert runs == 1
     assert all(r is error for r in results)
-    assert compute(1) == {"x": 1}
+    # cache_info(): one miss, and a joined caller of a call that raised counts as neither.
+    assert (after.misses - before.misses, after.hits - before.hits) == (1, 0)
+    assert compute(1) == {"x": 1}  # nothing was cached, and the key is free: the next call runs the function
     assert runs == 2
+
+
+def test_sync_backed_herd_makes_one_trip(waiting: list[int]) -> None:
+    """The 19 joined threads make no backend request: the herd costs what one call costs."""
+
+    def compute(x: int) -> dict[str, int]:
+        _until(lambda: waiting[0] == HERD - 1)  # every other thread joined this call
+        return {"x": x}
+
+    single_backend = _Backend()
+    assert _decorator("backed", single_backend)(lambda x: {"x": x})(1) == {"x": 1}
+    backend = _Backend()
+    results = _thread_herd(_decorator("backed", backend)(compute))
+
+    assert results == [{"x": 1}] * HERD
+    assert backend.requests == single_backend.requests == ["get", "set"]  # no lock: the sync path takes none
+
+
+def test_sync_backed_recheck_shares_a_value_a_trip_stored_after_the_callers_l1_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trip that settles between a caller's L1 lookup and its flight lookup left its envelope in
+    L1: the caller decodes that and makes no backend request. Another caller's call is made here,
+    on the same thread, just before the caller looks for a call in flight."""
+    runs = 0
+
+    def compute(x: int) -> dict[str, int]:
+        nonlocal runs
+        runs += 1
+        return {"x": x}
+
+    backend = _Backend()
+    fn = _decorator("backed", backend)(compute)
+    real_run = ThreadFlights.run
+    lookups = 0
+
+    def run_after_another_trip(self: ThreadFlights, *args: Any) -> Any:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            assert fn(1) == {"x": 1}  # another caller's trip, start to finish
+        return real_run(self, *args)
+
+    monkeypatch.setattr(ThreadFlights, "run", run_after_another_trip)
+    before = fn.cache_info()
+    assert fn(1) == {"x": 1}
+    after = fn.cache_info()
+
+    assert runs == 1
+    assert backend.requests == ["get", "set"]  # the other trip's: the re-check found its L1 entry
+    assert (after.misses - before.misses, after.l1_hits - before.l1_hits, after.l2_hits - before.l2_hits) == (1, 1, 0)
+
+
+def test_sync_backed_recheck_with_l1_off_takes_its_own_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With L1 off there is nothing to re-check under the flight map's lock: the caller reads L2 itself."""
+    runs = 0
+
+    def compute(x: int) -> dict[str, int]:
+        nonlocal runs
+        runs += 1
+        return {"x": x}
+
+    backend = _Backend()
+    fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"sf-{uuid.uuid4().hex}")(compute)
+    real_run = ThreadFlights.run
+    lookups = 0
+
+    def run_after_another_trip(self: ThreadFlights, *args: Any) -> Any:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            assert fn(1) == {"x": 1}
+        return real_run(self, *args)
+
+    monkeypatch.setattr(ThreadFlights, "run", run_after_another_trip)
+    assert fn(1) == {"x": 1}
+    assert runs == 1
+    assert backend.requests == ["get", "set", "get"]  # its own L2 read hit what the other trip stored
+
+
+def test_sync_backed_flight_identity_carries_the_backend_key_prefix() -> None:
+    """Two concurrent calls on one cache key under two key prefixes are two trips."""
+    both_in = threading.Barrier(2, timeout=2)  # breaks if the scopes shared one call
+
+    def compute(x: int) -> str:
+        both_in.wait()
+        return _scope.get()
+
+    fn = _decorator("backed", _ScopedBackend())(compute)
+    results: dict[str, str] = {}
+
+    def under(scope: str) -> None:
+        _scope.set(scope)  # each thread runs in a context of its own
+        results[scope] = fn(1)
+
+    threads = [threading.Thread(target=under, args=(scope,)) for scope in ("t:a:", "t:b:")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert results == {"t:a:": "t:a:", "t:b:": "t:b:"}
+
+
+def test_sync_backed_flight_identity_carries_the_tenant_in_multi_tenant_encryption() -> None:
+    """With a context tenant the cache key has no tenant: two tenants never share a call, its value or its error."""
+    extractor = ContextVarExtractor()
+    both_in = threading.Barrier(2, timeout=2)  # breaks if the tenants shared one call
+
+    def compute(x: int) -> str:
+        both_in.wait()
+        tenant = extractor.extract((), {})
+        if x == 2:
+            raise RuntimeError(f"failed for {tenant}")
+        return tenant
+
+    fn = cache.secure(
+        master_key=MASTER_KEY, backend=_Backend(), ttl=60, namespace=f"sf-{uuid.uuid4().hex}", tenant_extractor=extractor
+    )(compute)
+
+    def herd_of_two(x: int) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+
+        def as_tenant(tenant: str) -> None:
+            ContextVarExtractor.set_tenant_id(tenant)
+            try:
+                results[tenant] = fn(x)
+            except RuntimeError as e:
+                results[tenant] = str(e)
+
+        threads = [threading.Thread(target=as_tenant, args=(tenant,)) for tenant in (TENANT_A, TENANT_B)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        return results
+
+    assert herd_of_two(1) == {TENANT_A: TENANT_A, TENANT_B: TENANT_B}
+    assert herd_of_two(2) == {TENANT_A: f"failed for {TENANT_A}", TENANT_B: f"failed for {TENANT_B}"}
+
+
+def test_sync_joined_callers_leave_no_half_open_probe_slot_spent(
+    live_breakers: list[CircuitBreaker], waiting: list[int]
+) -> None:
+    """A joined thread hands its probe slot back before it waits: the herd leaves the slots one call
+    leaves. The threads join one at a time, so no admission races another's hand-back."""
+    release = threading.Event()
+    runs = 0
+
+    def compute(x: int) -> dict[str, int]:
+        nonlocal runs
+        runs += 1
+        release.wait(5)
+        return {"x": x}
+
+    single_fn = _decorator("backed")(lambda x: {"x": x})
+    herd_fn = _decorator("backed")(compute)
+    single_breaker, herd_breaker = live_breakers
+    results: list[Any] = [None] * HERD
+
+    def worker(i: int) -> None:
+        results[i] = herd_fn(1)
+
+    with time_machine.travel(1_000_000.0, tick=False) as clock:
+        for breaker in live_breakers:
+            for _ in range(breaker.config.failure_threshold):
+                breaker.record_failure()
+            assert breaker.state == CircuitState.OPEN
+        clock.shift(timedelta(seconds=single_breaker.config.timeout_seconds + 1))
+
+        assert single_fn(1) == {"x": 1}
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(HERD)]
+        threads[0].start()
+        _until(lambda: runs == 1)
+        for i in range(1, HERD):
+            threads[i].start()
+            _until(lambda i=i: waiting[0] == i)  # joined, so its slot is back before the next admission
+        release.set()
+        for t in threads:
+            t.join(5)
+
+        assert runs == 1  # no caller was rejected past the budget and run uncached
+        assert results == [{"x": 1}] * HERD
+        assert herd_breaker.state == single_breaker.state == CircuitState.HALF_OPEN
+        assert _free_probe_slots(herd_breaker) == _free_probe_slots(single_breaker) > 0
+
+
+def test_sync_joined_callers_take_their_own_trip_after_an_mmap_hit(tmp_path: Any, waiting: list[int]) -> None:
+    """A hit read through the sync mmap fast path leaves no envelope to share: each joined caller then
+    takes its own trip and reads L2 itself, as it would have alone. Nothing runs the function again."""
+    pd = pytest.importorskip("pandas")
+    from cachekit.backends.file import FileBackend
+    from cachekit.backends.file.config import FileBackendConfig
+
+    class _HoldingFileBackend(FileBackend):
+        """Counts the hits read through the mmap, and holds the first until every other caller joined it."""
+
+        def __init__(self, config: FileBackendConfig) -> None:
+            super().__init__(config)
+            self.mmap_hits: list[int] = []
+            self.holding = False
+            self.all_joined = False
+
+        def get_buffer(self, key: str) -> Any:
+            handle = super().get_buffer(key)
+            if handle is not None:
+                self.mmap_hits.append(1)
+                if self.holding and len(self.mmap_hits) == 1:
+                    # Not _until: a raise in here would be read as a failed L2 read, not a test failure.
+                    deadline = time.monotonic() + 5
+                    while waiting[0] < HERD - 1 and time.monotonic() < deadline:
+                        time.sleep(0.005)
+                    self.all_joined = waiting[0] == HERD - 1
+            return handle
+
+    runs = 0
+    frame = pd.DataFrame({"x": [1, 2, 3]})
+
+    def compute(x: int) -> Any:
+        nonlocal runs
+        runs += 1
+        return frame.copy()
+
+    backend = _HoldingFileBackend(FileBackendConfig(cache_dir=tmp_path))
+    fn = cache(backend=backend, serializer="arrow", ttl=60, namespace=f"sf-{uuid.uuid4().hex}")(compute)
+    fn(1)  # stored: a plaintext Arrow value streams to the File backend, so L1 holds nothing
+    assert (runs, backend.mmap_hits) == (1, [])
+    backend.holding = True
+    before = fn.cache_info()
+
+    results = _thread_herd(fn)
+    after = fn.cache_info()
+
+    assert backend.all_joined  # the first read was the trip every other caller joined
+    assert runs == 1
+    for result in results:
+        pd.testing.assert_frame_equal(result, frame)
+    assert len(backend.mmap_hits) == HERD  # the shared trip's read, then one per joined caller
+    assert (after.l2_hits - before.l2_hits, after.l1_hits - before.l1_hits) == (HERD, 0)
 
 
 @pytest.mark.parametrize("mode", SYNC_MODES)
@@ -884,6 +1133,45 @@ def test_sync_read_after_invalidation_does_not_join_an_earlier_miss(mode: str) -
         release.set()
         t.join(5)
     assert first == [1]
+
+
+def test_sync_read_after_invalidation_does_not_join_a_trip_that_started_during_it() -> None:
+    """A sync trip that read the old L2 entry while the delete ran is forgotten once the delete is done."""
+    version = 100
+
+    def compute(x: int) -> int:
+        return version
+
+    backend = _RacingDeleteBackend()
+    fn = cache(backend=backend, ttl=60, l1_enabled=False, namespace=f"sf-{uuid.uuid4().hex}")(compute)
+    assert fn(1) == 100
+
+    version = 200
+    invalidation = threading.Thread(target=fn.invalidate_cache, args=(1,))
+    invalidation.start()
+    during: list[int] = []
+    after: list[int] = []
+    threads = [invalidation]
+    try:
+        assert backend.deleting.wait(5)
+        backend.hold_reads = True
+        threads.append(threading.Thread(target=lambda: during.append(fn(1))))  # reads the old entry, then is held in flight
+        threads[-1].start()
+        _until(lambda: backend.reads_held == 1)
+        backend.finish_delete.set()
+        invalidation.join(5)
+        assert not invalidation.is_alive()
+
+        threads.append(threading.Thread(target=lambda: after.append(fn(1))))
+        threads[-1].start()
+        _until(lambda: backend.reads_held == 2)  # its own read: it did not join the trip that read the old entry
+    finally:
+        backend.finish_delete.set()
+        backend.release_reads.set()
+        for t in threads:
+            t.join(5)
+    assert after == [200]
+    assert during == [100]  # it overlapped the invalidation
 
 
 @pytest.mark.parametrize("mode", SYNC_MODES)
@@ -1033,6 +1321,51 @@ async def test_async_flights_keep_out_a_call_that_ran_past_a_forget_before_its_i
         loop.set_task_factory(None)
         release.set()
     assert await first == ("old", False)
+
+
+def test_l1_peek_reads_an_entry_without_counting_it_or_moving_it() -> None:
+    """The backed re-check's L1 read: the caller's own lookup already counted its miss."""
+    l1 = L1Cache(namespace=f"sf-{uuid.uuid4().hex}")
+    l1.put("a", b"A", redis_ttl=60)
+    l1.put("b", b"B", redis_ttl=60)
+    stats = l1.get_stats()
+
+    assert (l1.peek("a"), l1.peek("missing")) == (b"A", None)
+    assert (l1.get_stats()["hits"], l1.get_stats()["misses"]) == (stats["hits"], stats["misses"])
+    assert list(l1._state.cache) == ["a", "b"]  # pyright: ignore[reportPrivateUsage] - not moved in LRU order
+
+    l1.put("old", b"O", expires_at=time.time() - 1)
+    assert l1.peek("old") is None  # expired reads as absent
+
+
+def test_thread_flights_on_join_runs_once_per_join_before_the_caller_waits(waiting: list[int]) -> None:
+    """The starter never calls it; a joiner calls it before it blocks; a re-check hit shares without it."""
+    flights = ThreadFlights()
+    held = threading.Event()
+    gate = threading.Event()
+    joins: list[int] = []
+
+    def call() -> str:
+        held.set()
+        gate.wait(5)
+        return "v"
+
+    starter = threading.Thread(target=lambda: flights.run(("k",), call, lambda: (False, None), lambda: joins.append(1)))
+    starter.start()
+    assert held.wait(5)
+    result: list[tuple[str, bool]] = []
+    joiner = threading.Thread(
+        target=lambda: result.append(flights.run(("k",), call, lambda: (False, None), lambda: joins.append(2)))
+    )
+    joiner.start()
+    _until(lambda: waiting[0] == 1)
+    assert joins == [2]  # before it blocked on the call
+    gate.set()
+    starter.join(5)
+    joiner.join(5)
+    assert result == [("v", True)]
+    assert flights.run(("k",), call, lambda: (True, "stored"), lambda: joins.append(3)) == ("stored", True)
+    assert joins == [2]
 
 
 def test_thread_flights_recheck_finds_a_value_stored_after_the_callers_lookup() -> None:

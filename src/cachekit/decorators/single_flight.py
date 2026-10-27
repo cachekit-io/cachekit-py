@@ -234,12 +234,20 @@ class ThreadFlights(_FlightMap[_Flight]):
 
     __slots__ = ()
 
-    def run(self, key: FlightKey, call: Callable[[], _T], recheck: Callable[[], tuple[bool, _T]]) -> tuple[_T, bool]:
+    def run(
+        self,
+        key: FlightKey,
+        call: Callable[[], _T],
+        recheck: Callable[[], tuple[bool, _T]],
+        on_join: Callable[[], object] | None = None,
+    ) -> tuple[_T, bool]:
         """Wait for ``key``'s call in flight, or start it: ``(value, shared)``.
 
         ``shared`` is True when another caller's call produced the value. ``call`` must store its
         value where ``recheck`` finds it before returning. ``recheck`` runs under the map's lock
-        when no call is in flight, and must neither block nor call back into this map.
+        when no call is in flight, and must neither block nor call back into this map. ``on_join``
+        runs each time a caller joins a call in flight, before it waits; a value ``recheck`` found
+        is shared without it.
         """
         mine: _Flight | None = None
         try:
@@ -257,6 +265,8 @@ class ThreadFlights(_FlightMap[_Flight]):
                         break
                 if flight.owner == threading.get_ident():
                     return call(), False  # re-entered from inside its own call, which would wait on itself
+                if on_join is not None:
+                    on_join()
                 with flight.settled:  # blocks until the call settles
                     pass
                 if flight.ok:
