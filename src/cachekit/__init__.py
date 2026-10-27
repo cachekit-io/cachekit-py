@@ -66,6 +66,17 @@ Example Usage:
     health = custom_function.get_health_status()
     full_health = custom_function.check_health()
     ```
+
+Names in the examples:
+The examples in cachekit's docstrings carry no literal keys. They use these names, which you bind
+from your own secret store before running one:
+
+- ``secret_key``: a master key as ``@cache.secure`` takes it, 64 hex characters (32 bytes), for example
+  ``secret_key = os.environ["CACHEKIT_MASTER_KEY"]``. Generate one once with ``openssl rand -hex 32``.
+- ``old_secret_key``: a retired master key, kept decrypt-only during key rotation.
+- ``secret_key_bytes`` and ``old_secret_key_bytes``: the same keys as raw bytes, as ``EncryptionWrapper``
+  takes them, for example ``secret_key_bytes = bytes.fromhex(secret_key)``.
+- ``api_key``: a cachekit.io API key, for example ``api_key = os.environ["CACHEKIT_API_KEY"]``.
 """
 
 __version__ = "0.24.1"

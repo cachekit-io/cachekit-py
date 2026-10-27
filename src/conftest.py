@@ -1,7 +1,8 @@
 """Names the docstring examples under src/cachekit use for their keys.
 
 Docstrings feed the generated API reference, so no example carries a literal key: each reads one of these
-names instead. Test values only. markdown fences get the same secret_key from docs/conftest.py.
+names instead. Test values only. markdown fences get the same secret_key from docs/conftest.py. The cachekit
+package docstring tells readers what each name holds: add a name there when you add one here.
 """
 
 import pytest
