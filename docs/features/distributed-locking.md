@@ -41,22 +41,22 @@ report = await get_report("2025-01-15")
 > [!NOTE]
 > Locking requires **both** of:
 >
-> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call ([in-process single-flight](#in-process-single-flight-before-the-lock)).
+> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call, sync or async ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
 
 ---
 
 ## In-Process Single-Flight (Before the Lock)
 
-Concurrent misses on one key inside one process share one call. The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In async backed mode the shared call is the whole trip after the L1 miss (the L2 read, the lock, the function and the write), so a herd in one process costs one trip and the lock only has to dedup across processes. It is always on and costs no round trip. The exception is a trip that leaves no serialized value to share: a value the serializer rejects, a hit read through the mmap fast path, or a lock release that failed after the write. Each joined caller then takes its own trip once the first one ends, so that herd costs one trip per caller, as it did before.
+Concurrent misses on one key inside one process share one call. The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In backed mode the shared call is the whole trip after the L1 miss: the L2 read, the lock (async functions only, see [Async-only](#async-only-sync-functions-are-never-lock-protected)), the function and the write. A herd in one process costs one trip, so the lock only has to dedup across processes. It is always on and costs no round trip. The exception is a trip that leaves no serialized value to share. On either path that is a value the serializer rejects. On the async path it is also a lock release that failed after the locked work finished. On the sync path it is also a hit read through the mmap fast path, or a value streamed to the backend. A backend that is down does not count: its failed read is a miss and its failed write still leaves the serialized value, so the herd shares that trip. Each joined caller then takes its own trip once the first one ends. That herd costs one trip per caller, as it did before, but a joined caller waits for the first trip before it starts its own.
 
 | Mode | Sync | Async | A caller that joins gets |
 |------|------|-------|--------------------------|
 | `@cache(backend=None)` (L1-only) | Yes | Yes | The starter's object, as a later hit does |
 | `@cache.local()` | Yes | Yes | The starter's object, as a later hit does |
-| Backed (`@cache` with a backend, `@cache.io`, `@cache.secure`, ...) | No | Yes | Its own copy, decoded from the starter's serialized value, as an L1 hit does |
+| Backed (`@cache` with a backend, `@cache.io`, `@cache.secure`, ...) | Yes | Yes | Its own copy, decoded from the starter's serialized value, as an L1 hit does |
 
-The sync backed path is not coalesced: each sync caller that misses reads L2 and runs the function (see [Async-only](#async-only-sync-functions-are-never-lock-protected)).
+Sync callers share a call across the threads of one process; async callers share one across the tasks of one event loop. The sync backed path takes no distributed lock, so its trip dedups misses within a process only (see [Async-only](#async-only-sync-functions-are-never-lock-protected)).
 
 - **Failure.** If the call raises, every caller waiting on it gets that exception, nothing is cached, and the next call starts a new one.
 - **Cancellation.** Cancelling an async caller (a timeout, a dropped client) cancels only its own wait: the call runs on for the callers still waiting. Once every waiting caller is cancelled, the call is cancelled too, and the last caller returns once it has unwound, as an unshared call would. A joined caller whose shared call was cancelled under it (the function raised `CancelledError`), without being cancelled itself, runs its own call, as it would have alone.
@@ -66,7 +66,7 @@ The sync backed path is not coalesced: each sync caller that misses reads L2 and
 - **Circuit breaker.** A joined caller makes no backend request and records no outcome. In HALF_OPEN it hands its probe slot straight back, so a herd spends one probe.
 - **Event loops.** Async callers share a call only on the event loop running it; a caller on another thread's loop runs its own.
 - **Task and context.** Every async miss runs the function in its own task, a lone caller's miss included, in a copy of the starting caller's context. A context variable the function sets is not visible to its caller afterwards. Anything scoped by `asyncio.current_task()` binds to that short-lived task, not to the caller's: SQLAlchemy's `async_scoped_session(scopefunc=current_task)`, used inside the function, creates a new session per miss, which the caller's `remove()` at the end of its request never cleans up. Pass such resources in as arguments, or scope them by a context variable instead.
-- **Waiting on yourself.** A call that misses its own key again from inside itself runs that inner call on its own instead of waiting on itself: a recursive call, a call through other cached functions (`a(1)` awaiting `b(1)`, which awaits `a(1)`), and, in async code, a call from a task it starts, until the call ends. Anything else that waits on its own key's call never returns: a function must not wait on a thread it starts that calls it with the same arguments, and two calls must not miss each other's keys at once (`a(1)` awaiting `b(1)` while another caller's `b(1)` awaits `a(1)`).
+- **Waiting on yourself.** A call that misses its own key again from inside itself runs that inner call on its own instead of waiting on itself: a recursive call, a call through other cached functions (`a(1)` awaiting `b(1)`, which awaits `a(1)`), and, in async code, a call from a task it starts, until the call ends. In async backed mode that inner call still asks for the distributed lock its own outer trip holds: it waits up to `blocking_timeout` (5 s), logs "Failed to acquire lock", and then runs. Anything else that waits on its own key's call never returns: a sync function must not wait on a thread it starts that calls it with the same arguments (an async function called from that thread runs on that thread's own event loop, so it returns), two calls must not miss each other's keys at once (`a(1)` awaiting `b(1)` while another caller's `b(1)` awaits `a(1)`), and a sync caller must not hold a lock the function itself takes, such as an application lock, or the import lock of a module whose top level calls the function while the function imports that module. A caller that joins the call waits for it while still holding that lock.
 
 ---
 
@@ -75,10 +75,12 @@ The sync backed path is not coalesced: each sync caller that misses reads L2 and
 The `LockableBackend` protocol is async-only (`acquire_lock` is an async context
 manager), so **only async decorated functions get distributed locking**. The sync
 wrapper executes the function directly on cache miss — on every backend, including
-Redis and CachekitIO — and its backed path has no in-process single-flight either.
-Twelve concurrent sync callers on a cold key mean twelve recomputes and zero lock
-traffic; the same probe through the async wrapper means exactly one recompute, one
-L2 read and one lock request.
+Redis and CachekitIO — with no lock. Inside one process, concurrent sync misses on a
+key still share one trip ([in-process single-flight](#in-process-single-flight-before-the-lock)):
+twelve threads on a cold key mean one L2 read, one recompute and one write. Across
+processes nothing dedups them: twelve processes that each miss the key at once mean
+twelve recomputes and zero lock traffic, where the async wrapper means one recompute,
+with the others waiting on the lock.
 
 If a function is expensive enough that a stampede matters, decorate the async
 variant:
