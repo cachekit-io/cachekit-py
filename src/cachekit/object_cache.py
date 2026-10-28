@@ -7,6 +7,7 @@ cross process boundaries or survive restarts, with no serialization or network r
 
 from __future__ import annotations
 
+import heapq
 import math
 import os
 import random
@@ -67,18 +68,24 @@ class _Entry:
 
 
 class _ObjectCacheState:
-    """The entries, their byte total, their in-flight refresh markers, and the lock guarding all three.
+    """The entries, their byte total, their expiry heap, their in-flight refresh markers, and the lock guarding them.
 
     One object so the at-fork hook can replace all of it with a single attribute store: a thread
     still inside a critical section finishes on the state it bound. The stats and the generation
     counter stay on the cache, so a swap keeps them.
     """
 
-    __slots__ = ("lock", "refreshing", "size_bytes", "store")
+    __slots__ = ("expiry", "lock", "refreshing", "size_bytes", "store")
 
     def __init__(self) -> None:
         self.store: OrderedDict[str, _Entry] = OrderedDict()
         self.size_bytes = 0
+        # Min-heap of (expires_at, key), one per stored or refreshed deadline, so the over-bound
+        # eviction finds expired entries without scanning the store. Deletion is lazy: a removal or a
+        # refresh leaves the old tuple behind. A tuple is live while its key holds an entry with that
+        # deadline, and every entry's current deadline has one, so a dead tuple is safe to drop.
+        # push() rebuilds the heap from the store once dead tuples outnumber live entries.
+        self.expiry: list[tuple[float, str]] = []
         # In-flight refresh ownership: key -> owning generation. A refresh captures the entry's
         # generation at read time and only lands — or clears/cancels its marker — for that exact
         # generation, so a stale refresh from a replaced entry can neither resurrect data nor
@@ -102,13 +109,46 @@ class _ObjectCacheState:
         self.size_bytes -= entry.size_bytes
         self.refreshing.pop(key, None)
 
+    def push(self, key: str, entry: _Entry) -> None:
+        """Record a stored entry's deadline in the expiry heap; call with lock held, after the store write.
+
+        A rebuild from the store drops the dead tuples once they outnumber the live entries. It costs
+        O(n) in the entries left, and it at least halves the heap, so it amortises to O(1) per push.
+        """
+        if len(self.expiry) >= 2 * len(self.store):
+            self.expiry = [(e.expires_at, k) for k, e in self.store.items()]
+            heapq.heapify(self.expiry)
+        else:
+            heapq.heappush(self.expiry, (entry.expires_at, key))
+
+    def remove_expired(self, now: float) -> None:
+        """Remove every entry whose deadline has passed; call with lock held.
+
+        Pops heap tuples only while the earliest deadline is due, so when nothing has expired it
+        returns after one comparison. Each due tuple costs O(log n). A due tuple is dead when its key
+        holds no entry with that deadline, as a replaced or refreshed entry leaves behind; it is dropped.
+        """
+        heap = self.expiry
+        while heap and heap[0][0] <= now:
+            expires_at, key = heapq.heappop(heap)
+            entry = self.store.get(key)
+            if entry is not None and entry.expires_at == expires_at:
+                self.remove(key)
+
 
 class ObjectCache:
     """Thread-safe in-memory cache storing Python object references directly.
 
     Uses an OrderedDict for O(1) LRU ordering. On a put() when a bound is
-    exceeded, expired entries are swept first; if still over, the oldest fresh
-    entries are evicted (LRU).
+    exceeded, expired entries are removed first; if still over, the oldest fresh
+    entries are evicted (LRU). A min-heap of deadlines finds the expired entries,
+    so a put at capacity costs O(log n) per expired entry it removes and does not
+    scan for expired entries. The heap is memory the byte bound does not
+    count: about 64 to 72 bytes per entry (one 2-tuple and its list slot on 64-bit
+    CPython), plus the tuples of removed or refreshed entries. Once those
+    outnumber the live ones, the put that finds it rebuilds the heap: an O(n)
+    pause once per about n puts at capacity, against a full scan on every one
+    before the heap.
 
     Bounds (at least one required):
     - max_entries: entry-count bound (default 256, pass None to disable)
@@ -373,6 +413,7 @@ class ObjectCache:
             entry.size_bytes = size
             entry.refresh_failed_at = None  # success ends any retry back-off
             s.store.move_to_end(key)
+            s.push(key, entry)  # the old deadline's tuple is now dead
             # New value may be larger — restore the byte bound by evicting LRU others
             self._evict(s, extra_bytes=0, need_slot=False)
             return True
@@ -418,7 +459,9 @@ class ObjectCache:
         """Store a value in the cache.
 
         When a bound is exceeded:
-        1. Expired entries are removed first.
+        1. Expired entries are removed first, wherever they sit in LRU order.
+           The expiry heap finds them, so no entry is scanned to look for them; the one
+           put in about n that rebuilds the heap makes one pass over the entries.
         2. If still over, the oldest (LRU) fresh entries are evicted.
 
         A value whose estimated size exceeds the entire byte budget is never
@@ -454,9 +497,10 @@ class ObjectCache:
 
             now = time.monotonic()
             self._generation += 1
-            s.store[key] = _Entry(value=value, expires_at=now + ttl, cached_at=now, size_bytes=size, generation=self._generation)
+            entry = _Entry(value=value, expires_at=now + ttl, cached_at=now, size_bytes=size, generation=self._generation)
+            s.store[key] = entry  # a new key appends at the MRU end, so no move_to_end
             s.size_bytes += size
-            # No move_to_end needed — OrderedDict.__setitem__ appends new keys to end
+            s.push(key, entry)
 
     def delete(self, key: str) -> bool:
         """Remove a single entry from the cache.
@@ -488,6 +532,7 @@ class ObjectCache:
         with s.lock:
             s.store.clear()
             s.size_bytes = 0
+            s.expiry.clear()
             s.refreshing.clear()
 
     # ------------------------------------------------------------------
@@ -540,7 +585,8 @@ class ObjectCache:
         Must be called with s.lock held.
 
         Strategy:
-        1. If any bound is exceeded, remove all expired entries first.
+        1. If any bound is exceeded, remove all expired entries first, popping them off the
+           expiry heap: one comparison when none has expired, never a scan of the store.
         2. While still over a bound, evict the oldest (LRU) fresh entry.
 
         Args:
@@ -558,11 +604,7 @@ class ObjectCache:
         if not over_bounds():
             return
 
-        # Sweep expired entries first
-        now = time.monotonic()
-        expired_keys = [k for k, e in s.store.items() if now >= e.expires_at]
-        for k in expired_keys:
-            s.remove(k)
+        s.remove_expired(time.monotonic())
 
         # Still over a bound — evict the least-recently-used fresh entries
         while s.store and over_bounds():

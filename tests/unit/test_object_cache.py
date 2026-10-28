@@ -12,6 +12,7 @@ import threading
 import time
 import types
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
@@ -127,6 +128,124 @@ class TestObjectCacheTTL:
         found_b, _ = oc.get("b")
         assert found_a is False
         assert found_b is False
+
+    def test_put_evicts_expired_entry_deep_in_lru_order_before_live_head(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An expired entry read just before it expired sits at the MRU end; it still goes before the live LRU head."""
+        fake = _fake_clock(monkeypatch)
+        oc = ObjectCache(max_entries=3)
+        oc.put("head", "H", ttl=100)
+        oc.put("short", "S", ttl=10)  # expires at 1010
+        oc.put("mid", "M", ttl=100)
+        assert oc.get("short")[0] is True  # LRU order now: head, mid, short
+
+        fake.monotonic = lambda: 1015.0
+        oc.put("new", "N", ttl=100)
+
+        assert oc.peek("head")[0] is True
+        assert oc.peek("short")[0] is False
+        assert oc.size == 3
+
+    def test_put_at_capacity_scans_no_entry_when_none_has_expired(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A put that evicts while every entry is fresh looks only at the earliest deadline, not at each entry."""
+        _fake_clock(monkeypatch)
+        oc = ObjectCache(max_entries=100)
+        scans = []
+
+        class Store(OrderedDict):
+            def items(self):
+                scans.append("items")
+                return super().items()
+
+            def values(self):
+                scans.append("values")
+                return super().values()
+
+        oc._state.store = Store()
+        for i in range(100):
+            oc.put(f"k{i}", i, ttl=600)
+        scans.clear()
+
+        for i in range(100, 150):
+            oc.put(f"k{i}", i, ttl=600)  # each evicts the LRU head
+
+        assert scans == []
+        assert oc.size == 100
+        assert oc.peek("k49")[0] is False and oc.peek("k50")[0] is True
+
+    def test_refreshed_entry_is_not_evicted_at_its_old_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A refresh moves the deadline, so the heap tuple of the old one must not remove the live entry."""
+        fake = _fake_clock(monkeypatch)
+        oc = ObjectCache(max_entries=2, swr_threshold_ratio=0.5)
+        oc.put("k", "v1", ttl=10)  # expires at 1010
+        oc.put("other", "o", ttl=100)
+
+        fake.monotonic = lambda: 1006.0
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh
+        assert oc.complete_refresh("k", version, "v2", ttl=10) is True  # expires at 1016; LRU: other, k
+
+        fake.monotonic = lambda: 1012.0  # past the old deadline only
+        oc.put("new", "n", ttl=100)
+
+        assert oc.peek("k") == (True, "v2")
+        assert oc.peek("other")[0] is False  # the LRU head went, as for any live entries
+        assert _consistent(oc)
+
+    def test_replaced_entry_is_not_evicted_at_the_old_entrys_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A put over a key leaves the old entry's heap tuple behind; when it comes due it must not remove the new entry."""
+        fake = _fake_clock(monkeypatch)
+        oc = ObjectCache(max_entries=2)
+        oc.put("k", "v1", ttl=10)  # expires at 1010
+        oc.put("other", "o", ttl=100)
+        oc.put("k", "v2", ttl=10)  # same deadline, second tuple; LRU: other, k
+
+        fake.monotonic = lambda: 1005.0
+        oc.put("k", "v3", ttl=100)  # expires at 1105
+        fake.monotonic = lambda: 1012.0
+        oc.put("new", "n", ttl=100)
+
+        assert oc.peek("k") == (True, "v3")
+        assert oc.peek("other")[0] is False
+
+    def test_complete_refresh_over_the_byte_bound_evicts_expired_before_lru(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A refresh that grows its value restores the byte bound through the same expired-first eviction."""
+        fake = _fake_clock(monkeypatch)
+        small, large = "x" * 100, "x" * 1000
+        budget = _estimate_object_size(large) + 2 * _estimate_object_size(small)
+        oc = ObjectCache(max_entries=None, max_size_bytes=budget, swr_threshold_ratio=0.5)
+        oc.put("live", small, ttl=100)  # the LRU head
+        oc.put("short", small, ttl=10)  # expires at 1010
+        oc.put("k", small, ttl=20)
+        assert oc.get("short")[0] is True  # LRU order now: live, k, short
+
+        fake.monotonic = lambda: 1011.0
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=20)
+        assert needs_refresh
+        assert oc.complete_refresh("k", version, large, ttl=20) is True
+
+        assert oc.peek("live")[0] is True
+        assert oc.peek("short")[0] is False
+        assert oc.size_bytes <= budget
+
+    def test_expiry_heap_stays_bounded_at_capacity(self) -> None:
+        """Every put at capacity leaves a dead heap tuple; the heap is rebuilt before it outgrows the entries twice over.
+
+        The hot entry is read after every put, so it stays out of LRU reach while its tuple, the
+        earliest deadline, holds the heap top: dead tuples pile up behind it until a rebuild.
+        """
+        oc = ObjectCache(max_entries=50)
+        oc.put("hot", "h", ttl=600)
+        longest = 0
+        for i in range(1000):
+            oc.put(f"k{i}", i, ttl=600)
+            assert oc.get("hot")[0] is True
+            longest = max(longest, len(oc._state.expiry))
+            assert len(oc._state.expiry) <= 2 * oc.size
+        assert longest == 2 * oc.size  # the heap reached its bound and was rebuilt there, never passing it
+        assert _consistent(oc)
+
+        oc.clear()
+        assert oc._state.expiry == []
 
 
 @pytest.mark.unit
@@ -707,10 +826,11 @@ class TestObjectCacheRefreshRetryBackoff:
 
 
 def _consistent(oc: ObjectCache) -> bool:
-    """Whether the byte total and the in-flight refresh markers agree with the entries."""
+    """Whether the byte total, the expiry heap and the in-flight refresh markers agree with the entries."""
     s = oc._state
     sized = s.size_bytes == sum(entry.size_bytes for entry in s.store.values())
-    return sized and all(key in s.store and s.store[key].generation == g for key, g in s.refreshing.items())
+    tracked = {(e.expires_at, k) for k, e in s.store.items()} <= set(s.expiry)
+    return sized and tracked and all(key in s.store and s.store[key].generation == g for key, g in s.refreshing.items())
 
 
 @pytest.mark.unit
