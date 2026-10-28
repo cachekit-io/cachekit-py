@@ -573,7 +573,7 @@ jobs:
           --skip serializer_arrow_usgs --skip serializer_auto_usgs --report "$RUNNER_TEMP/ir-report-${{ matrix.shard }}.json"
 
     # The verdict, PASS or FAIL, for perf-ir-report, or the placeholder if the gate wrote none.
-    - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       if: always()
       with:
         name: perf-ir-report-${{ matrix.shard }}
