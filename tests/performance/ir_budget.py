@@ -112,6 +112,7 @@ PATHS = (
     "byte_storage_store_40b",
     "byte_storage_store_64k",
     "file_set",
+    "object_cache_put_full",
 )
 
 # ── gate ────────────────────────────────────────────────────────────────────────────────────

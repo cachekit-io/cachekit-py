@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 FILE_SET_ENTRIES = 1000
+OBJECT_CACHE_ENTRIES = 10_000
 # ByteStorage.store() inputs. 40 B is under cachekit-core's 64 B literals-only LZ4 threshold, which
 # every serializer path's input clears (the smallest, serializer_default's msgpack, is 79 B). The
 # 64 KiB input is address-like text, so the encoder finds many short matches rather than one run.
@@ -149,6 +150,19 @@ def build_workload(path: str) -> Callable[[], object]:
         for i in range(FILE_SET_ENTRIES):
             backend.set(f"entry:{i}", payload)
         return lambda: backend.set("entry:0", payload)
+
+    if path == "object_cache_put_full":
+        # ObjectCache.put() of a new key into a full byte budget, as an L1-only miss stores its result
+        # once the budget holds OBJECT_CACHE_ENTRIES fresh entries: each put evicts the LRU head.
+        import itertools
+
+        from cachekit.object_cache import ObjectCache, _estimate_object_size
+
+        oc = ObjectCache(max_entries=None, max_size_bytes=OBJECT_CACHE_ENTRIES * _estimate_object_size(value))
+        keys = itertools.count()
+        for _ in range(OBJECT_CACHE_ENTRIES):
+            oc.put(f"entry:{next(keys)}", value, ttl=3600)  # pinned clocks never reach the deadline
+        return lambda: oc.put(f"entry:{next(keys)}", value, ttl=3600)
 
     if path in BYTE_STORAGE_PAYLOADS:
         # ByteStorage.store() alone: LZ4, xxHash3-64 and the envelope, with no serializer around it.
