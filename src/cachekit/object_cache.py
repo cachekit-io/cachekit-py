@@ -142,8 +142,8 @@ class ObjectCache:
     Uses an OrderedDict for O(1) LRU ordering. On a put() when a bound is
     exceeded, expired entries are removed first; if still over, the oldest fresh
     entries are evicted (LRU). A min-heap of deadlines finds the expired entries,
-    so a put at capacity costs O(log n) per expired entry it removes and does no
-    scan when nothing has expired. The heap is memory the byte bound does not
+    so a put at capacity costs O(log n) per expired entry it removes and does not
+    scan for expired entries. The heap is memory the byte bound does not
     count: about 64 to 72 bytes per entry (one 2-tuple and its list slot on 64-bit
     CPython), plus the tuples of removed or refreshed entries. Once those
     outnumber the live ones, the put that finds it rebuilds the heap: an O(n)
@@ -460,7 +460,8 @@ class ObjectCache:
 
         When a bound is exceeded:
         1. Expired entries are removed first, wherever they sit in LRU order.
-           The expiry heap finds them, so no entry is scanned when none has expired.
+           The expiry heap finds them, so no entry is scanned to look for them; the one
+           put in about n that rebuilds the heap makes one pass over the entries.
         2. If still over, the oldest (LRU) fresh entries are evicted.
 
         A value whose estimated size exceeds the entire byte budget is never
