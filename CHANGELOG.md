@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.25.0](https://github.com/cachekit-io/cachekit-py/compare/v0.24.1...v0.25.0) (2026-10-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** `cachekit.config.nested.CircuitBreakerConfig.validate()`, which `DecoratorConfig` runs, now raises `ConfigurationError`, and `cachekit.reliability.CircuitBreakerConfig` (exported as the top-level `cachekit.CircuitBreakerConfig`) now raises `ValueError`, unless each of `failure_threshold`, `success_threshold` and `half_open_requests` is an int or a NumPy integer scalar, not a bool, and >= 1. Before, the decorator config refused a count only when `value < 1` and the top-level class only when `value <= 0`, so these used to pass and are now refused: a float such as `5.0` (in the top-level class also `0.5`), a `Decimal` such as `Decimal(5)`, a `Fraction` such as `Fraction(5)` (in the top-level class also `Fraction(1, 2)`), a bool, a NumPy bool scalar, NaN, inf, a `np.timedelta64`, and a 0-d or one-element NumPy array; pass an int. `recovery_timeout` / `timeout_seconds` must now be an int, a float, a `Fraction` or a NumPy integer or float scalar, not a bool, finite and > 0; a bool, a NumPy bool scalar, a `Decimal`, a 0-d or one-element NumPy array, and a `np.timedelta64` that is unitless or in `ns`, `M` or `Y` units, which passed before when positive and finite, are now refused (a timedelta in other units, or `NaT`, used to raise `TypeError` and now raises the class's error). `BackpressureConfig.validate()` now refuses a 0-d integer NumPy array, which passed before, for `max_concurrent_requests`, `queue_size` and `timeout`, and an object with `__index__` that is not a `numbers.Integral` for all three.
+* `cachekit.monitoring.CircuitBreakerProtocol` now requires a `get_stats() -> dict` method instead of the `state`, `failure_count`, `success_count` and `last_failure_time` properties. The dict holds `state` (the upper-case state name: `"CLOSED"`, `"OPEN"` or `"HALF_OPEN"`), `failure_count`, `success_count` and `last_failure_time` (epoch seconds of the last counted failure, `0.0` before the first). `HealthChecker` reads a circuit breaker only through `get_stats()`, and a state it does not recognise now reports UNHEALTHY instead of falling through to HEALTHY. `cachekit.reliability.CircuitBreaker` already implements the method. `BackpressureConfig.queue_size` and `timeout` now take effect. `BackpressureConfig.validate()`, which `DecoratorConfig` runs, raises `ConfigurationError` when `max_concurrent_requests` or `queue_size` is not a whole number >= 1 (a bool, a float or NaN included), or when `timeout` is not an int or float from 0 to `threading.TIMEOUT_MAX` (None, a str, a bool, a `Decimal`, a `Fraction` or NaN included). Those `queue_size` and `timeout` values were previously accepted and ignored, and such a `max_concurrent_requests` was accepted and disabled the limit.
+
+### Features
+
+* **build:** publish a free-threaded CPython 3.15 wheel (LAB-10969) ([#638](https://github.com/cachekit-io/cachekit-py/issues/638)) ([c9794b4](https://github.com/cachekit-io/cachekit-py/commit/c9794b4fe03e5a5d9a7f6e612c58656db46bcac1))
+* **build:** publish CPython 3.15 wheels (LAB-10967) ([#633](https://github.com/cachekit-io/cachekit-py/issues/633)) ([2f9a661](https://github.com/cachekit-io/cachekit-py/commit/2f9a6612fc1a732279dc36177d7e8bae98288824))
+* **decorators:** opt-in write_behind returns a miss before its L2 write lands (LAB-7161) ([#623](https://github.com/cachekit-io/cachekit-py/issues/623)) ([cbf4e85](https://github.com/cachekit-io/cachekit-py/commit/cbf4e85e0bbaadd026a5e22491c2773ca26ef7f9))
+* **decorators:** share one trip for concurrent sync backed misses (LAB-8457) ([#655](https://github.com/cachekit-io/cachekit-py/issues/655)) ([258bd77](https://github.com/cachekit-io/cachekit-py/commit/258bd7785c6933af4d0af46189bde89d50759ae5))
+* drop Python 3.10 support, require &gt;=3.11 (LAB-10968) ([#637](https://github.com/cachekit-io/cachekit-py/issues/637)) ([2911337](https://github.com/cachekit-io/cachekit-py/commit/2911337c0cd662616cb4a62eea1696f0ba1b1b64))
+
+
+### Bug Fixes
+
+* **config:** name the accepted types in the timeout messages (LAB-10984) ([#634](https://github.com/cachekit-io/cachekit-py/issues/634)) ([4188c1c](https://github.com/cachekit-io/cachekit-py/commit/4188c1ce427833657ea2c7145aab4acee774a34e))
+* **config:** refuse non-whole circuit-breaker thresholds and non-numeric timeouts (LAB-10531) ([#631](https://github.com/cachekit-io/cachekit-py/issues/631)) ([c87f83b](https://github.com/cachekit-io/cachekit-py/commit/c87f83b22930db9391243ab0110c76e4ea5e1ff8))
+* **deps:** floor filelock at 4.2.1 on Python 3.11+ for pip-audit (LAB-10807) ([#629](https://github.com/cachekit-io/cachekit-py/issues/629)) ([234e3e2](https://github.com/cachekit-io/cachekit-py/commit/234e3e2a822186de5dbb6c7cecc1ed27b91e855c))
+* **make:** remove the pytest base temp after a passing test run (LAB-11059) ([#642](https://github.com/cachekit-io/cachekit-py/issues/642)) ([2e7443e](https://github.com/cachekit-io/cachekit-py/commit/2e7443e1c82ce1639d75f299ca02a79c580011b4))
+* **perf:** wake the instruction-budget gate's wait so a signal is never slept through (LAB-10970) ([#641](https://github.com/cachekit-io/cachekit-py/issues/641)) ([f930482](https://github.com/cachekit-io/cachekit-py/commit/f930482512bc43a1133376ed57cc305ecf27afda))
+* **readme:** replace the unmeasured performance figures with measured ones (LAB-10638) ([#622](https://github.com/cachekit-io/cachekit-py/issues/622)) ([9d00c5e](https://github.com/cachekit-io/cachekit-py/commit/9d00c5ece33af57b98111629373b0f7d63831fdd))
+* **redis:** replace deprecated setex with set(ex=) (LAB-11029) ([#651](https://github.com/cachekit-io/cachekit-py/issues/651)) ([6b18341](https://github.com/cachekit-io/cachekit-py/commit/6b18341490079b0a6ea770589d2f7bc76e5ac067))
+* **redis:** run on redis-py 8: invalidation listener and RESP3 error-frame tests (LAB-10979) ([fcd7f27](https://github.com/cachekit-io/cachekit-py/commit/fcd7f2724484ce05cc52fb6440bb60bd0afa3225))
+* **security:** make security-medium mirror the Security Medium workflow (LAB-10606) ([#621](https://github.com/cachekit-io/cachekit-py/issues/621)) ([60c5182](https://github.com/cachekit-io/cachekit-py/commit/60c5182a92c161a8c311027ce845e3b1c767de89))
+* **serializers:** count empty collections toward the nesting bound; the guard's ValueError replaces msgpack's StackError (LAB-6485) ([#618](https://github.com/cachekit-io/cachekit-py/issues/618)) ([39320e5](https://github.com/cachekit-io/cachekit-py/commit/39320e5218aaac21a25ec56c2c01c1bf779d3f59))
+* six defects in health checks, backpressure wiring and serializer and breaker docs (LAB-10106) ([#615](https://github.com/cachekit-io/cachekit-py/issues/615)) ([a46c9c1](https://github.com/cachekit-io/cachekit-py/commit/a46c9c168bea6cb133c380191ec03588d38ba83b))
+
+
+### Performance Improvements
+
+* **decorators:** memoise generated keys and serve L1-only hits on a fast path (LAB-10663) ([#625](https://github.com/cachekit-io/cachekit-py/issues/625)) ([75440ff](https://github.com/cachekit-io/cachekit-py/commit/75440ffec434bc5b21ceb31b1243eb800dc9c54a))
+* **deps:** bump cachekit-core to 0.7.2 (LAB-11012) ([#654](https://github.com/cachekit-io/cachekit-py/issues/654)) ([0b8aa83](https://github.com/cachekit-io/cachekit-py/commit/0b8aa83d51a15049aff38180b52cf29d49bb8e55))
+* **deps:** update cachekit-core to 0.7.1 (LAB-10985) ([#636](https://github.com/cachekit-io/cachekit-py/issues/636)) ([c8ddc7d](https://github.com/cachekit-io/cachekit-py/commit/c8ddc7d92267721dbccb76ba833452854cd8e1c9))
+* **encryption:** precompute the AAD prefix and bind the keyring to the tenant (LAB-7126) ([#644](https://github.com/cachekit-io/cachekit-py/issues/644)) ([986ed04](https://github.com/cachekit-io/cachekit-py/commit/986ed047233b142db17eb534db83e42c58de1636))
+* **encryption:** read decrypt ciphertext from any buffer without a bytes() copy (LAB-7127) ([#647](https://github.com/cachekit-io/cachekit-py/issues/647)) ([ffa8cc0](https://github.com/cachekit-io/cachekit-py/commit/ffa8cc079e6fb566f2fd3e5d07f9b50761c024a8))
+
 ## [0.24.1](https://github.com/cachekit-io/cachekit-py/compare/v0.24.0...v0.24.1) (2026-10-21)
 
 
