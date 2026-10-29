@@ -368,6 +368,58 @@ def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
     return callable(getattr(cls, "track_key", None)) and callable(getattr(cls, "drain_tracked", None))
 
 
+def _fuses_tracked_write(backend: object) -> bool:
+    """Whether the backend writes a value and its registry entry in one call: a private ``_set_tracked``,
+    found on the CLASS as ``supports_key_tracking`` finds ``track_key``.
+
+    Only while the instance resolves ``set`` and ``track_key`` to the functions in the owner's
+    ``_set_tracked_replaces``, as plain methods bound to the backend itself. An override, patch, wrapper or
+    delegation anywhere (a subclass, the class itself, the instance, ``__getattribute__``, a proxy) keeps
+    both calls, so it still runs on every write. An SWR-capable backend keeps ``set`` too: the fused write
+    has no slot for a stale-grace window.
+    """
+    owner = next((klass for klass in type(backend).__mro__ if "_set_tracked" in vars(klass)), None)
+    if owner is None or not supports_key_tracking(backend) or supports_swr(backend):  # pyright: ignore[reportArgumentType]
+        return False
+    replaces = vars(owner).get("_set_tracked_replaces", {})
+    for name in ("set", "track_key"):
+        func = replaces.get(name)  # None when the owner records nothing for it: nothing to match
+        bound = getattr(backend, name, None)
+        if func is None or type(bound) is not types.MethodType:  # a wrapper or proxy (wrapt, APM) must run: not fused
+            return False
+        if bound.__func__ is not func or bound.__self__ is not backend:  # another function, or another backend's
+            return False
+    return True
+
+
+def _set_l2(
+    handler: Any,
+    key: str,
+    value: bytes,
+    ttl: int | None,
+    stale_ttl: int | None,
+    registry_id: str | None,
+    on_track_error: Callable[[str, Exception], None],
+) -> tuple[bool, bool]:
+    """A buffered L2 write through ``handler``: (stored, tracked).
+
+    With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
+    (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
+    False and the caller tracks a stored key itself. getattr: custom CacheHandlerStrategy impls predate
+    set_tracked, as they predate set_streaming.
+    """
+    set_tracked = None if registry_id is None else getattr(handler, "set_tracked", None)
+    if set_tracked is not None:
+        stored = set_tracked(key, value, ttl, registry_id, on_track_error)
+        if stored is not None:
+            return stored, True
+    # Only thread the SWR kwarg when set: strategy implementations without
+    # **metadata (tests, custom handlers) must keep working unchanged.
+    if stale_ttl is not None:
+        return bool(handler.set(key, value, ttl, stale_ttl=stale_ttl)), False
+    return bool(handler.set(key, value, ttl)), False
+
+
 class _MultiDeleteBackend(Protocol):
     """Internal: a backend that deletes many keys in one multi-key call (the backend may split
     it into several sends; Memcached sends per server, 1,000 keys a send).
@@ -1628,11 +1680,14 @@ class StoreOutcome(NamedTuple):
     envelope cannot say: a buffered write whose backend set failed still has an envelope, and
     a successful stream has none. Key tracking follows stored, L1 follows envelope. deferred says the
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
+    tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
+    already reported: the caller must not track the key again.
     """
 
     envelope: Optional[bytes]
     stored: bool
     deferred: bool = False
+    tracked: bool = False
 
 
 class CacheOperationHandler:
@@ -2056,6 +2111,8 @@ class CacheOperationHandler:
         kwargs: dict[str, Any] | None = None,
         stale_ttl: int | None = None,
         defer: Callable[[bytes], bool] | None = None,
+        registry_id: str | None = None,
+        on_track_error: Callable[[str, Exception], None] = lambda _key, _error: None,
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
@@ -2069,6 +2126,10 @@ class CacheOperationHandler:
                 the backend write; True means it took the write (StoreOutcome.deferred), False that it
                 refused and the write runs here. Serialization stays here either way, so its errors
                 reach the caller as without it; the streaming path never defers.
+            registry_id: Key registry to record a stored key in, in the same round trip as the buffered
+                write when the handler can (``set_tracked``; StoreOutcome.tracked). None writes only.
+            on_track_error: Called with the key and the error when that registry write fails; the write
+                still counts as stored.
 
         Returns:
             StoreOutcome. envelope: serialized bytes when the buffered path produced them
@@ -2111,17 +2172,14 @@ class CacheOperationHandler:
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
-            # Only thread the SWR kwarg when set: strategy implementations without
-            # **metadata (tests, custom handlers) must keep working unchanged.
-            if stale_ttl is not None:
-                stored = self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
-            else:
-                stored = self._cache_handler.set(cache_key, serialized_data, ttl)
+            stored, tracked = _set_l2(
+                self._cache_handler, cache_key, serialized_data, ttl, stale_ttl, registry_id, on_track_error
+            )
             if stored:
                 get_logger().cache_stored(cache_key, ttl)
 
             # The envelope goes to L1 even when the backend write failed (L1 serves it only within the per-entry share)
-            return StoreOutcome(envelope=serialized_data, stored=bool(stored))
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored), tracked=tracked)
         except (InteropError, KeyringConfigurationError):
             # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts), or
             # a LOCAL keyring config fault, which a cold key first hits here, on the
@@ -2494,6 +2552,36 @@ class StandardCacheHandler:
             get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
+    def set_tracked(
+        self,
+        key: str,
+        value: bytes,
+        ttl: Optional[int],
+        registry_id: str,
+        on_track_error: Callable[[str, Exception], None],
+    ) -> Optional[bool]:
+        """``set`` plus the key-registry write (``KeyTrackableBackend.track_key``), in one backend round trip.
+
+        Returns:
+            None when the backend cannot fuse the two: the caller falls back to ``set``, then its own
+            ``track_key``, as for ``set_streaming``. Otherwise what ``set`` returns: whether the value
+            was stored. A registry write that fails after a stored value goes to ``on_track_error`` with
+            the key, and the value still counts as stored.
+        """
+        if not _fuses_tracked_write(self.backend):
+            return None
+        try:
+            track_error = self._with_backpressure_and_timeout(self.backend._set_tracked, key, value, ttl, registry_id)  # type: ignore[attr-defined]
+        except BackendError as e:
+            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+            return False
+        except Exception as e:
+            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+            return False
+        if track_error is not None:
+            on_track_error(key, track_error)
+        return True
+
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
         """Stream a value to a streaming-writable backend.
 
@@ -2616,6 +2704,35 @@ class StandardCacheHandler:
         except Exception as e:
             get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
+
+    async def set_tracked_async(
+        self,
+        key: str,
+        value: bytes,
+        ttl: Optional[int],
+        registry_id: str,
+        on_track_error: Callable[[str, Exception], None],
+    ) -> Optional[bool]:
+        """Async variant of :meth:`set_tracked`: the write and its registry entry in one thread-pool hop."""
+        if not _fuses_tracked_write(self.backend):
+            return None
+        try:
+            track_error = await self._with_backpressure_and_timeout_async(
+                self.backend._set_tracked,  # type: ignore[attr-defined]
+                key,
+                value,
+                ttl,
+                registry_id,
+            )
+        except BackendError as e:
+            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+            return False
+        except Exception as e:
+            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+            return False
+        if track_error is not None:
+            on_track_error(key, track_error)
+        return True
 
     async def delete_async(self, key: str) -> bool:
         """Delete key from cache asynchronously using backend.

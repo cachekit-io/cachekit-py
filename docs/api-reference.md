@@ -360,11 +360,12 @@ orchestrator = FeatureOrchestrator(
 These components work behind the scenes to provide reliability features:
 
 #### `AsyncMetricsCollector`
-Non-blocking metrics collection system that prevents performance degradation:
-- Queue-based collection with overflow protection
-- Background thread processing
+Metrics collection kept off the shared hot path:
+- Cache operations record into per-thread cells, which the Prometheus series sum when scraped: a record takes no
+  shared lock, and a scrape counts every operation recorded before it
+- Generic counters and histograms record synchronously, or queue for a background worker once a collector is busy,
+  with overflow protection
 - Self-healing worker thread management
-- Zero impact on critical path latency
 
 #### `get_cached_redis_client()`
 Thread-local Redis client caching (`cachekit.backends.redis.client`):

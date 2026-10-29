@@ -28,6 +28,7 @@ from ..cache_handler import (
     L2MissProbe,
     StandardCacheHandler,
     TenantResolutionError,
+    _set_l2,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
@@ -1306,23 +1307,40 @@ def create_cache_wrapper(
         try:
             _backend.track_key(_registry_id, cache_key)  # type: ignore[union-attr]
         except Exception as e:
-            failures = _track_warn.claim()
-            if not failures:
-                _logger.debug("Key tracking failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
-                return
-            _logger.warning(
-                "Key tracking failed in registry %s (failures since the last warning: %d); other processes' "
-                "drains miss those keys until their TTL. Latest key %s: %s",
-                redact_cache_key(_registry_id),
-                failures,
-                redact_cache_key(cache_key),
-                redact_error_for_log(e),
-            )
+            _warn_track_failure(cache_key, e)
+
+    def _warn_track_failure(cache_key: str, e: Exception) -> None:
+        """Report a failed key-registry write: _track_and_record's, or one fused with the L2 write (set_tracked)."""
+        failures = _track_warn.claim()
+        if not failures:
+            _logger.debug("Key tracking failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+            return
+        _logger.warning(
+            "Key tracking failed in registry %s (failures since the last warning: %d); other processes' "
+            "drains miss those keys until their TTL. Latest key %s: %s",
+            redact_cache_key(_registry_id),
+            failures,
+            redact_cache_key(cache_key),
+            redact_error_for_log(e),
+        )
 
     async def _track_and_record_async(cache_key: str) -> None:
         """_track_and_record off the event loop, skipping the thread hop when nothing tracks."""
         if _is_trackable():
             await asyncio.to_thread(_track_and_record, cache_key)
+
+    async def _set_l2_async(cache_key: str, serialized_data: bytes) -> tuple[bool, bool]:
+        """An async miss's L2 write: (stored, tracked). Where the handler can (set_tracked_async), the
+        key-registry write rides in the same round trip and thread hop, and tracked is True; otherwise the
+        caller tracks a stored key itself (_track_and_record_async)."""
+        handler = operation_handler.cache_handler
+        # Asked first: a backend without a registry never pays for the probe. Custom strategies predate set_tracked_async.
+        set_tracked_async = getattr(handler, "set_tracked_async", None) if _is_trackable() else None
+        if set_tracked_async is not None:
+            stored = await set_tracked_async(cache_key, serialized_data, ttl, _registry_id, _warn_track_failure)
+            if stored is not None:
+                return stored, True
+        return await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl), False  # type: ignore[union-attr]
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
@@ -1826,15 +1844,15 @@ def create_cache_wrapper(
         the backend write alone, the caller having serialized.
         """
         start = time.perf_counter()
-        if _stale_ttl is not None:
-            stored = handler.set(cache_key, envelope, ttl, stale_ttl=_stale_ttl)
-        else:
-            stored = handler.set(cache_key, envelope, ttl)
+        # Trackable first: a backend without a registry never pays for set_tracked's probe.
+        registry_id = _registry_id if _is_trackable() else None
+        stored, tracked = _set_l2(handler, cache_key, envelope, ttl, _stale_ttl, registry_id, _warn_track_failure)
         duration_ms = (time.perf_counter() - start) * 1000
         if stored:
             get_logger().cache_stored(cache_key, ttl)
             _record(cache_key, twin)
-            _track_and_record(cache_key)
+            if not tracked:
+                _track_and_record(cache_key)
         else:
             _warn_deferred_write(cache_key, "the backend refused or failed the write (logged above)")
         if features.collect_stats:
@@ -2551,6 +2569,8 @@ def create_cache_wrapper(
             # With write-behind, store_result hands the serialized bytes to the writer instead of writing
             # them, and the L1 put below follows the hand-off as it follows a write: an invalidation
             # landing between the two leaves the same state either way.
+            # Asked once, before the write: a backend without a registry never pays for set_tracked's probe.
+            trackable = _is_trackable()
             outcome = operation_handler.store_result(
                 cache_key,
                 result,
@@ -2559,13 +2579,15 @@ def create_cache_wrapper(
                 kwargs,
                 stale_ttl=_stale_ttl,
                 defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
+                registry_id=_registry_id if trackable else None,
+                on_track_error=_warn_track_failure,
             )
             envelope = outcome.envelope
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
             _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
-            if outcome.stored:
+            if outcome.stored and trackable and not outcome.tracked:
                 _track_and_record(cache_key)
 
             # Record successful cache set
@@ -3125,17 +3147,12 @@ def create_cache_wrapper(
                             )
 
                             # Store in Redis with TTL
-                            stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                                cache_key,
-                                serialized_data,
-                                ttl=ttl,
-                                stale_ttl=_stale_ttl,
-                            )
+                            stored, tracked = await _set_l2_async(cache_key, serialized_data)
                             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
                             _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-                            if stored:
+                            if stored and not tracked:
                                 await _track_and_record_async(cache_key)
 
                             # Record successful cache set
@@ -3249,19 +3266,14 @@ def create_cache_wrapper(
             # Write-behind (unlocked path only: the locked path's write must land inside its lock, or
             # waiters re-read before L2 holds the value and recompute). A refusal writes here, as without it.
             deferred = _write_behind is not None and _defer_write(cache_key, twin_key, serialized_data)
-            stored = False  # a deferred write is not stored yet: the writer tracks it once it lands
+            stored = tracked = False  # a deferred write is not stored yet: the writer tracks it once it lands
             if not deferred:
-                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                    cache_key,
-                    serialized_data,
-                    ttl=ttl,
-                    stale_ttl=_stale_ttl,
-                )
+                stored, tracked = await _set_l2_async(cache_key, serialized_data)
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
             _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-            if stored:
+            if stored and not tracked:
                 await _track_and_record_async(cache_key)
 
             # Record successful cache set

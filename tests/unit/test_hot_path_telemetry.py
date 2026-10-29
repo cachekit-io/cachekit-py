@@ -218,3 +218,15 @@ def test_prometheus_private_attributes_the_series_cache_reads(kind):
     child = metric.labels(a="x", b=1)
     metric.clear()
     assert metric._metrics.get(child._labelvalues) is None
+
+    # The per-thread path swaps these values for views and bisects the bounds; it records directly unless the value
+    # class is MutexValue.
+    from prometheus_client import values
+
+    assert values.ValueClass is values.MutexValue
+    if kind == "Counter":
+        assert isinstance(child._value, values.MutexValue)
+    else:
+        assert isinstance(child._sum, values.MutexValue)
+        assert all(isinstance(b, values.MutexValue) for b in child._buckets)
+        assert len(child._buckets) == len(child._upper_bounds) and child._upper_bounds[-1] == float("inf")

@@ -36,6 +36,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -474,6 +475,35 @@ class _FakeRedis:
                 return 0
             del self._store[name]
             return 1
+
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:
+        return _FakePipeline(self)
+
+
+class _FakePipeline:
+    """The fused tracked write's pipeline over ``_FakeRedis``: SET runs, and the key registry's commands,
+    which the fake does not model, reply with an error, so tracking fails as it does without a pipeline."""
+
+    def __init__(self, fake: _FakeRedis) -> None:
+        self._fake = fake
+        self._queued: list[Any] = []
+
+    def set(self, name: str, value: bytes, ex: int | None = None) -> _FakePipeline:
+        self._queued.append(lambda: self._fake.set(name, value, ex=ex))
+        return self
+
+    def sadd(self, *_args: Any) -> _FakePipeline:
+        self._queued.append(lambda: redis.exceptions.ResponseError("unknown command"))
+        return self
+
+    expire = sadd
+
+    def execute(self, raise_on_error: bool = True) -> list[Any]:
+        replies = [command() for command in self._queued]
+        error = next((reply for reply in replies if isinstance(reply, Exception)), None)
+        if raise_on_error and error is not None:
+            raise error
+        return replies
 
 
 async def _entered(event: threading.Event, what: str) -> None:

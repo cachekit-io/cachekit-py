@@ -152,11 +152,14 @@ def test_default_max_value_size_has_a_finite_size_bucket() -> None:
     assert SIZE_BUCKETS_BYTES[-1] >= CachekitConfig.model_fields["max_value_size"].default
 
 
-def test_malformed_batched_record_is_skipped_alone() -> None:
-    # One record the flush cannot compare must not cost the batch's other observations.
+@pytest.mark.parametrize("sync_mode", [True, False], ids=["sync", "batched"])
+def test_malformed_record_raises_and_costs_no_other_observation(sync_mode: bool) -> None:
+    # Cache operations record on the caller's thread in both modes, so a duration that cannot be compared reaches the
+    # caller, after the count and before any observation, as sync mode always did. Later records are unaffected.
     namespace = f"buckets-malformed-{uuid.uuid4().hex}"
-    collector = AsyncMetricsCollector(sync_mode=False, auto_detect_mode=False)
-    collector.record_cache_operation("get", namespace, True, "invalid", serializer="rust", size_bytes=4)  # type: ignore[arg-type]
+    collector = AsyncMetricsCollector(sync_mode=sync_mode, auto_detect_mode=False)
+    with pytest.raises(TypeError):
+        collector.record_cache_operation("get", namespace, True, "invalid", serializer="rust", size_bytes=4)  # type: ignore[arg-type]
     collector.record_cache_operation("get", namespace, True, 55.0, serializer="rust", size_bytes=300)
     collector.shutdown()
 
@@ -165,4 +168,4 @@ def test_malformed_batched_record_is_skipped_alone() -> None:
     assert _samples(DURATION, namespace)[("cache_operation_duration_ms_sum", labels)] == 55.0
     assert _samples(SIZE, namespace)[("cache_operation_size_bytes_count", labels)] == 1
     counter = _metrics_cache["cache_operations_total"]
-    assert counter.labels(operation="get", namespace=namespace, success="True", serializer="rust")._value.get() == 1
+    assert counter.labels(operation="get", namespace=namespace, success="True", serializer="rust")._value.get() == 2
