@@ -76,7 +76,6 @@ if TYPE_CHECKING:
 # it chooses its decoder by inspecting the bytes.
 CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
 
-
 # Uncompressed Arrow IPC alignment: the body follows the File header, the CK frame
 # prefix and ArrowSerializer's 8-byte xxHash3-64 checksum; 64 is Arrow's recommended alignment.
 _ARROW_IPC_ALIGN = 64
