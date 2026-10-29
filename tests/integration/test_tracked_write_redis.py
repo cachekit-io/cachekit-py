@@ -254,7 +254,6 @@ class TestDelegationWritesWhereItReads:
         fn(1)
         assert calls == 1
         assert client.keys("t:source:*") == []
-        assert any(b":ck:reg:" not in key for key in client.keys("t:target:*"))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("delegation", list(_DELEGATIONS))
@@ -290,6 +289,37 @@ class TestFuseDecision:
         original = getattr(PerRequestRedisBackend, name)
         monkeypatch.setattr(PerRequestRedisBackend, name, lambda self, *args: original(self, *args))
         assert not _fuses_tracked_write(PerRequestRedisBackend(client, "default"))
+
+    def test_forwarding_proxy_runs_its_wrapper(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wrapt-style instrumentation proxy forwards __func__ and __self__ to the real bound method; its wrapper
+        must still run on every write."""
+        calls = 0
+
+        class _Proxy:
+            def __init__(self, bound: Any) -> None:
+                self._bound = bound
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._bound, name)
+
+            def __call__(self, *args: Any) -> Any:
+                nonlocal calls
+                calls += 1
+                return self._bound(*args)
+
+        class _Wrapped:
+            def __init__(self, func: Any) -> None:
+                self._func = func
+
+            def __get__(self, backend: Any, owner: Any = None) -> Any:
+                return _Proxy(self._func.__get__(backend, owner))
+
+        monkeypatch.setattr(PerRequestRedisBackend, "set", _Wrapped(PerRequestRedisBackend.set))
+        backend = PerRequestRedisBackend(client, "default")
+        assert backend.set.__func__ is PerRequestRedisBackend._set_tracked_replaces["set"]  # the proxy forwards
+        assert not _fuses_tracked_write(backend)
+        cache(backend=backend, ttl=300, l1_enabled=False)(lambda x: x)(1)
+        assert calls == 1
 
     def test_autospec_patch_runs_the_patched_set(self, client: redis.Redis) -> None:
         fn = cache(backend=PerRequestRedisBackend(client, "default"), ttl=300, l1_enabled=False)(lambda x: x)

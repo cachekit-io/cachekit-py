@@ -372,10 +372,10 @@ def _fuses_tracked_write(backend: object) -> bool:
     found on the CLASS as ``supports_key_tracking`` finds ``track_key``.
 
     Only while the instance resolves ``set`` and ``track_key`` to the functions in the owner's
-    ``_set_tracked_replaces``, bound to the backend itself. An override, patch or delegation anywhere (a
-    subclass, the class itself, the instance, ``__getattribute__``) keeps both calls, so it still runs on
-    every write. An SWR-capable backend keeps ``set`` too: the fused write has no slot for a stale-grace
-    window.
+    ``_set_tracked_replaces``, as plain methods bound to the backend itself. An override, patch, wrapper or
+    delegation anywhere (a subclass, the class itself, the instance, ``__getattribute__``, a proxy) keeps
+    both calls, so it still runs on every write. An SWR-capable backend keeps ``set`` too: the fused write
+    has no slot for a stale-grace window.
     """
     owner = next((klass for klass in type(backend).__mro__ if "_set_tracked" in vars(klass)), None)
     if owner is None or not supports_key_tracking(backend) or supports_swr(backend):  # pyright: ignore[reportArgumentType]
@@ -384,8 +384,9 @@ def _fuses_tracked_write(backend: object) -> bool:
     for name in ("set", "track_key"):
         func = replaces.get(name)  # None when the owner records nothing for it: nothing to match
         bound = getattr(backend, name, None)
-        # The receiver too: the recorded function bound to ANOTHER backend (delegation) writes elsewhere.
-        if func is None or getattr(bound, "__func__", None) is not func or getattr(bound, "__self__", None) is not backend:
+        if func is None or type(bound) is not types.MethodType:  # a wrapper or proxy (wrapt, APM) must run: not fused
+            return False
+        if bound.__func__ is not func or bound.__self__ is not backend:  # another function, or another backend's
             return False
     return True
 
