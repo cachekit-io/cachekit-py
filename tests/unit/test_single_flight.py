@@ -1005,6 +1005,7 @@ def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(wa
     results = _thread_herd(_decorator("backed", backend)(compute))
 
     assert results == [{"x": 1}] * HERD
+    assert len({id(result) for result in results}) == HERD
     assert backend.requests == ["get", "set"]
     assert decoded == [bytes] * (HERD - 1)
 

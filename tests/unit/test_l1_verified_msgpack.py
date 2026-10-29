@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import msgpack
@@ -41,7 +41,7 @@ MASTER_KEY = "a" * 64
 
 
 @pytest.fixture(autouse=True)
-def _no_cachekit_env(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _no_cachekit_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Handlers here read key settings when built, so no CACHEKIT_* variable in the shell may reach them."""
     clear_cachekit_env(monkeypatch)
     reset_settings()
