@@ -94,8 +94,10 @@ covered, plus what the free-threaded CI lane surfaced and sites added since:
 
    The 3.15t leg builds the extension as the release does, as abi3t, by
    setting `MATURIN_PEP517_ARGS="--features pyo3/abi3t-py315"`, and asserts
-   that `_rust_serializer.abi3t.so` is the module it loaded. The GIL 3.15 leg
-   of the `test` job (push matrix only) builds and asserts abi3t the same way.
+   that the module it loaded is the abi3t build:
+   `_rust_serializer.abi3t-x86_64-linux-gnu.so` from maturin 1.16 on, or
+   `_rust_serializer.abi3t.so` from maturin 1.15. The GIL 3.15 leg of the
+   `test` job (push matrix only) builds and asserts abi3t the same way.
 
    The `test` dependency group is the core test toolchain. orjson, numpy,
    pandas and pyarrow live only in the `dev` group and the `[data]`/`[json]`
