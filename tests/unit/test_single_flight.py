@@ -994,8 +994,8 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
     assert decoded == [bytes, VerifiedMsgpack]  # the other caller's hit, then this caller's re-check
 
 
-def test_sync_backed_joiner_decodes_the_trips_envelope(waiting: list[int], decoded: list[type]) -> None:
-    """A joined caller decodes its own copy of the trip's envelope, as before: never the L1 entry."""
+def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(waiting: list[int], decoded: list[type]) -> None:
+    """Each joined caller decodes the trip's envelope once, for its own copy, as before."""
 
     def compute(x: int) -> dict[str, int]:
         _until(lambda: waiting[0] == HERD - 1)

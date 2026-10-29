@@ -896,12 +896,11 @@ class CacheSerializationHandler:
         else:
             self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
         self._custom_serializer = not isinstance(serializer_name, str)
-        # Whether L1 may hold this handler's entries as VerifiedMsgpack (deserialize_l1): plaintext CK-frame
-        # entries of the built-in StandardSerializer with integrity on. Encrypted handlers keep ciphertext in
-        # L1 (protocol PRE-10, PRE-11).
-        self.l1_msgpack = (
+        # Whether an L1 hit may swap this handler's entry for its VerifiedMsgpack (deserialize_l1): plaintext
+        # CK-frame entries of the built-in StandardSerializer with integrity on (interop mode's InteropSerializer
+        # is not one). Encrypted handlers keep ciphertext in L1 (protocol PRE-10, PRE-11).
+        self.keeps_msgpack_in_l1 = (
             not encryption
-            and not interop_mode
             and not self._custom_serializer
             and type(self._base_serializer) is StandardSerializer
             and self._base_serializer.enable_integrity_checking
@@ -1301,11 +1300,11 @@ class CacheSerializationHandler:
     ) -> tuple[Any, VerifiedMsgpack | None]:
         """:meth:`deserialize_data` for an entry read from L1, plus what L1 should hold in its place, if anything.
 
-        That is the entry's verified MessagePack, when this handler can hold it (the built-in
-        StandardSerializer with integrity on, no encryption), the entry is its own plaintext envelope,
-        and the MessagePack is no longer. It comes from the retrieve() this decode ran anyway, so the
-        caller's swap (``L1Cache.replace``) costs no second retrieve(), and later hits skip it. Every other
-        entry gets None, and is decoded exactly as deserialize_data decodes it. Raises as deserialize_data.
+        That is the entry's verified MessagePack, when this handler keeps it (``keeps_msgpack_in_l1``), the
+        entry is its own plaintext envelope, and the MessagePack is no longer. It comes from the retrieve()
+        this decode ran anyway, so the caller's swap (``L1Cache.shrink_if_held``) costs no second retrieve(),
+        and later hits skip it. Every other entry gets None and is decoded by deserialize_data, which refuses
+        a VerifiedMsgpack as a corrupt frame. Raises as deserialize_data.
 
         Examples:
             >>> handler = CacheSerializationHandler()
@@ -1321,14 +1320,9 @@ class CacheSerializationHandler:
         """
         # Inline, not helpers: this is every L1 hit's decode, and an envelope it keeps must cost what
         # deserialize_data costs.
-        if type(data) is VerifiedMsgpack:
-            # Only L1 holds this type, so only a handler that swaps it in decodes it. Another handler sharing
-            # the namespace and key refuses it as it would the plaintext envelope.
-            if not self.l1_msgpack:
-                error = SuspiciousCacheEntryError if self.encryption else SerializationError
-                raise error("L1 entry holds plaintext MessagePack another handler verified; this handler does not read it")
-            return self._base_serializer.deserialize_verified(data), None  # type: ignore[union-attr]
-        if self.l1_msgpack:
+        if self.keeps_msgpack_in_l1:
+            if type(data) is VerifiedMsgpack:  # only L1 holds this type: only such a handler swapped it in
+                return self._base_serializer.deserialize_verified(data), None  # type: ignore[union-attr]
             try:
                 payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
             except (AttributeError, KeyError, TypeError, ValueError):
@@ -1338,7 +1332,8 @@ class CacheSerializationHandler:
                 # entry whose ciphertext must stay in L1, is decoded below exactly as before.
                 if serializer_name == self._serializer_string_name and not metadata.encrypted and metadata.compressed:
                     return self._base_serializer.deserialize_keeping_msgpack(payload, len(data))  # type: ignore[union-attr]
-        return self.deserialize_data(data, cache_key, args, kwargs), None
+        # A VerifiedMsgpack here (another handler's, under the same key) fails the frame check there as corrupt.
+        return self.deserialize_data(data, cache_key, args, kwargs), None  # pyright: ignore[reportArgumentType]
 
     def deserialize_data(
         self,

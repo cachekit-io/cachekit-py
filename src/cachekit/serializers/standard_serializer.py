@@ -413,9 +413,10 @@ class StandardSerializer:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
     def deserialize_keeping_msgpack(self, data: bytes | memoryview, limit: int) -> tuple[Any, VerifiedMsgpack | None]:
-        """:meth:`deserialize` of a ByteStorage envelope, with integrity checking on, plus the MessagePack
-        ``retrieve()`` verified when it is at most ``limit`` bytes, for the caller to keep and decode later
-        without retrieve() (:meth:`deserialize_verified`). Raises as deserialize does.
+        """What :meth:`deserialize` returns for a ByteStorage envelope when integrity checking is on, plus the
+        MessagePack ``retrieve()`` verified when it is at most ``limit`` bytes, for the caller to keep and decode
+        later without retrieve() (:meth:`deserialize_verified`). It always unwraps the envelope, so call it
+        only for an integrity-on serializer. Raises SerializationError as deserialize does then.
 
         Examples:
             >>> serializer = StandardSerializer()

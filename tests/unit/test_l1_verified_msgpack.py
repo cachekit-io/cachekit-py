@@ -2,7 +2,7 @@
 
 The first L1 hit on an entry decodes the envelope as before, and its retrieve() yields the MessagePack;
 L1 then holds that in place of the envelope (``CacheSerializationHandler.deserialize_l1``,
-``L1Cache.replace``), and later hits decode it without retrieve(). Each rule that keeps this from costing
+``L1Cache.shrink_if_held``), and later hits decode it without retrieve(). Each rule that keeps this from costing
 L1 hits or security is pinned here:
 
 - L1 admits and stores envelopes exactly as before; a hit only ever shrinks an entry in place. So L1 never
@@ -28,7 +28,7 @@ from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache, get_l1_cache
-from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 from cachekit.serializers.standard_serializer import VerifiedMsgpack
 
@@ -227,14 +227,54 @@ def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_sam
     ids=["auto", "integrity-off", "encrypted"],
 )
 def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(handler: CacheSerializationHandler) -> None:
+    """The L1 hit sites send these handlers' entries to deserialize_data, which refuses a swapped entry another
+    handler left under the same key as a corrupt frame."""
     envelope = handler.serialize_data({"x": 1}, cache_key="k")
+    assert not handler.keeps_msgpack_in_l1
     assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
-    refusal = SuspiciousCacheEntryError if handler.encryption else SerializationError  # as for a plaintext envelope
-    with pytest.raises(refusal):
-        handler.deserialize_l1(VerifiedMsgpack(msgpack.packb({"x": 2})), cache_key="k")
+    planted = VerifiedMsgpack(msgpack.packb({"x": 2}))
+    for decode in (handler.deserialize_l1, handler.deserialize_data):
+        with pytest.raises(SerializationError, match="Corrupt cache envelope"):
+            decode(planted, cache_key="k")  # type: ignore[arg-type]
 
 
-# ── L1Cache.replace ───────────────────────────────────────────────────────────────────────────
+def _frames() -> dict[str, bytes]:
+    """Entries a plaintext default-serializer handler must decode exactly as deserialize_data does."""
+    k = "k"
+    own = CacheSerializationHandler(encryption=False).serialize_data({"x": 1}, cache_key=k)
+    return {
+        "own-envelope": own,
+        "other-serializer": CacheSerializationHandler(serializer_name="auto").serialize_data({"x": 1}, cache_key=k),
+        "encrypted-drift": CacheSerializationHandler(
+            encryption=True, master_key=MASTER_KEY, single_tenant_mode=True
+        ).serialize_data({"x": 1}, cache_key=k),
+        "integrity-off": CacheSerializationHandler(enable_integrity_checking=False).serialize_data({"x": 1}, cache_key=k),
+        "corrupt-header": b"\x00" + own[1:],
+        "corrupt-payload": _corrupt(own),
+        "not-a-frame": msgpack.packb({"x": 1}),
+    }
+
+
+@pytest.mark.parametrize("name", list(_frames()))
+def test_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """deserialize_l1's fast path repeats deserialize_data's frame checks, so the two must agree on every entry."""
+    data = _frames()[name]
+    monkeypatch.setenv("CACHEKIT_MASTER_KEY", MASTER_KEY)  # lets the encrypted-drift entry decrypt, as it would
+    handler = CacheSerializationHandler(encryption=False)
+
+    def outcome(decode: Callable[[], Any]) -> Any:
+        try:
+            return decode()
+        except Exception as e:  # noqa: BLE001 - the outcome under comparison
+            return type(e)
+
+    expected = outcome(lambda: handler.deserialize_data(data, cache_key="k"))
+    assert outcome(lambda: handler.deserialize_l1(data, cache_key="k")[0]) == expected
+
+
+# ── L1Cache.shrink_if_held ───────────────────────────────────────────────────────────────────────────
 
 
 def test_replace_shrinks_the_entry_in_place() -> None:
@@ -245,7 +285,7 @@ def test_replace_shrinks_the_entry_in_place() -> None:
     expires_at = l1._state.cache["a"].expires_at
 
     new = VerifiedMsgpack(b"m" * 40)
-    l1.replace("a", old, new)
+    assert l1.shrink_if_held("a", old, new)
 
     assert l1.peek("a") is new
     assert l1._state.memory_bytes == 50
@@ -269,7 +309,7 @@ def test_replace_leaves_an_entry_it_did_not_read_or_would_grow(change: str) -> N
         new = VerifiedMsgpack(b"m" * 101)
     held = l1.peek("a")
 
-    l1.replace("a", old, new)
+    assert not l1.shrink_if_held("a", old, new)
 
     assert l1.peek("a") is held
     assert l1._state.memory_bytes == (0 if held is None else 100)
@@ -328,7 +368,7 @@ def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
     compute(1)
     ((key, _),) = backend.store.items()
     l1 = get_l1_cache(namespace)
-    l1.replace(key, l1.peek(key), VerifiedMsgpack(msgpack.packb({"x": "planted"})))  # type: ignore[arg-type]
+    assert l1.shrink_if_held(key, l1.peek(key), VerifiedMsgpack(msgpack.packb({"x": "planted"})))  # type: ignore[arg-type]
     assert type(l1.peek(key)) is VerifiedMsgpack
     assert compute(1) == {"x": 1}  # read from L2 instead
     assert type(l1.peek(key)) is bytes
@@ -338,7 +378,8 @@ def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
 #
 # A replay over the real L1Cache. A read that misses puts the entry a put rule picks from the entry's
 # envelope and MessagePack sizes; with promote, a read that hits an envelope swaps it for its MessagePack
-# when that is no longer, as the L1 hit sites do (deserialize_l1, then L1Cache.replace). The shipped design
+# when that is no longer, as the L1 hit sites do (deserialize_l1, then L1Cache.shrink_if_held, which alone
+# refuses a longer value here). The shipped design
 # is the envelope rule with promote. The two rejected put rules are the counterexamples an adversarial
 # review found against storing MessagePack at write time; they show the pinned traces bite.
 
@@ -376,8 +417,8 @@ class _SizedMsgpack(_Sized):
 def _replay(trace: list[tuple[str, str, int, int]], budget_mb: int, rule: Rule, *, promote: bool = False) -> list[int]:
     """The indices of the trace's reads that hit L1.
 
-    Ops: ("read", key, ...) reads and, on a miss, puts; ("write", key, ...) puts whatever L1 holds (a
-    revalidation, another writer); ("set", key, envelope, raw) is a new value at L2: L1 drops the key, and
+    Ops: ("read", key, ...) reads and, on a miss, puts; ("write", key, ...) puts whether or not L1 holds the
+    key (a revalidation, another writer); ("set", key, envelope, raw) is a new value at L2: L1 drops the key, and
     later puts use the new sizes. A key's first op fixes its sizes until a "set".
     """
     l1 = L1Cache(max_memory_mb=budget_mb, namespace=_namespace())
@@ -393,8 +434,8 @@ def _replay(trace: list[tuple[str, str, int, int]], budget_mb: int, rule: Rule, 
             found, held = l1.get(key)
             if found:
                 hits.append(i)
-                if promote and not isinstance(held, _SizedMsgpack) and raw <= envelope:
-                    l1.replace(key, held, _SizedMsgpack(raw))  # type: ignore[arg-type]
+                if promote and not isinstance(held, _SizedMsgpack):
+                    l1.shrink_if_held(key, held, _SizedMsgpack(raw))  # type: ignore[arg-type]
                 continue
         l1.put(key, _Sized(rule(l1, envelope, raw)))
     return hits
@@ -435,7 +476,7 @@ def _traces(draw: st.DrawFn, budget_mb: int) -> list[tuple[str, str, int, int]]:
 
 
 @pytest.mark.parametrize("budget_mb", [1, 100], ids=["1MiB-minimum", "100MiB-default"])
-@settings(max_examples=100, deadline=None)  # enough: each rejected rule below fails it in every run tried
+@settings(max_examples=100, deadline=None)
 @given(data=st.data())
 def test_no_access_trace_gets_fewer_l1_hits_than_with_envelopes(budget_mb: int, data: st.DataObject) -> None:
     trace = data.draw(_traces(budget_mb))

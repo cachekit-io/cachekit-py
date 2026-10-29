@@ -31,7 +31,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 > **Architecture Principles:**
 > - **L1 + L2 Caching**: In-memory bytes cache (L1) + pluggable backend storage (L2) for optimal performance
 > - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CachekitIO, File, Memcached, custom)
-> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself. From its first L1 hit on, a plaintext entry of the default serializer with integrity checking on is held as its verified MessagePack when that is no longer than its envelope, so later hits skip the LZ4 decompress and checksum; encrypted caches keep the ciphertext
+> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself. After its first hit, a plaintext entry may be held as its verified MessagePack instead (see [Storage Architecture](#storage-architecture)); encrypted caches keep the ciphertext
 > - **Security First**: Decompression bomb protection, checksum validation, size limits, encrypted-at-rest
 > - **Performance Optimized**: Thread affinity, connection pooling, pre-cached serializers
 > - **Flexible Configuration**: L1+L2, L1-only, L2-only, or observability-only modes

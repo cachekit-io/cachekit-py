@@ -1147,7 +1147,7 @@ def create_cache_wrapper(
     _l1_cache = get_l1_cache(namespace or "default", max_size_mb=l1_max_size_mb) if l1_enabled else None
     # Whether an L1 hit may swap its entry for the verified MessagePack (deserialize_l1). Every other handler's
     # hit decodes exactly as before, at no extra cost.
-    _l1_swaps_msgpack = serialization_handler.l1_msgpack
+    _l1_keeps_msgpack = serialization_handler.keeps_msgpack_in_l1
 
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
@@ -1898,17 +1898,26 @@ def create_cache_wrapper(
             return None
 
     def _decode_shared(
-        envelope: bytes | VerifiedMsgpack | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        entry: bytes | VerifiedMsgpack | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[bool, Any]:
-        """A joined backed-mode caller's own copy of the trip's envelope, decoded as an L1 hit would be:
-        every caller gets its own object, and the decrypt checks bind to this caller's tenant.
+        """A joined backed-mode caller's own copy of the trip's envelope, or of the L1 entry the re-check
+        found (which may be a VerifiedMsgpack), decoded as an L1 hit would be: every caller gets its own
+        object, and the decrypt checks bind to this caller's tenant. It never swaps the L1 entry.
 
-        (False, None) when there is no envelope or it does not decode for this caller, who then takes
+        (False, None) when there is no entry or it does not decode for this caller, who then takes
         its own trip, unshared: its probe slot went back on joining, so it is admitted afresh.
         """
-        if envelope is not None:
+        if entry is not None:
             try:
-                value = operation_handler.serialization_handler.deserialize_l1(envelope, cache_key, args, kwargs)[0]
+                if _l1_keeps_msgpack:
+                    value = operation_handler.serialization_handler.deserialize_l1(entry, cache_key, args, kwargs)[0]
+                else:
+                    value = operation_handler.serialization_handler.deserialize_data(
+                        entry,  # pyright: ignore[reportArgumentType]
+                        cache_key,
+                        args,
+                        kwargs,
+                    )
             except KeyringConfigurationError:
                 raise  # a LOCAL keyring config fault: see the L1 guard in _sync_call
             except Exception as e:
@@ -2216,12 +2225,12 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit - deserialize bytes
                     try:
-                        if _l1_swaps_msgpack:
+                        if _l1_keeps_msgpack:
                             l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
                                 l1_bytes, cache_key, args, kwargs
                             )
                             if l1_kept is not None:  # its verified MessagePack: later hits skip retrieve()
-                                _l1_cache.replace(cache_key, l1_bytes, l1_kept)
+                                _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
                         else:  # decoded as before; an entry another handler swapped in fails as a corrupt frame
                             l1_value = operation_handler.serialization_handler.deserialize_data(
                                 l1_bytes,  # pyright: ignore[reportArgumentType]
@@ -2384,11 +2393,11 @@ def create_cache_wrapper(
 
     def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | VerifiedMsgpack | None]]:
         """The sync backed flight's re-check (ThreadFlights.run): the L1 entry a trip that settled since
-        the caller's own L1 lookup left, as the envelope a joined caller decodes. Never an L2 read: it
-        runs under the flight map's lock."""
+        the caller's own L1 lookup left (its envelope, or the VerifiedMsgpack a hit swapped in), for a joined
+        caller to decode. Never an L2 read: it runs under the flight map's lock."""
         assert _l1_cache is not None  # noqa: S101 - passed only with L1 on
-        envelope = _l1_cache.peek(cache_key)
-        return bool(envelope), (None, envelope)
+        entry = _l1_cache.peek(cache_key)
+        return bool(entry), (None, entry)
 
     def _found_nothing() -> tuple[bool, tuple[None, None]]:
         """The re-check with L1 off: no entry to peek."""
@@ -2722,12 +2731,12 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit - deserialize bytes
                     try:
-                        if _l1_swaps_msgpack:  # as in sync_wrapper
+                        if _l1_keeps_msgpack:  # as in sync_wrapper
                             l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
                                 l1_bytes, cache_key, args, kwargs
                             )
                             if l1_kept is not None:
-                                _l1_cache.replace(cache_key, l1_bytes, l1_kept)
+                                _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
                         else:
                             l1_value = operation_handler.serialization_handler.deserialize_data(
                                 l1_bytes,  # pyright: ignore[reportArgumentType]

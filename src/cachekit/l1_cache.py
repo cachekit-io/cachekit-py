@@ -52,7 +52,7 @@ class CacheEntry:
     read time in CacheHandler, not storage time.
     """
 
-    value: "bytes | VerifiedMsgpack"  # VerifiedMsgpack once a hit swapped it in (replace)
+    value: "bytes | VerifiedMsgpack"  # VerifiedMsgpack once a hit swapped it in (shrink_if_held)
     expires_at: float
     size_bytes: int
 
@@ -176,7 +176,7 @@ class L1Cache:
         Returns:
             Tuple of (found, value) where found is True if hit.
             Value is bytes (encrypted or plaintext msgpack), or the VerifiedMsgpack a hit swapped in
-            (replace), not deserialized object.
+            (shrink_if_held), not deserialized object.
             Caller (CacheHandler) is responsible for decryption/deserialization.
         """
         s = self._state
@@ -218,22 +218,23 @@ class L1Cache:
             entry = s.cache.get(key)
             return None if entry is None or entry.is_expired() else entry.value
 
-    def replace(self, key: str, old: "bytes | VerifiedMsgpack", new: "VerifiedMsgpack") -> None:
-        """Hold ``new`` in place of ``old``, the very object a read of ``key`` returned, if the entry still holds
-        it and ``new`` is no longer. The entry keeps its expiry and LRU place.
+    def shrink_if_held(self, key: str, held: "bytes | VerifiedMsgpack", smaller: "VerifiedMsgpack") -> bool:
+        """Hold ``smaller`` in place of ``held``, the very object a read of ``key`` returned, if the entry still
+        holds it and ``smaller`` is no longer. The entry keeps its expiry and LRU place. Returns whether it did.
 
         For a hit that re-encodes the entry it read. The identity check leaves alone an entry that was
         removed, or stored again, since that read, so an invalidation is never undone. Never growing an
         entry means L1 never evicts for it.
         """
-        size = self._estimate_size(new)
+        size = self._estimate_size(smaller)
         s = self._state
         with s.lock:
             entry = s.cache.get(key)
-            if entry is None or entry.value is not old or size > entry.size_bytes:
-                return
+            if entry is None or entry.value is not held or size > entry.size_bytes:
+                return False
             s.memory_bytes -= entry.size_bytes - size
-            entry.value, entry.size_bytes = new, size
+            entry.value, entry.size_bytes = smaller, size
+            return True
 
     def put(
         self,
