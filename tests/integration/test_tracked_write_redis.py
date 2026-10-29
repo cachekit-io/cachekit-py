@@ -153,14 +153,55 @@ class _OwnTracking(PerRequestRedisBackend):
         super().track_key(registry_id, key)
 
 
-class TestSubclassOverridesKeepTheSeparateCalls:
-    """A subclass's own set or track_key runs on every write: N override calls, 2N round trips, its TTL kept."""
+class _InterceptedSet(PerRequestRedisBackend):
+    """A subclass that caps ``set``'s TTL at 60 s through ``__getattribute__``, not by defining ``set``."""
 
-    @pytest.mark.parametrize(
-        ("backend_class", "max_ttl"), [(_CappedTTL, 60), (_OwnTracking, 300)], ids=["own-set", "own-track-key"]
-    )
-    def test_sync_miss(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch, backend_class: Any, max_ttl: int) -> None:
-        backend = backend_class(client, "default")
+    calls = 0
+
+    def __getattribute__(self, name: str) -> Any:
+        method = super().__getattribute__(name)
+        if name != "set":
+            return method
+
+        def capped(key: str, value: bytes, ttl: int | None = None) -> None:
+            self.calls += 1
+            method(key, value, 60)
+
+        return capped
+
+
+def _instance_bound(client: redis.Redis, name: str) -> PerRequestRedisBackend:
+    """A plain backend whose ``set`` (capped at 60 s) or ``track_key`` is replaced on the instance only."""
+    backend = PerRequestRedisBackend(client, "default")
+    backend.calls = 0  # type: ignore[attr-defined]
+    original = getattr(backend, name)
+
+    def hooked(key: str, value: Any, ttl: int | None = None) -> None:
+        backend.calls += 1  # type: ignore[attr-defined]
+        original(key, value, 60) if name == "set" else original(key, value)
+
+    setattr(backend, name, hooked)
+    return backend
+
+
+# (backend factory, the TTL a stored key must carry at most)
+_OVERRIDES = {
+    "subclass-set": (lambda client: _CappedTTL(client, "default"), 60),
+    "subclass-track-key": (lambda client: _OwnTracking(client, "default"), 300),
+    "getattribute-set": (lambda client: _InterceptedSet(client, "default"), 60),
+    "instance-set": (lambda client: _instance_bound(client, "set"), 60),
+    "instance-track-key": (lambda client: _instance_bound(client, "track_key"), 300),
+}
+
+
+class TestOverridesKeepTheSeparateCalls:
+    """Whatever way set or track_key is overridden, the override runs on every write: N calls, 2N round trips,
+    its TTL kept."""
+
+    @pytest.mark.parametrize("override", list(_OVERRIDES))
+    def test_sync_miss(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch, override: str) -> None:
+        make, max_ttl = _OVERRIDES[override]
+        backend = make(client)
         fn = cache(backend=backend, ttl=300, l1_enabled=False)(lambda x: x)
         flushes = _write_flushes(monkeypatch)
         for x in range(N):
@@ -171,16 +212,18 @@ class TestSubclassOverridesKeepTheSeparateCalls:
         assert all(max_ttl - 10 < client.ttl(f"t:default:{key.decode()}") <= max_ttl for key in _cache_keys(client))
 
     @pytest.mark.asyncio
-    async def test_async_miss(self, client: redis.Redis) -> None:
+    @pytest.mark.parametrize("override", list(_OVERRIDES))
+    async def test_async_miss(self, client: redis.Redis, override: str) -> None:
         async def lookup(x: int) -> int:
             return x
 
-        backend = _CappedTTL(client, "default")
+        make, max_ttl = _OVERRIDES[override]
+        backend = make(client)
         fn = cache(backend=backend, ttl=300, l1_enabled=False)(lookup)
         for x in range(N):
             await fn(x)
         assert backend.calls == N
-        assert all(50 < client.ttl(f"t:default:{key.decode()}") <= 60 for key in _cache_keys(client))
+        assert all(max_ttl - 10 < client.ttl(f"t:default:{key.decode()}") <= max_ttl for key in _cache_keys(client))
 
 
 class TestOneThreadHopPerAsyncTrackedWrite:
