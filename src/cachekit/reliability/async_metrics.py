@@ -16,7 +16,8 @@ import warnings
 import weakref
 from bisect import bisect_left
 from collections import defaultdict
-from typing import Any, Optional, Union
+from collections.abc import Callable
+from typing import Any, Optional, TypeVar, Union
 
 from cachekit import _fork
 from cachekit.hash_utils import redact_error_for_log
@@ -123,26 +124,29 @@ _metrics_locks: dict[int, threading.Lock] = {}
 # Reentrant: Python code runs under it, so a garbage collection there can run a finalizer on the same thread, and a
 # finalizer that records a cache operation, reads a series or drops a collector takes it again. Every holder iterates
 # snapshots, so such a nested call cannot change a dict under an outer loop.
-_shard_locks: dict[int, Any] = {}
-_RLOCK = threading.RLock
+_shard_locks: dict[int, threading.RLock] = {}
+_RLOCK = threading.RLock  # bound here: some tests swap this module's threading for a namespace without it
 
 
-def _pid_lock(locks: dict[int, Any], factory: Any = None) -> Any:
-    """Return this process's lock in ``locks``, creating it with ``factory`` (default ``threading.Lock``) on first use."""
+_L = TypeVar("_L")
+
+
+def _pid_lock(locks: dict[int, _L], factory: Callable[[], _L]) -> _L:
+    """Return this process's lock in ``locks``, creating it with ``factory`` on first use."""
     pid = os.getpid()
     lock = locks.get(pid)
     if lock is None:
         # setdefault is atomic, so threads racing here in a new child all get one lock.
-        lock = locks.setdefault(pid, (factory or threading.Lock)())
+        lock = locks.setdefault(pid, factory())
     return lock
 
 
 def _metrics_cache_lock() -> threading.Lock:
     """Return this process's metric-cache lock, creating it on first use."""
-    return _pid_lock(_metrics_locks)
+    return _pid_lock(_metrics_locks, threading.Lock)
 
 
-def _shard_lock() -> Any:
+def _shard_lock() -> threading.RLock:
     """Return this process's per-thread-cell lock, an ``RLock``, creating it on first use."""
     return _pid_lock(_shard_locks, _RLOCK)
 
@@ -1070,7 +1074,7 @@ class AsyncMetricsCollector:
 
     def _mode_lock(self) -> threading.Lock:
         """Return this process's mode-switch lock, creating it on first use."""
-        return _pid_lock(self._mode_locks)
+        return _pid_lock(self._mode_locks, threading.Lock)
 
     def _take_over_if_forked(self) -> None:
         """In a forked child, replace the batching state inherited from the parent and fall back to sync mode.
