@@ -50,6 +50,18 @@ T = TypeVar("T")
 
 # Key registry (KeyTrackableBackend). A tracking set lives 7 days past its last write.
 _TRACKING_SET_TTL_SECONDS = 604_800
+
+
+def _registry_add(pipeline: Any, scoped_reg: str, key: str) -> Any:
+    """Queue a key's registry entry on ``pipeline``: ``SADD`` the raw key, then ``EXPIRE`` the set to 7 days.
+
+    The one place the registry's write commands live: ``track_key`` and ``_set_tracked`` both queue them here.
+    Queuing sends nothing; the caller chains ``execute()`` on the result. ``pipeline`` is a parameter here only
+    for the two queuing calls, which raise only on an argument type no caller passes.
+    """
+    return pipeline.sadd(scoped_reg, key).expire(scoped_reg, _TRACKING_SET_TTL_SECONDS)
+
+
 # Members popped (and keys unlinked) per script call. Bounds each atomic step well under
 # lua-time-limit: a script that has written cannot be SCRIPT KILLed, so unbounded work in
 # one call can leave every other client on this Redis answered with BUSY.
@@ -706,14 +718,61 @@ class PerRequestRedisBackend:
         scoped_reg = self._scoped_key(registry_id)
         with _ClearedOnInterrupt():
             try:
-                # Chained, never bound to a local: a pipeline's repr lists the password. A pipelined
-                # command returns its pipeline; redis-py's annotations give the reply type instead.
-                self._client.pipeline(transaction=False).sadd(scoped_reg, key).expire(  # pyright: ignore[reportAttributeAccessIssue]
-                    scoped_reg, _TRACKING_SET_TTL_SECONDS
-                ).execute()
+                # Chained, never bound to a local: a pipeline's repr lists the password.
+                _registry_add(self._client.pipeline(transaction=False), scoped_reg, key).execute()
                 return
             except Exception as exc:
                 error = classify_redis_error(exc, operation="track_key", key=registry_id)
+        try:
+            raise error from error.original_exception
+        finally:
+            del error
+
+    def _set_tracked(self, key: str, value: bytes, ttl: Optional[int], registry_id: str) -> Optional[BackendError]:
+        """``set`` and ``track_key`` in one round trip: ``SET``, ``SADD`` and ``EXPIRE`` on one
+        non-transactional pipeline.
+
+        Private: ``CacheHandler.set_tracked`` finds it on the backend class, and a backend without it
+        keeps the separate ``track_key`` call. The write's success is the ``SET`` reply alone. The
+        registry commands run even when the ``SET`` fails (no transaction rolls a failed ``SET`` back),
+        which leaves a member with no key: the next drain unlinks the missing key, and the set's 7-day
+        expiry bounds it until then.
+
+        Args:
+            key: Cache key to store (will be tenant-scoped), as for ``set``
+            value: Bytes value to store
+            ttl: Time-to-live in seconds (None or <= 0 = no expiry), as for ``set``
+            registry_id: Unscoped registry id, as for ``track_key``
+
+        Returns:
+            None when the write and its tracking both succeeded; the classified tracking error when
+            the ``SET`` succeeded and ``SADD`` or ``EXPIRE`` did not. Tracking is advisory, so that
+            error is the caller's to report, never to raise.
+
+        Raises:
+            BackendError: If the ``SET`` failed, or the pipeline did (a dropped connection: whether
+                the ``SET`` landed is unknown, as for ``set``)
+        """
+        scoped_key = self._scoped_key(key)
+        scoped_reg = self._scoped_key(registry_id)
+        with _ClearedOnInterrupt():
+            try:
+                # Chained, never bound to a local: a pipeline's repr lists the password. Error replies come
+                # back in place, so each command's outcome is read on its own.
+                replies = _registry_add(
+                    self._client.pipeline(transaction=False).set(
+                        scoped_key, value, ex=ttl if ttl is not None and ttl > 0 else None
+                    ),
+                    scoped_reg,
+                    key,
+                ).execute(raise_on_error=False)
+            except Exception as exc:
+                error = classify_redis_error(exc, operation="set", key=key)
+            else:
+                if not isinstance(replies[0], Exception):
+                    failed = next((reply for reply in replies[1:] if isinstance(reply, Exception)), None)
+                    return None if failed is None else classify_redis_error(failed, operation="track_key", key=registry_id)
+                error = classify_redis_error(replies[0], operation="set", key=key)
         try:
             raise error from error.original_exception
         finally:

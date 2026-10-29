@@ -82,7 +82,7 @@ Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is
 
 ## Characteristics
 
-- Network latency: one round trip per operation, which depends on your network and region ([not measured here](../performance.md#not-measured-here))
+- Network latency: one round trip per operation, a decorated write included (its [key-registry](../features/l1-invalidation.md#whole-function-invalidation) entry rides in the same pipeline as its `SET`), which depends on your network and region ([not measured here](../performance.md#not-measured-here))
 - Automatic TTL support (Redis `SET … EX`)
 - Connection pooling built-in
 - Supports large values (up to Redis limits)
