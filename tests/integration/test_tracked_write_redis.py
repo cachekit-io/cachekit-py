@@ -133,6 +133,54 @@ class TestOneRoundTripPerTrackedWrite:
         self._check(client, flushes, fused)
 
 
+class _CappedTTL(PerRequestRedisBackend):
+    """A subclass whose ``set`` caps every TTL: the fused write must not bypass it."""
+
+    calls = 0
+
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        type(self).calls += 1
+        super().set(key, value, 2)
+
+
+class _OwnTracking(PerRequestRedisBackend):
+    """A subclass whose ``track_key`` does more than the registry write: the fused write must not bypass it."""
+
+    calls = 0
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        type(self).calls += 1
+        super().track_key(registry_id, key)
+
+
+class TestSubclassOverridesKeepTheSeparateCalls:
+    @pytest.mark.parametrize("backend_class", [_CappedTTL, _OwnTracking])
+    def test_sync_miss(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch, backend_class: Any) -> None:
+        monkeypatch.setattr(backend_class, "calls", 0)
+        fn = cache(backend=backend_class(client, "default"), ttl=300, l1_enabled=False)(lambda x: x)
+        flushes = _write_flushes(monkeypatch)
+        for x in range(N):
+            fn(x)
+        assert backend_class.calls == N
+        assert len(flushes) == 2 * N
+        assert _tracked(client) == _cache_keys(client)
+        if backend_class is _CappedTTL:
+            assert all(0 < client.ttl(f"t:default:{key.decode()}") <= 2 for key in _cache_keys(client))
+
+    @pytest.mark.asyncio
+    async def test_async_miss(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_CappedTTL, "calls", 0)
+
+        async def lookup(x: int) -> int:
+            return x
+
+        fn = cache(backend=_CappedTTL(client, "default"), ttl=300, l1_enabled=False)(lookup)
+        for x in range(N):
+            await fn(x)
+        assert _CappedTTL.calls == N
+        assert all(0 < client.ttl(f"t:default:{key.decode()}") <= 2 for key in _cache_keys(client))
+
+
 class TestOneThreadHopPerAsyncTrackedWrite:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("backend_class", [PerRequestRedisBackend, _Unlockable], ids=["locked", "unlocked"])

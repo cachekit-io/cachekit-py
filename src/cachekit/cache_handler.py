@@ -369,11 +369,18 @@ def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
 
 def _fuses_tracked_write(backend: object) -> bool:
     """Whether the backend writes a value and its registry entry in one call: a private ``_set_tracked``,
-    found on the CLASS as ``supports_key_tracking`` finds ``track_key``. An SWR-capable backend keeps ``set``:
-    the fused write has no slot for a stale-grace window."""
-    return (
-        callable(getattr(type(backend), "_set_tracked", None)) and supports_key_tracking(backend) and not supports_swr(backend)  # pyright: ignore[reportArgumentType]
-    )
+    found on the CLASS as ``supports_key_tracking`` finds ``track_key``.
+
+    Only when ``set`` and ``track_key`` come from the class that defines ``_set_tracked``: a subclass that
+    overrides either one (a TTL cap, extra writes) keeps both calls, so its override still runs. An
+    SWR-capable backend keeps ``set`` too: the fused write has no slot for a stale-grace window.
+    """
+    cls = type(backend)
+    owner = next((klass for klass in cls.__mro__ if "_set_tracked" in vars(klass)), None)
+    if owner is None or not supports_key_tracking(backend) or supports_swr(backend):  # pyright: ignore[reportArgumentType]
+        return False
+    defined = vars(owner)
+    return getattr(cls, "set", None) is defined.get("set") and getattr(cls, "track_key", None) is defined.get("track_key")
 
 
 def _set_l2(
