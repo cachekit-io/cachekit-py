@@ -125,7 +125,8 @@ jobs:
 
     - name: Verify the 3.15 leg loads the abi3t extension
       if: matrix.python-version == '3.15'
-      run: uv run --no-sync python -c "import cachekit._rust_serializer as r; assert r.__file__.endswith('.abi3t.so'), r.__file__"
+      # maturin 1.16 adds the platform triple to the abi3t filename (PyO3/maturin#3305); 1.15 omits it.
+      run: uv run --no-sync python -c "import cachekit._rust_serializer as r; assert r.__file__.endswith(('.abi3t-x86_64-linux-gnu.so', '.abi3t.so')), r.__file__"
 
     - name: Run tests (PRs)
       if: github.event_name == 'pull_request'
@@ -311,11 +312,12 @@ jobs:
       matrix:
         include:
           - python-version: "3.14t"
-            extension-suffix: .cpython-314t-x86_64-linux-gnu.so
+            extension-suffixes: .cpython-314t-x86_64-linux-gnu.so
           # 3.15t tests the abi3t extension the release ships for 3.15+, not a per-version build.
+          # maturin 1.16 adds the platform triple to the abi3t filename (PyO3/maturin#3305); 1.15 omits it.
           - python-version: "3.15t"
             maturin-args: --features pyo3/abi3t-py315
-            extension-suffix: .abi3t.so
+            extension-suffixes: .abi3t-x86_64-linux-gnu.so .abi3t.so
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -345,7 +347,8 @@ jobs:
         import cachekit._rust_serializer
         import redis
         assert not sys._is_gil_enabled(), 'an import re-enabled the GIL'
-        assert cachekit._rust_serializer.__file__.endswith('${{ matrix.extension-suffix }}'), cachekit._rust_serializer.__file__
+        suffixes = tuple('${{ matrix.extension-suffixes }}'.split())
+        assert cachekit._rust_serializer.__file__.endswith(suffixes), cachekit._rust_serializer.__file__
         print('free-threaded build, GIL still disabled after imports')
         "
 
