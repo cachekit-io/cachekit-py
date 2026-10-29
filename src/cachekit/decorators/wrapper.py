@@ -1252,11 +1252,6 @@ def create_cache_wrapper(
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
         then record the key, and its pre-0.20.0 twin if it has one (_twin_key), in _cached_keys.
 
-        An envelope L1 admits is put in the form l1_entry gives it: its verified MessagePack when that
-        is no longer, so a hit skips retrieve(). Admission is judged on the envelope, as before: judged on
-        a shorter form, an entry L1 used to refuse would get in and evict others. So L1 never holds fewer
-        entries than it would hold envelopes.
-
         Recording after the put makes "in L1 => in _cached_keys" hold by construction, so a
         whole-function invalidation that trims _cached_keys before evicting L1 cannot miss an
         entry. The key is recorded even when there is nothing to put (L1 disabled, a streamed
@@ -1267,8 +1262,6 @@ def create_cache_wrapper(
         """
         if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-            if type(_b) is bytes and _l1_cache.admits(len(_b)):
-                _b = serialization_handler.l1_entry(_b)
             _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
         _record(cache_key, twin)
 
@@ -2219,7 +2212,11 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit - deserialize bytes
                     try:
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
+                        l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
+                            l1_bytes, cache_key, args, kwargs
+                        )
+                        if l1_kept is not None:  # its verified MessagePack: later hits skip retrieve()
+                            _l1_cache.replace(cache_key, l1_bytes, l1_kept)
                         l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
                         # Record L1 cache hit metrics
@@ -2713,7 +2710,11 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit - deserialize bytes
                     try:
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
+                        l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
+                            l1_bytes, cache_key, args, kwargs
+                        )
+                        if l1_kept is not None:  # as in sync_wrapper
+                            _l1_cache.replace(cache_key, l1_bytes, l1_kept)
                         l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
                         # Record L1 cache hit metrics (same labels as the sync L1 hit)

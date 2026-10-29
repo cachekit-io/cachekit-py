@@ -1,11 +1,13 @@
-"""A non-encrypted backed cache keeps verified MessagePack in L1 where it is no longer than the envelope.
+"""A non-encrypted backed cache's L1 hit swaps its entry for the verified MessagePack, where that is no longer.
 
-An L1 hit on such an entry decodes without ``ByteStorage.retrieve()``. Three rules keep that from costing
-L1 hits or security, and each is pinned here:
+The first L1 hit on an entry decodes the envelope as before, and its retrieve() yields the MessagePack;
+L1 then holds that in place of the envelope (``CacheSerializationHandler.deserialize_l1``,
+``L1Cache.replace``), and later hits decode it without retrieve(). Each rule that keeps this from costing
+L1 hits or security is pinned here:
 
-- Admission is judged on the envelope, as before; the shorter form only replaces an envelope L1 admits.
-  So L1 never holds fewer entries than it would hold envelopes (the replay property below).
-- MessagePack enters L1 only from a ``retrieve()`` that verified it; a corrupt envelope stays an envelope.
+- L1 admits and stores envelopes exactly as before; a hit only ever shrinks an entry in place. So L1 never
+  holds fewer entries than it would hold envelopes (the replay property below).
+- MessagePack enters L1 only from a retrieve() that verified it; a corrupt envelope is never swapped.
 - Encrypted handlers keep their ciphertext envelope in L1, and every hit on it decrypts (protocol PRE-10,
   PRE-11: the secure preset holds only ciphertext in L1).
 """
@@ -75,13 +77,13 @@ def _corrupt(envelope: bytes) -> bytes:
     return bytes(corrupt)
 
 
-# ── what _put_l1 stores ───────────────────────────────────────────────────────────────────────
+# ── what L1 holds ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
     "value", ["hello", 42, {"id": 7, "tags": ["a"]}, os.urandom(5000)], ids=["str", "int", "dict", "random"]
 )
-def test_a_value_no_longer_than_its_envelope_is_kept_as_verified_msgpack(value: Any) -> None:
+def test_the_first_hit_swaps_an_envelope_for_its_msgpack_when_no_longer(value: Any) -> None:
     backend, namespace, runs = _Backend(), _namespace(), []
 
     @cache(backend=backend, ttl=60, namespace=namespace)
@@ -89,35 +91,40 @@ def test_a_value_no_longer_than_its_envelope_is_kept_as_verified_msgpack(value: 
         runs.append(x)
         return value
 
-    assert compute(1) == value
+    assert compute(1) == value  # miss: L1 gets the envelope L2 got, as before
     envelope, entry = _stored(backend, namespace)
+    assert type(entry) is bytes and entry == envelope
+
+    before = compute.cache_info().l1_hits  # type: ignore[attr-defined]  # stats are per function name
+    assert compute(1) == value  # first hit: decodes the envelope, keeps its MessagePack
+    _, entry = _stored(backend, namespace)
     assert type(entry) is VerifiedMsgpack
     assert entry == msgpack.packb(value, use_bin_type=True)
     assert len(entry) <= len(envelope)
 
-    before = compute.cache_info().l1_hits  # type: ignore[attr-defined]  # stats are per function name
-    assert compute(1) == value  # the L1 hit decodes it
+    assert compute(1) == value  # decodes the MessagePack
     assert (runs, backend.gets) == ([1], 1)
-    assert compute.cache_info().l1_hits == before + 1  # type: ignore[attr-defined]
+    assert compute.cache_info().l1_hits == before + 2  # type: ignore[attr-defined]
 
 
-def test_a_value_longer_than_its_envelope_keeps_the_envelope() -> None:
+def test_a_value_longer_as_msgpack_keeps_its_envelope() -> None:
     backend, namespace = _Backend(), _namespace()
 
     @cache(backend=backend, ttl=60, namespace=namespace)
     def compute(x: int) -> str:
         return "ab" * 600
 
-    assert compute(1) == "ab" * 600
+    for _ in range(3):
+        assert compute(1) == "ab" * 600
     envelope, entry = _stored(backend, namespace)
     assert len(msgpack.packb("ab" * 600)) > len(envelope)
     assert type(entry) is bytes and entry == envelope
-    assert compute(1) == "ab" * 600
     assert backend.gets == 1
 
 
-def test_an_envelope_over_the_admission_cap_is_refused_even_when_its_msgpack_would_fit() -> None:
-    """Admission is judged on the envelope. Judged on the MessagePack, this entry would get in and evict others."""
+def test_an_envelope_over_the_admission_cap_stays_out_though_its_msgpack_would_fit() -> None:
+    """Admission is judged on the envelope, as before. Judged on the MessagePack, this entry would get in and
+    evict others."""
     backend, namespace = _Backend(), _namespace()
     value = os.urandom(131_067)  # MessagePack 131,072 B, the cap at 1 MiB; the envelope is longer
 
@@ -125,15 +132,15 @@ def test_an_envelope_over_the_admission_cap_is_refused_even_when_its_msgpack_wou
     def compute(x: int) -> bytes:
         return value
 
-    assert compute(1) == value
+    for _ in range(3):
+        assert compute(1) == value
     envelope, entry = _stored(backend, namespace)
-    l1 = get_l1_cache(namespace)
-    assert not l1.admits(len(envelope))
-    assert l1.admits(len(CacheSerializationHandler().l1_entry(envelope)))  # the shorter form alone would get in
+    assert len(envelope) > 131_072 >= len(msgpack.packb(value))
     assert entry is None
+    assert backend.gets == 3  # every call reads L2
 
 
-def test_an_l2_hit_backfills_verified_msgpack() -> None:
+def test_an_l2_hit_backfills_the_envelope_and_the_next_hit_swaps_it() -> None:
     backend, namespace = _Backend(), _namespace()
 
     @cache(backend=backend, ttl=60, namespace=namespace)
@@ -142,16 +149,18 @@ def test_an_l2_hit_backfills_verified_msgpack() -> None:
 
     assert compute(1) == {"x": 1}
     get_l1_cache(namespace).clear()
-    assert compute(1) == {"x": 1}  # L2 hit, backfilled
+    assert compute(1) == {"x": 1}  # L2 hit
+    envelope, entry = _stored(backend, namespace)
+    assert type(entry) is bytes and entry == envelope
+    assert compute(1) == {"x": 1}
     _, entry = _stored(backend, namespace)
     assert type(entry) is VerifiedMsgpack
-    assert compute(1) == {"x": 1}
     assert backend.gets == 2
 
 
-def test_a_backfill_from_a_corrupt_envelope_writes_no_msgpack(monkeypatch: pytest.MonkeyPatch) -> None:
-    """MessagePack enters L1 only from a retrieve() that verified it. The L2 decode is stubbed to succeed, as
-    if it had not checked the bytes: the backfill still puts the envelope, which the next L1 read refuses."""
+def test_a_corrupt_envelope_backfilled_into_l1_is_never_swapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MessagePack enters L1 only from a retrieve() that verified it. The L2 decode is stubbed to accept the
+    corrupt envelope, so the backfill puts it in L1; the next hit's retrieve() refuses it, and L1 drops it."""
     backend, namespace = _Backend(), _namespace()
 
     @cache(backend=backend, ttl=60, namespace=namespace)
@@ -161,7 +170,8 @@ def test_a_backfill_from_a_corrupt_envelope_writes_no_msgpack(monkeypatch: pytes
     compute(1)
     ((key, envelope),) = backend.store.items()
     backend.store[key] = corrupt = _corrupt(envelope)
-    get_l1_cache(namespace).clear()
+    l1 = get_l1_cache(namespace)
+    l1.clear()
     real = CacheSerializationHandler.deserialize_data
     monkeypatch.setattr(
         CacheSerializationHandler,
@@ -169,18 +179,19 @@ def test_a_backfill_from_a_corrupt_envelope_writes_no_msgpack(monkeypatch: pytes
         lambda self, data, *a, **kw: {"x": 1} if bytes(data) == corrupt else real(self, data, *a, **kw),
     )
 
-    assert compute(1) == {"x": 1}
-    entry = get_l1_cache(namespace).peek(key)
+    assert compute(1) == {"x": 1}  # L2 hit on the corrupt envelope: backfilled as it is
+    assert l1.peek(key) == corrupt
+    assert compute(1) == {"x": 1}  # the L1 hit refuses it; L2 serves and backfills it again
+    entry = l1.peek(key)
     assert type(entry) is bytes and entry == corrupt
 
 
 @pytest.mark.parametrize("damage", [_corrupt, lambda e: e[:-30]], ids=["flipped-byte", "truncated"])
-def test_l1_entry_keeps_an_envelope_retrieve_refuses(damage: Callable[[bytes], bytes]) -> None:
+def test_deserialize_l1_refuses_an_envelope_retrieve_refuses(damage: Callable[[bytes], bytes]) -> None:
     handler = CacheSerializationHandler()
     envelope = damage(handler.serialize_data({"x": 1}, cache_key="k"))
     with pytest.raises(SerializationError):
-        handler.deserialize_data(envelope, cache_key="k")
-    assert handler.l1_entry(envelope) is envelope
+        handler.deserialize_l1(envelope, cache_key="k")
 
 
 _VALUES = st.recursive(
@@ -192,13 +203,17 @@ _VALUES = st.recursive(
 
 @settings(max_examples=300, deadline=None)
 @given(value=_VALUES | st.binary(min_size=1000, max_size=20_000) | st.text(min_size=1000, max_size=20_000))
-def test_l1_entry_is_never_longer_than_the_envelope_and_decodes_to_the_same_value(value: Any) -> None:
+def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_same(value: Any) -> None:
     handler = CacheSerializationHandler()
     envelope = handler.serialize_data(value, cache_key="k")
-    entry = handler.l1_entry(envelope)
-    assert len(entry) <= len(envelope)
-    assert type(entry) is (VerifiedMsgpack if len(msgpack.packb(value, use_bin_type=True)) <= len(envelope) else bytes)
-    assert handler.deserialize_data(entry, cache_key="k") == handler.deserialize_data(envelope, cache_key="k")
+    decoded, entry = handler.deserialize_l1(envelope, cache_key="k")
+    expected = handler.deserialize_data(envelope, cache_key="k")
+    assert decoded == expected
+    if len(msgpack.packb(value, use_bin_type=True)) > len(envelope):
+        assert entry is None
+    else:
+        assert type(entry) is VerifiedMsgpack and len(entry) <= len(envelope)
+        assert handler.deserialize_l1(entry, cache_key="k") == (expected, None)
 
 
 @pytest.mark.parametrize(
@@ -210,11 +225,51 @@ def test_l1_entry_is_never_longer_than_the_envelope_and_decodes_to_the_same_valu
     ],
     ids=["auto", "integrity-off", "encrypted"],
 )
-def test_other_handlers_keep_the_envelope_and_refuse_verified_msgpack(handler: CacheSerializationHandler) -> None:
+def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(handler: CacheSerializationHandler) -> None:
     envelope = handler.serialize_data({"x": 1}, cache_key="k")
-    assert handler.l1_entry(envelope) is envelope
+    assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
     with pytest.raises(SerializationError):  # SuspiciousCacheEntryError under encryption: a plaintext entry
         handler.deserialize_data(VerifiedMsgpack(msgpack.packb({"x": 2})), cache_key="k")
+
+
+# ── L1Cache.replace ───────────────────────────────────────────────────────────────────────────
+
+
+def test_replace_shrinks_the_entry_in_place() -> None:
+    l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
+    old = b"e" * 100
+    l1.put("a", old, redis_ttl=60)
+    l1.put("b", b"b" * 10, redis_ttl=60)
+    expires_at = l1._state.cache["a"].expires_at
+
+    l1.replace("a", old, b"m" * 40)
+
+    assert l1.peek("a") == b"m" * 40
+    assert l1._state.memory_bytes == 50
+    assert l1._state.cache["a"].expires_at == expires_at
+    assert list(l1._state.cache) == ["a", "b"]  # LRU place kept
+
+
+@pytest.mark.parametrize(
+    "change", ["removed", "stored-again", "longer"], ids=["removed-since-read", "stored-again-since-read", "longer"]
+)
+def test_replace_leaves_an_entry_it_did_not_read_or_would_grow(change: str) -> None:
+    l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
+    old = b"e" * 100
+    l1.put("a", old, redis_ttl=60)
+    new = b"m" * 40
+    if change == "removed":
+        l1.invalidate("a")
+    elif change == "stored-again":
+        l1.put("a", bytes(bytearray(old)), redis_ttl=60)  # equal bytes, another object: a newer write
+    else:
+        new = b"m" * 101
+    held = l1.peek("a")
+
+    l1.replace("a", old, new)
+
+    assert l1.peek("a") is held
+    assert l1._state.memory_bytes == (0 if held is None else 100)
 
 
 # ── encrypted handlers: ciphertext in L1, every hit decrypts ──────────────────────────────────
@@ -245,17 +300,18 @@ def test_encrypted_l1_holds_the_l2_ciphertext_and_every_hit_decrypts(
         return {"x": x}
 
     assert compute(1) == {"x": 1}  # miss: L1 gets the very envelope L2 got
-    envelope, entry = _stored(backend, namespace)
-    assert type(entry) is bytes and entry == envelope
-    assert compute(1) == {"x": 1}  # L1 hit
-    assert (len(decrypts), backend.gets) == (1, 1)
+    for hits in (1, 2):
+        assert compute(1) == {"x": 1}  # L1 hit
+        envelope, entry = _stored(backend, namespace)
+        assert type(entry) is bytes and entry == envelope
+        assert (len(decrypts), backend.gets) == (hits, 1)
 
     get_l1_cache(namespace).clear()
     assert compute(1) == {"x": 1}  # L2 hit: the backfill is the ciphertext too
+    assert compute(1) == {"x": 1}
     envelope, entry = _stored(backend, namespace)
     assert type(entry) is bytes and entry == envelope
-    assert compute(1) == {"x": 1}
-    assert (len(decrypts), backend.gets) == (3, 2)
+    assert (len(decrypts), backend.gets) == (4, 2)
 
 
 def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
@@ -275,11 +331,11 @@ def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
 
 # ── L1 hits: never fewer than with envelopes ──────────────────────────────────────────────────
 #
-# A replay over the real L1Cache. An access reads the key and, on a miss, puts the entry that a rule
-# picks from the entry's envelope and MessagePack sizes. _kept_rule is _put_l1's: the MessagePack only
-# when L1 admits the envelope (L1Cache.admits) and the MessagePack is no longer (l1_entry); the tests
-# above pin that _put_l1 applies it. The two rejected rules are the counterexamples an adversarial
-# review found; they show the pinned traces bite.
+# A replay over the real L1Cache. A read that misses puts the entry a put rule picks from the entry's
+# envelope and MessagePack sizes; with promote, a read that hits an envelope swaps it for its MessagePack
+# when that is no longer, as the L1 hit sites do (deserialize_l1, then L1Cache.replace). The shipped design
+# is the envelope rule with promote. The two rejected put rules are the counterexamples an adversarial
+# review found against storing MessagePack at write time; they show the pinned traces bite.
 
 Rule = Callable[[L1Cache, int, int], int]
 
@@ -288,12 +344,8 @@ def _envelope_rule(l1: L1Cache, envelope: int, raw: int) -> int:
     return envelope
 
 
-def _kept_rule(l1: L1Cache, envelope: int, raw: int) -> int:
-    return raw if l1.admits(envelope) and raw <= envelope else envelope
-
-
 def _growth_allowance_rule(l1: L1Cache, envelope: int, raw: int) -> int:
-    return raw if l1.admits(envelope) and raw <= envelope * 1.1 else envelope
+    return raw if raw <= envelope * 1.1 and envelope <= l1.max_memory_bytes / 8 else envelope
 
 
 def _admit_on_raw_rule(l1: L1Cache, envelope: int, raw: int) -> int:
@@ -312,7 +364,11 @@ class _Sized(bytes):
         return self.size  # type: ignore[attr-defined]
 
 
-def _replay(trace: list[tuple[str, str, int, int]], budget_mb: int, rule: Rule) -> list[int]:
+class _SizedMsgpack(_Sized):
+    """A replayed entry a hit swapped in."""
+
+
+def _replay(trace: list[tuple[str, str, int, int]], budget_mb: int, rule: Rule, *, promote: bool = False) -> list[int]:
     """The indices of the trace's reads that hit L1.
 
     Ops: ("read", key, ...) reads and, on a miss, puts; ("write", key, ...) puts whatever L1 holds (a
@@ -327,10 +383,15 @@ def _replay(trace: list[tuple[str, str, int, int]], budget_mb: int, rule: Rule) 
             l1.invalidate(key)
             sizes[key] = (envelope, raw)
             continue
-        if op == "read" and l1.get(key)[0]:
-            hits.append(i)
-            continue
-        l1.put(key, _Sized(rule(l1, *sizes.setdefault(key, (envelope, raw)))))
+        envelope, raw = sizes.setdefault(key, (envelope, raw))
+        if op == "read":
+            found, held = l1.get(key)
+            if found:
+                hits.append(i)
+                if promote and not isinstance(held, _SizedMsgpack) and raw <= envelope:
+                    l1.replace(key, held, _SizedMsgpack(raw))  # type: ignore[arg-type]
+                continue
+        l1.put(key, _Sized(rule(l1, envelope, raw)))
     return hits
 
 
@@ -374,8 +435,8 @@ def _traces(draw: st.DrawFn, budget_mb: int) -> list[tuple[str, str, int, int]]:
 def test_no_access_trace_gets_fewer_l1_hits_than_with_envelopes(budget_mb: int, data: st.DataObject) -> None:
     trace = data.draw(_traces(budget_mb))
     with_envelopes = _replay(trace, budget_mb, _envelope_rule)
-    kept = _replay(trace, budget_mb, _kept_rule)
-    assert set(with_envelopes) <= set(kept)  # every read that hit before still hits
+    promoted = _replay(trace, budget_mb, _envelope_rule, promote=True)
+    assert set(with_envelopes) <= set(promoted)  # every read that hit before still hits
 
 
 def test_entries_growing_past_their_envelope_keep_it_so_a_near_full_lru_keeps_its_hits() -> None:
@@ -386,7 +447,7 @@ def test_entries_growing_past_their_envelope_keep_it_so_a_near_full_lru_keeps_it
     hot = [i for i in range(len(trace)) if i >= len(keys)]
 
     assert _replay(trace, 100, _envelope_rule) == hot  # 208/208
-    assert _replay(trace, 100, _kept_rule) == hot
+    assert _replay(trace, 100, _envelope_rule, promote=True) == hot
     assert _replay(trace, 100, _growth_allowance_rule) == []  # 0/208
 
 
@@ -399,5 +460,5 @@ def test_an_entry_shrunk_under_the_admission_cap_stays_out_so_the_hot_set_keeps_
     trace = warm + rounds
 
     assert len(_replay(trace, 1, _envelope_rule)) == 20
-    assert len(_replay(trace, 1, _kept_rule)) == 20
+    assert len(_replay(trace, 1, _envelope_rule, promote=True)) == 20
     assert _replay(trace, 1, _admit_on_raw_rule) == []  # 20 hits fell to 0

@@ -164,15 +164,6 @@ class L1Cache:
         """
         return len(value)
 
-    def admits(self, size: int) -> bool:
-        """Whether ``put`` stores a value of ``size`` bytes: at most an eighth of max_memory_bytes (_MAX_ENTRY_SHARE).
-
-        Examples:
-            >>> L1Cache(max_memory_mb=1).admits(131_072), L1Cache(max_memory_mb=1).admits(131_073)
-            (True, False)
-        """
-        return size <= self.max_memory_bytes * _MAX_ENTRY_SHARE
-
     def get(self, key: str) -> tuple[bool, Optional[bytes]]:
         """Get value from L1 cache if present and not expired.
 
@@ -222,6 +213,23 @@ class L1Cache:
         with s.lock:
             entry = s.cache.get(key)
             return None if entry is None or entry.is_expired() else entry.value
+
+    def replace(self, key: str, old: bytes, new: bytes) -> None:
+        """Hold ``new`` in place of ``old``, the very object a read of ``key`` returned, if the entry still holds
+        it and ``new`` is no longer. The entry keeps its expiry and LRU place.
+
+        For a hit that re-encodes the entry it read. The identity check leaves alone an entry that was
+        removed, or stored again, since that read, so an invalidation is never undone. Never growing an
+        entry means L1 never evicts for it.
+        """
+        size = self._estimate_size(new)
+        s = self._state
+        with s.lock:
+            entry = s.cache.get(key)
+            if entry is None or entry.value is not old or size > entry.size_bytes:
+                return
+            s.memory_bytes -= entry.size_bytes - size
+            entry.value, entry.size_bytes = new, size
 
     def put(
         self,
@@ -287,13 +295,14 @@ class L1Cache:
         # would also push L1 permanently over its limit (a multi-GB DataFrame envelope is a direct
         # OOM vector). We only decline to mirror the value in L1. If a smaller entry for this key
         # was cached, drop it so L1 stops serving the stale value.
-        if not self.admits(size):
+        max_entry_bytes = self.max_memory_bytes * _MAX_ENTRY_SHARE
+        if size > max_entry_bytes:
             self._on_current_state(_L1State.remove, key)
             logger.debug(
                 "Skipping L1 cache for key %s - value %d bytes exceeds L1 per-entry limit %d bytes (not kept in L1)",
                 redact_key_for_log(key),
                 size,
-                self.max_memory_bytes * _MAX_ENTRY_SHARE,
+                max_entry_bytes,
             )
             return
 

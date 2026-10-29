@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.l1_cache import get_l1_cache, get_l1_cache_manager
+from cachekit.l1_cache import get_l1_cache_manager
 from cachekit.reliability.async_metrics import AsyncMetricsCollector
 
 
@@ -80,12 +80,9 @@ async def test_async_get_hit_records_sync_labels(recorded: list[dict[str, Any]],
 
     assert len(recorded) == 1  # one hit, one record
     assert (recorded[0]["operation"], recorded[0].get("serializer")) == ("get", tier)  # what the sync hit sites pass
-    # Exact served size, not just positive: each hit site records the length of the bytes it read,
-    # the L2 envelope for an L2 hit and the L1 entry for an L1 hit. This one's L1 entry is its
-    # verified MessagePack, shorter than the envelope (CacheSerializationHandler.l1_entry). A `> 0`
-    # assertion would pass on a wrong constant (e.g. size_bytes=1); this pins the real value.
-    ((key, envelope),) = backend.store.items()
-    l1_entry = get_l1_cache("async-get-labels").peek(key)
-    assert l1_entry is not None and len(l1_entry) < len(envelope)
-    expected_size = len(envelope) if tier == "rust" else len(l1_entry)
+    # Exact served size, not just positive: both hit sites record the raw serialized
+    # envelope's length — the L1 backfill stores the same bytes L2 returned, so the
+    # single L2 store value is the ground truth for either tier. A `> 0` assertion
+    # would pass on a wrong constant (e.g. size_bytes=1); this pins the real value.
+    expected_size = len(next(iter(backend.store.values())))
     assert recorded[0].get("size_bytes") == expected_size

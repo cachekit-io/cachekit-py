@@ -73,7 +73,7 @@ With `backend=None`, cachekit keeps the returned object itself in memory and han
 
 With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. For the 100-user dict it takes 310 ± 20μs on the same runner, about 340 times an L1-only hit of the same dict. Nearly all of the difference is deserializing 23.5KB of MessagePack back into about 400 nested dicts. It is still about half of a Redis L2 hit there (551 ± 18μs), which deserializes the same bytes after the round trip.
 
-For a plaintext cache with the default serializer and integrity checking on, L1 holds an entry as its verified MessagePack instead of its envelope when the MessagePack is no longer, which is true of small values and incompressible ones. Such a hit decodes the MessagePack without the envelope's LZ4 decompress and xxHash3-64 checksum. The 100-user dict compresses to a 3,171-byte envelope from 23.5KB of MessagePack, so L1 keeps its envelope and the figures above are unchanged. Encrypted caches always keep the ciphertext envelope.
+For a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit swaps its envelope for its verified MessagePack when the MessagePack is no longer, which is true of small values and incompressible ones. Later hits decode the MessagePack without the envelope's LZ4 decompress and xxHash3-64 checksum. The 100-user dict compresses to a 3,171-byte envelope from 23.5KB of MessagePack, so L1 keeps its envelope and the figures above are unchanged. Encrypted caches always keep the ciphertext envelope.
 
 ### Decorator + L1 Hit (Hot Path)
 

@@ -1,9 +1,9 @@
 """Sync/async L2-hit parity (cachekit-py#164).
 
 An L2 hit must (a) backfill L1 so the next read of the same key never
-re-pays the L2 round-trip, and (b) record ``size_bytes`` as the length of the
-bytes the hit read (the L2 envelope, or the L1 entry), not ``len(str(value))`` —
-a repr is neither the payload size nor cheap to build on every hit. The async wrapper always did (a); the
+re-pays the L2 round-trip, and (b) record ``size_bytes`` as the serialized
+envelope's length, not ``len(str(value))`` — a repr is neither the payload
+size nor cheap to build on every hit. The async wrapper always did (a); the
 sync wrapper did neither. Both are pinned here through the real decorator
 stack against a plain (non-SWR, non-locking) byte store.
 """
@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.l1_cache import get_l1_cache
 from cachekit.reliability.async_metrics import AsyncMetricsCollector
 
 VALUE = {"answer": 42}
@@ -68,14 +67,12 @@ def _force_l2_only(backend: _CountingBackend, l2_snapshot: dict[str, bytes]) -> 
     backend.gets = 0
 
 
-def _assert_parity(backend: _CountingBackend, recorded: list[dict[str, Any]], info: Any, namespace: str) -> None:
-    ((key, envelope),) = backend.store.items()
-    l1_entry = get_l1_cache(namespace).peek(key)  # the backfill: VALUE's verified MessagePack (l1_entry)
-    assert l1_entry is not None and len(l1_entry) < len(envelope)
+def _assert_parity(backend: _CountingBackend, recorded: list[dict[str, Any]], info: Any) -> None:
+    envelope = next(iter(backend.store.values()))
     assert len(recorded) == 2  # one L2 hit, one L1 hit — one record each, nothing else
     assert [c["operation"] for c in recorded] == ["get", "get"]
     assert [c["serializer"] for c in recorded] == ["rust", "l1_memory"]
-    assert [c["size_bytes"] for c in recorded] == [len(envelope), len(l1_entry)]  # the bytes each hit read
+    assert [c["size_bytes"] for c in recorded] == [len(envelope)] * 2
     assert len(envelope) != len(str(VALUE).encode("utf-8"))  # the old str(value) accounting would differ
     assert backend.gets == 1  # second read never reached L2
     assert (info.l1_hits, info.l2_hits) == (1, 1)
@@ -101,7 +98,7 @@ class TestL2HitParity:
         assert compute() == VALUE  # L1 miss -> L2 hit -> backfill L1
         assert compute() == VALUE  # served from L1
         assert calls["n"] == 1
-        _assert_parity(backend, recorded, compute.cache_info(), "l2-parity-sync")  # type: ignore[attr-defined]
+        _assert_parity(backend, recorded, compute.cache_info())  # type: ignore[attr-defined]
 
     async def test_async_l2_hit_backfills_l1_and_records_envelope_size(self, recorded: list[dict[str, Any]]) -> None:
         backend = _CountingBackend()
@@ -121,7 +118,7 @@ class TestL2HitParity:
         assert await compute() == VALUE
         assert await compute() == VALUE
         assert calls["n"] == 1
-        _assert_parity(backend, recorded, compute.cache_info(), "l2-parity-async")  # type: ignore[attr-defined]
+        _assert_parity(backend, recorded, compute.cache_info())  # type: ignore[attr-defined]
 
     def test_sync_l2_hit_survives_refused_l1_backfill(self, caplog: pytest.LogCaptureFixture) -> None:
         """A refused backfill is logged and skipped; the served hit is never demoted to a recompute."""

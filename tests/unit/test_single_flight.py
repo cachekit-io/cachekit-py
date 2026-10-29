@@ -963,8 +963,9 @@ def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
 def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
     monkeypatch: pytest.MonkeyPatch, decoded: list[type]
 ) -> None:
-    """The trip that settled left the value's verified MessagePack in L1 (l1_entry); the re-check hands it to
-    _decode_shared, which decodes it without retrieve() and without a trip of its own."""
+    """Another caller's trip and then its L1 hit settle before this caller's flight lookup: the hit left the
+    value's verified MessagePack in L1 (deserialize_l1). The re-check hands it to _decode_shared, which decodes
+    it without retrieve() and without a trip of its own."""
     runs = 0
 
     def compute(x: int) -> dict[str, int]:
@@ -974,7 +975,17 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
 
     backend = _Backend()
     fn = _decorator("backed", backend)(compute)
-    _settle_another_trip_first(monkeypatch, fn)
+    real_run = ThreadFlights.run
+    lookups = 0
+
+    def run_after_another_trip_and_hit(self: ThreadFlights, *args: Any) -> Any:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            assert fn(1) == fn(1) == {"x": 1}  # another caller's trip, then its L1 hit
+        return real_run(self, *args)
+
+    monkeypatch.setattr(ThreadFlights, "run", run_after_another_trip_and_hit)
     assert fn(1) == {"x": 1}
 
     assert (runs, backend.requests) == (1, ["get", "set"])  # one function call and one backend read in all
