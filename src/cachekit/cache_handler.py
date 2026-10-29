@@ -373,7 +373,8 @@ def _fuses_tracked_write(backend: object) -> bool:
 
     Only while the instance resolves ``set`` and ``track_key`` to the functions in the owner's
     ``_set_tracked_replaces``. An override or patch anywhere (a subclass, the class itself, the instance,
-    ``__getattribute__``) keeps both calls, so the override still runs on every write. An SWR-capable backend keeps ``set`` too: the fused write has no slot for a stale-grace window.
+    ``__getattribute__``) keeps both calls, so the override still runs on every write. An SWR-capable backend
+    keeps ``set`` too: the fused write has no slot for a stale-grace window.
     """
     owner = next((klass for klass in type(backend).__mro__ if "_set_tracked" in vars(klass)), None)
     if owner is None or not supports_key_tracking(backend) or supports_swr(backend):  # pyright: ignore[reportArgumentType]

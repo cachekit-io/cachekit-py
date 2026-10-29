@@ -210,8 +210,11 @@ class TestFuseDecision:
         assert _fuses_tracked_write(PerRequestRedisBackend(client, "default"))
 
     def test_owner_without_a_record_never_fuses(self, client: redis.Redis) -> None:
-        """An owner that defines ``_set_tracked`` but records no ``_set_tracked_replaces`` never fuses."""
-        assert not _fuses_tracked_write(_OwnFused(client, "default"))
+        """An owner that defines ``_set_tracked`` but records no ``_set_tracked_replaces`` never fuses, even when the
+        instance's set and track_key are plain functions: their missing ``__func__`` must not match the missing record."""
+        backend = _OwnFused(client, "default")
+        backend.set = backend.track_key = lambda *args: None  # type: ignore[method-assign]
+        assert not _fuses_tracked_write(backend)
 
     @pytest.mark.parametrize("name", ["set", "track_key"])
     def test_class_level_patch_never_fuses(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
