@@ -772,6 +772,7 @@ class PerRequestRedisBackend:
                     failed = next((reply for reply in replies[1:] if isinstance(reply, Exception)), None)
                     return None if failed is None else classify_redis_error(failed, operation="track_key", key=registry_id)
                 error = classify_redis_error(replies[0], operation="set", key=key)
+                replies = None  # its raw redis-py error replies must not stay in a frame on the raised error's traceback
         try:
             raise error from error.original_exception
         finally:

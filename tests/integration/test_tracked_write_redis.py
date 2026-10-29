@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -169,7 +169,7 @@ class TestOneThreadHopPerAsyncTrackedWrite:
 
 
 @pytest.fixture
-def set_denied(client: redis.Redis) -> redis.Redis:
+def set_denied(client: redis.Redis) -> Iterator[redis.Redis]:
     """A client whose ACL user may run everything but SET: the SET of a fused write gets an error reply while
     its SADD and EXPIRE run."""
     client.acl_setuser("no-set", enabled=True, nopass=True, keys=["*"], commands=["+@all", "-set"])
