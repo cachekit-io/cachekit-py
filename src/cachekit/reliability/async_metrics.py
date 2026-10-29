@@ -1,16 +1,19 @@
 """Async metrics collection for high-performance reliability features.
 
-This module provides asynchronous, batched metrics collection to eliminate
-synchronous Prometheus updates from the hot path.
+Cache operations record into per-thread cells that their Prometheus series sum when read, so the hot path takes no
+shared lock and a scrape is exact at once. Generic counters and histograms record synchronously or through a
+batching worker.
 """
 
 import logging
+import math
 import numbers
 import os
 import queue
 import threading
 import time
 import warnings
+from bisect import bisect_left
 from collections import defaultdict
 from typing import Any, Optional, Union
 
@@ -39,18 +42,20 @@ DURATION_BUCKETS_MS = (0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 10
 # Bytes, powers of 4: 16 B through 256 MiB, above the default max_value_size (100 MiB).
 SIZE_BUCKETS_BYTES = tuple(float(4**i) for i in range(2, 15))
 
-# A batched flush's cache_operations_total series: (operation, namespace, success, serializer).
+# A cache operation's label tuple: (operation, namespace, success, serializer).
 _CacheOpKey = tuple[str, str, bool, str]
-# One batched record's histogram values: (operation, namespace, success, serializer, duration_ms, size_bytes). None
-# marks a value the sync path would not observe.
-_CacheObservation = tuple[str, str, bool, str, Optional[float], Optional[int]]
 
 try:
     from prometheus_client import REGISTRY, Counter, Gauge, Histogram  # type: ignore[assignment]
+    from prometheus_client import values as _prometheus_values
 
     PROMETHEUS_AVAILABLE = True
+    # Per-thread cells need in-process values. In multiprocess mode (PROMETHEUS_MULTIPROC_DIR) a scrape reads each
+    # process's mmap files, not the values, so cache operations record into the series directly instead.
+    _PER_THREAD = _prometheus_values.ValueClass is _prometheus_values.MutexValue
 except ImportError:
     PROMETHEUS_AVAILABLE = False  # type: ignore[misc]
+    _PER_THREAD = False  # type: ignore[misc]
     REGISTRY = None  # type: ignore[assignment]
 
     # Mock classes for when Prometheus is not available
@@ -110,23 +115,38 @@ _metrics_cache: dict[str, Any] = {}
 # One lock per process, keyed by pid: a C-level fork skips the at-fork hooks below, so a
 # child must never take a lock it inherited, possibly held by a thread that is gone.
 _metrics_locks: dict[int, threading.Lock] = {}
+# Guards the per-thread cells' registries (see _Shards and _ThreadState), keyed by pid for the same reason. A leaf
+# lock: nothing takes another lock while holding it, except the value locks of a series it is first installing into.
+_shard_locks: dict[int, threading.Lock] = {}
+
+
+def _pid_lock(locks: dict[int, threading.Lock]) -> threading.Lock:
+    """Return this process's lock in ``locks``, creating it on first use."""
+    pid = os.getpid()
+    lock = locks.get(pid)
+    if lock is None:
+        # setdefault is atomic, so threads racing here in a new child all get one lock.
+        lock = locks.setdefault(pid, threading.Lock())
+    return lock
 
 
 def _metrics_cache_lock() -> threading.Lock:
     """Return this process's metric-cache lock, creating it on first use."""
-    pid = os.getpid()
-    lock = _metrics_locks.get(pid)
-    if lock is None:
-        # setdefault is atomic, so threads racing here in a new child all get one lock.
-        lock = _metrics_locks.setdefault(pid, threading.Lock())
-    return lock
+    return _pid_lock(_metrics_locks)
 
 
-def _acquire_metrics_lock() -> None:
+def _shard_lock() -> threading.Lock:
+    """Return this process's per-thread-cell lock, creating it on first use."""
+    return _pid_lock(_shard_locks)
+
+
+def _acquire_fork_locks() -> None:
     _metrics_cache_lock().acquire()
+    _shard_lock().acquire()
 
 
-def _release_metrics_lock() -> None:
+def _release_fork_locks() -> None:
+    _shard_lock().release()
     _metrics_cache_lock().release()
 
 
@@ -200,16 +220,17 @@ def _after_fork_in_child() -> None:
     """Repair the child of a fork made from Python, which runs this while it is single-threaded."""
     global _hooked_fork_pid
     _metrics_locks.clear()  # only frees the parent's entry: keyed by its PID, it is never looked up here
+    _shard_locks.clear()
     _hooked_fork_pid = os.getpid()
     _reset_metric_locks()
 
 
 if hasattr(os, "register_at_fork"):
-    # Hold the lock across fork (as the logging module does) so no thread is between
-    # registering a metric and caching it.
+    # Hold the locks across fork (as the logging module does) so no thread is between registering a metric and
+    # caching it, or between moving an exited thread's counts into a series and dropping its cells.
     os.register_at_fork(
-        before=_acquire_metrics_lock,
-        after_in_parent=_release_metrics_lock,
+        before=_acquire_fork_locks,
+        after_in_parent=_release_fork_locks,
         after_in_child=_after_fork_in_child,
     )
 
@@ -266,46 +287,29 @@ _SIZE = "cache_operation_size_bytes"
 class _CacheOpSeries:
     """The three cache-operation series of one (operation, namespace, success, serializer) tuple, bound once.
 
-    ``Metric.labels()`` sorts its arguments, validates them and takes a lock on every call: three of them cost
-    about 5 us per recorded operation. Each series binds on its first update, so a tuple that never counts, or
-    never observes a duration or size, gets no empty series, exactly as per-call ``labels()`` left it. A series
-    detached by the parent's ``clear()`` or ``remove()`` binds again on its next update, as per-call ``labels()``
-    would: each update checks that the child is still the one its parent exports, inline because a helper call
-    costs about 1% per operation. The parent metrics are kept so ``_cache_op_series`` can tell when
-    ``_metrics_cache`` holds a different metric under a name (tests replace them), and rebind instead of recording
-    into an orphan.
+    ``Metric.labels()`` sorts its arguments, validates them and takes a lock on every call. Each series binds on
+    its first update, so a tuple that never counts, or never observes a duration or size, gets no empty series,
+    exactly as per-call ``labels()`` left it. A series detached by the parent's ``clear()`` or ``remove()`` binds
+    again on its next update, as per-call ``labels()`` would. ``metrics`` is kept so ``_cache_op_series`` can tell
+    when ``_metrics_cache`` holds a different metric under a name (tests replace them), and rebind instead of
+    recording into an orphan. Index 0 is the counter, 1 the duration histogram and 2 the size histogram.
     """
 
-    __slots__ = ("counter_metric", "duration_metric", "size_metric", "_success", "_labels", "_counter", "_duration", "_size")
+    __slots__ = ("metrics", "_labels", "_children")
 
-    def __init__(self, counter_metric: Any, duration_metric: Any, size_metric: Any, key: _CacheOpKey):
+    def __init__(self, metrics: tuple[Any, Any, Any], key: _CacheOpKey):
         operation, namespace, success, serializer = key
-        self.counter_metric = counter_metric
-        self.duration_metric = duration_metric
-        self.size_metric = size_metric
-        self._success = str(success)
-        self._labels = {"operation": operation, "namespace": namespace, "serializer": serializer}
-        self._counter: Any = None
-        self._duration: Any = None
-        self._size: Any = None
+        self.metrics = metrics
+        histogram_labels = {"operation": operation, "namespace": namespace, "serializer": serializer}
+        self._labels = ({**histogram_labels, "success": str(success)}, histogram_labels, histogram_labels)
+        self._children: list[Any] = [None, None, None]
 
-    def inc(self, amount: int = 1) -> None:
-        child, parent = self._counter, self.counter_metric
+    def child(self, i: int) -> Any:
+        """Return series ``i``'s child, binding it if it is unbound or its parent no longer exports it."""
+        child, parent = self._children[i], self.metrics[i]
         if child is None or (child is not parent and parent._metrics.get(child._labelvalues) is not child):
-            child = self._counter = self.counter_metric.labels(success=self._success, **self._labels)
-        child.inc(amount)
-
-    def observe_duration(self, duration_ms: float) -> None:
-        child, parent = self._duration, self.duration_metric
-        if child is None or (child is not parent and parent._metrics.get(child._labelvalues) is not child):
-            child = self._duration = self.duration_metric.labels(**self._labels)
-        child.observe(duration_ms)
-
-    def observe_size(self, size_bytes: float) -> None:
-        child, parent = self._size, self.size_metric
-        if child is None or (child is not parent and parent._metrics.get(child._labelvalues) is not child):
-            child = self._size = self.size_metric.labels(**self._labels)
-        child.observe(size_bytes)
+            child = self._children[i] = parent.labels(**self._labels[i])
+        return child
 
 
 # Process-wide, like the metrics whose series it holds. One entry per label tuple, the same cardinality
@@ -320,32 +324,230 @@ def _cache_op_series(operation: str, namespace: str, success: bool, serializer: 
     series = _cache_op_series_cache.get(key)
     if (
         series is None
-        or series.counter_metric is not _metrics_cache.get(_COUNTER)
-        or series.duration_metric is not _metrics_cache.get(_DURATION)
-        or series.size_metric is not _metrics_cache.get(_SIZE)
+        or series.metrics[0] is not _metrics_cache.get(_COUNTER)
+        or series.metrics[1] is not _metrics_cache.get(_DURATION)
+        or series.metrics[2] is not _metrics_cache.get(_SIZE)
     ):
         series = _cache_op_series_cache[key] = _CacheOpSeries(
-            _get_shared_metric(_COUNTER, Counter, "Total cache operations", ["operation", "namespace", "success", "serializer"]),
-            _get_shared_metric(
-                _DURATION, Histogram, "Cache operation duration", ["operation", "namespace", "serializer"], DURATION_BUCKETS_MS
-            ),
-            _get_shared_metric(
-                _SIZE, Histogram, "Cache operation size", ["operation", "namespace", "serializer"], SIZE_BUCKETS_BYTES
+            (
+                _get_shared_metric(
+                    _COUNTER, Counter, "Total cache operations", ["operation", "namespace", "success", "serializer"]
+                ),
+                _get_shared_metric(
+                    _DURATION,
+                    Histogram,
+                    "Cache operation duration",
+                    ["operation", "namespace", "serializer"],
+                    DURATION_BUCKETS_MS,
+                ),
+                _get_shared_metric(
+                    _SIZE, Histogram, "Cache operation size", ["operation", "namespace", "serializer"], SIZE_BUCKETS_BYTES
+                ),
             ),
             key,
         )
     return series
 
 
+def _add_exact(partials: list[float], x: float) -> None:
+    """Add ``x`` to the exact sum that ``partials`` holds as non-overlapping floats (Shewchuk's algorithm).
+
+    ``math.fsum`` of the partials and any other floats is then the correctly rounded total, however the values were
+    grouped. A plain float total would round differently once an exited thread's cell joined it, and could read one
+    ulp lower than the scrape before: a decrease Prometheus takes for a counter reset.
+    """
+    i = 0
+    for y in partials:
+        if abs(x) < abs(y):
+            x, y = y, x
+        hi = x + y
+        lo = y - (hi - x)
+        if lo:
+            partials[i] = lo
+            i += 1
+        x = hi
+    partials[i:] = [x]
+
+
+class _Shards:
+    """The per-thread cells behind one Prometheus child, and the exact total of every cell already retired.
+
+    A counter child has one value (its count); a histogram child has its sum, then one count per bucket. Each
+    thread that records into the child owns one cell, a list of floats only that thread writes. Readers sum the
+    cells under ``_shard_lock()`` and see each value monotonic: a cell only grows, and retiring one moves it into
+    ``retired`` and drops it in one step under that lock.
+    """
+
+    __slots__ = ("retired", "cells")
+
+    def __init__(self, values: list[float]):
+        self.retired = [[v] for v in values]
+        self.cells: dict[int, list[float]] = {}  # id(cell) -> cell; the dict keeps each cell, so its id is unique
+
+    def add_cell(self) -> list[float]:
+        """Return a new zeroed cell that the calling thread owns. Caller holds ``_shard_lock()``."""
+        cell = [0.0] * len(self.retired)
+        self.cells[id(cell)] = cell
+        return cell
+
+    def retire(self, cell: list[float]) -> None:
+        """Move ``cell``'s counts into ``retired``. Caller holds ``_shard_lock()``; no thread may write ``cell`` again."""
+        if self.cells.pop(id(cell), None) is not None:
+            for partials, value in zip(self.retired, cell, strict=True):
+                _add_exact(partials, value)
+
+    def total(self, i: int) -> float:
+        """Return value ``i`` summed over every cell, live and retired. Caller holds ``_shard_lock()``."""
+        return math.fsum([*self.retired[i], *(cell[i] for cell in self.cells.values())])
+
+
+class _ShardView:
+    """Stands in for one prometheus_client value of a cache-operation child, reading its total from ``_Shards``.
+
+    The child's own ``inc()``, ``observe()``, ``set()`` and ``reset()`` still work: they change the retired total.
+    Only the per-thread record path writes the cells.
+    """
+
+    __slots__ = ("shards", "i", "_exemplar")
+
+    def __init__(self, shards: _Shards, i: int, exemplar: Any = None):
+        self.shards = shards
+        self.i = i
+        self._exemplar = exemplar
+
+    def inc(self, amount: float) -> None:
+        with _shard_lock():
+            _add_exact(self.shards.retired[self.i], amount)
+
+    def set(self, value: float, timestamp: Optional[float] = None) -> None:
+        with _shard_lock():
+            partials = [float(value)]
+            for cell in self.shards.cells.values():
+                _add_exact(partials, -cell[self.i])
+            self.shards.retired[self.i] = partials
+
+    def get(self) -> float:
+        with _shard_lock():
+            return self.shards.total(self.i)
+
+    def set_exemplar(self, exemplar: Any) -> None:
+        self._exemplar = exemplar
+
+    def get_exemplar(self) -> Any:
+        return self._exemplar
+
+
+def _shards_of(child: Any, i: int) -> _Shards:
+    """Return the ``_Shards`` behind ``child``, installing views over its values first. Caller holds ``_shard_lock()``.
+
+    Index 0 is a counter child; 1 and 2 are histogram children. The values a child already holds become the
+    retired total, so nothing recorded into it before is lost.
+    """
+    if i == 0:
+        value = child._value
+        if isinstance(value, _ShardView):
+            return value.shards
+        shards = _Shards([value.get()])
+        child._value = _ShardView(shards, 0, value.get_exemplar())
+        return shards
+    if isinstance(child._sum, _ShardView):
+        return child._sum.shards
+    buckets = child._buckets
+    shards = _Shards([child._sum.get(), *(b.get() for b in buckets)])
+    child._sum = _ShardView(shards, 0)
+    child._buckets = [_ShardView(shards, j + 1, b.get_exemplar()) for j, b in enumerate(buckets)]
+    return shards
+
+
+class _Slot:
+    """One thread's cell in one bound series, with what the record path checks to tell the series is still live."""
+
+    __slots__ = ("metric", "child", "cell", "bounds", "shards")
+
+    def __init__(self, metric: Any, child: Any, cell: list[float], bounds: Any, shards: Optional[_Shards]):
+        self.metric = metric
+        self.child = child
+        self.cell = cell
+        self.bounds = bounds  # a histogram's bucket upper bounds, +Inf last; None for the counter
+        self.shards = shards  # None for a metric the host owns, whose records go nowhere
+
+
+class _ThreadState:
+    """One thread's cache-operation cells and per-collector operation counts.
+
+    Only ``_tls`` refers to it, so it is freed when its thread exits, and ``__del__`` then folds its counts into
+    the totals the thread leaves behind: a collector's ``_retired_ops`` entry and each series' retired total. That
+    keeps an exited thread's counts and bounds the cells to the live threads.
+    """
+
+    __slots__ = ("slots", "ops")
+
+    def __init__(self) -> None:
+        self.slots: dict[_CacheOpKey, list[Optional[_Slot]]] = {}
+        self.ops: dict[object, int] = {}  # collector token -> operations this thread recorded
+        with _shard_lock():
+            _thread_ops[id(self)] = self.ops
+
+    def new_slots(self, key: _CacheOpKey) -> list[Optional[_Slot]]:
+        """Return this thread's empty slots for ``key``: counter, duration, size. ``_bind`` fills each on first use."""
+        slots: list[Optional[_Slot]] = [None, None, None]
+        self.slots[key] = slots
+        return slots
+
+    def __del__(self) -> None:
+        with _shard_lock():
+            # One step, so a reader sums each count once: before its move, or after it.
+            _thread_ops.pop(id(self), None)
+            for token, count in self.ops.items():
+                _retired_ops[token] = _retired_ops.get(token, 0) + count
+            for slots in self.slots.values():
+                for slot in slots:
+                    if slot is not None and slot.shards is not None:
+                        slot.shards.retire(slot.cell)
+
+
+_tls = threading.local()
+# Every live thread's operation counts, keyed by id() of its _ThreadState, and the counts of threads that exited, per
+# collector token. Both guarded by _shard_lock(). A forked child keeps its parent's threads' counts here.
+_thread_ops: dict[int, dict[object, int]] = {}
+_retired_ops: dict[object, int] = {}
+
+
+def _new_thread_state() -> _ThreadState:
+    state = _tls.state = _ThreadState()
+    return state
+
+
+def _bind(slots: list[Optional[_Slot]], i: int, key: _CacheOpKey) -> _Slot:
+    """Give this thread a cell in series ``i`` of ``key``, retiring any cell it held in a series no longer live."""
+    # Off the hot path, so a child of a fork made from C replaces any lock a parent thread held before labels() and
+    # the values below take it.
+    _reset_metric_locks_once()
+    series = _cache_op_series(*key)
+    metric, child = series.metrics[i], series.child(i)
+    old = slots[i]
+    noop = isinstance(metric, _NoopMetric)
+    bounds = None if i == 0 else (math.inf,) if noop else child._upper_bounds
+    with _shard_lock():
+        if old is not None and old.shards is not None:
+            old.shards.retire(old.cell)
+        shards = None if noop else _shards_of(child, i)
+        # A host-owned name records nowhere: a scratch cell wide enough for a count, or a sum and the one +Inf bucket.
+        cell = [0.0, 0.0] if shards is None else shards.add_cell()
+    slot = slots[i] = _Slot(metric, child, cell, bounds, shards)
+    return slot
+
+
 class AsyncMetricsCollector:
     """High-performance metrics collector with sync/async modes.
 
     Features:
-    - Sync mode: Direct Prometheus calls for low-frequency operations
-    - Async mode: Non-blocking batched updates for high-frequency scenarios
+    - Cache operations: recorded into per-thread cells in either mode, so the hot path takes no shared lock and
+      a scrape reads every operation recorded before it
+    - Sync mode: Direct Prometheus calls for low-frequency generic metrics
+    - Async mode: Non-blocking batched updates of generic metrics for high-frequency scenarios
     - Automatic mode detection based on usage patterns
-    - Zero-copy thread communication with memory pools
-    - Graceful overflow handling (drops metrics under extreme load)
+    - Graceful overflow handling (drops batched metrics under extreme load)
 
     Examples:
         Create collector in sync mode:
@@ -391,7 +593,8 @@ class AsyncMetricsCollector:
             batch_size: Number of metrics to batch before flushing (async mode only)
             flush_interval: Maximum time between flushes in seconds (async mode only)
             max_queue_size: Maximum queue size before dropping metrics (async mode only)
-            sync_mode: Force sync mode (True) or async mode (False). None for auto-detect. Whatever the mode, a
+            sync_mode: Force sync mode (True) or async mode (False). None for auto-detect. The mode decides how
+                generic counters and histograms record; cache operations record per thread in both. Whatever the mode, a
                 collector records synchronously after ``shutdown()``. So does one inherited by a forked child,
                 until a mode check starts a worker of the child's own, which never happens with auto-detect off.
                 In the child of a fork made from C, every collector, inherited or built there, records
@@ -405,8 +608,10 @@ class AsyncMetricsCollector:
         self.max_queue_size = max_queue_size
         self.auto_detect_mode = auto_detect_mode
 
-        # Performance tracking for mode detection
-        self._operation_count = 0
+        # Performance tracking for mode detection. Each thread counts this collector's operations under this token in
+        # its own _ThreadState; _operation_count sums them. The offset is what assigning _operation_count adds.
+        self._token = object()
+        self._ops_offset = 0
         self._start_time = time.time()
         self._last_mode_check = time.time()
 
@@ -456,18 +661,85 @@ class AsyncMetricsCollector:
     ):
         """Record cache operation metric.
 
-        Automatically uses sync or async mode based on configuration.
+        In either mode, the operation lands in this thread's cells, which its series sum when read: the call writes
+        no state another thread writes, and a scrape right after it counts it. Each series check below is inline,
+        because a helper call costs about 1% per operation; it rebinds a series whose metric was replaced or whose
+        child was detached (see ``_CacheOpSeries``).
         """
-        self._operation_count += 1
+        try:
+            state = _tls.state
+        except AttributeError:
+            state = _new_thread_state()
+        ops, token = state.ops, self._token
+        ops[token] = ops.get(token, 0) + 1
 
         # Auto-detect mode switch if enabled
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
 
-        if self._sync_mode or not self._may_enqueue():
+        if not _PER_THREAD:
             self._record_cache_operation_sync(operation, namespace, success, duration_ms, serializer, size_bytes)
-        else:
-            self._record_cache_operation_async(operation, namespace, success, duration_ms, serializer, size_bytes)
+            return
+
+        key = (operation, namespace, success, serializer)
+        slots = state.slots.get(key)
+        if slots is None:
+            slots = state.new_slots(key)
+        s = slots[0]
+        if (
+            s is None
+            or s.metric is not _metrics_cache.get(_COUNTER)
+            or (s.child is not s.metric and s.metric._metrics.get(s.child._labelvalues) is not s.child)
+        ):
+            s = _bind(slots, 0, key)
+        s.cell[0] += 1
+        if duration_ms > 0:
+            s = slots[1]
+            if (
+                s is None
+                or s.metric is not _metrics_cache.get(_DURATION)
+                or (s.child is not s.metric and s.metric._metrics.get(s.child._labelvalues) is not s.child)
+            ):
+                s = _bind(slots, 1, key)
+            cell = s.cell
+            cell[0] += duration_ms
+            cell[bisect_left(s.bounds, duration_ms) + 1] += 1  # the first bucket whose bound is >= the value
+        if size_bytes > 0:
+            s = slots[2]
+            if (
+                s is None
+                or s.metric is not _metrics_cache.get(_SIZE)
+                or (s.child is not s.metric and s.metric._metrics.get(s.child._labelvalues) is not s.child)
+            ):
+                s = _bind(slots, 2, key)
+            cell = s.cell
+            cell[0] += size_bytes
+            cell[bisect_left(s.bounds, size_bytes) + 1] += 1
+
+    def _count_operation(self) -> None:
+        """Count one operation of this collector in this thread's state."""
+        try:
+            state = _tls.state
+        except AttributeError:
+            state = _new_thread_state()
+        ops, token = state.ops, self._token
+        ops[token] = ops.get(token, 0) + 1
+
+    def _operation_total(self) -> int:
+        """Return this collector's operations summed over every thread. Caller holds ``_shard_lock()``."""
+        token = self._token
+        return self._ops_offset + _retired_ops.get(token, 0) + sum(ops.get(token, 0) for ops in _thread_ops.values())
+
+    @property
+    def _operation_count(self) -> int:
+        """Operations recorded so far, summed over every thread, live or exited. Never decreases unless assigned."""
+        with _shard_lock():
+            return self._operation_total()
+
+    @_operation_count.setter
+    def _operation_count(self, value: int) -> None:
+        with _shard_lock():
+            self._ops_offset += value - self._operation_total()
 
     def record_circuit_breaker_state(self, namespace: str, state: str, transitions: int = 0):
         """Deprecated: records nothing.
@@ -500,7 +772,7 @@ class AsyncMetricsCollector:
                 label names differ from those the metric was first recorded with.
             OverflowError: If ``value`` is too large for a float.
         """
-        self._operation_count += 1
+        self._count_operation()
 
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
@@ -528,7 +800,7 @@ class AsyncMetricsCollector:
                 label names differ from those the metric was first recorded with.
             OverflowError: If ``value`` is too large for a float.
         """
-        self._operation_count += 1
+        self._count_operation()
 
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
@@ -597,24 +869,12 @@ class AsyncMetricsCollector:
             return
 
         # Group metrics by type for efficient processing
-        cache_ops: dict[_CacheOpKey, int] = defaultdict(int)
-        # Every record's own duration and size, in record order, so the histograms get what sync mode observes.
-        cache_observations: list[_CacheObservation] = []
         counters = defaultdict(lambda: defaultdict(float))  # {name: {labels_key: value}}
         histograms = defaultdict(list)  # {name: [(value, labels_key)]}
 
         for metric in batch:
             try:
-                if metric["type"] == "cache_operation":
-                    operation, namespace, serializer = metric["operation"], metric["namespace"], metric["serializer"]
-                    # Compared here, before anything is counted: a value that cannot be compared rejects only this
-                    # record, where in the update below it would end the batch's remaining observations.
-                    duration_ms = metric["duration_ms"] if metric["duration_ms"] > 0 else None
-                    size_bytes = metric["size_bytes"] if metric["size_bytes"] > 0 else None
-                    cache_ops[(operation, namespace, metric["success"], serializer)] += 1
-                    cache_observations.append((operation, namespace, metric["success"], serializer, duration_ms, size_bytes))
-
-                elif metric["type"] == "counter":
+                if metric["type"] == "counter":
                     value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
@@ -637,7 +897,7 @@ class AsyncMetricsCollector:
         # unforeseen: most worker call sites (the shutdown drain among them) have no handler above them, so an
         # escaping exception would end the worker and strand every record still queued.
         try:
-            self._update_prometheus_metrics(cache_ops, cache_observations, counters, histograms)  # type: ignore[arg-type]
+            self._update_prometheus_metrics(counters, histograms)  # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
@@ -673,26 +933,8 @@ class AsyncMetricsCollector:
             raise TypeError("metric value must be a number")
         return float(value)
 
-    def _update_prometheus_metrics(
-        self,
-        cache_ops: dict[_CacheOpKey, int],
-        cache_observations: list[_CacheObservation],
-        counters: dict[str, dict[str, Any]],
-        histograms: dict[str, list[Any]],
-    ):
+    def _update_prometheus_metrics(self, counters: dict[str, dict[str, Any]], histograms: dict[str, list[Any]]):
         """Update Prometheus metrics in batch."""
-        # Batch update cache metrics
-        for (operation, namespace, success, serializer), count in cache_ops.items():
-            _cache_op_series(operation, namespace, success, serializer).inc(count)
-
-        # One observation per record, skipping zero values as the sync path does.
-        for operation, namespace, success, serializer, duration_ms, size_bytes in cache_observations:
-            series = _cache_op_series(operation, namespace, success, serializer)
-            if duration_ms is not None:
-                series.observe_duration(duration_ms)
-            if size_bytes is not None:
-                series.observe_size(size_bytes)
-
         # Update generic counters
         for name, label_values in counters.items():
             # Extract label names from first entry
@@ -753,11 +995,12 @@ class AsyncMetricsCollector:
     def get_stats(self) -> dict[str, Any]:
         """Get comprehensive performance statistics."""
         elapsed = time.time() - self._start_time
-        ops_per_second = self._operation_count / elapsed if elapsed > 0 else 0
+        total = self._operation_count  # read once: the sum takes a lock, and both fields must agree
+        ops_per_second = total / elapsed if elapsed > 0 else 0
 
         return {
             "mode": "sync" if self._sync_mode else "async",
-            "total_operations": self._operation_count,
+            "total_operations": total,
             "dropped_metrics": self._dropped_metrics,
             "uptime_seconds": elapsed,
             "ops_per_second": ops_per_second,
@@ -870,14 +1113,15 @@ class AsyncMetricsCollector:
 
     def _maybe_switch_mode(self):
         """Switch between sync and async mode based on usage patterns."""
-        if self._operation_count < 10:  # Need minimum sample size
+        count = self._operation_count  # summed over every thread
+        if count < 10:  # Need minimum sample size
             return
 
         elapsed = time.time() - self._start_time
         if elapsed < 1.0:  # Need at least 1 second of data
             return
 
-        ops_per_second = self._operation_count / elapsed
+        ops_per_second = count / elapsed
 
         # Both switches touch the batching state: one reuses the queue, the other sets the stop event.
         self._take_over_if_forked()
@@ -926,16 +1170,16 @@ class AsyncMetricsCollector:
         serializer: str,
         size_bytes: int,
     ):
-        """Record cache operation directly to Prometheus (sync mode)."""
+        """Record cache operation directly to Prometheus: the path for multiprocess mode, which has no per-thread cells."""
         if not PROMETHEUS_AVAILABLE:
             return
 
         series = _cache_op_series(operation, namespace, success, serializer)
-        series.inc()
+        series.child(0).inc()
         if duration_ms > 0:
-            series.observe_duration(duration_ms)
+            series.child(1).observe(duration_ms)
         if size_bytes > 0:
-            series.observe_size(size_bytes)
+            series.child(2).observe(size_bytes)
 
     def _record_counter_sync(self, metric_name: str, labels: dict[str, Any], value: float):
         """Record counter directly to Prometheus (sync mode)."""
@@ -956,38 +1200,6 @@ class AsyncMetricsCollector:
         self._series(histogram, labels).observe(value)
 
     # Async mode implementations (queued processing)
-    def _record_cache_operation_async(
-        self,
-        operation: str,
-        namespace: str,
-        success: bool,
-        duration_ms: float,
-        serializer: str,
-        size_bytes: int,
-    ):
-        """Record cache operation to queue for async processing."""
-        assert self._queue is not None, "Async metrics not initialized"
-
-        metric_data = self._get_pooled_metric_data()
-        metric_data.update(
-            {
-                "type": "cache_operation",
-                "operation": operation,
-                "namespace": namespace,
-                "success": success,
-                "duration_ms": duration_ms,
-                "serializer": serializer,
-                "size_bytes": size_bytes,
-                "timestamp": time.time(),
-            }
-        )
-
-        try:
-            self._queue.put_nowait(metric_data)
-        except queue.Full:
-            self._dropped_metrics += 1
-            self._return_to_pool(metric_data)  # Return to pool if failed
-
     def _record_counter_async(self, metric_name: str, labels: dict[str, Any], value: float):
         """Record counter to queue for async processing."""
         assert self._queue is not None, "Async metrics not initialized"

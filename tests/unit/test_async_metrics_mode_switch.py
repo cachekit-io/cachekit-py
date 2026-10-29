@@ -112,13 +112,12 @@ def test_no_new_worker_starts_while_the_previous_one_is_alive(monkeypatch):
     assert collector._sync_mode
     assert collector._worker_thread is old_worker
 
-    before = _flushed(namespace)
-    q.put_nowait({"type": "cache_operation", "operation": "get", "namespace": namespace, "success": True,
-                  "duration_ms": 1.0, "serializer": "unknown", "size_bytes": 0})  # fmt: skip
+    counter = _metric_name(namespace)
+    q.put_nowait({"type": "counter", "name": counter, "labels": {}, "value": 1.0})
     old_worker.join(timeout=5.0)
     assert not old_worker.is_alive()
     # The old worker's exit drain flushed the record it was woken with.
-    assert _flushed(namespace) - before == 1
+    assert _sample(f"{counter}_total") == 1
 
     _steer(collector, 500)
     _record(collector, namespace)
@@ -348,23 +347,27 @@ def test_child_of_a_batched_parent_records_past_a_lock_held_at_fork(held, entry)
 
 
 def _prometheus_lock(held: str, namespace: str) -> Any:
-    """Return the prometheus_client lock named by ``held``, for the series a cache operation in ``namespace`` updates."""
+    """Return the lock named by ``held``, for the series a cache operation in ``namespace`` updates."""
     from prometheus_client import REGISTRY
 
     if held == "registry":
         return REGISTRY._lock
-    counter = async_metrics._metrics_cache["cache_operations_total"]
-    if held == "counter":
-        return counter._lock  # taken by labels()
-    if held == "counter-series":
-        return counter.labels(operation="get", namespace=namespace, success="True", serializer="unknown")._value._lock
-    duration = async_metrics._metrics_cache["cache_operation_duration_ms"]
-    series = duration.labels(operation="get", namespace=namespace, serializer="unknown")
-    return series._sum._lock if held == "histogram-sum" else series._buckets[0]._lock
+    if held == "series":
+        # Every cache-operation series value reads and retires per-thread cells under this one lock (_ShardView).
+        return async_metrics._shard_lock()
+    return async_metrics._metrics_cache["cache_operations_total"]._lock  # taken by labels()
 
 
-@pytest.mark.parametrize("fork_holding", FORKS)
-@pytest.mark.parametrize("held", ["counter", "counter-series", "histogram-sum", "histogram-bucket", "registry"])
+# The at-fork hook takes the series lock itself, so only a fork made from C can inherit it held.
+PROMETHEUS_LOCKS = [
+    pytest.param(held, fork.values[0], id=f"{held}-{fork.id}", marks=fork.marks)
+    for held in ("counter", "series", "registry")
+    for fork in FORKS
+    if not (held == "series" and fork.id == "fork")
+]
+
+
+@pytest.mark.parametrize(("held", "fork_holding"), PROMETHEUS_LOCKS)
 def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
     namespace = f"fork-prometheus-{held}-{uuid.uuid4().hex}"
     # Create the series first, as a parent that has recorded before has; its worker updates them under these locks.
@@ -386,7 +389,7 @@ def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
 
 
 @needs_fork
-@pytest.mark.parametrize("held", ["counter", "counter-series", "histogram-sum", "histogram-bucket", "registry"])
+@pytest.mark.parametrize("held", ["counter", "registry"])  # the series lock: see PROMETHEUS_LOCKS
 def test_child_of_a_sync_parent_records_past_a_prometheus_lock_held_at_fork(held):
     namespace = f"fork-prometheus-sync-{held}-{uuid.uuid4().hex}"
     collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
@@ -502,7 +505,7 @@ def test_collector_built_in_a_c_level_fork_child_records_synchronously_and_start
         return len(_UnstartedThread.started), modes, _flushed(namespace)
 
     # A parent thread holds the series lock, so a record into it hangs unless the child's locks are fresh.
-    held = _prometheus_lock("counter-series", namespace)
+    held = _prometheus_lock("series", namespace)
     assert _in_c_forked_child_holding(held, child) == (0, [(True, True), (True, True)], 3)
 
 
@@ -549,7 +552,8 @@ def _batched_collector_as_a_child_inherits_it() -> AsyncMetricsCollector:
     return collector
 
 
-@pytest.mark.parametrize("entry", ENTRY_POINTS)
+# A cache operation never queues, so it never takes over the batching state; a mode check does that for it.
+@pytest.mark.parametrize("entry", [e for e in ENTRY_POINTS if e != "cache-operation"])
 def test_take_over_replaces_the_inherited_batching_state(entry):
     record, read, after_batched = ENTRY_POINTS[entry]
     namespace = f"take-over-{entry}-{uuid.uuid4().hex}"

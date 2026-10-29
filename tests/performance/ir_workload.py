@@ -83,11 +83,11 @@ def build_workload(path: str) -> Callable[[], object]:
         """Decorate with the metrics collector in batched mode, where a busy long-lived process runs.
 
         A collector starts synchronous. At a mode check (every 5 s) that sees more than 100
-        records/s it switches to batched mode: each call puts its record on a queue and a worker
-        thread updates Prometheus. Pinned clocks never let 5 s pass, so this variant starts the
-        collector batched. It then stops the worker, which drains the queue on real time and would
-        otherwise change the main thread's count with host load. The budget covers the caller's
-        side, putting the record on the queue; the worker's Prometheus update is not budgeted.
+        records/s it switches to batched mode, which queues generic metrics for a worker thread.
+        Cache operations record into per-thread cells in either mode, so this path must cost what
+        ``l2_hit`` costs. Pinned clocks never let 5 s pass, so this variant starts the collector
+        batched. It then stops the worker, which wakes on real time and would otherwise change the
+        main thread's count with host load.
         """
         made: list[Any] = []
 
@@ -106,19 +106,9 @@ def build_workload(path: str) -> Callable[[], object]:
         collector._worker_thread.join()
         queued = collector._queue.qsize()
         fn(42, "user-profile")
-        if collector._sync_mode or collector._queue.qsize() <= queued:
-            raise RuntimeError("l2_hit_async_metrics: the call did not queue its metric, so batched mode is not measured")
-
-        def call(*args: Any) -> dict:
-            result = fn(*args)
-            # Do what the worker does with a record: take it off the queue and return its dict to
-            # the pool. Queue and pool then hold one item each, as a keeping-up worker leaves them,
-            # so every call takes the pool-hit branch a busy process takes and the heap stops
-            # growing (a growing queue widened the layout spread). Under 1.6k Ir of the figure.
-            collector._metric_pool.append(collector._queue.queue.popleft())
-            return result
-
-        return call
+        if collector._sync_mode or collector._queue.qsize() != queued:
+            raise RuntimeError("l2_hit_async_metrics: the collector left batched mode, or a cache operation queued")
+        return fn
 
     l2 = lambda: cache(backend=DictBackend(), l1_enabled=False, ttl=300)(body)  # noqa: E731
     # Every metrics path records through the same AsyncMetricsCollector.record_cache_operation, once

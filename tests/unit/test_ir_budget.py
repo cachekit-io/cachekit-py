@@ -420,29 +420,30 @@ def test_performance_docs_state_the_committed_budgets() -> None:
     assert table == {path: tuple(interpreters[key]["budgets"][path] for key in columns) for path in PATHS}
 
 
-def test_batched_metrics_path_queues_every_call_and_never_records_synchronously(monkeypatch) -> None:
-    """``l2_hit_async_metrics`` claims to budget batched mode; a collector change must not turn it synchronous."""
+def test_batched_metrics_path_records_every_call_per_thread_and_queues_none(monkeypatch) -> None:
+    """``l2_hit_async_metrics`` budgets a batched collector, whose cache operations record per thread, not on the queue."""
     pytest.importorskip("pandas")  # the workload builder makes the Arrow path's DataFrame too
+    from cachekit.reliability import async_metrics
     from cachekit.reliability.async_metrics import AsyncMetricsCollector
 
-    calls: Counter[str] = Counter()
+    made: list[AsyncMetricsCollector] = []
+    real_init = AsyncMetricsCollector.__init__
 
-    def counting(mode: str):
-        real = getattr(AsyncMetricsCollector, f"_record_cache_operation_{mode}")
+    def tracking_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        made.append(self)
 
-        def record(self, *args, **kwargs):
-            calls[mode] += 1
-            return real(self, *args, **kwargs)
-
-        return record
-
-    for mode in ("sync", "async"):
-        monkeypatch.setattr(AsyncMetricsCollector, f"_record_cache_operation_{mode}", counting(mode))
+    direct: Counter[str] = Counter()
+    monkeypatch.setattr(AsyncMetricsCollector, "__init__", tracking_init)
+    monkeypatch.setattr(AsyncMetricsCollector, "_record_cache_operation_sync", lambda *a, **k: direct.update(["sync"]))
     op = ir_workload.build_workload("l2_hit_async_metrics")
-    calls.clear()
+    (collector,) = made
+    before = collector._operation_count
     for _ in range(20):
         op()
-    assert calls == {"async": 20}
+    assert async_metrics._PER_THREAD
+    assert (collector._sync_mode, collector._queue.qsize(), collector._operation_count - before) == (False, 0, 20)
+    assert direct == {}
 
 
 def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> None:
