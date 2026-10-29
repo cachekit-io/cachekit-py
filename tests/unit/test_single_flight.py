@@ -949,15 +949,16 @@ def test_sync_backed_recheck_after_a_trip_settled_since_the_callers_l1_lookup(
 
 @pytest.fixture
 def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
-    """The type of every entry a backed-mode handler decodes: VerifiedMsgpack from L1, bytes for an envelope."""
+    """The type of every entry an L1 hit or a joined caller decodes (deserialize_l1): VerifiedMsgpack, or bytes for
+    an envelope."""
     seen: list[type] = []
-    real = CacheSerializationHandler.deserialize_data
+    real = CacheSerializationHandler.deserialize_l1
 
     def recording(self: CacheSerializationHandler, data: Any, *args: Any, **kwargs: Any) -> Any:
         seen.append(type(data))
         return real(self, data, *args, **kwargs)
 
-    monkeypatch.setattr(CacheSerializationHandler, "deserialize_data", recording)
+    monkeypatch.setattr(CacheSerializationHandler, "deserialize_l1", recording)
     return seen
 
 
@@ -990,7 +991,7 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
     assert fn(1) == {"x": 1}
 
     assert (runs, backend.requests) == (1, ["get", "set"])  # one function call and one backend read in all
-    assert decoded == [VerifiedMsgpack]
+    assert decoded == [bytes, VerifiedMsgpack]  # the other caller's hit, then this caller's re-check
 
 
 def test_sync_backed_joiner_decodes_the_trips_envelope(waiting: list[int], decoded: list[type]) -> None:

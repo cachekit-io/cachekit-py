@@ -900,7 +900,7 @@ class CacheSerializationHandler:
         # Whether L1 may hold this handler's entries as VerifiedMsgpack (deserialize_l1): plaintext CK-frame
         # entries of the built-in StandardSerializer with integrity on. Encrypted handlers keep ciphertext in
         # L1 (protocol PRE-10, PRE-11).
-        self._l1_msgpack = (
+        self.l1_msgpack = (
             not encryption
             and not interop_mode
             and not self._custom_serializer
@@ -1322,9 +1322,14 @@ class CacheSerializationHandler:
         """
         # Inline, not helpers: this is every L1 hit's decode, and an envelope it keeps must cost what
         # deserialize_data costs.
-        if self._l1_msgpack:
-            if type(data) is VerifiedMsgpack:
-                return self._base_serializer.deserialize_verified(data), None  # type: ignore[union-attr]
+        if type(data) is VerifiedMsgpack:
+            # Only L1 holds this type, so only a handler that swaps it in decodes it. Another handler sharing
+            # the namespace and key refuses it as it would the plaintext envelope.
+            if not self.l1_msgpack:
+                error = SuspiciousCacheEntryError if self.encryption else SerializationError
+                raise error("L1 entry holds plaintext MessagePack another handler verified; this handler does not read it")
+            return self._base_serializer.deserialize_verified(data), None  # type: ignore[union-attr]
+        if self.l1_msgpack:
             try:
                 payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
             except (AttributeError, KeyError, TypeError, ValueError):
@@ -1338,7 +1343,7 @@ class CacheSerializationHandler:
 
     def deserialize_data(
         self,
-        data: str | bytes | memoryview | VerifiedMsgpack,
+        data: str | bytes | memoryview,
         cache_key: str = "",
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
@@ -1414,13 +1419,6 @@ class CacheSerializationHandler:
             >>> result["flag"] is False
             True
         """
-        if type(data) is VerifiedMsgpack:
-            # Only L1 holds this type (deserialize_l1), so only a handler that writes it decodes it. Another
-            # handler sharing the namespace and key refuses it as it would the plaintext envelope.
-            if not self._l1_msgpack:
-                error = SuspiciousCacheEntryError if self.encryption else SerializationError
-                raise error("L1 entry holds plaintext MessagePack another handler verified; this handler does not read it")
-            return self._base_serializer.deserialize_verified(data)  # type: ignore[union-attr]
         if self.interop_mode:
             return self._deserialize_interop(data, cache_key)
 

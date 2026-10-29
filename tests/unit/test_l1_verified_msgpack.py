@@ -28,7 +28,7 @@ from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache, get_l1_cache
-from cachekit.serializers.base import SerializationError
+from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 from cachekit.serializers.standard_serializer import VerifiedMsgpack
 
@@ -229,8 +229,9 @@ def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_sam
 def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(handler: CacheSerializationHandler) -> None:
     envelope = handler.serialize_data({"x": 1}, cache_key="k")
     assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
-    with pytest.raises(SerializationError):  # SuspiciousCacheEntryError under encryption: a plaintext entry
-        handler.deserialize_data(VerifiedMsgpack(msgpack.packb({"x": 2})), cache_key="k")
+    refusal = SuspiciousCacheEntryError if handler.encryption else SerializationError  # as for a plaintext envelope
+    with pytest.raises(refusal):
+        handler.deserialize_l1(VerifiedMsgpack(msgpack.packb({"x": 2})), cache_key="k")
 
 
 # ── L1Cache.replace ───────────────────────────────────────────────────────────────────────────

@@ -1145,6 +1145,9 @@ def create_cache_wrapper(
     # applies only when this namespace's cache is first created — namespaces share one
     # L1Cache, so give functions with distinct budgets distinct namespaces (issue #163).
     _l1_cache = get_l1_cache(namespace or "default", max_size_mb=l1_max_size_mb) if l1_enabled else None
+    # Whether an L1 hit may swap its entry for the verified MessagePack (deserialize_l1). Every other handler's
+    # hit decodes exactly as before, at no extra cost.
+    _l1_swaps_msgpack = serialization_handler.l1_msgpack
 
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
@@ -1905,7 +1908,7 @@ def create_cache_wrapper(
         """
         if envelope is not None:
             try:
-                value = operation_handler.serialization_handler.deserialize_data(envelope, cache_key, args, kwargs)
+                value = operation_handler.serialization_handler.deserialize_l1(envelope, cache_key, args, kwargs)[0]
             except KeyringConfigurationError:
                 raise  # a LOCAL keyring config fault: see the L1 guard in _sync_call
             except Exception as e:
@@ -2213,11 +2216,19 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit - deserialize bytes
                     try:
-                        l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
-                            l1_bytes, cache_key, args, kwargs
-                        )
-                        if l1_kept is not None:  # its verified MessagePack: later hits skip retrieve()
-                            _l1_cache.replace(cache_key, l1_bytes, l1_kept)
+                        if _l1_swaps_msgpack:
+                            l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
+                                l1_bytes, cache_key, args, kwargs
+                            )
+                            if l1_kept is not None:  # its verified MessagePack: later hits skip retrieve()
+                                _l1_cache.replace(cache_key, l1_bytes, l1_kept)
+                        else:  # decoded as before; an entry another handler swapped in fails as a corrupt frame
+                            l1_value = operation_handler.serialization_handler.deserialize_data(
+                                l1_bytes,  # pyright: ignore[reportArgumentType]
+                                cache_key,
+                                args,
+                                kwargs,
+                            )
                         l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
                         # Record L1 cache hit metrics
@@ -2711,11 +2722,19 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit - deserialize bytes
                     try:
-                        l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
-                            l1_bytes, cache_key, args, kwargs
-                        )
-                        if l1_kept is not None:  # as in sync_wrapper
-                            _l1_cache.replace(cache_key, l1_bytes, l1_kept)
+                        if _l1_swaps_msgpack:  # as in sync_wrapper
+                            l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
+                                l1_bytes, cache_key, args, kwargs
+                            )
+                            if l1_kept is not None:
+                                _l1_cache.replace(cache_key, l1_bytes, l1_kept)
+                        else:
+                            l1_value = operation_handler.serialization_handler.deserialize_data(
+                                l1_bytes,  # pyright: ignore[reportArgumentType]
+                                cache_key,
+                                args,
+                                kwargs,
+                            )
                         l1_duration_ms = (time.perf_counter() - l1_start) * 1000  # L1 get plus deserialize
 
                         # Record L1 cache hit metrics (same labels as the sync L1 hit)
