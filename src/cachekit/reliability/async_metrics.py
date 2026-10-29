@@ -16,7 +16,9 @@ import warnings
 import weakref
 from bisect import bisect_left
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from functools import partial
 from typing import Any, Optional, TypeVar, Union
 
 from cachekit import _fork
@@ -123,7 +125,8 @@ _metrics_locks: dict[int, threading.Lock] = {}
 # lock, never before it, so the at-fork hooks hold both in that order.
 # Reentrant: Python code runs under it, so a garbage collection there can run a finalizer on the same thread, and a
 # finalizer that records a cache operation, reads a series or drops a collector takes it again. Every holder iterates
-# snapshots, so such a nested call cannot change a dict under an outer loop.
+# snapshots, so such a nested call cannot change a dict under an outer loop, and a nested call that would move counts
+# (an exited thread's retirement, a rebind, a dropped collector) is deferred: see _locked().
 _shard_locks: dict[int, threading.RLock] = {}
 _RLOCK = threading.RLock  # bound here: some tests swap this module's threading for a namespace without it
 
@@ -149,6 +152,32 @@ def _metrics_cache_lock() -> threading.Lock:
 def _shard_lock() -> threading.RLock:
     """Return this process's per-thread-cell lock, an ``RLock``, creating it on first use."""
     return _pid_lock(_shard_locks, _RLOCK)
+
+
+# Count moves requested while their thread already held _shard_lock(): by a finalizer that a garbage collection ran
+# inside another section, such as a cyclic collection freeing an exited thread's state mid-scrape. Moving counts there
+# would let the outer section read them twice or not at all. Until the next section that is not nested applies them,
+# the counts stay where they were, and every reader still counts them once.
+_deferred: list[Callable[[], None]] = []
+
+
+def _defer_if_nested(move: Callable[[], None]) -> bool:
+    """Queue ``move`` and return True if this thread already holds ``_shard_lock()``; otherwise return False."""
+    if _shard_lock()._is_owned():  # type: ignore[attr-defined]  # RLock's ownership test, as Condition uses it
+        _deferred.append(move)
+        return True
+    return False
+
+
+@contextmanager
+def _locked() -> Iterator[None]:
+    """Hold ``_shard_lock()``; an outermost holder first applies the count moves deferred until it."""
+    lock = _shard_lock()
+    nested = lock._is_owned()  # type: ignore[attr-defined]
+    with lock:
+        while not nested and _deferred:
+            _deferred.pop(0)()
+        yield
 
 
 def _acquire_fork_locks() -> None:
@@ -368,7 +397,16 @@ def _add_exact(partials: list[float], x: float) -> None:
     ``math.fsum`` of the partials and any other floats is then the correctly rounded total, however the values were
     grouped. A plain float total would round differently once an exited thread's cell joined it, and could read one
     ulp lower than the scrape before: a decrease Prometheus takes for a counter reset.
+
+    The algorithm holds only for finite values: with ``inf`` it stores ``nan``. Once a term is not finite the total is
+    not either, exactness no longer matters, and ``math.fsum`` collapses the terms (``inf + -inf`` gives ``nan``).
     """
+    if not math.isfinite(x) or not all(map(math.isfinite, partials)):
+        try:
+            partials[:] = [math.fsum([*partials, x])]
+        except ValueError:  # fsum raises on inf + -inf
+            partials[:] = [math.nan]
+        return
     i = 0
     for y in partials:
         if abs(x) < abs(y):
@@ -430,18 +468,18 @@ class _ShardView:
         self._exemplar = exemplar
 
     def inc(self, amount: float) -> None:
-        with _shard_lock():
+        with _locked():
             _add_exact(self.shards.retired[self.i], amount)
 
     def set(self, value: float, timestamp: Optional[float] = None) -> None:
-        with _shard_lock():
+        with _locked():
             partials = [float(value)]
             for cell in list(self.shards.cells.values()):
                 _add_exact(partials, -cell[self.i])
             self.shards.retired[self.i] = partials
 
     def get(self) -> float:
-        with _shard_lock():
+        with _locked():
             return self.shards.total(self.i)
 
     def set_exemplar(self, exemplar: Any) -> None:
@@ -489,9 +527,11 @@ class _Slot:
 class _ThreadState:
     """One thread's cache-operation cells and per-collector operation counts.
 
-    Only ``_tls`` refers to it, so it is freed when its thread exits, and ``__del__`` then folds its counts into
-    the totals the thread leaves behind: a collector's ``_retired_ops`` entry and each series' retired total. That
-    keeps an exited thread's counts and bounds the cells to the live threads.
+    Usually only ``_tls`` refers to it, so it is freed when its thread exits, and ``__del__`` then folds its counts
+    into the totals the thread leaves behind: a collector's ``_retired_ops`` entry and each series' retired total.
+    That keeps an exited thread's counts and bounds the cells to the live threads. A traceback in a reference cycle
+    can keep it alive past the exit; a cyclic collection then frees it on another thread, possibly inside a section
+    of that thread's, and the move is deferred (``_defer_if_nested``).
     """
 
     __slots__ = ("slots", "ops")
@@ -499,8 +539,8 @@ class _ThreadState:
     def __init__(self) -> None:
         self.slots: dict[_CacheOpKey, list[Optional[_Slot]]] = {}
         self.ops: dict[object, int] = {}  # collector token -> operations this thread recorded
-        with _shard_lock():
-            _thread_ops[id(self)] = self.ops
+        with _locked():
+            _thread_ops[id(self.ops)] = self.ops  # keyed by the dict, which a deferred retirement keeps alive
 
     def new_slots(self, key: _CacheOpKey) -> list[Optional[_Slot]]:
         """Return this thread's empty slots for ``key``: counter, duration, size. ``_bind`` fills each on first use."""
@@ -509,20 +549,29 @@ class _ThreadState:
         return slots
 
     def __del__(self) -> None:
-        with _shard_lock():
-            # One step, so a reader sums each count once: before its move, or after it.
-            _thread_ops.pop(id(self), None)
-            for token, count in list(self.ops.items()):
-                _retired_ops[token] = _retired_ops.get(token, 0) + count
-            for slots in list(self.slots.values()):
-                for slot in slots:
-                    if slot is not None and slot.shards is not None:
-                        slot.shards.retire(slot.cell)
+        move = partial(_retire_thread, self.ops, list(self.slots.values()))
+        if not _defer_if_nested(move):
+            with _locked():
+                move()
+
+
+def _retire_thread(ops: dict[object, int], slots: list[list[Optional[_Slot]]]) -> None:
+    """Fold an exited thread's counts into the retired totals. Caller holds ``_shard_lock()`` and is not nested.
+
+    One step under the lock, so a reader sums each count once: before its move, or after it.
+    """
+    _thread_ops.pop(id(ops), None)
+    for token, count in list(ops.items()):
+        _retired_ops[token] = _retired_ops.get(token, 0) + count
+    for series in slots:
+        for slot in series:
+            if slot is not None and slot.shards is not None:
+                slot.shards.retire(slot.cell)
 
 
 _tls = threading.local()
-# Every live thread's operation counts, keyed by id() of its _ThreadState, and the counts of threads that exited, per
-# collector token. Both guarded by _shard_lock(). A forked child keeps its parent's threads' counts here.
+# Every live thread's operation counts, keyed by id() of its _ThreadState's ops dict, and the counts of threads that
+# exited, per collector token. Both guarded by _shard_lock(). A forked child keeps its parent's threads' counts here.
 _thread_ops: dict[int, dict[object, int]] = {}
 _retired_ops: dict[object, int] = {}
 
@@ -534,10 +583,17 @@ def _new_thread_state() -> _ThreadState:
 
 def _forget_collector(token: object) -> None:
     """Drop a collector's counts once the collector is gone, so building and dropping collectors leaks nothing."""
-    with _shard_lock():
-        _retired_ops.pop(token, None)
-        for ops in list(_thread_ops.values()):
-            ops.pop(token, None)  # the collector is gone, so no thread can be adding to this entry
+    move = partial(_forget_token, token)
+    if not _defer_if_nested(move):
+        with _locked():
+            move()
+
+
+def _forget_token(token: object) -> None:
+    """Drop ``token`` from every count. Caller holds ``_shard_lock()`` and is not nested."""
+    _retired_ops.pop(token, None)
+    for ops in list(_thread_ops.values()):
+        ops.pop(token, None)  # the collector is gone, so no thread can be adding to this entry
 
 
 def _bind(slots: list[Optional[_Slot]], i: int, key: _CacheOpKey) -> _Slot:
@@ -550,9 +606,13 @@ def _bind(slots: list[Optional[_Slot]], i: int, key: _CacheOpKey) -> _Slot:
     old = slots[i]
     noop = isinstance(metric, _NoopMetric)
     bounds = None if i == 0 else (math.inf,) if noop else child._upper_bounds
-    with _shard_lock():
-        if old is not None and old.shards is not None:
-            old.shards.retire(old.cell)
+    if old is not None and old.shards is not None:
+        # This thread stops writing the old cell now; its counts move once no section of this thread is open.
+        retire = partial(old.shards.retire, old.cell)
+        if not _defer_if_nested(retire):
+            with _locked():
+                retire()
+    with _locked():
         shards = None if noop else _shards_of(child, i)
         # A host-owned name records nowhere: a scratch cell wide enough for a count, or a sum and the one +Inf bucket.
         cell = [0.0, 0.0] if shards is None else shards.add_cell()
@@ -757,12 +817,12 @@ class AsyncMetricsCollector:
     @property
     def _operation_count(self) -> int:
         """Operations recorded so far, summed over every thread, live or exited. Never decreases unless assigned."""
-        with _shard_lock():
+        with _locked():
             return self._operation_total()
 
     @_operation_count.setter
     def _operation_count(self, value: int) -> None:
-        with _shard_lock():
+        with _locked():
             self._ops_offset += value - self._operation_total()
 
     def record_circuit_breaker_state(self, namespace: str, state: str, transitions: int = 0):

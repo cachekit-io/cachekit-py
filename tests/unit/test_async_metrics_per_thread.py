@@ -304,6 +304,44 @@ def test_a_finalizer_that_runs_under_the_series_lock_does_not_deadlock():
     assert results == [(2, 2)]
 
 
+def test_an_infinite_duration_stays_infinite_after_its_thread_exits():
+    namespace = f"per-thread-inf-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    _in_threads(lambda i: _record(collector, namespace, duration_ms=math.inf if i == 0 else 1.0), threads=2)
+
+    assert _sample("cache_operation_duration_ms_sum", namespace) == math.inf
+    assert _sample("cache_operation_duration_ms_count", namespace) == 2
+
+
+def test_a_retirement_inside_an_open_section_waits_until_the_section_closes():
+    # A traceback in a reference cycle can keep an exited thread's state alive until a cyclic collection frees it,
+    # on whatever thread runs that collection, possibly in the middle of a read there.
+    namespace = f"per-thread-defer-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    kept: list[object] = []
+
+    def record_and_keep_state() -> None:
+        _record(collector, namespace)
+        kept.append(async_metrics._tls.state)
+
+    thread = threading.Thread(target=record_and_keep_state)
+    thread.start()
+    thread.join()
+    (state,) = kept
+    ops = state.ops  # type: ignore[attr-defined]
+    del state
+
+    with async_metrics._locked():
+        before = (collector._operation_count, _sample("cache_operations_total", namespace))
+        kept.clear()  # frees the state here, inside the section
+        assert len(async_metrics._deferred) == 1 and id(ops) in async_metrics._thread_ops  # nothing moved yet
+        assert (collector._operation_count, _sample("cache_operations_total", namespace)) == before == (1, 1)
+
+    assert (collector._operation_count, _sample("cache_operations_total", namespace)) == (1, 1)  # applied by that read
+    assert async_metrics._deferred == [] and id(ops) not in async_metrics._thread_ops
+    assert _cells(namespace) == 0
+
+
 def test_retiring_a_cell_never_changes_a_total():
     # A plain float total rounds differently once a cell joins it, and can read one ulp lower than before.
     rng = random.Random(7117)
