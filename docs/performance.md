@@ -290,36 +290,36 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 - Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the median. Any code change moves the layout, and the allocators take shorter or longer paths in some heap states: single layouts of the orjson round trip and the minimal L1 hit sat up to 2.4% from the rest. The median ignores one or two such layouts. The cheapest layout is not used, because a lucky one can sit 1% below the rest, and a budget recorded there makes every later run look like a regression.
 - `ir_workload.py`'s text is compiled into every measured process, so editing it moves the layout the budgets were recorded at: re-record after any change to it. The gate itself (`ir_budget.py`) is kept out of the measured process, so editing it does not move a budget.
 - The L2 paths use an in-process dict backend, so they cost instructions only: no sockets, retries or timeouts.
-- The metrics collector starts synchronous and switches to batched mode (each call queues its record for a worker thread) when its 5 s check sees more than 100 records/s. Pinned clocks never reach that check, so the plain paths measure synchronous recording, and `l2_hit_async_metrics` measures the batched mode a busy long-lived process runs. Every metrics path records once per call through the same method, so one batched path covers that mode.
+- The metrics collector starts synchronous and switches to batched mode (generic metrics queue for a worker thread) when its 5 s check sees more than 100 records/s. Cache operations record into per-thread cells in either mode. Pinned clocks never reach that check, so the plain paths measure a synchronous collector, and `l2_hit_async_metrics` the batched collector a busy long-lived process runs; it checks that no cache operation queues. Every metrics path records once per call through the same method, so one batched path covers that mode.
 
 **Budgets** (instructions per call, `tests/performance/ir_baselines.json`):
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 11,632 | 10,896 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,505 | 9,790 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 188,634 | 182,083 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 222,372 | 212,493 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 157,389 | 155,969 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 178,846 | 172,851 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 58,743 | 59,601 |
-| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,421,931 | 1,422,896 |
-| `serializer_auto` | `AutoSerializer` round trip | 65,943 | 66,651 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 22,068 | 22,688 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,980,225 | 1,982,998 |
-| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,768,020 | 61,261,299 |
-| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,770,277 | 61,264,653 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,048 | 101,948 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,656 | 2,540 |
-| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,634 | 720,648 |
-| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,881 | 73,987 |
-| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 164,507 | 160,678 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 11,614 | 10,904 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,496 | 9,788 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 171,988 | 167,408 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 211,434 | 203,521 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 139,943 | 140,926 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,370 | 167,447 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 58,661 | 59,595 |
+| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,422,079 | 1,422,120 |
+| `serializer_auto` | `AutoSerializer` round trip | 65,971 | 66,624 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 22,085 | 22,677 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,972,713 | 1,982,226 |
+| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,750,733 | 61,321,806 |
+| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,806,031 | 61,327,994 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,164 | 101,927 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,658 | 2,530 |
+| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,667 | 720,663 |
+| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,887 | 74,132 |
+| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 164,514 | 160,511 |
 
-Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 9,000 to 10,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread. The gap was about 50,000 until each label tuple's Prometheus series was bound once instead of looked up per call.
+Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. `l2_hit` and `l2_hit_async_metrics` now cost the same within 0.4%: a cache operation records into per-thread cells in either mode. Against the previous budgets that is 14,700 to 16,600 fewer instructions per L2 hit than the synchronous Prometheus update, and 5,400 to 7,500 fewer than queueing the record for the batching worker.
 
 **Sensitivity:** before the key memo, one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,700 to 4,900 instructions (`l1_hit` +6.1%, `l2_hit_async_metrics` +1.5%, `miss` +1.4%) and failed the gate, while the serializer paths, which generate no key, stayed within 0.11%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 
-**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted, and so does part of pyarrow's work on the real-data paths: about half of their instructions run on pyarrow's threads. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.3% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`). A change to the Rust extension moves the paths that run through it more, with no change in their work: `main`'s own source, built with and without symbol stripping, moved the `ByteStorage` round trip of `serializer_default` by 1.9%, while every function in it cost the same over 5,000 round trips, so the move is a one-time allocator event that the binary's layout puts inside one loop size. After an extension change, re-record the serializer paths that fail (`--update --allow-increase --path <path>`) and say why in the PR.
+**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. A Prometheus scrape, which sums each thread's cache-operation cells, runs outside the measured calls and is not budgeted. Part of pyarrow's work on the real-data paths is not budgeted either: about half of their instructions run on pyarrow's threads. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.3% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`). A change to the Rust extension moves the paths that run through it more, with no change in their work: `main`'s own source, built with and without symbol stripping, moved the `ByteStorage` round trip of `serializer_default` by 1.9%, while every function in it cost the same over 5,000 round trips, so the move is a one-time allocator event that the binary's layout puts inside one loop size. After an extension change, re-record the serializer paths that fail (`--update --allow-increase --path <path>`) and say why in the PR.
 
 ```bash
 make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 170 runs, several minutes)
