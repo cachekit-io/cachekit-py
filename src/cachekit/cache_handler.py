@@ -380,7 +380,11 @@ def _fuses_tracked_write(backend: object) -> bool:
     if owner is None or not supports_key_tracking(backend) or supports_swr(backend):  # pyright: ignore[reportArgumentType]
         return False
     defined = vars(owner)
-    return all(getattr(getattr(backend, name, None), "__func__", None) is defined.get(name) for name in ("set", "track_key"))
+    for name in ("set", "track_key"):
+        func = defined.get(name)  # None when the owner inherits it: no plain method of its own to match
+        if func is None or getattr(getattr(backend, name, None), "__func__", None) is not func:
+            return False
+    return True
 
 
 def _set_l2(

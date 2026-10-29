@@ -19,7 +19,7 @@ import redis
 from cachekit import cache
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis.provider import PerRequestRedisBackend
-from cachekit.cache_handler import StandardCacheHandler
+from cachekit.cache_handler import StandardCacheHandler, _fuses_tracked_write
 from cachekit.decorators import write_behind as wb
 
 pytestmark = pytest.mark.integration
@@ -170,17 +170,26 @@ class _InterceptedSet(PerRequestRedisBackend):
         return capped
 
 
-def _instance_bound(client: redis.Redis, name: str) -> PerRequestRedisBackend:
-    """A plain backend whose ``set`` (capped at 60 s) or ``track_key`` is replaced on the instance only."""
-    backend = PerRequestRedisBackend(client, "default")
+class _OwnFused(PerRequestRedisBackend):
+    """A subclass that defines its own ``_set_tracked`` and inherits ``set`` and ``track_key``."""
+
+    _set_tracked = PerRequestRedisBackend._set_tracked
+
+
+def _instance_bound(backend: PerRequestRedisBackend, name: str) -> PerRequestRedisBackend:
+    """``backend`` with its ``set`` (capped at 60 s) or ``track_key`` replaced on the instance only."""
     backend.calls = 0  # type: ignore[attr-defined]
     original = getattr(backend, name)
 
-    def hooked(key: str, value: Any, ttl: int | None = None) -> None:
+    def hooked_set(key: str, value: bytes, ttl: int | None = None) -> None:
         backend.calls += 1  # type: ignore[attr-defined]
-        original(key, value, 60) if name == "set" else original(key, value)
+        original(key, value, 60)
 
-    setattr(backend, name, hooked)
+    def hooked_track_key(registry_id: str, key: str) -> None:
+        backend.calls += 1  # type: ignore[attr-defined]
+        original(registry_id, key)
+
+    setattr(backend, name, hooked_set if name == "set" else hooked_track_key)
     return backend
 
 
@@ -189,9 +198,22 @@ _OVERRIDES = {
     "subclass-set": (lambda client: _CappedTTL(client, "default"), 60),
     "subclass-track-key": (lambda client: _OwnTracking(client, "default"), 300),
     "getattribute-set": (lambda client: _InterceptedSet(client, "default"), 60),
-    "instance-set": (lambda client: _instance_bound(client, "set"), 60),
-    "instance-track-key": (lambda client: _instance_bound(client, "track_key"), 300),
+    "instance-set": (lambda client: _instance_bound(PerRequestRedisBackend(client, "default"), "set"), 60),
+    "instance-track-key": (lambda client: _instance_bound(PerRequestRedisBackend(client, "default"), "track_key"), 300),
 }
+
+
+class TestFuseDecision:
+    def test_plain_backend_fuses(self, client: redis.Redis) -> None:
+        assert _fuses_tracked_write(PerRequestRedisBackend(client, "default"))
+
+    def test_owner_that_inherits_set_and_track_key_never_fuses(self, client: redis.Redis) -> None:
+        """Its own methods are None in its namespace, and plain functions bound on the instance have no __func__:
+        None must not match None."""
+        backend = _OwnFused(client, "default")
+        backend.set = lambda *args: None  # type: ignore[method-assign]
+        backend.track_key = lambda *args: None  # type: ignore[method-assign]
+        assert not _fuses_tracked_write(backend)
 
 
 class TestOverridesKeepTheSeparateCalls:
