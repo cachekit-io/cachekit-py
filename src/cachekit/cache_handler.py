@@ -371,17 +371,17 @@ def _fuses_tracked_write(backend: object) -> bool:
     """Whether the backend writes a value and its registry entry in one call: a private ``_set_tracked``,
     found on the CLASS as ``supports_key_tracking`` finds ``track_key``.
 
-    Only when the backend's own ``set`` and ``track_key``, as the instance resolves them, are the plain methods
-    of the class that defines ``_set_tracked``. An override anywhere (a subclass, an instance attribute,
-    ``__getattribute__``) keeps both calls, so it still runs on every write. An SWR-capable backend keeps
-    ``set`` too: the fused write has no slot for a stale-grace window.
+    Only while the instance resolves ``set`` and ``track_key`` to the functions the class that defines
+    ``_set_tracked`` recorded as standing in for (``_set_tracked_replaces``). An override or patch anywhere (a
+    subclass, the class itself, the instance, ``__getattribute__``) keeps both calls, so it still runs on every
+    write. An SWR-capable backend keeps ``set`` too: the fused write has no slot for a stale-grace window.
     """
     owner = next((klass for klass in type(backend).__mro__ if "_set_tracked" in vars(klass)), None)
     if owner is None or not supports_key_tracking(backend) or supports_swr(backend):  # pyright: ignore[reportArgumentType]
         return False
-    defined = vars(owner)
+    replaces = vars(owner).get("_set_tracked_replaces", {})
     for name in ("set", "track_key"):
-        func = defined.get(name)  # None when the owner inherits it: no plain method of its own to match
+        func = replaces.get(name)  # None when the owner records nothing for it: nothing to match
         if func is None or getattr(getattr(backend, name, None), "__func__", None) is not func:
             return False
     return True

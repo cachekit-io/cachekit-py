@@ -12,6 +12,7 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import redis
@@ -176,8 +177,9 @@ class _OwnFused(PerRequestRedisBackend):
     _set_tracked = PerRequestRedisBackend._set_tracked
 
 
-def _instance_bound(backend: PerRequestRedisBackend, name: str) -> PerRequestRedisBackend:
-    """``backend`` with its ``set`` (capped at 60 s) or ``track_key`` replaced on the instance only."""
+def _instance_bound(client: redis.Redis, name: str) -> PerRequestRedisBackend:
+    """A plain backend whose ``set`` (capped at 60 s) or ``track_key`` is replaced on the instance only."""
+    backend = PerRequestRedisBackend(client, "default")
     backend.calls = 0  # type: ignore[attr-defined]
     original = getattr(backend, name)
 
@@ -198,8 +200,8 @@ _OVERRIDES = {
     "subclass-set": (lambda client: _CappedTTL(client, "default"), 60),
     "subclass-track-key": (lambda client: _OwnTracking(client, "default"), 300),
     "getattribute-set": (lambda client: _InterceptedSet(client, "default"), 60),
-    "instance-set": (lambda client: _instance_bound(PerRequestRedisBackend(client, "default"), "set"), 60),
-    "instance-track-key": (lambda client: _instance_bound(PerRequestRedisBackend(client, "default"), "track_key"), 300),
+    "instance-set": (lambda client: _instance_bound(client, "set"), 60),
+    "instance-track-key": (lambda client: _instance_bound(client, "track_key"), 300),
 }
 
 
@@ -214,6 +216,19 @@ class TestFuseDecision:
         backend.set = lambda *args: None  # type: ignore[method-assign]
         backend.track_key = lambda *args: None  # type: ignore[method-assign]
         assert not _fuses_tracked_write(backend)
+
+    @pytest.mark.parametrize("name", ["set", "track_key"])
+    def test_class_level_patch_never_fuses(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+        """A patch of the class itself, as a test double or an app hook would apply it, keeps the separate calls."""
+        original = getattr(PerRequestRedisBackend, name)
+        monkeypatch.setattr(PerRequestRedisBackend, name, lambda self, *args: original(self, *args))
+        assert not _fuses_tracked_write(PerRequestRedisBackend(client, "default"))
+
+    def test_autospec_patch_runs_the_patched_set(self, client: redis.Redis) -> None:
+        fn = cache(backend=PerRequestRedisBackend(client, "default"), ttl=300, l1_enabled=False)(lambda x: x)
+        with patch.object(PerRequestRedisBackend, "set", autospec=True) as patched:
+            fn(1)
+        assert patched.call_count == 1
 
 
 class TestOverridesKeepTheSeparateCalls:

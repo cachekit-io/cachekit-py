@@ -778,6 +778,11 @@ class PerRequestRedisBackend:
         finally:
             del error
 
+    # What _set_tracked stands in for, captured at class creation. The fused write runs only while the instance
+    # still resolves set and track_key to these (cache_handler._fuses_tracked_write), so a later override or patch
+    # of either one, on a subclass, the class or the instance, keeps the separate calls and runs.
+    _set_tracked_replaces = {"set": set, "track_key": track_key}
+
     def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
         """Delete every tracked key of a registry, then every local key the drain missed
         (KeyTrackableBackend protocol).
