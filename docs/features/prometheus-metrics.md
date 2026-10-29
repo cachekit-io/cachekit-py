@@ -149,6 +149,11 @@ What each `cache_operation_duration_ms` series times, measured with a monotonic 
 | `operation="get"`, `serializer="rust"` | The L2 read of a hit |
 | `operation="set"` | Serialization plus the L2 write: not the miss read, the function, a lock wait, the L1 put or key tracking |
 
+`cache_operation_size_bytes` records the length of the bytes the operation read or wrote. For an L1 `get`, that is the L1 entry:
+on a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit swaps its envelope for its
+MessagePack when that is no longer, so later L1 `get`s of it record a smaller size than its L2 `get`. Earlier releases recorded
+the envelope's length on every hit.
+
 > **Changed durations.** Earlier releases recorded every L1 hit as a constant 0.001 ms, and timed
 > `set` from before the L2 read, so each `set` sample also held the miss round trip and the
 > decorated function's own run time, plus the lock wait and a second read on the async locked path.

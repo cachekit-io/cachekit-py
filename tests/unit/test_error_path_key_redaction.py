@@ -554,9 +554,9 @@ class TestDecoratorWrapperRedaction:
 
     @staticmethod
     def _poison_deserialize(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
-        # Class-level patch: the wrapper reaches deserialize_data through the handler instance
-        # it built at decoration time, so an instance patch has nothing to attach to.
-        monkeypatch.setattr(CacheSerializationHandler, "deserialize_data", MagicMock(side_effect=error))
+        # Class-level patch: the wrapper reaches deserialize_l1 (the L1 hit sites' decode) through the
+        # handler instance it built at decoration time, so an instance patch has nothing to attach to.
+        monkeypatch.setattr(CacheSerializationHandler, "deserialize_l1", MagicMock(side_effect=error))
 
     @staticmethod
     def _assert_l1_sink(caplog: pytest.LogCaptureFixture, cache_key: str, error: Exception) -> None:
