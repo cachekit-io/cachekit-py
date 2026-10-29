@@ -46,6 +46,10 @@ _ENVELOPE_PROBE_MAX_SIZE = 256 * 1024
 # lz4_flex's get_maximum_output_size for that budget: the most compressed bytes any envelope within it carries.
 _ENVELOPE_PROBE_MAX_COMPRESSED = 20 + _ENVELOPE_PROBE_MAX_SIZE * 110 // 100
 _CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
+# Length-field width of each bin marker, the payload slot's header in the current envelope layout.
+_BIN_LENGTH_WIDTH = {0xC4: 1, 0xC5: 2, 0xC6: 4}
+# Bytes after the payload slot that hold the checksum (eight uint8, at most 17 bytes) and original_size (at most 9).
+_ENVELOPE_TAIL_PREFIX = 32
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -392,6 +396,44 @@ class StandardSerializer:
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
+    def verified_msgpack(self, envelope: bytes | memoryview, limit: int) -> bytes | None:
+        """The MessagePack ``envelope`` holds, if it is at most ``limit`` bytes and ``retrieve()`` verifies it; else None.
+
+        The size the envelope declares is read first, so an envelope whose payload would exceed ``limit``
+        is never decompressed. Any retrieve() failure, and any layout other than the current bin
+        layout, gives None: the caller keeps the envelope, whose own read reports the fault.
+
+        Examples:
+            >>> serializer = StandardSerializer()
+            >>> envelope, _ = serializer.serialize("x" * 8)
+            >>> serializer.verified_msgpack(envelope, len(envelope))
+            b'\\xa8xxxxxxxx'
+            >>> serializer.verified_msgpack(envelope, 8) is None  # the payload is 9 bytes
+            True
+        """
+        size = _declared_size(envelope)
+        if size is None or size > limit:
+            return None
+        try:
+            msgpack_data, _ = self._byte_storage.retrieve(envelope)
+        except Exception:  # noqa: BLE001 - not verified, whatever the cause: the envelope is kept
+            return None
+        return msgpack_data if len(msgpack_data) <= limit else None
+
+    def deserialize_verified(self, msgpack_data: bytes) -> Any:
+        """Decode MessagePack that :meth:`verified_msgpack` returned, without another ``retrieve()``.
+
+        Examples:
+            >>> serializer = StandardSerializer()
+            >>> envelope, _ = serializer.serialize({"test": 123})
+            >>> serializer.deserialize_verified(serializer.verified_msgpack(envelope, len(envelope)))
+            {'test': 123}
+        """
+        try:
+            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
+
     def _is_verified_envelope(self, data: bytes | memoryview, value: Any, markers: frozenset[int]) -> bool:
         """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope whose payload marker
         is in ``markers`` and that passes ``retrieve()``."""
@@ -411,6 +453,32 @@ class StandardSerializer:
         except Exception:  # any failure (not an envelope, checksum, size) means "not verified"
             return False
         return True
+
+
+def _declared_size(envelope: bytes | memoryview) -> int | None:
+    """The original_size a bin-layout ByteStorage envelope declares, read without decompressing; None for
+    any other layout. Unverified: retrieve() checks it.
+
+    Examples:
+        >>> envelope, _ = StandardSerializer().serialize("x" * 1000)
+        >>> _declared_size(envelope)
+        1003
+        >>> _declared_size(b"\\x93") is None
+        True
+    """
+    width = _BIN_LENGTH_WIDTH.get(envelope[1]) if len(envelope) > 1 and envelope[0] == 0x94 else None
+    if width is None:
+        return None
+    start = 2 + width
+    end = start + int.from_bytes(envelope[2:start], "big")
+    tail = msgpack.Unpacker()
+    tail.feed(envelope[end : end + _ENVELOPE_TAIL_PREFIX])
+    try:
+        next(tail)  # the checksum
+        size = next(tail)
+    except (StopIteration, ValueError):  # msgpack's decode errors are ValueErrors
+        return None
+    return size if type(size) is int else None
 
 
 # Default instance for convenience

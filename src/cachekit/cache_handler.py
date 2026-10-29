@@ -64,6 +64,7 @@ from cachekit.serializers.encryption_wrapper import (
     KeyringConfigurationError,
     require_cross_sdk_serializer,
 )
+from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
@@ -74,6 +75,18 @@ if TYPE_CHECKING:
 # format after decryption, as protocol ENC-2 requires. 'auto' is intentionally excluded:
 # it chooses its decoder by inspecting the bytes.
 CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
+
+
+class VerifiedMsgpack(bytes):
+    """An L1 entry that holds the MessagePack a successful ``ByteStorage.retrieve()`` returned, in place of
+    its envelope (:meth:`CacheSerializationHandler.l1_entry`). It decodes without another retrieve().
+
+    The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never take
+    the unverified decode, whatever they hold.
+    """
+
+    __slots__ = ()
+
 
 # Uncompressed Arrow IPC alignment: the body follows the File header, the CK frame
 # prefix and ArrowSerializer's 8-byte xxHash3-64 checksum; 64 is Arrow's recommended alignment.
@@ -895,6 +908,16 @@ class CacheSerializationHandler:
         else:
             self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
         self._custom_serializer = not isinstance(serializer_name, str)
+        # Whether L1 may hold this handler's entries as VerifiedMsgpack (l1_entry): plaintext CK-frame
+        # entries of the built-in StandardSerializer with integrity on. Encrypted handlers keep ciphertext in
+        # L1 (protocol PRE-10, PRE-11).
+        self._l1_msgpack = (
+            not encryption
+            and not interop_mode
+            and not self._custom_serializer
+            and type(self._base_serializer) is StandardSerializer
+            and self._base_serializer.enable_integrity_checking
+        )
 
         # Cache EncryptionWrapper instances per tenant to prevent
         # 360K key copies/hour at 100 req/sec. Uses thread-safe LRU cache (maxsize=256)
@@ -1281,6 +1304,39 @@ class CacheSerializationHandler:
         budget = get_settings().max_value_size - len(prefix)
         serializer.serialize_to_sink(data, sink, max_bytes=budget)
 
+    def l1_entry(self, envelope: bytes) -> bytes:
+        """What L1 holds for ``envelope``, an entry this handler wrote or decoded: its MessagePack as
+        :class:`VerifiedMsgpack` when retrieve() verifies it and it is no longer than the envelope, else the
+        envelope itself.
+
+        Never longer than ``envelope``, so an L1 that admits the envelope admits the result and holds
+        no fewer entries. Call it only for an envelope L1 admits: a result shorter than the envelope
+        could pass an admission check the envelope fails. Encrypted handlers, and every handler other
+        than the built-in StandardSerializer with integrity on, get the envelope back unchanged.
+
+        Examples:
+            >>> handler = CacheSerializationHandler()
+            >>> envelope = handler.serialize_data("hello", cache_key="greeting")
+            >>> entry = handler.l1_entry(envelope)
+            >>> type(entry).__name__, len(entry) <= len(envelope)
+            ('VerifiedMsgpack', True)
+            >>> handler.deserialize_data(entry, cache_key="greeting")
+            'hello'
+            >>> compressible = handler.serialize_data("ab" * 600, cache_key="k")
+            >>> handler.l1_entry(compressible) is compressible  # its MessagePack is longer
+            True
+        """
+        if not self._l1_msgpack:
+            return envelope
+        try:
+            payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(envelope)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return envelope  # its own read reports the corrupt frame
+        if serializer_name != self._serializer_string_name or metadata.encrypted or not metadata.compressed:
+            return envelope  # a config-drift entry: an encrypted one keeps its ciphertext in L1
+        msgpack_data = self._base_serializer.verified_msgpack(payload, len(envelope))  # type: ignore[union-attr]
+        return envelope if msgpack_data is None else VerifiedMsgpack(msgpack_data)
+
     def deserialize_data(
         self,
         data: str | bytes | memoryview,
@@ -1359,6 +1415,13 @@ class CacheSerializationHandler:
             >>> result["flag"] is False
             True
         """
+        if type(data) is VerifiedMsgpack:
+            # Only L1 holds this type (l1_entry), so only a handler that writes it decodes it. Another
+            # handler sharing the namespace and key refuses it as it would the plaintext envelope.
+            if not self._l1_msgpack:
+                error = SuspiciousCacheEntryError if self.encryption else SerializationError
+                raise error("L1 entry holds plaintext MessagePack another handler verified; this handler does not read it")
+            return self._base_serializer.deserialize_verified(data)  # type: ignore[union-attr]
         if self.interop_mode:
             return self._deserialize_interop(data, cache_key)
 

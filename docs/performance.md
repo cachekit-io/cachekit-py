@@ -12,7 +12,7 @@
 > **Key numbers** (mean of five run medians; GitHub-hosted `ubuntu-latest` runner, AMD EPYC 7763, CPython 3.14.7, 2026-10-23; see [GitHub-Hosted Runner](#github-hosted-runner)):
 > - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 0.906 ± 0.007μs (about 10,900 instructions per call on CPython 3.14, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 0.91 ± 0.01μs. An L1-only hit never serializes, so payload size barely matters
-> - **Decorator + L1 hit with an L2 backend configured, same dict**: 310 ± 20μs. With a backend, L1 holds bytes and every hit deserializes them
+> - **Decorator + L1 hit with an L2 backend configured, same dict**: 310 ± 20μs. With a backend, L1 holds bytes and every hit deserializes them. This dict compresses, so L1 holds its envelope; see [Why an L1-Only Hit Costs the Same for Any Payload](#why-an-l1-only-hit-costs-the-same-for-any-payload) for the values L1 holds as MessagePack
 > - **Redis L2 hit**, L1 disabled, same dict, Redis in a container on the same runner: 551 ± 18μs
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns on a shared x86_64 Linux host (see [Measured Figures](#measured-figures))
 
@@ -72,6 +72,8 @@ Without `REDIS_URL`, the Redis guard uses the pytest-redis server the suite star
 With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict and a 10K-row DataFrame cost about the same: 0.906μs and 0.91μs on the hosted EPYC 7763, for finding the key, the lookup and the decorator's bookkeeping.
 
 With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. For the 100-user dict it takes 310 ± 20μs on the same runner, about 340 times an L1-only hit of the same dict. Nearly all of the difference is deserializing 23.5KB of MessagePack back into about 400 nested dicts. It is still about half of a Redis L2 hit there (551 ± 18μs), which deserializes the same bytes after the round trip.
+
+For a plaintext cache with the default serializer and integrity checking on, L1 holds an entry as its verified MessagePack instead of its envelope when the MessagePack is no longer, which is true of small values and incompressible ones. Such a hit decodes the MessagePack without the envelope's LZ4 decompress and xxHash3-64 checksum. The 100-user dict compresses to a 3,171-byte envelope from 23.5KB of MessagePack, so L1 keeps its envelope and the figures above are unchanged. Encrypted caches always keep the ciphertext envelope.
 
 ### Decorator + L1 Hit (Hot Path)
 

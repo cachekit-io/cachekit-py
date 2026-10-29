@@ -164,6 +164,15 @@ class L1Cache:
         """
         return len(value)
 
+    def admits(self, size: int) -> bool:
+        """Whether ``put`` stores a value of ``size`` bytes: at most an eighth of max_memory_bytes (_MAX_ENTRY_SHARE).
+
+        Examples:
+            >>> L1Cache(max_memory_mb=1).admits(131_072), L1Cache(max_memory_mb=1).admits(131_073)
+            (True, False)
+        """
+        return size <= self.max_memory_bytes * _MAX_ENTRY_SHARE
+
     def get(self, key: str) -> tuple[bool, Optional[bytes]]:
         """Get value from L1 cache if present and not expired.
 
@@ -278,14 +287,13 @@ class L1Cache:
         # would also push L1 permanently over its limit (a multi-GB DataFrame envelope is a direct
         # OOM vector). We only decline to mirror the value in L1. If a smaller entry for this key
         # was cached, drop it so L1 stops serving the stale value.
-        max_entry_bytes = self.max_memory_bytes * _MAX_ENTRY_SHARE
-        if size > max_entry_bytes:
+        if not self.admits(size):
             self._on_current_state(_L1State.remove, key)
             logger.debug(
                 "Skipping L1 cache for key %s - value %d bytes exceeds L1 per-entry limit %d bytes (not kept in L1)",
                 redact_key_for_log(key),
                 size,
-                max_entry_bytes,
+                self.max_memory_bytes * _MAX_ENTRY_SHARE,
             )
             return
 

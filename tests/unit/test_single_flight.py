@@ -37,6 +37,7 @@ import time_machine
 from cachekit import cache
 from cachekit import object_cache as object_cache_module
 from cachekit.backends.errors import BackendError
+from cachekit.cache_handler import CacheSerializationHandler, VerifiedMsgpack
 from cachekit.config.nested import L1CacheConfig
 from cachekit.decorators import single_flight
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
@@ -943,6 +944,56 @@ def test_sync_backed_recheck_after_a_trip_settled_since_the_callers_l1_lookup(
     else:
         assert backend.requests == ["get", "set", "get"]  # its own L2 read hit what the other trip stored
         assert counts == (1, 0, 1)
+
+
+@pytest.fixture
+def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
+    """The type of every entry a backed-mode handler decodes: VerifiedMsgpack from L1, bytes for an envelope."""
+    seen: list[type] = []
+    real = CacheSerializationHandler.deserialize_data
+
+    def recording(self: CacheSerializationHandler, data: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(type(data))
+        return real(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(CacheSerializationHandler, "deserialize_data", recording)
+    return seen
+
+
+def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
+    monkeypatch: pytest.MonkeyPatch, decoded: list[type]
+) -> None:
+    """The trip that settled left the value's verified MessagePack in L1 (l1_entry); the re-check hands it to
+    _decode_shared, which decodes it without retrieve() and without a trip of its own."""
+    runs = 0
+
+    def compute(x: int) -> dict[str, int]:
+        nonlocal runs
+        runs += 1
+        return {"x": x}
+
+    backend = _Backend()
+    fn = _decorator("backed", backend)(compute)
+    _settle_another_trip_first(monkeypatch, fn)
+    assert fn(1) == {"x": 1}
+
+    assert (runs, backend.requests) == (1, ["get", "set"])  # one function call and one backend read in all
+    assert decoded == [VerifiedMsgpack]
+
+
+def test_sync_backed_joiner_decodes_the_trips_envelope(waiting: list[int], decoded: list[type]) -> None:
+    """A joined caller decodes its own copy of the trip's envelope, as before: never the L1 entry."""
+
+    def compute(x: int) -> dict[str, int]:
+        _until(lambda: waiting[0] == HERD - 1)
+        return {"x": x}
+
+    backend = _Backend()
+    results = _thread_herd(_decorator("backed", backend)(compute))
+
+    assert results == [{"x": 1}] * HERD
+    assert backend.requests == ["get", "set"]
+    assert decoded == [bytes] * (HERD - 1)
 
 
 def test_sync_backed_recheck_hit_hands_its_half_open_probe_slot_back(

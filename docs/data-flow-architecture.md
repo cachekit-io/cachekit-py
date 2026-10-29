@@ -31,7 +31,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 > **Architecture Principles:**
 > - **L1 + L2 Caching**: In-memory bytes cache (L1) + pluggable backend storage (L2) for optimal performance
 > - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CachekitIO, File, Memcached, custom)
-> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself
+> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself. A plaintext entry of the default serializer with integrity checking on is kept as its verified MessagePack when that is no longer than its envelope, so its hit skips the LZ4 decompress and checksum; encrypted caches keep the ciphertext
 > - **Security First**: Decompression bomb protection, checksum validation, size limits, encrypted-at-rest
 > - **Performance Optimized**: Thread affinity, connection pooling, pre-cached serializers
 > - **Flexible Configuration**: L1+L2, L1-only, L2-only, or observability-only modes
@@ -307,6 +307,12 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  Note: with a backend, L1 stores bytes (encrypted or plaintext), not Python │
 │  objects. L1-only mode (backend=None) stores the object itself.             │
+│                                                                             │
+│  Before the put, the wrapper (_put_l1) swaps an envelope L1 admits for its  │
+│  verified MessagePack when the cache is plaintext, the serializer is the    │
+│  default one with integrity on, and the MessagePack is no longer            │
+│  (CacheSerializationHandler.l1_entry). Admission is judged on the envelope, │
+│  so L1 never holds fewer entries. Encrypted caches keep the ciphertext.     │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
                                    ▼
@@ -480,9 +486,10 @@ L1-only mode (`backend=None`) skips this layer: it stores the Python object itse
 - **After refactor**: Stores bytes (encrypted or plaintext) → `len(bytes)` for size estimation
 - **Performance improvement**: O(1) size calculation vs recursive traversal
 - **Security improvement**: Encrypted bytes at rest (decrypt-at-read-time only)
+- **Verified MessagePack**: a plaintext entry of the default serializer with integrity checking on is kept as the MessagePack a successful `ByteStorage.retrieve()` returned, in place of its envelope, when that is no longer and L1 admits the envelope. Its hit decodes the MessagePack without decompressing or checksumming it again. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. Bytes from L2 never take this path: L1 marks the entry by its type (`VerifiedMsgpack`), which no backend returns
 
 **Hierarchical Read Path:**
-1. Check L1 cache (bytes) → if hit, deserialize and return
+1. Check L1 cache (bytes) → if hit, deserialize (verified MessagePack skips the envelope's decompress and checksum) and return
 2. If L1 miss, check L2 backend (bytes) → if hit, deserialize, populate L1 with bytes, return
 3. If L2 miss, execute function → serialize to bytes → store in L2 and L1 → return
 
