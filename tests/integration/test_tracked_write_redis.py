@@ -205,6 +205,74 @@ _OVERRIDES = {
 }
 
 
+_DELEGATED = ("get", "set", "track_key")
+
+
+def _delegating_by_assignment(client: redis.Redis) -> PerRequestRedisBackend:
+    """A tenant-``source`` facade whose get, set and track_key are tenant ``target``'s bound methods."""
+    facade, target = PerRequestRedisBackend(client, "source"), PerRequestRedisBackend(client, "target")
+    for name in _DELEGATED:
+        setattr(facade, name, getattr(target, name))
+    return facade
+
+
+class _DelegatingFacade(PerRequestRedisBackend):
+    """A tenant-``source`` facade that hands get, set and track_key to tenant ``target`` through ``__getattribute__``."""
+
+    def __init__(self, client: redis.Redis) -> None:
+        super().__init__(client, "source")
+        self._target = PerRequestRedisBackend(client, "target")
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in _DELEGATED:
+            return getattr(object.__getattribute__(self, "_target"), name)
+        return super().__getattribute__(name)
+
+
+_DELEGATIONS = {"assignment": _delegating_by_assignment, "getattribute": _DelegatingFacade}
+
+
+class TestDelegationWritesWhereItReads:
+    """Methods bound to another backend carry the recorded functions but another receiver: the write must go
+    where the delegate's set sends it, so the next read, also delegated, hits."""
+
+    @pytest.mark.parametrize("delegation", list(_DELEGATIONS))
+    def test_never_fuses(self, client: redis.Redis, delegation: str) -> None:
+        assert not _fuses_tracked_write(_DELEGATIONS[delegation](client))
+
+    @pytest.mark.parametrize("delegation", list(_DELEGATIONS))
+    def test_sync_miss(self, client: redis.Redis, delegation: str) -> None:
+        calls = 0
+
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        fn = cache(backend=_DELEGATIONS[delegation](client), ttl=300, l1_enabled=False)(f)
+        fn(1)
+        fn(1)
+        assert calls == 1
+        assert client.keys("t:source:*") == []
+        assert any(b":ck:reg:" not in key for key in client.keys("t:target:*"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delegation", list(_DELEGATIONS))
+    async def test_async_miss(self, client: redis.Redis, delegation: str) -> None:
+        calls = 0
+
+        async def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        fn = cache(backend=_DELEGATIONS[delegation](client), ttl=300, l1_enabled=False)(f)
+        await fn(1)
+        await fn(1)
+        assert calls == 1
+        assert client.keys("t:source:*") == []
+
+
 class TestFuseDecision:
     def test_plain_backend_fuses(self, client: redis.Redis) -> None:
         assert _fuses_tracked_write(PerRequestRedisBackend(client, "default"))
