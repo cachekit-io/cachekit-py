@@ -331,7 +331,9 @@ field list and an example stats endpoint.
 
 ## Performance Impact
 
-No wall-clock guard times metrics recording, so the Performance Guide publishes no timing for it. Its [Instruction Budgets](../performance.md#instruction-budgets) give the instruction cost of an L2 hit with synchronous and with batched metrics recording.
+No wall-clock guard times metrics recording, so the Performance Guide publishes no timing for it. Its [Instruction Budgets](../performance.md#instruction-budgets) give the instruction cost of an L2 hit with a synchronous and with a batched collector.
+
+Each thread records a cache operation into cells of its own, and the series add those cells up when Prometheus scrapes them. So a record takes no lock another thread waits on, which matters on free-threaded Python, and a scrape counts every operation recorded before it, in either collector mode. With `PROMETHEUS_MULTIPROC_DIR` set, a scrape reads each process's files instead of these values, so cache operations then record into the series directly.
 
 ---
 
