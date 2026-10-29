@@ -116,8 +116,10 @@ _metrics_cache: dict[str, Any] = {}
 # One lock per process, keyed by pid: a C-level fork skips the at-fork hooks below, so a
 # child must never take a lock it inherited, possibly held by a thread that is gone.
 _metrics_locks: dict[int, threading.Lock] = {}
-# Guards the per-thread cells' registries (see _Shards and _ThreadState), keyed by pid for the same reason. A leaf
-# lock: nothing takes another lock while holding it, except the value locks of a series it is first installing into.
+# Guards the per-thread cells' registries (see _Shards and _ThreadState), keyed by pid for the same reason. cachekit
+# takes no other lock under it except the value locks of a series it is first installing views into; a finalizer that
+# runs under it can take more (a new bind's labels() takes prometheus_client's metric lock). Taken after the metric-cache
+# lock, never before it, so the at-fork hooks hold both in that order.
 # Reentrant: Python code runs under it, so a garbage collection there can run a finalizer on the same thread, and a
 # finalizer that records a cache operation, reads a series or drops a collector takes it again. Every holder iterates
 # snapshots, so such a nested call cannot change a dict under an outer loop.
