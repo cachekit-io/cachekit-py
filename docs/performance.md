@@ -296,26 +296,26 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 11,632 | 10,896 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,505 | 9,790 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 188,634 | 182,083 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 222,372 | 212,493 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 157,389 | 155,969 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 178,846 | 172,851 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 58,743 | 59,601 |
-| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,421,931 | 1,422,896 |
-| `serializer_auto` | `AutoSerializer` round trip | 65,943 | 66,651 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 22,068 | 22,688 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,980,225 | 1,982,998 |
-| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,768,020 | 61,261,299 |
-| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,770,277 | 61,264,653 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,048 | 101,948 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,656 | 2,540 |
-| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,634 | 720,648 |
-| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,881 | 73,987 |
-| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 164,507 | 160,678 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 11,614 | 10,904 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,496 | 9,788 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 171,988 | 167,408 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 211,434 | 203,521 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 139,943 | 140,926 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,370 | 167,447 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 58,661 | 59,595 |
+| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,422,079 | 1,422,120 |
+| `serializer_auto` | `AutoSerializer` round trip | 65,971 | 66,624 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 22,085 | 22,677 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,972,713 | 1,982,226 |
+| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,750,733 | 61,321,806 |
+| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,806,031 | 61,327,994 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,164 | 101,927 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,658 | 2,530 |
+| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,667 | 720,663 |
+| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,887 | 74,132 |
+| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 164,514 | 160,511 |
 
-Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 9,000 to 10,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread. The gap was about 50,000 until each label tuple's Prometheus series was bound once instead of looked up per call.
+Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. `l2_hit` and `l2_hit_async_metrics` now cost the same within 0.03%: a cache operation records into per-thread cells in either mode, which also costs about 15,000 fewer instructions per L2 hit than the synchronous Prometheus update did, and about 5,000 fewer than queueing the record for the batching worker.
 
 **Sensitivity:** before the key memo, one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,700 to 4,900 instructions (`l1_hit` +6.1%, `l2_hit_async_metrics` +1.5%, `miss` +1.4%) and failed the gate, while the serializer paths, which generate no key, stayed within 0.11%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 
