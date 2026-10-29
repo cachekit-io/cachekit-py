@@ -26,15 +26,27 @@ from hypothesis import strategies as st
 
 from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
+from cachekit.config import reset_settings
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache, get_l1_cache
-from cachekit.serializers.base import SerializationError
+from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
-from cachekit.serializers.standard_serializer import VerifiedMsgpack
+from cachekit.serializers.standard_serializer import StandardSerializer, VerifiedMsgpack
+from cachekit.serializers.wrapper import SerializationWrapper
+from tests.fixtures.zero_config import clear_cachekit_env
 
 pytestmark = pytest.mark.unit
 
 MASTER_KEY = "a" * 64
+
+
+@pytest.fixture(autouse=True)
+def _no_cachekit_env(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Handlers here read key settings when built, so no CACHEKIT_* variable in the shell may reach them."""
+    clear_cachekit_env(monkeypatch)
+    reset_settings()
+    yield
+    reset_settings()
 
 
 class _Backend:
@@ -187,14 +199,6 @@ def test_a_corrupt_envelope_backfilled_into_l1_is_never_swapped(monkeypatch: pyt
     assert type(entry) is bytes and entry == corrupt
 
 
-@pytest.mark.parametrize("damage", [_corrupt, lambda e: e[:-30]], ids=["flipped-byte", "truncated"])
-def test_deserialize_l1_refuses_an_envelope_retrieve_refuses(damage: Callable[[bytes], bytes]) -> None:
-    handler = CacheSerializationHandler()
-    envelope = damage(handler.serialize_data({"x": 1}, cache_key="k"))
-    with pytest.raises(SerializationError):
-        handler.deserialize_l1(envelope, cache_key="k")
-
-
 _VALUES = st.recursive(
     st.none() | st.booleans() | st.integers(-(2**63), 2**64 - 1) | st.floats(allow_nan=False) | st.text() | st.binary(),
     lambda inner: st.lists(inner, max_size=8) | st.dictionaries(st.text(max_size=8), inner, max_size=8),
@@ -217,33 +221,46 @@ def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_sam
         assert handler.deserialize_l1(entry, cache_key="k") == (expected, None)
 
 
-@pytest.mark.parametrize(
-    "handler",
-    [
-        CacheSerializationHandler(serializer_name="auto"),
-        CacheSerializationHandler(enable_integrity_checking=False),
-        CacheSerializationHandler(encryption=True, master_key=MASTER_KEY, single_tenant_mode=True),
-    ],
-    ids=["auto", "integrity-off", "encrypted"],
-)
-def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(handler: CacheSerializationHandler) -> None:
+def test_msgpack_exactly_as_long_as_the_limit_is_kept() -> None:
+    serializer = StandardSerializer()
+    envelope, _ = serializer.serialize({"x": 1})
+    size = len(msgpack.packb({"x": 1}))
+    assert serializer._deserialize_keeping_msgpack(envelope, size)[1] is not None
+    assert serializer._deserialize_keeping_msgpack(envelope, size - 1)[1] is None
+
+
+_OTHER_HANDLERS: dict[str, Callable[[], CacheSerializationHandler]] = {
+    "auto": lambda: CacheSerializationHandler(serializer_name="auto"),
+    "integrity-off": lambda: CacheSerializationHandler(enable_integrity_checking=False),
+    "encrypted": lambda: CacheSerializationHandler(encryption=True, master_key=MASTER_KEY, single_tenant_mode=True),
+}
+
+
+@pytest.mark.parametrize("make", list(_OTHER_HANDLERS.values()), ids=list(_OTHER_HANDLERS))
+def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(make: Callable[[], CacheSerializationHandler]) -> None:
     """The L1 hit sites send these handlers' entries to deserialize_data, which refuses a swapped entry another
-    handler left under the same key as a corrupt frame."""
+    handler left under the same key: under encryption as the plaintext envelope it replaced would be."""
+    handler = make()
     envelope = handler.serialize_data({"x": 1}, cache_key="k")
     assert not handler.keeps_msgpack_in_l1
     assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
     planted = VerifiedMsgpack(msgpack.packb({"x": 2}))
+    refusal = SuspiciousCacheEntryError if handler.encryption else SerializationError
     for decode in (handler.deserialize_l1, handler.deserialize_data):
-        with pytest.raises(SerializationError, match="Corrupt cache envelope"):
+        with pytest.raises(refusal) as raised:
             decode(planted, cache_key="k")  # type: ignore[arg-type]
+        assert handler.encryption or "Corrupt cache envelope" in str(raised.value)
 
 
 def _frames() -> dict[str, bytes]:
-    """Entries a plaintext default-serializer handler must decode exactly as deserialize_data does."""
+    """Entries a plaintext default-serializer handler must decode exactly as deserialize_data does. Only the
+    first is its own plaintext envelope, the one entry L1 may swap."""
     k = "k"
     own = CacheSerializationHandler(encryption=False).serialize_data({"x": 1}, cache_key=k)
+    payload, metadata, name = SerializationWrapper.unwrap(own)
     return {
         "own-envelope": own,
+        "header-not-compressed": SerializationWrapper.wrap(bytes(payload), metadata | {"compressed": False}, name),
         "other-serializer": CacheSerializationHandler(serializer_name="auto").serialize_data({"x": 1}, cache_key=k),
         "encrypted-drift": CacheSerializationHandler(
             encryption=True, master_key=MASTER_KEY, single_tenant_mode=True
@@ -251,17 +268,33 @@ def _frames() -> dict[str, bytes]:
         "integrity-off": CacheSerializationHandler(enable_integrity_checking=False).serialize_data({"x": 1}, cache_key=k),
         "corrupt-header": b"\x00" + own[1:],
         "corrupt-payload": _corrupt(own),
+        "truncated": own[:-30],
         "not-a-frame": msgpack.packb({"x": 1}),
     }
 
 
-@pytest.mark.parametrize("name", list(_frames()))
+_FRAME_NAMES = (
+    "own-envelope",
+    "header-not-compressed",
+    "other-serializer",
+    "encrypted-drift",
+    "integrity-off",
+    "corrupt-header",
+    "corrupt-payload",
+    "truncated",
+    "not-a-frame",
+)
+
+
+@pytest.mark.parametrize("name", _FRAME_NAMES)
 def test_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
     name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """deserialize_l1's fast path repeats deserialize_data's frame checks, so the two must agree on every entry."""
+    """deserialize_l1's fast path repeats deserialize_data's frame checks, so the two must agree on every entry,
+    and only the handler's own plaintext envelope may come back with MessagePack to keep."""
     data = _frames()[name]
     monkeypatch.setenv("CACHEKIT_MASTER_KEY", MASTER_KEY)  # lets the encrypted-drift entry decrypt, as it would
+    reset_settings()
     handler = CacheSerializationHandler(encryption=False)
 
     def outcome(decode: Callable[[], Any]) -> Any:
@@ -271,24 +304,27 @@ def test_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
             return type(e)
 
     expected = outcome(lambda: handler.deserialize_data(data, cache_key="k"))
-    assert outcome(lambda: handler.deserialize_l1(data, cache_key="k")[0]) == expected
+    got = outcome(lambda: handler.deserialize_l1(data, cache_key="k"))
+    assert (got[0] if isinstance(got, tuple) else got) == expected
+    assert (isinstance(got, tuple) and got[1] is not None) == (name == "own-envelope")
 
 
-# ── L1Cache.shrink_if_held ───────────────────────────────────────────────────────────────────────────
+# ── L1Cache.shrink_if_held ───────────────────────────────────────────────────────────────────
 
 
-def test_replace_shrinks_the_entry_in_place() -> None:
+@pytest.mark.parametrize("size", [40, 100], ids=["shorter", "as-long"])
+def test_shrink_if_held_swaps_the_entry_in_place(size: int) -> None:
     l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
     old = b"e" * 100
     l1.put("a", old, redis_ttl=60)
     l1.put("b", b"b" * 10, redis_ttl=60)
     expires_at = l1._state.cache["a"].expires_at
 
-    new = VerifiedMsgpack(b"m" * 40)
+    new = VerifiedMsgpack(b"m" * size)
     assert l1.shrink_if_held("a", old, new)
 
     assert l1.peek("a") is new
-    assert l1._state.memory_bytes == 50
+    assert l1._state.memory_bytes == size + 10
     assert l1._state.cache["a"].expires_at == expires_at
     assert list(l1._state.cache) == ["a", "b"]  # LRU place kept
 
@@ -296,7 +332,7 @@ def test_replace_shrinks_the_entry_in_place() -> None:
 @pytest.mark.parametrize(
     "change", ["removed", "stored-again", "longer"], ids=["removed-since-read", "stored-again-since-read", "longer"]
 )
-def test_replace_leaves_an_entry_it_did_not_read_or_would_grow(change: str) -> None:
+def test_shrink_if_held_leaves_an_entry_it_did_not_read_or_would_grow(change: str) -> None:
     l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
     old = b"e" * 100
     l1.put("a", old, redis_ttl=60)
@@ -380,8 +416,8 @@ def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
 # envelope and MessagePack sizes; with promote, a read that hits an envelope swaps it for its MessagePack
 # when that is no longer, as the L1 hit sites do (deserialize_l1, then L1Cache.shrink_if_held, which alone
 # refuses a longer value here). The shipped design
-# is the envelope rule with promote. The two rejected put rules are the counterexamples an adversarial
-# review found against storing MessagePack at write time; they show the pinned traces bite.
+# is the envelope rule with promote. The two rejected put rules are counterexamples against storing
+# MessagePack at write time; they show the pinned traces bite.
 
 Rule = Callable[[L1Cache, int, int], int]
 
@@ -436,6 +472,7 @@ def _replay(trace: list[tuple[str, str, int, int]], budget_mb: int, rule: Rule, 
                 hits.append(i)
                 if promote and not isinstance(held, _SizedMsgpack):
                     l1.shrink_if_held(key, held, _SizedMsgpack(raw))  # type: ignore[arg-type]
+                    assert l1._state.cache[key].size_bytes <= envelope  # a swap never grows an entry
                 continue
         l1.put(key, _Sized(rule(l1, envelope, raw)))
     return hits

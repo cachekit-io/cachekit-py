@@ -412,19 +412,19 @@ class StandardSerializer:
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
-    def deserialize_keeping_msgpack(self, data: bytes | memoryview, limit: int) -> tuple[Any, VerifiedMsgpack | None]:
+    def _deserialize_keeping_msgpack(self, data: bytes | memoryview, limit: int) -> tuple[Any, VerifiedMsgpack | None]:
         """What :meth:`deserialize` returns for a ByteStorage envelope when integrity checking is on, plus the
         MessagePack ``retrieve()`` verified when it is at most ``limit`` bytes, for the caller to keep and decode
-        later without retrieve() (:meth:`deserialize_verified`). It always unwraps the envelope, so call it
+        later without retrieve() (:meth:`_deserialize_verified`). It always unwraps the envelope, so call it
         only for an integrity-on serializer. Raises SerializationError as deserialize does then.
 
         Examples:
             >>> serializer = StandardSerializer()
             >>> envelope, _ = serializer.serialize({"test": 123})
-            >>> value, kept = serializer.deserialize_keeping_msgpack(envelope, len(envelope))
-            >>> value, serializer.deserialize_verified(kept)
+            >>> value, kept = serializer._deserialize_keeping_msgpack(envelope, len(envelope))
+            >>> value, serializer._deserialize_verified(kept)
             ({'test': 123}, {'test': 123})
-            >>> serializer.deserialize_keeping_msgpack(envelope, 4)  # the MessagePack is 7 bytes
+            >>> serializer._deserialize_keeping_msgpack(envelope, 4)  # the MessagePack is 7 bytes
             ({'test': 123}, None)
         """
         try:
@@ -434,8 +434,8 @@ class StandardSerializer:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
         return value, VerifiedMsgpack(msgpack_data) if len(msgpack_data) <= limit else None
 
-    def deserialize_verified(self, kept: VerifiedMsgpack) -> Any:
-        """Decode MessagePack that :meth:`deserialize_keeping_msgpack` kept, without another ``retrieve()``.
+    def _deserialize_verified(self, kept: VerifiedMsgpack) -> Any:
+        """Decode MessagePack that :meth:`_deserialize_keeping_msgpack` kept, without another ``retrieve()``.
         Raises SerializationError as deserialize does."""
         try:
             return unpackb_bounded(kept.data, **self._msgpack_unpack_opts)
