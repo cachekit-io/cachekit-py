@@ -435,7 +435,7 @@ def test_batched_metrics_path_records_every_call_per_thread_and_queues_none(monk
 
     direct: Counter[str] = Counter()
     monkeypatch.setattr(AsyncMetricsCollector, "__init__", tracking_init)
-    monkeypatch.setattr(AsyncMetricsCollector, "_record_cache_operation_sync", lambda *a, **k: direct.update(["sync"]))
+    monkeypatch.setattr(AsyncMetricsCollector, "_record_cache_operation_direct", lambda *a, **k: direct.update(["direct"]))
     op = ir_workload.build_workload("l2_hit_async_metrics")
     (collector,) = made
     before = collector._operation_count

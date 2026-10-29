@@ -8,6 +8,7 @@ thread churn.
 
 from __future__ import annotations
 
+import gc
 import math
 import multiprocessing
 import os
@@ -258,6 +259,49 @@ def test_cells_stay_bounded_across_10000_thread_lifetimes():
     assert len(async_metrics._thread_ops) <= states
     assert _cells(namespace) == 3
     assert _sample("cache_operations_total", namespace) == collector._operation_count == 10_001
+
+
+def test_dropped_collectors_leave_no_counts_behind():
+    namespace = f"per-thread-drop-{uuid.uuid4().hex}"
+    _record(AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False), namespace)  # this thread's state exists
+    gc.collect()
+    retired, own = len(async_metrics._retired_ops), len(async_metrics._tls.state.ops)
+    for _ in range(500):
+        collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+        _record(collector, namespace)
+        thread = threading.Thread(target=_record, args=(collector, namespace))  # retires its count on exit
+        thread.start()
+        thread.join()
+        del collector, thread
+    gc.collect()
+
+    assert len(async_metrics._retired_ops) <= retired
+    assert len(async_metrics._tls.state.ops) <= own
+    assert _sample("cache_operations_total", namespace) == 1001  # the series keep every operation
+
+
+def test_a_finalizer_that_runs_under_the_series_lock_does_not_deadlock():
+    # A garbage collection can run a finalizer while its thread holds the lock (inside a scrape, a bind or a
+    # thread's exit). A finalizer that records, reads or drops a collector then takes the lock again on that thread.
+    namespace = f"per-thread-reenter-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    _record(collector, namespace)
+    results: list[object] = []
+
+    def nested() -> None:
+        with async_metrics._shard_lock():
+            _record(collector, f"{namespace}-new")  # binds a new label tuple
+            dropped = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+            _record(dropped, namespace)
+            del dropped
+            gc.collect()  # finalizes the dropped collector under the lock
+            results.append((collector.get_stats()["total_operations"], _sample("cache_operations_total", namespace)))
+
+    thread = threading.Thread(target=nested, daemon=True)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive(), "deadlocked on the series lock"
+    assert results == [(2, 2)]
 
 
 def test_retiring_a_cell_never_changes_a_total():

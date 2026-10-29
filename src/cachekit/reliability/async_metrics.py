@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 import warnings
+import weakref
 from bisect import bisect_left
 from collections import defaultdict
 from typing import Any, Optional, Union
@@ -52,7 +53,7 @@ try:
     PROMETHEUS_AVAILABLE = True
     # Per-thread cells need in-process values. In multiprocess mode (PROMETHEUS_MULTIPROC_DIR) a scrape reads each
     # process's mmap files, not the values, so cache operations record into the series directly instead.
-    _PER_THREAD = _prometheus_values.ValueClass is _prometheus_values.MutexValue
+    _PER_THREAD = _prometheus_values.ValueClass is getattr(_prometheus_values, "MutexValue", None)
 except ImportError:
     PROMETHEUS_AVAILABLE = False  # type: ignore[misc]
     _PER_THREAD = False  # type: ignore[misc]
@@ -117,16 +118,20 @@ _metrics_cache: dict[str, Any] = {}
 _metrics_locks: dict[int, threading.Lock] = {}
 # Guards the per-thread cells' registries (see _Shards and _ThreadState), keyed by pid for the same reason. A leaf
 # lock: nothing takes another lock while holding it, except the value locks of a series it is first installing into.
-_shard_locks: dict[int, threading.Lock] = {}
+# Reentrant: Python code runs under it, so a garbage collection there can run a finalizer on the same thread, and a
+# finalizer that records a cache operation, reads a series or drops a collector takes it again. Every holder iterates
+# snapshots, so such a nested call cannot change a dict under an outer loop.
+_shard_locks: dict[int, Any] = {}
+_RLOCK = threading.RLock
 
 
-def _pid_lock(locks: dict[int, threading.Lock]) -> threading.Lock:
-    """Return this process's lock in ``locks``, creating it on first use."""
+def _pid_lock(locks: dict[int, Any], factory: Any = None) -> Any:
+    """Return this process's lock in ``locks``, creating it with ``factory`` (default ``threading.Lock``) on first use."""
     pid = os.getpid()
     lock = locks.get(pid)
     if lock is None:
         # setdefault is atomic, so threads racing here in a new child all get one lock.
-        lock = locks.setdefault(pid, threading.Lock())
+        lock = locks.setdefault(pid, (factory or threading.Lock)())
     return lock
 
 
@@ -135,9 +140,9 @@ def _metrics_cache_lock() -> threading.Lock:
     return _pid_lock(_metrics_locks)
 
 
-def _shard_lock() -> threading.Lock:
-    """Return this process's per-thread-cell lock, creating it on first use."""
-    return _pid_lock(_shard_locks)
+def _shard_lock() -> Any:
+    """Return this process's per-thread-cell lock, an ``RLock``, creating it on first use."""
+    return _pid_lock(_shard_locks, _RLOCK)
 
 
 def _acquire_fork_locks() -> None:
@@ -173,7 +178,9 @@ def _reset_metric_locks() -> None:
     ``tests/unit/test_async_metrics_mode_switch.py`` fail if a release renames them. ``_CacheOpSeries`` also reads
     two private attributes, a labelled metric's ``_metrics`` and a child's ``_labelvalues``, to tell whether a bound
     child is still exported; ``test_prometheus_private_attributes_the_series_cache_reads`` in
-    ``tests/unit/test_hot_path_telemetry.py`` fails if a release renames either. Only cachekit's own metrics
+    ``tests/unit/test_hot_path_telemetry.py`` fails if a release renames either. The per-thread path also replaces a
+    child's ``_value``, ``_sum`` and ``_buckets`` with ``_ShardView``s, reads a histogram child's ``_upper_bounds``, and
+    reads ``values.ValueClass`` and ``values.MutexValue`` to tell multiprocess mode; the same test pins those. Only cachekit's own metrics
     and the default registry are covered, not an application's metrics. In multiprocess mode
     (``PROMETHEUS_MULTIPROC_DIR``) values share one lock that this cannot reach, so a child forked while a parent
     thread holds it can still hang.
@@ -242,7 +249,7 @@ def _get_shared_metric(
 
     Module-level so ``circuit_breaker_gauge()`` shares the collectors' metric cache without
     creating a collector. ``buckets`` reach a ``Histogram`` only on first creation. It is a named
-    parameter, not ``**kwargs``: every recorded cache operation calls this up to three times, and
+    parameter, not ``**kwargs``: every series bind (``_bind``) calls it up to three times, and
     forwarding ``**kwargs`` cost about 2,500 instructions per call.
 
     Raises:
@@ -398,7 +405,8 @@ class _Shards:
 
     def total(self, i: int) -> float:
         """Return value ``i`` summed over every cell, live and retired. Caller holds ``_shard_lock()``."""
-        return math.fsum([*self.retired[i], *(cell[i] for cell in self.cells.values())])
+        cells = list(self.cells.values())  # a snapshot: see _shard_locks
+        return math.fsum([*self.retired[i], *(cell[i] for cell in cells)])
 
 
 class _ShardView:
@@ -422,7 +430,7 @@ class _ShardView:
     def set(self, value: float, timestamp: Optional[float] = None) -> None:
         with _shard_lock():
             partials = [float(value)]
-            for cell in self.shards.cells.values():
+            for cell in list(self.shards.cells.values()):
                 _add_exact(partials, -cell[self.i])
             self.shards.retired[self.i] = partials
 
@@ -498,9 +506,9 @@ class _ThreadState:
         with _shard_lock():
             # One step, so a reader sums each count once: before its move, or after it.
             _thread_ops.pop(id(self), None)
-            for token, count in self.ops.items():
+            for token, count in list(self.ops.items()):
                 _retired_ops[token] = _retired_ops.get(token, 0) + count
-            for slots in self.slots.values():
+            for slots in list(self.slots.values()):
                 for slot in slots:
                     if slot is not None and slot.shards is not None:
                         slot.shards.retire(slot.cell)
@@ -516,6 +524,14 @@ _retired_ops: dict[object, int] = {}
 def _new_thread_state() -> _ThreadState:
     state = _tls.state = _ThreadState()
     return state
+
+
+def _forget_collector(token: object) -> None:
+    """Drop a collector's counts once the collector is gone, so building and dropping collectors leaks nothing."""
+    with _shard_lock():
+        _retired_ops.pop(token, None)
+        for ops in list(_thread_ops.values()):
+            ops.pop(token, None)  # the collector is gone, so no thread can be adding to this entry
 
 
 def _bind(slots: list[Optional[_Slot]], i: int, key: _CacheOpKey) -> _Slot:
@@ -612,6 +628,7 @@ class AsyncMetricsCollector:
         # its own _ThreadState; _operation_count sums them. The offset is what assigning _operation_count adds.
         self._token = object()
         self._ops_offset = 0
+        weakref.finalize(self, _forget_collector, self._token).atexit = False
         self._start_time = time.time()
         self._last_mode_check = time.time()
 
@@ -662,7 +679,8 @@ class AsyncMetricsCollector:
         """Record cache operation metric.
 
         In either mode, the operation lands in this thread's cells, which its series sum when read: the call writes
-        no state another thread writes, and a scrape right after it counts it. Each series check below is inline,
+        no state another thread writes, and a scrape right after it counts it. In prometheus_client's multiprocess
+        mode it records into the series directly instead (``_PER_THREAD``). Each series check below is inline,
         because a helper call costs about 1% per operation; it rebinds a series whose metric was replaced or whose
         child was detached (see ``_CacheOpSeries``).
         """
@@ -678,7 +696,7 @@ class AsyncMetricsCollector:
             self._maybe_switch_mode()
 
         if not _PER_THREAD:
-            self._record_cache_operation_sync(operation, namespace, success, duration_ms, serializer, size_bytes)
+            self._record_cache_operation_direct(operation, namespace, success, duration_ms, serializer, size_bytes)
             return
 
         key = (operation, namespace, success, serializer)
@@ -728,7 +746,7 @@ class AsyncMetricsCollector:
     def _operation_total(self) -> int:
         """Return this collector's operations summed over every thread. Caller holds ``_shard_lock()``."""
         token = self._token
-        return self._ops_offset + _retired_ops.get(token, 0) + sum(ops.get(token, 0) for ops in _thread_ops.values())
+        return self._ops_offset + _retired_ops.get(token, 0) + sum(ops.get(token, 0) for ops in list(_thread_ops.values()))
 
     @property
     def _operation_count(self) -> int:
@@ -1050,12 +1068,7 @@ class AsyncMetricsCollector:
 
     def _mode_lock(self) -> threading.Lock:
         """Return this process's mode-switch lock, creating it on first use."""
-        pid = os.getpid()
-        lock = self._mode_locks.get(pid)
-        if lock is None:
-            # setdefault is atomic, so threads racing here in a new child all get one lock.
-            lock = self._mode_locks.setdefault(pid, threading.Lock())
-        return lock
+        return _pid_lock(self._mode_locks)
 
     def _take_over_if_forked(self) -> None:
         """In a forked child, replace the batching state inherited from the parent and fall back to sync mode.
@@ -1160,8 +1173,8 @@ class AsyncMetricsCollector:
             if len(self._metric_pool) < 100:  # Limit pool size
                 self._metric_pool.append(metric_data)
 
-    # Sync mode implementations (direct Prometheus calls)
-    def _record_cache_operation_sync(
+    # Direct recording: cache operations in multiprocess mode, and the generic sync-mode metrics below
+    def _record_cache_operation_direct(
         self,
         operation: str,
         namespace: str,

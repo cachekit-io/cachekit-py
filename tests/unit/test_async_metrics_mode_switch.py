@@ -346,8 +346,8 @@ def test_child_of_a_batched_parent_records_past_a_lock_held_at_fork(held, entry)
     collector.shutdown()
 
 
-def _prometheus_lock(held: str, namespace: str) -> Any:
-    """Return the lock named by ``held``, for the series a cache operation in ``namespace`` updates."""
+def _prometheus_lock(held: str) -> Any:
+    """Return the lock named by ``held``, one that the cache-operation series or their registration take."""
     from prometheus_client import REGISTRY
 
     if held == "registry":
@@ -384,7 +384,7 @@ def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
         return _flushed(namespace), _sample(f"{_metric_name(namespace)}_total")
 
     # prometheus_client resets none of its locks after a fork, so the child must not use the parent's copies.
-    assert fork_holding(_prometheus_lock(held, namespace), child) == (2, 1)
+    assert fork_holding(_prometheus_lock(held), child) == (2, 1)
     collector.shutdown()
 
 
@@ -401,7 +401,7 @@ def test_child_of_a_sync_parent_records_past_a_prometheus_lock_held_at_fork(held
         collector.record_counter(_metric_name(namespace))
         return _flushed(namespace), _sample(f"{_metric_name(namespace)}_total")
 
-    assert _in_child_forked_holding(_prometheus_lock(held, namespace), child) == (2, 1)
+    assert _in_child_forked_holding(_prometheus_lock(held), child) == (2, 1)
 
 
 @needs_fork
@@ -505,7 +505,7 @@ def test_collector_built_in_a_c_level_fork_child_records_synchronously_and_start
         return len(_UnstartedThread.started), modes, _flushed(namespace)
 
     # A parent thread holds the series lock, so a record into it hangs unless the child's locks are fresh.
-    held = _prometheus_lock("series", namespace)
+    held = _prometheus_lock("series")
     assert _in_c_forked_child_holding(held, child) == (0, [(True, True), (True, True)], 3)
 
 
