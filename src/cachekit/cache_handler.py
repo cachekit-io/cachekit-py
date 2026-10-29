@@ -369,8 +369,39 @@ def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
 
 def _fuses_tracked_write(backend: object) -> bool:
     """Whether the backend writes a value and its registry entry in one call: a private ``_set_tracked``,
-    found on the CLASS as ``supports_key_tracking`` finds ``track_key``."""
-    return callable(getattr(type(backend), "_set_tracked", None)) and supports_key_tracking(backend)
+    found on the CLASS as ``supports_key_tracking`` finds ``track_key``. An SWR-capable backend keeps ``set``:
+    the fused write has no slot for a stale-grace window."""
+    return (
+        callable(getattr(type(backend), "_set_tracked", None)) and supports_key_tracking(backend) and not supports_swr(backend)  # pyright: ignore[reportArgumentType]
+    )
+
+
+def _set_l2(
+    handler: Any,
+    key: str,
+    value: bytes,
+    ttl: int | None,
+    stale_ttl: int | None,
+    registry_id: str | None,
+    on_track_error: Callable[[str, Exception], None],
+) -> tuple[bool, bool]:
+    """A buffered L2 write through ``handler``: (stored, tracked).
+
+    With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
+    (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
+    False and the caller tracks a stored key itself. getattr: custom CacheHandlerStrategy impls predate
+    set_tracked, as they predate set_streaming.
+    """
+    set_tracked = None if registry_id is None else getattr(handler, "set_tracked", None)
+    if set_tracked is not None:
+        stored = set_tracked(key, value, ttl, registry_id, on_track_error)
+        if stored is not None:
+            return stored, True
+    # Only thread the SWR kwarg when set: strategy implementations without
+    # **metadata (tests, custom handlers) must keep working unchanged.
+    if stale_ttl is not None:
+        return bool(handler.set(key, value, ttl, stale_ttl=stale_ttl)), False
+    return bool(handler.set(key, value, ttl)), False
 
 
 class _MultiDeleteBackend(Protocol):
@@ -2003,7 +2034,7 @@ class CacheOperationHandler:
         stale_ttl: int | None = None,
         defer: Callable[[bytes], bool] | None = None,
         registry_id: str | None = None,
-        on_track_error: Callable[[str, Exception], None] | None = None,
+        on_track_error: Callable[[str, Exception], None] = lambda _key, _error: None,
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
@@ -2063,20 +2094,9 @@ class CacheOperationHandler:
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
-            # getattr: custom CacheHandlerStrategy impls predate set_tracked, as set_streaming above.
-            set_tracked = None if registry_id is None else getattr(self._cache_handler, "set_tracked", None)
-            stored = (
-                None
-                if set_tracked is None
-                else set_tracked(cache_key, serialized_data, ttl, registry_id, on_track_error, stale_ttl=stale_ttl)
+            stored, tracked = _set_l2(
+                self._cache_handler, cache_key, serialized_data, ttl, stale_ttl, registry_id, on_track_error
             )
-            tracked = stored is not None
-            # Only thread the SWR kwarg when set: strategy implementations without
-            # **metadata (tests, custom handlers) must keep working unchanged.
-            if not tracked and stale_ttl is not None:
-                stored = self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
-            elif not tracked:
-                stored = self._cache_handler.set(cache_key, serialized_data, ttl)
             if stored:
                 get_logger().cache_stored(cache_key, ttl)
 
@@ -2460,8 +2480,7 @@ class StandardCacheHandler:
         value: bytes,
         ttl: Optional[int],
         registry_id: str,
-        on_track_error: Optional[Callable[[str, Exception], None]],
-        stale_ttl: Optional[int] = None,
+        on_track_error: Callable[[str, Exception], None],
     ) -> Optional[bool]:
         """``set`` plus the key-registry write (``KeyTrackableBackend.track_key``), in one backend round trip.
 
@@ -2471,7 +2490,7 @@ class StandardCacheHandler:
             was stored. A registry write that fails after a stored value goes to ``on_track_error`` with
             the key, and the value still counts as stored.
         """
-        if not self._fuses_tracking(stale_ttl):
+        if not _fuses_tracked_write(self.backend):
             return None
         try:
             track_error = self._with_backpressure_and_timeout(self.backend._set_tracked, key, value, ttl, registry_id)  # type: ignore[attr-defined]
@@ -2481,14 +2500,9 @@ class StandardCacheHandler:
         except Exception as e:
             get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
-        if track_error is not None and on_track_error is not None:
+        if track_error is not None:
             on_track_error(key, track_error)
         return True
-
-    def _fuses_tracking(self, stale_ttl: Optional[int]) -> bool:
-        """Whether set_tracked can fuse on this backend. An SWR window is a set argument the fused write
-        has no slot for, so an SWR-capable backend given one keeps set."""
-        return _fuses_tracked_write(self.backend) and (stale_ttl is None or not supports_swr(self.backend))
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
         """Stream a value to a streaming-writable backend.
@@ -2619,11 +2633,10 @@ class StandardCacheHandler:
         value: bytes,
         ttl: Optional[int],
         registry_id: str,
-        on_track_error: Optional[Callable[[str, Exception], None]],
-        stale_ttl: Optional[int] = None,
+        on_track_error: Callable[[str, Exception], None],
     ) -> Optional[bool]:
         """Async variant of :meth:`set_tracked`: the write and its registry entry in one thread-pool hop."""
-        if not self._fuses_tracking(stale_ttl):
+        if not _fuses_tracked_write(self.backend):
             return None
         try:
             track_error = await self._with_backpressure_and_timeout_async(
@@ -2639,7 +2652,7 @@ class StandardCacheHandler:
         except Exception as e:
             get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
-        if track_error is not None and on_track_error is not None:
+        if track_error is not None:
             on_track_error(key, track_error)
         return True
 

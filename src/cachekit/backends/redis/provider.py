@@ -56,8 +56,7 @@ def _registry_add(pipeline: Any, scoped_reg: str, key: str) -> Any:
     """Queue a key's registry entry on ``pipeline``: ``SADD`` the raw key, then ``EXPIRE`` the set to 7 days.
 
     The one place the registry's write commands live: ``track_key`` and ``_set_tracked`` both queue them here.
-    Queuing sends nothing; the caller chains ``execute()`` on the result. ``pipeline`` is a parameter here only
-    for the two queuing calls, which raise only on an argument type no caller passes.
+    Queuing sends nothing; the caller chains ``execute()`` on the result.
     """
     return pipeline.sadd(scoped_reg, key).expire(scoped_reg, _TRACKING_SET_TTL_SECONDS)
 
@@ -732,7 +731,7 @@ class PerRequestRedisBackend:
         """``set`` and ``track_key`` in one round trip: ``SET``, ``SADD`` and ``EXPIRE`` on one
         non-transactional pipeline.
 
-        Private: ``CacheHandler.set_tracked`` finds it on the backend class, and a backend without it
+        Private: ``StandardCacheHandler.set_tracked`` finds it on the backend class, and a backend without it
         keeps the separate ``track_key`` call. The write's success is the ``SET`` reply alone. The
         registry commands run even when the ``SET`` fails (no transaction rolls a failed ``SET`` back),
         which leaves a member with no key: the next drain unlinks the missing key, and the set's 7-day

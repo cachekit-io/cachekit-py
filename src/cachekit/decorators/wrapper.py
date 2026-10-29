@@ -28,6 +28,7 @@ from ..cache_handler import (
     L2MissProbe,
     StandardCacheHandler,
     TenantResolutionError,
+    _set_l2,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
@@ -1332,9 +1333,7 @@ def create_cache_wrapper(
         # Asked first: a backend without a registry never pays for the probe. Custom strategies predate set_tracked_async.
         set_tracked_async = getattr(handler, "set_tracked_async", None) if _is_trackable() else None
         if set_tracked_async is not None:
-            stored = await set_tracked_async(
-                cache_key, serialized_data, ttl, _registry_id, _warn_track_failure, stale_ttl=_stale_ttl
-            )
+            stored = await set_tracked_async(cache_key, serialized_data, ttl, _registry_id, _warn_track_failure)
             if stored is not None:
                 return stored, True
         return await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl), False  # type: ignore[union-attr]
@@ -1841,18 +1840,9 @@ def create_cache_wrapper(
         the backend write alone, the caller having serialized.
         """
         start = time.perf_counter()
-        # As in _set_l2_async: trackable first, and custom strategies predate set_tracked.
-        set_tracked = getattr(handler, "set_tracked", None) if _is_trackable() else None
-        stored = (
-            None
-            if set_tracked is None
-            else set_tracked(cache_key, envelope, ttl, _registry_id, _warn_track_failure, stale_ttl=_stale_ttl)
-        )
-        tracked = stored is not None
-        if not tracked and _stale_ttl is not None:
-            stored = handler.set(cache_key, envelope, ttl, stale_ttl=_stale_ttl)
-        elif not tracked:
-            stored = handler.set(cache_key, envelope, ttl)
+        # Trackable first: a backend without a registry never pays for set_tracked's probe.
+        registry_id = _registry_id if _is_trackable() else None
+        stored, tracked = _set_l2(handler, cache_key, envelope, ttl, _stale_ttl, registry_id, _warn_track_failure)
         duration_ms = (time.perf_counter() - start) * 1000
         if stored:
             get_logger().cache_stored(cache_key, ttl)

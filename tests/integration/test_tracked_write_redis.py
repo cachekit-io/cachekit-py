@@ -198,18 +198,18 @@ class TestFusedWriteErrors:
         assert fn(3) == 6  # the write failed; the caller still gets its value
         assert _cache_keys(client) == set()
 
-    def test_backend_raises_on_set_error_reply(self, set_denied: redis.Redis) -> None:
-        with pytest.raises(BackendError):
-            PerRequestRedisBackend(set_denied, "default")._set_tracked("k", b"v", 60, REG)
-
-    def test_registry_error_reply_is_stored_and_warns(self, client: redis.Redis, caplog: pytest.LogCaptureFixture) -> None:
+    def test_registry_error_reply_is_stored_and_warns(
+        self, client: redis.Redis, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         fn = cache(backend=PerRequestRedisBackend(client, "default"), ttl=300, l1_enabled=False)(lambda x: x)
         fn(0)  # creates the registry set; turn it into a string so the next SADD gets WRONGTYPE
         [reg] = client.keys("t:default:ck:reg:*")
         client.delete(reg)
         client.set(reg, b"not a set")
+        flushes = _write_flushes(monkeypatch)
         with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
             assert fn(1) == 1
+        assert len(flushes) == 1  # the SADD error came back from the fused pipeline, not a separate track_key
         assert len(_cache_keys(client)) == 2  # stored despite the failed SADD
         assert any("Key tracking failed" in r.getMessage() for r in caplog.records)
 
@@ -225,7 +225,9 @@ class TestFusedWriteErrors:
 
         monkeypatch.setattr(redis.client.Pipeline, "execute", dropped)
         handler = StandardCacheHandler(PerRequestRedisBackend(client, "default"))
-        assert handler.set_tracked("k", b"v", 60, REG, None) is False
+        track_errors: list[Exception] = []
+        assert handler.set_tracked("k", b"v", 60, REG, lambda _key, e: track_errors.append(e)) is False
+        assert track_errors == []
 
     @pytest.mark.parametrize(("ttl", "expected"), [(None, -1), (0, -1), (-5, -1), (60, 60)])
     def test_ttl_none_or_not_positive_sends_no_expiry(self, client: redis.Redis, ttl: int | None, expected: int) -> None:
