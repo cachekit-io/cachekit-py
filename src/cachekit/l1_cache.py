@@ -14,10 +14,13 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Concatenate, Optional, ParamSpec
+from typing import TYPE_CHECKING, Any, Concatenate, Optional, ParamSpec
 
 from cachekit import _fork
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
+
+if TYPE_CHECKING:
+    from cachekit.serializers.standard_serializer import VerifiedMsgpack
 
 # Default L1 entry lifetime when the caller supplies no TTL. Shared with the
 # decorator's freshness backfill bound: the server's Fresh-For may only ever
@@ -49,7 +52,7 @@ class CacheEntry:
     read time in CacheHandler, not storage time.
     """
 
-    value: bytes
+    value: "bytes | VerifiedMsgpack"  # VerifiedMsgpack once a hit swapped it in (replace)
     expires_at: float
     size_bytes: int
 
@@ -150,7 +153,7 @@ class L1Cache:
             ttl_buffer_seconds,
         )
 
-    def _estimate_size(self, value: bytes) -> int:
+    def _estimate_size(self, value: "bytes | VerifiedMsgpack") -> int:
         """Estimate memory size of bytes value.
 
         Simplified from recursive sys.getsizeof() - faster and more accurate
@@ -164,7 +167,7 @@ class L1Cache:
         """
         return len(value)
 
-    def get(self, key: str) -> tuple[bool, Optional[bytes]]:
+    def get(self, key: str) -> "tuple[bool, Optional[bytes | VerifiedMsgpack]]":
         """Get value from L1 cache if present and not expired.
 
         Args:
@@ -172,7 +175,8 @@ class L1Cache:
 
         Returns:
             Tuple of (found, value) where found is True if hit.
-            Value is bytes (encrypted or plaintext msgpack), not deserialized object.
+            Value is bytes (encrypted or plaintext msgpack), or the VerifiedMsgpack a hit swapped in
+            (replace), not deserialized object.
             Caller (CacheHandler) is responsible for decryption/deserialization.
         """
         s = self._state
@@ -197,7 +201,7 @@ class L1Cache:
 
             return True, entry.value
 
-    def peek(self, key: str) -> Optional[bytes]:
+    def peek(self, key: str) -> "Optional[bytes | VerifiedMsgpack]":
         """The bytes ``get`` would return, without counting a hit or miss or moving the entry in LRU order.
 
         For a second lookup within one call, such as the single-flight re-check after a miss, which
@@ -214,7 +218,7 @@ class L1Cache:
             entry = s.cache.get(key)
             return None if entry is None or entry.is_expired() else entry.value
 
-    def replace(self, key: str, old: bytes, new: bytes) -> None:
+    def replace(self, key: str, old: "bytes | VerifiedMsgpack", new: "VerifiedMsgpack") -> None:
         """Hold ``new`` in place of ``old``, the very object a read of ``key`` returned, if the entry still holds
         it and ``new`` is no longer. The entry keeps its expiry and LRU place.
 

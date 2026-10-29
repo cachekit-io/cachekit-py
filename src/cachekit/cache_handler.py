@@ -1295,7 +1295,7 @@ class CacheSerializationHandler:
 
     def deserialize_l1(
         self,
-        data: str | bytes | memoryview,
+        data: str | bytes | memoryview | VerifiedMsgpack,
         cache_key: str = "",
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
@@ -1338,7 +1338,7 @@ class CacheSerializationHandler:
 
     def deserialize_data(
         self,
-        data: str | bytes | memoryview,
+        data: str | bytes | memoryview | VerifiedMsgpack,
         cache_key: str = "",
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,

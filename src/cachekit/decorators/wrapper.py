@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 
     from ..backends.base import BaseBackend, LockableBackend
     from ..serializers.base import SerializerProtocol
+    from ..serializers.standard_serializer import VerifiedMsgpack
 
 
 def _resolve_lazy_backend() -> BaseBackend:
@@ -1894,7 +1895,7 @@ def create_cache_wrapper(
             return None
 
     def _decode_shared(
-        envelope: bytes | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        envelope: bytes | VerifiedMsgpack | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[bool, Any]:
         """A joined backed-mode caller's own copy of the trip's envelope, decoded as an L1 hit would be:
         every caller gets its own object, and the decrypt checks bind to this caller's tenant.
@@ -2370,7 +2371,7 @@ def create_cache_wrapper(
         decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
         return value if decoded else _own_trip_sync(cache_key, args, kwargs, twin_key)[0]
 
-    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | None]]:
+    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | VerifiedMsgpack | None]]:
         """The sync backed flight's re-check (ThreadFlights.run): the L1 entry a trip that settled since
         the caller's own L1 lookup left, as the envelope a joined caller decodes. Never an L2 read: it
         runs under the flight map's lock."""

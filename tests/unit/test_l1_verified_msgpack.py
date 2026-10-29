@@ -25,11 +25,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cachekit import cache
-from cachekit.cache_handler import CacheSerializationHandler, VerifiedMsgpack
+from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache, get_l1_cache
 from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
+from cachekit.serializers.standard_serializer import VerifiedMsgpack
 
 pytestmark = pytest.mark.unit
 
@@ -99,7 +100,7 @@ def test_the_first_hit_swaps_an_envelope_for_its_msgpack_when_no_longer(value: A
     assert compute(1) == value  # first hit: decodes the envelope, keeps its MessagePack
     _, entry = _stored(backend, namespace)
     assert type(entry) is VerifiedMsgpack
-    assert entry == msgpack.packb(value, use_bin_type=True)
+    assert entry.data == msgpack.packb(value, use_bin_type=True)
     assert len(entry) <= len(envelope)
 
     assert compute(1) == value  # decodes the MessagePack
@@ -242,9 +243,10 @@ def test_replace_shrinks_the_entry_in_place() -> None:
     l1.put("b", b"b" * 10, redis_ttl=60)
     expires_at = l1._state.cache["a"].expires_at
 
-    l1.replace("a", old, b"m" * 40)
+    new = VerifiedMsgpack(b"m" * 40)
+    l1.replace("a", old, new)
 
-    assert l1.peek("a") == b"m" * 40
+    assert l1.peek("a") is new
     assert l1._state.memory_bytes == 50
     assert l1._state.cache["a"].expires_at == expires_at
     assert list(l1._state.cache) == ["a", "b"]  # LRU place kept
@@ -257,13 +259,13 @@ def test_replace_leaves_an_entry_it_did_not_read_or_would_grow(change: str) -> N
     l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
     old = b"e" * 100
     l1.put("a", old, redis_ttl=60)
-    new = b"m" * 40
+    new = VerifiedMsgpack(b"m" * 40)
     if change == "removed":
         l1.invalidate("a")
     elif change == "stored-again":
         l1.put("a", bytes(bytearray(old)), redis_ttl=60)  # equal bytes, another object: a newer write
     else:
-        new = b"m" * 101
+        new = VerifiedMsgpack(b"m" * 101)
     held = l1.peek("a")
 
     l1.replace("a", old, new)
@@ -324,9 +326,11 @@ def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
 
     compute(1)
     ((key, _),) = backend.store.items()
-    get_l1_cache(namespace).put(key, VerifiedMsgpack(msgpack.packb({"x": "planted"})))
+    l1 = get_l1_cache(namespace)
+    l1.replace(key, l1.peek(key), VerifiedMsgpack(msgpack.packb({"x": "planted"})))  # type: ignore[arg-type]
+    assert type(l1.peek(key)) is VerifiedMsgpack
     assert compute(1) == {"x": 1}  # read from L2 instead
-    assert type(get_l1_cache(namespace).peek(key)) is bytes
+    assert type(l1.peek(key)) is bytes
 
 
 # ── L1 hits: never fewer than with envelopes ──────────────────────────────────────────────────

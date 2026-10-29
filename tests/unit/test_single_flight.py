@@ -37,13 +37,14 @@ import time_machine
 from cachekit import cache
 from cachekit import object_cache as object_cache_module
 from cachekit.backends.errors import BackendError
-from cachekit.cache_handler import CacheSerializationHandler, VerifiedMsgpack
+from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.nested import L1CacheConfig
 from cachekit.decorators import single_flight
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
 from cachekit.decorators.tenant_context import ContextVarExtractor
 from cachekit.l1_cache import L1Cache, get_l1_cache_manager
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitState
+from cachekit.serializers.standard_serializer import VerifiedMsgpack
 
 pytestmark = pytest.mark.unit
 

@@ -21,7 +21,7 @@ Security: Uses strict isinstance() checks (no hasattr()) to prevent arbitrary co
 from __future__ import annotations
 
 from datetime import date, datetime, time
-from typing import Any, ClassVar
+from typing import Any, ClassVar, final
 
 import msgpack
 
@@ -48,15 +48,23 @@ _ENVELOPE_PROBE_MAX_COMPRESSED = 20 + _ENVELOPE_PROBE_MAX_SIZE * 110 // 100
 _CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
 
 
-class VerifiedMsgpack(bytes):
+@final  # the read paths test `type(data) is VerifiedMsgpack`
+class VerifiedMsgpack:
     """MessagePack a successful ``ByteStorage.retrieve()`` returned, which an L1 entry holds in place of its
     envelope (``CacheSerializationHandler.deserialize_l1``). It decodes without another retrieve().
 
     The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never take
-    the unverified decode, whatever they hold.
+    the unverified decode, whatever they hold. It holds retrieve()'s own bytes object rather than
+    copying it into a bytes subclass, and its length is theirs, which L1 accounts.
     """
 
-    __slots__ = ()
+    __slots__ = ("data",)
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def __len__(self) -> int:
+        return len(self.data)
 
 
 # Error message constants for unsupported types (Task 2)
@@ -412,8 +420,8 @@ class StandardSerializer:
         Examples:
             >>> serializer = StandardSerializer()
             >>> envelope, _ = serializer.serialize({"test": 123})
-            >>> value, msgpack_data = serializer.deserialize_keeping_msgpack(envelope, len(envelope))
-            >>> value, serializer.deserialize_verified(msgpack_data)
+            >>> value, kept = serializer.deserialize_keeping_msgpack(envelope, len(envelope))
+            >>> value, serializer.deserialize_verified(kept)
             ({'test': 123}, {'test': 123})
             >>> serializer.deserialize_keeping_msgpack(envelope, 4)  # the MessagePack is 7 bytes
             ({'test': 123}, None)
@@ -425,11 +433,11 @@ class StandardSerializer:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
         return value, VerifiedMsgpack(msgpack_data) if len(msgpack_data) <= limit else None
 
-    def deserialize_verified(self, msgpack_data: bytes) -> Any:
-        """Decode MessagePack that :meth:`deserialize_keeping_msgpack` returned, without another ``retrieve()``.
+    def deserialize_verified(self, kept: VerifiedMsgpack) -> Any:
+        """Decode MessagePack that :meth:`deserialize_keeping_msgpack` kept, without another ``retrieve()``.
         Raises SerializationError as deserialize does."""
         try:
-            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+            return unpackb_bounded(kept.data, **self._msgpack_unpack_opts)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
