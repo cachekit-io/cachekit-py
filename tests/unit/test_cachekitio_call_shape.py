@@ -313,10 +313,8 @@ class _Gate:
                     await self._next_event({caller})
             caller.result()
             # The caller has returned: whatever it left running is background. Drain it to the end.
-            # A write-behind thread sends outside any task or job, so the drain waits for each one the run started
-            # to exit, as run_sync joins it. The join runs off the loop, which must stay free to release its requests.
-            writers = _writers() - writers_before
-            exits = [type(loop).run_in_executor(loop, None, writer.join, _GUARD_SECONDS) for writer in writers]
+            writers: set[threading.Thread] = set()
+            exits: list[asyncio.Future[None]] = []
             while True:
                 await _settle()
                 if self._parked:
@@ -326,6 +324,12 @@ class _Gate:
                     self._parked.clear()
                     continue
                 # Background work is a Task, an executor job (the lock release runs in a thread), or a write-behind thread.
+                # A writer sends outside any task or job, so the drain joins each one the run started, as run_sync does,
+                # including one a background task started during the drain. The join runs off the loop, which must stay
+                # free to release the writer's requests.
+                for writer in _writers() - writers_before - writers:
+                    writers.add(writer)
+                    exits.append(type(loop).run_in_executor(loop, None, writer.join, _GUARD_SECONDS))
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
                 jobs = {job.inner for job in self._jobs if not job.inner.done()}
                 if not (pending := tasks | jobs | {exited for exited in exits if not exited.done()}):
