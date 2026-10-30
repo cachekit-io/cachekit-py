@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.25.1](https://github.com/cachekit-io/cachekit-py/compare/v0.25.0...v0.25.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **tests:** compare Redis connection ids, not totals, in the flag-unset listener test (LAB-11835) ([#664](https://github.com/cachekit-io/cachekit-py/issues/664)) ([4db94e8](https://github.com/cachekit-io/cachekit-py/commit/4db94e89a1edb1794fe457210d0e07a073091502))
+
+
+### Performance Improvements
+
+* **l1:** keep verified MessagePack in L1 after an entry's first hit (LAB-7116) ([#662](https://github.com/cachekit-io/cachekit-py/issues/662)) ([844070d](https://github.com/cachekit-io/cachekit-py/commit/844070d302a66b2bbdd3326dede02765fb0d7e04))
+* **metrics:** record cache operations into per-thread cells (LAB-7117) ([#661](https://github.com/cachekit-io/cachekit-py/issues/661)) ([d0febb6](https://github.com/cachekit-io/cachekit-py/commit/d0febb68b3e2bd57aab91e213f90f586920a54ad))
+* **object-cache:** find expired entries with a deadline heap, not a scan (LAB-7106) ([#658](https://github.com/cachekit-io/cachekit-py/issues/658)) ([99047e1](https://github.com/cachekit-io/cachekit-py/commit/99047e11c6ee4d706003bf5fc09e3ca192ce62c3))
+* **redis:** send the key-registry SADD+EXPIRE in the same pipeline as the SET (LAB-7115) ([#660](https://github.com/cachekit-io/cachekit-py/issues/660)) ([73e99e0](https://github.com/cachekit-io/cachekit-py/commit/73e99e0621371f7522dc9f0d772a33195c0576d4))
+
 ## [0.25.0](https://github.com/cachekit-io/cachekit-py/compare/v0.24.1...v0.25.0) (2026-10-28)
 
 

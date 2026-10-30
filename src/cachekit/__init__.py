@@ -79,7 +79,7 @@ from your own secret store before running one:
 - ``api_key``: a cachekit.io API key, for example ``api_key = os.environ["CACHEKIT_API_KEY"]``.
 """
 
-__version__ = "0.25.0"
+__version__ = "0.25.1"
 
 from collections.abc import Callable
 from typing import Any, TypeVar
