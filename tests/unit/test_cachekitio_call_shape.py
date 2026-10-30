@@ -466,6 +466,39 @@ class TestAsyncCallShape:
         # Deferred, the PUT would land after the release, and a waiter's re-read would miss and recompute.
         assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
+    async def test_cold_miss_without_distributed_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, distributed_lock=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET", "PUT"])
+
+    async def test_cold_miss_write_behind_without_distributed_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, write_behind=True, distributed_lock=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        shape = await gate.run_async(fn(1))
+        # No lock for a waiter to re-read under, so the PUT leaves the caller's path as on the sync side.
+        assert shape == _Shape(blocking=["GET"], background=["PUT"])
+
+    async def test_herd_without_distributed_lock_runs_once(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        """An invariant, not a pinned list: 10 concurrent callers on one cold key share one in-process trip."""
+        calls: list[int] = []
+
+        @cache(backend=backend, ttl=60, distributed_lock=False)
+        async def fn(x: int) -> int:
+            calls.append(x)
+            return x * 2
+
+        async def herd() -> list[int]:
+            return await asyncio.gather(*(fn(1) for _ in range(10)))
+
+        shape = await gate.run_async(herd())
+        assert calls == [1]
+        assert _op_counts(shape) == {"GET": 1, "PUT": 1}
+
     async def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, l1_enabled=False)
         async def fn(x: int) -> int:
@@ -475,8 +508,11 @@ class TestAsyncCallShape:
         shape = await gate.run_async(fn(1))
         assert shape == _Shape(blocking=["GET"])
 
-    async def test_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
-        @cache(backend=backend, ttl=60, stale_ttl=60, l1_enabled=False)
+    @pytest.mark.parametrize("distributed_lock", [True, False])
+    async def test_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, distributed_lock: bool) -> None:
+        """The revalidation lease runs off the caller's path, so the miss-path option leaves it alone."""
+
+        @cache(backend=backend, ttl=60, stale_ttl=60, l1_enabled=False, distributed_lock=distributed_lock)
         async def fn(x: int) -> int:
             return x * 2
 

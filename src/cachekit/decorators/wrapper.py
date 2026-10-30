@@ -734,6 +734,7 @@ def create_cache_wrapper(
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
     write_behind: bool = False,
+    distributed_lock: bool = True,
     fast_mode: bool = False,
     l1_enabled: bool = True,
     backend: Any = None,
@@ -792,6 +793,9 @@ def create_cache_wrapper(
         ttl_refresh_threshold: Refresh when TTL below this fraction
         write_behind: Return a miss once its value is serialized and in L1, and write L2 from a bounded
                      background writer (decorators/write_behind.py). No effect without a backend.
+        distributed_lock: Take the backend's distributed lock around an async miss (default True). False
+                     skips it: concurrent misses in this process still run the function once, but other
+                     processes can recompute the same key at the same time. Sync functions never take it.
         fast_mode: Disable monitoring for maximum performance
         l1_enabled: Enable L1 in-memory cache. With encryption=True, L1 stores encrypted bytes
                    (decryption at read time only). Both L1+L2 support any combination with encryption
@@ -847,6 +851,7 @@ def create_cache_wrapper(
         refresh_ttl_on_get = config.refresh_ttl_on_get
         ttl_refresh_threshold = config.ttl_refresh_threshold
         write_behind = config.write_behind
+        distributed_lock = config.distributed_lock
         # config.backend None is an explicit L1-only request; UNSET leaves the backend to resolve at first call.
         if backend is None and config.backend is None:
             _l1_only_mode = True
@@ -3047,8 +3052,8 @@ def create_cache_wrapper(
         lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
         blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
-        # Check if backend supports distributed locking
-        if supports_locking(_backend):
+        # Check if backend supports distributed locking (and the function has not opted out of it)
+        if distributed_lock and supports_locking(_backend):
             func_error: Exception | None = None
             lock_phase = _LockPhase()
             try:
@@ -3243,8 +3248,8 @@ def create_cache_wrapper(
                 # The function's own exception, unchanged and never recorded (as before).
                 raise func_error
 
-        # Execute without locking (either backend doesn't support it or lock failed)
-        if not supports_locking(_backend):
+        # Execute without locking (opted out, the backend doesn't support it, or the lock failed)
+        if distributed_lock and not supports_locking(_backend):
             logger().debug(
                 f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
             )

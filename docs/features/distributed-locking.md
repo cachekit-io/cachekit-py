@@ -43,6 +43,7 @@ report = await get_report("2025-01-15")
 >
 > 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call, sync or async ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
+> 3. The function has not opted out with `distributed_lock=False` — see [Turning It Off](#turning-it-off-distributed_lockfalse).
 
 ---
 
@@ -142,7 +143,7 @@ degradation paths.
 > 2. **Low concurrency** (1-2 pods): No stampede risk
 > 3. **Cache always hits** (TTL never expires): Locking never used
 
-When locking overhead matters, use a backend that doesn't implement `LockableBackend`, or raise the issue — per-decorator toggle is being tracked.
+When locking overhead matters, turn it off for that function with `distributed_lock=False` ([Turning It Off](#turning-it-off-distributed_lockfalse)). The default stays on.
 
 ---
 
@@ -214,7 +215,9 @@ thing the process does, and even if `close_http_clients()` runs straight after. 
 ### Request Count on CachekitIO
 
 On `CachekitIOBackend`, an uncontended async miss makes three requests the caller
-waits on: the read, the lock `POST`, and the write. Two steps are trimmed:
+waits on: the read, the lock `POST`, and the write. With `distributed_lock=False`
+it makes two, the read and the write, and sends no lock request at all. With the
+lock on, two steps are trimmed:
 
 - **No re-read when nobody else held the lock.** The post-lock re-read only
   runs when the lock was granted after a wait, or when the first read failed
@@ -290,17 +293,35 @@ async def generate_stats(date):
 The SaaS lock is available to every authenticated API key — no extra
 configuration or plan tier required.
 
-### Disabling for Cheap Operations
-```python notest
-# Use a non-LockableBackend for operations where stampede isn't a concern,
-# or just accept the minimal overhead — locking only activates on cache miss.
-# (A sync function like this never locks anyway — zero lock overhead.)
+### Turning It Off (`distributed_lock=False`)
 
-@cache(ttl=300)
-def cheap_lookup(x):
-    # <1ms operation; even if 1000 pods hit simultaneously, DB load is trivial
-    return simple_dict.get(x)
+The lock is on by default. Pass `distributed_lock=False` to skip it for one function:
+
+```python notest
+from cachekit import cache
+
+@cache.io(ttl=300, distributed_lock=False)
+async def cheap_lookup(x):
+    # Cheap to recompute: a cross-process stampede costs little, the lock's round trips cost every miss
+    return await db.lookup(x)
 ```
+
+Every serialized preset and `DecoratorConfig(distributed_lock=False)` take it; any non-bool raises `ConfigurationError`.
+`@cache.local()` takes no lock and does not accept it.
+
+What changes on an async miss:
+
+| | `distributed_lock=True` (default) | `distributed_lock=False` |
+|---|---|---|
+| Lock requests (CachekitIO) | One `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
+| Concurrent misses in one process | One call ([single-flight](#in-process-single-flight-before-the-lock)) | One call (single-flight is unchanged) |
+| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits | One call per process: each process that misses computes and writes |
+| [Write-behind](write-behind.md) | Not applied: the write lands inside the lock | Applied: the L2 write leaves the caller's path |
+
+The trade-off is cross-process stampede protection. Turn it off when the function is cheap or idempotent and a
+recompute per process is acceptable, and keep it on for an expensive function behind many processes. Stale-while-revalidate
+is unaffected: its background revalidation still takes its own non-blocking lease, off the caller's path. A sync
+function never takes the lock, so the option changes nothing there.
 
 ---
 
