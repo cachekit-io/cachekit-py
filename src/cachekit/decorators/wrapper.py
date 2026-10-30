@@ -815,8 +815,9 @@ def create_cache_wrapper(
                 cachekit-rs / cachekit-ts. Requires namespace; mutually
                 exclusive with key= and fast_mode. None (default) = auto mode.
         distributed_lock: Take the backend's distributed lock around an async miss (default True). False
-                     skips it: concurrent misses on one event loop still run the function once, but other
-                     event loops and processes can recompute the same key at once. Sync functions never take it.
+                     skips it: concurrent misses on the event loop running the key's call still share it, but other
+                     processes, and every caller on another thread's event loop while that call runs, compute
+                     the key. Sync functions never take it.
 
     Security Note:
         When encryption=True and tenant_extractor is provided: a failed extraction is logged

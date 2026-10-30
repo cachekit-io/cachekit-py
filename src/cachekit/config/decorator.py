@@ -162,8 +162,9 @@ class DecoratorConfig:
                       distributed-lock path or a sync miss's streaming (File + Arrow) write, which stay
                       synchronous. See docs/features/write-behind.md.
         distributed_lock: Take the backend's distributed lock around an async miss (default: True). False
-                      skips the lock's round trips: concurrent misses on one event loop still run the
-                      function once, but other event loops and processes can compute the same key at once.
+                      skips the lock's round trips: concurrent misses on the event loop running the key's
+                      call still share it, but other processes, and every caller on another thread's
+                      event loop while that call runs, compute the key themselves.
                       Sync functions never take the lock. See docs/features/distributed-locking.md.
         backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
                  @cache(backend=None) does. The default, UNSET, resolves per "Backend Resolution Priority".

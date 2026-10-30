@@ -315,7 +315,7 @@ What changes on an async miss:
 |---|---|---|
 | Lock requests (CachekitIO) | Uncontended: one `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
 | Concurrent misses on one event loop | One call ([single-flight](#in-process-single-flight-before-the-lock)) | One call (single-flight is unchanged) |
-| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits | One call per event loop: each process (and each event loop in it) that misses computes and writes |
+| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits | At least one call per process that misses, each computing and writing. Within a process, only callers on the event loop running the key's call share it: while it runs, every caller on another thread's loop runs its own call (ten such callers, ten calls) |
 | [Write-behind](write-behind.md) | Not applied while the lock is held: the write lands inside it | Applied: the L2 write leaves the caller's path |
 
 The trade-off is cross-process stampede protection. Turn it off when the function is cheap or idempotent and a
