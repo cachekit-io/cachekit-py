@@ -734,7 +734,6 @@ def create_cache_wrapper(
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
     write_behind: bool = False,
-    distributed_lock: bool = True,
     fast_mode: bool = False,
     l1_enabled: bool = True,
     backend: Any = None,
@@ -747,6 +746,8 @@ def create_cache_wrapper(
     enable_structured_logging: bool = True,
     # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
     interop: str | None = None,
+    # Last, so existing positional calls keep their bindings
+    distributed_lock: bool = True,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -793,9 +794,6 @@ def create_cache_wrapper(
         ttl_refresh_threshold: Refresh when TTL below this fraction
         write_behind: Return a miss once its value is serialized and in L1, and write L2 from a bounded
                      background writer (decorators/write_behind.py). No effect without a backend.
-        distributed_lock: Take the backend's distributed lock around an async miss (default True). False
-                     skips it: concurrent misses in this process still run the function once, but other
-                     processes can recompute the same key at the same time. Sync functions never take it.
         fast_mode: Disable monitoring for maximum performance
         l1_enabled: Enable L1 in-memory cache. With encryption=True, L1 stores encrypted bytes
                    (decryption at read time only). Both L1+L2 support any combination with encryption
@@ -816,6 +814,9 @@ def create_cache_wrapper(
                 and plain-MessagePack values shared byte-identically with
                 cachekit-rs / cachekit-ts. Requires namespace; mutually
                 exclusive with key= and fast_mode. None (default) = auto mode.
+        distributed_lock: Take the backend's distributed lock around an async miss (default True). False
+                     skips it: concurrent misses on one event loop still run the function once, but other
+                     event loops and processes can recompute the same key at once. Sync functions never take it.
 
     Security Note:
         When encryption=True and tenant_extractor is provided: a failed extraction is logged
@@ -922,6 +923,10 @@ def create_cache_wrapper(
     if isinstance(namespace, str):
         _legacy_namespace = f"{namespace}"
         namespace = str.__str__(namespace)
+
+    # DecoratorConfig checks this too; a direct create_cache_wrapper call does not go through it.
+    if not isinstance(distributed_lock, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
+        raise ConfigurationError(f"distributed_lock must be a bool, got {type(distributed_lock).__name__}")
 
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
@@ -3052,7 +3057,7 @@ def create_cache_wrapper(
         lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
         blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
-        # Check if backend supports distributed locking (and the function has not opted out of it)
+        # Check if backend supports distributed locking
         if distributed_lock and supports_locking(_backend):
             func_error: Exception | None = None
             lock_phase = _LockPhase()

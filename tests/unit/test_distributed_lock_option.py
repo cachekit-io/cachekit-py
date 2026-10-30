@@ -7,6 +7,8 @@ single-flight that still holds with the lock off, are pinned in test_cachekitio_
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -16,6 +18,7 @@ import pytest
 from cachekit import cache
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.validation import ConfigurationError
+from cachekit.decorators.wrapper import create_cache_wrapper
 
 pytestmark = pytest.mark.unit
 
@@ -76,9 +79,17 @@ class TestConfig:
         with pytest.raises(ConfigurationError, match="distributed_lock must be a bool"):
             DecoratorConfig(distributed_lock=0)  # type: ignore[arg-type]
 
-    def test_preset_keyword(self) -> None:
-        config = DecoratorConfig.io(api_key="ck_test_distributed_lock", distributed_lock=False)  # pragma: allowlist secret
-        assert config.distributed_lock is False
+    def test_direct_factory_call_must_pass_a_bool(self) -> None:
+        async def fn(x: int) -> int:
+            return x
+
+        with pytest.raises(ConfigurationError, match="distributed_lock must be a bool"):
+            create_cache_wrapper(fn, backend=_BothLocksBackend(), distributed_lock=0)  # type: ignore[arg-type]
+
+    def test_adds_no_positional_parameter(self) -> None:
+        """Appended keyword-only to the config and last to the factory: existing positional calls bind as before."""
+        assert next(f for f in dataclasses.fields(DecoratorConfig) if f.name == "distributed_lock").kw_only
+        assert list(inspect.signature(create_cache_wrapper).parameters)[-1] == "distributed_lock"
 
 
 class TestAsyncMiss:
@@ -92,24 +103,17 @@ class TestAsyncMiss:
         assert await fn(1) == 2
         assert backend.locks == ["fill"]
 
-    @pytest.mark.parametrize("form", ["keyword", "config"])
-    async def test_off_requests_no_lock(self, form: str) -> None:
+    async def test_off_requests_no_lock(self) -> None:
         backend = _BothLocksBackend()
         calls: list[int] = []
-        decorator = (
-            cache(backend=backend, ttl=60, distributed_lock=False)
-            if form == "keyword"
-            else cache(config=DecoratorConfig(backend=backend, ttl=60, distributed_lock=False))  # type: ignore[arg-type]
-        )
 
-        @decorator
+        @cache(backend=backend, ttl=60, distributed_lock=False)
         async def fn(x: int) -> int:
             calls.append(x)
             return x * 2
 
-        arg = 1 if form == "keyword" else 2  # one qualname for both forms: distinct args keep L1 from serving the second
-        assert await fn(arg) == arg * 2
-        assert calls == [arg]
+        assert await fn(1) == 2
+        assert calls == [1]
         assert backend.locks == []
         assert len(backend.store) == 1  # the miss still wrote L2
 
