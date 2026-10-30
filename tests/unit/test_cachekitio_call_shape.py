@@ -70,6 +70,7 @@ _PREFIX = "/v1/cache/"
 # a background request would read as blocking: the pinned list fails, it does not pass by mistake.
 _SETTLE_TURNS = 100
 _GUARD_SECONDS = 10.0  # hang guard only: hitting it fails the test, it never classifies a request
+_WRITER = "cachekit-write-behind"  # the threads write_behind=True sends deferred writes from
 
 
 @dataclass
@@ -288,6 +289,7 @@ class _Gate:
     async def run_async(self, call: Awaitable[Any]) -> _Shape:
         self.shape = shape = _Shape()
         self.arrivals, self._jobs = [], []
+        writers_before = _writers()
         self._loop = loop = asyncio.get_running_loop()
         loop.run_in_executor = self._run_in_executor  # type: ignore[method-assign]
         loop.call_at = self._call_at  # type: ignore[method-assign]
@@ -311,6 +313,10 @@ class _Gate:
                     await self._next_event({caller})
             caller.result()
             # The caller has returned: whatever it left running is background. Drain it to the end.
+            # A write-behind thread sends outside any task or job, so the drain waits for each one the run started
+            # to exit, as run_sync joins it. The join runs off the loop, which must stay free to release its requests.
+            writers = _writers() - writers_before
+            exits = [type(loop).run_in_executor(loop, None, writer.join, _GUARD_SECONDS) for writer in writers]
             while True:
                 await _settle()
                 if self._parked:
@@ -319,9 +325,10 @@ class _Gate:
                         parked.release()
                     self._parked.clear()
                     continue
-                # Background work is a Task, or an executor job (the lock release runs in a thread).
+                # Background work is a Task, an executor job (the lock release runs in a thread), or a write-behind thread.
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
-                if not (pending := tasks | {job.inner for job in self._jobs if not job.inner.done()}):
+                jobs = {job.inner for job in self._jobs if not job.inner.done()}
+                if not (pending := tasks | jobs | {exited for exited in exits if not exited.done()}):
                     break
                 await self._next_event(pending)
         finally:
@@ -331,6 +338,8 @@ class _Gate:
             del loop.run_in_executor, loop.call_at
             self._loop = self._waiting = None
         assert not self.errors, self.errors
+        for writer in writers:
+            assert not writer.is_alive(), f"background thread {writer.name} did not finish"
         return shape
 
     async def _next_event(self, tasks: set[Any]) -> None:
@@ -341,6 +350,10 @@ class _Gate:
         arrived.cancel()
         await asyncio.gather(arrived, return_exceptions=True)
         assert done, "nothing finished and no request arrived"
+
+
+def _writers() -> set[threading.Thread]:
+    return {thread for thread in threading.enumerate() if thread.name == _WRITER}
 
 
 async def _settle() -> None:
