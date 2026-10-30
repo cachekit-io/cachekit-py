@@ -646,11 +646,12 @@ class TestListenerConfiguration:
     def test_flag_unset_opens_no_connection(self, client: redis.Redis) -> None:
         assert invalidation._listener_enabled() is False  # the default
         fn = worker.cached_lookup(client, namespace="chan_flag_off")
-        before = len(client.client_list())
+        # Compare ids, not counts: CLIENT LIST also holds earlier tests' connections, which close whenever Python frees them
+        before = {c["id"] for c in client.client_list()}
         for x in range(3):
             fn(x)
         assert invalidation._listener_pid is None and _subscribers(client) == 0
-        assert len(client.client_list()) == before  # no dedicated connection (the shared pool's is reused)
+        assert {c["id"] for c in client.client_list()} - before == set()  # no dedicated connection (the shared pool's is reused)
         assert not [t for t in threading.enumerate() if t.name == "cachekit-invalidation-listener"]
 
     def test_refused_subscription_fails_the_start_and_a_cache_operation_after_the_window_retries_it(
