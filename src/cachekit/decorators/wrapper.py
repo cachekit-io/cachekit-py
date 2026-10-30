@@ -2249,7 +2249,7 @@ def create_cache_wrapper(
                             )
                             if l1_kept is not None:  # its verified MessagePack: later hits skip retrieve()
                                 _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
-                        else:  # decoded as before; an entry another handler swapped in fails as a corrupt frame
+                        else:  # as before; a swapped entry fails: SuspiciousCacheEntryError if encrypted, else a corrupt frame
                             l1_value = operation_handler.serialization_handler.deserialize_data(
                                 l1_bytes,  # pyright: ignore[reportArgumentType]
                                 cache_key,

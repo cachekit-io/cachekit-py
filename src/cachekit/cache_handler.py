@@ -1377,7 +1377,7 @@ class CacheSerializationHandler:
         if not self.keeps_msgpack_in_l1:
             return self.deserialize_data(data, cache_key, args, kwargs), None  # pyright: ignore[reportArgumentType]
         if type(data) is VerifiedMsgpack:  # only L1 holds this type: only such a handler swapped it in
-            return self._base_serializer._deserialize_verified(data), None  # type: ignore[union-attr]  # noqa: SLF001
+            return self._base_serializer._deserialize_verified(data), None  # type: ignore[union-attr]
         try:
             payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -1387,7 +1387,7 @@ class CacheSerializationHandler:
         # stay in L1, or a header that misdescribes its payload, is decoded by deserialize_data, not kept.
         if serializer_name != self._serializer_string_name or metadata.encrypted or not metadata.compressed:
             return self.deserialize_data(data, cache_key, args, kwargs), None
-        return self._base_serializer._deserialize_keeping_msgpack(payload, len(data))  # type: ignore[union-attr]  # noqa: SLF001
+        return self._base_serializer._deserialize_keeping_msgpack(payload, len(data))  # type: ignore[union-attr]
 
     def deserialize_data(
         self,
