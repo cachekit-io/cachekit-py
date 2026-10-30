@@ -44,9 +44,7 @@ MASTER_KEY = "a" * 64
 def _no_cachekit_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Handlers here read key settings when built, so no CACHEKIT_* variable in the shell may reach them."""
     clear_cachekit_env(monkeypatch)
-    reset_settings()
     yield
-    reset_settings()
 
 
 class _Backend:
@@ -229,15 +227,21 @@ def test_msgpack_exactly_as_long_as_the_limit_is_kept() -> None:
     assert serializer._deserialize_keeping_msgpack(envelope, size - 1)[1] is None
 
 
-_OTHER_HANDLERS: dict[str, Callable[[], CacheSerializationHandler]] = {
-    "auto": lambda: CacheSerializationHandler(serializer_name="auto"),
-    "integrity-off": lambda: CacheSerializationHandler(enable_integrity_checking=False),
-    "encrypted": lambda: CacheSerializationHandler(encryption=True, master_key=MASTER_KEY, single_tenant_mode=True),
+_CORRUPT = (SerializationError, "Corrupt cache envelope")
+_OTHER_HANDLERS: dict[str, tuple[Callable[[], CacheSerializationHandler], tuple[type[Exception], str]]] = {
+    "auto": (lambda: CacheSerializationHandler(serializer_name="auto"), _CORRUPT),
+    "integrity-off": (lambda: CacheSerializationHandler(enable_integrity_checking=False), _CORRUPT),
+    "encrypted": (
+        lambda: CacheSerializationHandler(encryption=True, master_key=MASTER_KEY, single_tenant_mode=True),
+        (SuspiciousCacheEntryError, "another handler's plaintext MessagePack"),
+    ),
 }
 
 
-@pytest.mark.parametrize("make", list(_OTHER_HANDLERS.values()), ids=list(_OTHER_HANDLERS))
-def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(make: Callable[[], CacheSerializationHandler]) -> None:
+@pytest.mark.parametrize(("make", "refusal"), list(_OTHER_HANDLERS.values()), ids=list(_OTHER_HANDLERS))
+def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(
+    make: Callable[[], CacheSerializationHandler], refusal: tuple[type[Exception], str]
+) -> None:
     """The L1 hit sites send these handlers' entries to deserialize_data, which refuses a swapped entry another
     handler left under the same key: under encryption as the plaintext envelope it replaced would be."""
     handler = make()
@@ -245,11 +249,10 @@ def test_other_handlers_keep_their_envelope_and_refuse_verified_msgpack(make: Ca
     assert not handler.keeps_msgpack_in_l1
     assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
     planted = VerifiedMsgpack(msgpack.packb({"x": 2}))
-    refusal = SuspiciousCacheEntryError if handler.encryption else SerializationError
+    error, message = refusal
     for decode in (handler.deserialize_l1, handler.deserialize_data):
-        with pytest.raises(refusal) as raised:
+        with pytest.raises(error, match=message):
             decode(planted, cache_key="k")  # type: ignore[arg-type]
-        assert handler.encryption or "Corrupt cache envelope" in str(raised.value)
 
 
 def _frames() -> dict[str, bytes]:
@@ -284,6 +287,11 @@ _FRAME_NAMES = (
     "truncated",
     "not-a-frame",
 )
+
+
+def test_frame_names_list_every_frame() -> None:
+    """_FRAME_NAMES is spelled out because _frames() builds handlers, which must wait for the env fixture."""
+    assert set(_frames()) == set(_FRAME_NAMES)
 
 
 @pytest.mark.parametrize("name", _FRAME_NAMES)
@@ -415,9 +423,10 @@ def test_an_encrypted_reader_refuses_verified_msgpack_in_its_l1() -> None:
 # A replay over the real L1Cache. A read that misses puts the entry a put rule picks from the entry's
 # envelope and MessagePack sizes; with promote, a read that hits an envelope swaps it for its MessagePack
 # when that is no longer, as the L1 hit sites do (deserialize_l1, then L1Cache.shrink_if_held, which alone
-# refuses a longer value here). The shipped design
-# is the envelope rule with promote. The two rejected put rules are counterexamples against storing
-# MessagePack at write time; they show the pinned traces bite.
+# refuses a longer value here).
+#
+# The shipped design is the envelope rule with promote. The two rejected put rules are counterexamples
+# against storing MessagePack at write time; they show the pinned traces bite.
 
 Rule = Callable[[L1Cache, int, int], int]
 
