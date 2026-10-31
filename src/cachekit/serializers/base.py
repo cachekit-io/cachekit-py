@@ -490,6 +490,12 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
         ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
     data = immutable_buffer(data)  # the walk and the decode must see one document
-    n = len(data)
     check_msgpack_structure(data, MSGPACK_MAX_NESTING)
+    return unpackb_capped(data, **unpack_opts)
+
+
+def unpackb_capped(data: bytes | memoryview, **unpack_opts: Any) -> Any:
+    """``msgpack.unpackb`` under :func:`unpackb_bounded`'s ``max_*_len`` caps, without its walk: only for an
+    immutable document a walk in this process already passed (an L1 hit's kept entry)."""
+    n = len(data)
     return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)

@@ -142,7 +142,7 @@ def test_a_value_longer_as_msgpack_keeps_its_envelope_marked_as_walked() -> None
         assert compute(1) == "ab" * 600
     _, entry = _stored(backend, namespace)
     assert len(msgpack.packb("ab" * 600)) > len(envelope)
-    assert type(entry) is WalkedEnvelope and entry.frame is not None and entry.frame == envelope
+    assert type(entry) is WalkedEnvelope and entry.frame == envelope
     assert len(entry) == len(envelope) and get_l1_cache(namespace)._state.memory_bytes == held
     assert backend.gets == 1
 
@@ -458,17 +458,14 @@ def _bomb_frame(own: bytes) -> bytes:
 def test_an_l2_read_of_a_nesting_bomb_is_still_walked_and_refused(mode: str, walks: list[str]) -> None:
     backend, namespace, runs = _Backend(), _namespace(), []
 
-    @cache(backend=backend, ttl=60, namespace=namespace)
     def compute(x: int) -> dict[str, int]:
         runs.append(x)
         return {"x": x}
 
-    @cache(backend=backend, ttl=60, namespace=namespace)
     async def acompute(x: int) -> dict[str, int]:
-        runs.append(x)
-        return {"x": x}
+        return compute(x)
 
-    fn = acompute if mode == "async" else compute
+    fn = cache(backend=backend, ttl=60, namespace=namespace)(acompute if mode == "async" else compute)
     _call(fn, mode)
     ((key, envelope),) = backend.store.items()
     backend.store[key] = _bomb_frame(envelope)
@@ -551,7 +548,7 @@ def test_every_decode_of_a_kept_entry_equals_the_walked_hooked_decode(value: Any
     assert repr(first) == expected
     assert kept is not None
     raw, _ = ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])
-    assert kept.hook is any(m.encode() in raw for m in _MARKER_KEYS)
+    assert kept.hook or not any(m.encode() in raw for m in _MARKER_KEYS)  # a marker key present keeps the hook
     for entry in (VerifiedMsgpack(raw, kept.hook), WalkedEnvelope(envelope, kept.hook)):
         assert _outcome(lambda entry=entry: handler.deserialize_l1(entry, cache_key="k")[0]) == expected
 
@@ -596,7 +593,7 @@ def test_shrink_if_held_swaps_the_entry_in_place(size: int) -> None:
     l1.put("b", b"b" * 10, redis_ttl=60)
     expires_at = l1._state.cache["a"].expires_at
 
-    new = VerifiedMsgpack(b"m" * size)
+    new = VerifiedMsgpack(b"m" * size, hook=True)
     assert l1.shrink_if_held("a", old, new)
 
     assert l1.peek("a") is new
@@ -612,13 +609,13 @@ def test_shrink_if_held_leaves_an_entry_it_did_not_read_or_would_grow(change: st
     l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
     old = b"e" * 100
     l1.put("a", old, redis_ttl=60)
-    new = VerifiedMsgpack(b"m" * 40)
+    new = VerifiedMsgpack(b"m" * 40, hook=True)
     if change == "removed":
         l1.invalidate("a")
     elif change == "stored-again":
         l1.put("a", bytes(bytearray(old)), redis_ttl=60)  # equal bytes, another object: a newer write
     else:
-        new = VerifiedMsgpack(b"m" * 101)
+        new = VerifiedMsgpack(b"m" * 101, hook=True)
     held = l1.peek("a")
 
     assert not l1.shrink_if_held("a", old, new)

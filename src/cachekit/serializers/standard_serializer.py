@@ -34,6 +34,7 @@ from .base import (
     SerializationMetadata,
     immutable_buffer,
     unpackb_bounded,
+    unpackb_capped,
 )
 
 # Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
@@ -62,7 +63,7 @@ class VerifiedMsgpack:
 
     __slots__ = ("data", "hook")
 
-    def __init__(self, data: bytes, hook: bool = True) -> None:
+    def __init__(self, data: bytes, hook: bool) -> None:
         self.data = data
         self.hook = hook
 
@@ -350,7 +351,7 @@ class StandardSerializer:
             "object_hook": _standard_object_hook,  # Restore datetime/date/time
         }
         # For MessagePack _may_hold_marker cleared: the hook would return every map unchanged.
-        self._msgpack_unpack_opts_hookless = {"use_list": True, "raw": False}
+        self._msgpack_unpack_opts_hookless = {k: v for k, v in self._msgpack_unpack_opts.items() if k != "object_hook"}
 
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:
         """Serialize object to pure MessagePack bytes with optional ByteStorage wrapper.
@@ -483,20 +484,10 @@ class StandardSerializer:
         return value, VerifiedMsgpack(msgpack_data, _may_hold_marker(msgpack_data))
 
     def _deserialize_verified(self, msgpack_data: bytes, hook: bool) -> Any:
-        """Decode MessagePack that :meth:`_deserialize_keeping_msgpack` kept: no retrieve(), no walk, and no object
-        hook unless ``hook``. The ``max_*_len`` caps stay as :func:`unpackb_bounded` sets them. Raises
-        SerializationError as deserialize does."""
-        n = len(msgpack_data)
+        """Decode MessagePack a decode in this process already verified and walked (:meth:`_deserialize_keeping_msgpack`):
+        no retrieve(), no walk, and no object hook unless ``hook``. Raises SerializationError as deserialize does."""
         try:
-            return msgpack.unpackb(
-                msgpack_data,
-                max_str_len=n,
-                max_bin_len=n,
-                max_array_len=n,
-                max_map_len=n,
-                max_ext_len=n,
-                **(self._msgpack_unpack_opts if hook else self._msgpack_unpack_opts_hookless),
-            )
+            return unpackb_capped(msgpack_data, **(self._msgpack_unpack_opts if hook else self._msgpack_unpack_opts_hookless))
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 

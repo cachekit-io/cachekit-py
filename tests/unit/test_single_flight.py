@@ -948,33 +948,30 @@ def test_sync_backed_recheck_after_a_trip_settled_since_the_callers_l1_lookup(
         assert counts == (1, 0, 1)
 
 
-@pytest.fixture
-def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
-    """The type of every entry an L1 hit or a joined caller decodes (deserialize_l1): VerifiedMsgpack, or bytes for
-    an envelope."""
+def _record_types(monkeypatch: pytest.MonkeyPatch, method: str) -> list[type]:
+    """The type of every entry CacheSerializationHandler.<method> decodes."""
     seen: list[type] = []
-    real = CacheSerializationHandler.deserialize_l1
+    real = getattr(CacheSerializationHandler, method)
 
     def recording(self: CacheSerializationHandler, data: Any, *args: Any, **kwargs: Any) -> Any:
         seen.append(type(data))
         return real(self, data, *args, **kwargs)
 
-    monkeypatch.setattr(CacheSerializationHandler, "deserialize_l1", recording)
+    monkeypatch.setattr(CacheSerializationHandler, method, recording)
     return seen
+
+
+@pytest.fixture
+def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
+    """The type of every entry an L1 hit or a joined caller decodes through deserialize_l1: a kept entry, or bytes for
+    an envelope an L1 hit reads."""
+    return _record_types(monkeypatch, "deserialize_l1")
 
 
 @pytest.fixture
 def decoded_data(monkeypatch: pytest.MonkeyPatch) -> list[type]:
     """The type of every entry deserialize_data decodes, as a joined caller decodes the trip's envelope."""
-    seen: list[type] = []
-    real = CacheSerializationHandler.deserialize_data
-
-    def recording(self: CacheSerializationHandler, data: Any, *args: Any, **kwargs: Any) -> Any:
-        seen.append(type(data))
-        return real(self, data, *args, **kwargs)
-
-    monkeypatch.setattr(CacheSerializationHandler, "deserialize_data", recording)
-    return seen
+    return _record_types(monkeypatch, "deserialize_data")
 
 
 def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(

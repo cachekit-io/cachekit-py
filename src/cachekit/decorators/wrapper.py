@@ -1940,7 +1940,7 @@ def create_cache_wrapper(
         """
         if entry is not None:
             try:
-                if _l1_keeps_msgpack and type(entry) is not bytes:
+                if type(entry) is not bytes:
                     value = operation_handler.serialization_handler.deserialize_l1(entry, cache_key, args, kwargs)[0]
                 else:
                     value = operation_handler.serialization_handler.deserialize_data(

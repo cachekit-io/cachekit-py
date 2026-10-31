@@ -222,7 +222,7 @@ class L1Cache:
         """Hold ``smaller`` in place of ``held``, the very object a read of ``key`` returned, if the entry still
         holds it and ``smaller`` is no longer. The entry keeps its expiry and LRU place. Returns whether it did.
 
-        For a hit that re-encodes the entry it read. The identity check leaves alone an entry that was
+        For a hit that keeps the entry it read in another form (a kept entry, never longer). The identity check leaves alone an entry that was
         removed, or stored again, since that read, so an invalidation is never undone. Never growing an
         entry means L1 never evicts for it.
         """

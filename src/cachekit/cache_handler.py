@@ -948,7 +948,7 @@ class CacheSerializationHandler:
         else:
             self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
         self._custom_serializer = not isinstance(serializer_name, str)
-        # Whether an L1 hit may swap this handler's entry for its VerifiedMsgpack (deserialize_l1): plaintext
+        # Whether an L1 hit may swap this handler's entry for a kept one (deserialize_l1): plaintext
         # CK-frame entries of the built-in StandardSerializer with integrity on (interop mode's InteropSerializer
         # is not one). Encrypted handlers keep ciphertext in L1 (protocol PRE-10, PRE-11).
         self.keeps_msgpack_in_l1 = (
@@ -1387,18 +1387,16 @@ class CacheSerializationHandler:
             payload = SerializationWrapper.unwrap_metadata(data.frame)[0]  # parsed when it was walked: cannot fail
             return self._base_serializer._deserialize_walked(payload, data.hook), None  # type: ignore[union-attr]
         try:
-            payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)  # pyright: ignore[reportArgumentType]
+            payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
         except (AttributeError, KeyError, TypeError, ValueError):
-            return self.deserialize_data(
-                data, cache_key, args, kwargs
-            ), None  # a corrupt frame: it raises  # pyright: ignore[reportArgumentType]
+            return self.deserialize_data(data, cache_key, args, kwargs), None  # a corrupt frame: it raises
         # Only this handler's own plaintext envelope, whose header says what this handler writes
         # (compressed: integrity on). Anything else, such as a config-drift entry whose ciphertext must
         # stay in L1, or a header that misdescribes its payload, is decoded by deserialize_data, not kept.
         if serializer_name != self._serializer_string_name or metadata.encrypted or not metadata.compressed:
-            return self.deserialize_data(data, cache_key, args, kwargs), None  # pyright: ignore[reportArgumentType]
+            return self.deserialize_data(data, cache_key, args, kwargs), None
         value, kept = self._base_serializer._deserialize_keeping_msgpack(payload)  # type: ignore[union-attr]
-        return value, kept if len(kept) <= len(data) else WalkedEnvelope(data, kept.hook)  # pyright: ignore[reportArgumentType]
+        return value, kept if len(kept) <= len(data) else WalkedEnvelope(data, kept.hook)
 
     def deserialize_data(
         self,
