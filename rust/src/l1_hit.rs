@@ -2,21 +2,23 @@
 //!
 //! `@cache(backend=None)` keeps its values in an `ObjectCache` (`src/cachekit/object_cache.py`), whose
 //! writes and removals run under its lock. A hit does not take it: [`HitMemo::get`] maps the call's
-//! arguments ([`memo_key`]) to the [`HitEntry`] the cache stored for them, in one dict lookup, and
+//! arguments ([`memo_key_of`]) to the [`HitEntry`] the cache stored for them, in one dict lookup, and
 //! serves the entry's value while the entry is alive and before its deadline, counting the hit on the
 //! function's `HitCounter`.
 //!
 //! The cache keeps the memo in step under its lock. An entry it stores or finds for a call is memoised
-//! under that call's key, and an entry it removes (expiry, eviction, invalidation, clear, the at-fork
-//! reset) is killed and forgotten before the removal returns. So a hit that starts after a removal has
-//! returned never serves the removed value: it finds no memo slot, or it finds the entry dead. And no
-//! removed value stays referenced from here, as the memo holds no removed entry.
+//! under that call's key, and an entry it removes (expiry, eviction, invalidation, replacement, clear,
+//! the at-fork reset) is forgotten before the removal returns; a refreshed entry's slots are repointed
+//! at its successor. Forgetting, repointing or clearing kills the entries it drops, so the memo, not
+//! each removal route, ends their lock-free hits. A hit that starts after a removal has returned never serves the removed
+//! value: it finds no memo slot, or it finds the entry dead. And no removed value stays referenced
+//! from here, as the memo holds no removed entry.
 //!
 //! Each entry lists the memo keys whose slots hold it, so a removal finds its slots without a scan,
 //! and the memo keeps every key list in step with its slots. The arguments a memo key holds are
 //! therefore kept only while their slot is: at most [`MEMO_MAX_ENTRIES`] keys per function.
 //!
-//! Deadlines are read on one clock, [`monotonic`], which `ObjectCache` uses too.
+//! Deadlines are read on one clock, [`now`] (`monotonic` in Python), which `ObjectCache` uses too.
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -28,19 +30,23 @@ use pyo3::ffi;
 use pyo3::gc::PyVisit;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple};
+use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 use pyo3::PyTraverseError;
 
 use crate::hit_counter::PyHitCounter;
 
+// The memo's bounds, exported to Python under the same names for tests.
+
 /// A call's str and bytes arguments and keyword names may hold at most this many characters or bytes
-/// between them: the memo keeps what it is keyed by. Mirrors `_MEMO_MAX_LEN` in decorators/wrapper.py.
-const MEMO_MAX_LEN: ffi::Py_ssize_t = 256;
-/// Arguments per call, positional and keyword together (`_MEMO_MAX_ARGS`).
-const MEMO_MAX_ARGS: usize = 8;
-/// Memo slots per decorated function (`_MEMO_MAX_ENTRIES`). A full memo is emptied rather than
-/// evicted slot by slot, so a hit writes nothing to it.
-const MEMO_MAX_ENTRIES: usize = 1024;
+/// between them, as the memo keeps what it is keyed by. That bounds an entry at a few KiB (a str of
+/// 4-byte characters also keeps its UTF-8 copy once the key generator encodes it), and it bounds the
+/// hashing a lookup repeats for strings that are new to each call.
+pub(crate) const MEMO_MAX_LEN: ffi::Py_ssize_t = 256;
+/// Arguments per call, positional and keyword together.
+pub(crate) const MEMO_MAX_ARGS: usize = 8;
+/// Memo slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a
+/// hit writes nothing to it.
+pub(crate) const MEMO_MAX_ENTRIES: usize = 1024;
 
 // ── The clock ────────────────────────────────────────────────────────────────────────────────
 
@@ -54,7 +60,15 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// reader that loaded the pointer before a replacement still holds a live object.
 static CLOCK_OVERRIDE: AtomicPtr<ffi::PyObject> = AtomicPtr::new(ptr::null_mut());
 
-fn now(py: Python<'_>) -> PyResult<f64> {
+/// Seconds on the clock `ObjectCache` and the lock-free hit share, from an arbitrary zero.
+///
+/// One clock for both, so an entry's deadline, computed by the cache, means the same instant to
+/// the hit that compares against it. The OS monotonic clock is read here, not `time.monotonic`, so
+/// patching `time.monotonic` (monkeypatch, freezegun) does not move it: the hit would have to call
+/// back into Python on every call to follow a patch.
+#[pyfunction]
+#[pyo3(name = "monotonic")]
+pub fn now(py: Python<'_>) -> PyResult<f64> {
     let fake = CLOCK_OVERRIDE.load(Ordering::Acquire);
     if fake.is_null() {
         return Ok(EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64());
@@ -63,15 +77,6 @@ fn now(py: Python<'_>) -> PyResult<f64> {
     unsafe { Bound::from_borrowed_ptr(py, fake) }
         .call0()?
         .extract()
-}
-
-/// Seconds on the clock `ObjectCache` and the lock-free hit share, from an arbitrary zero.
-///
-/// One clock for both, so an entry's deadline, computed by the cache, means the same instant to
-/// the hit that compares against it.
-#[pyfunction]
-pub fn monotonic(py: Python<'_>) -> PyResult<f64> {
-    now(py)
 }
 
 /// Replace the shared clock with a callable returning seconds, or restore the real one with None.
@@ -135,18 +140,26 @@ unsafe fn type_of<'py>(py: Python<'py>, a: *mut ffi::PyObject) -> Bound<'py, PyA
 
 /// The memo key of a call's arguments, or None when the memo does not take the call.
 ///
-/// The admission rules (`_memo_key` in decorators/wrapper.py documents them): every value an exact
-/// int, float, bool, None, str or bytes; every keyword name an exact str; at most
-/// [`MEMO_MAX_ARGS`] arguments; at most [`MEMO_MAX_LEN`] characters or bytes in the str and bytes
-/// values and the keyword names together. The shapes, when [`admit`] needs no types: a lone int
-/// or str positional argument itself, which hashes and compares without a tuple around it, and the
-/// argument tuple itself otherwise (a lone None too, as None means no key). With types: `(t, a)`
-/// and `(t, a, u, b)` for one and two positional arguments, `(args, types)` for more, and
-/// `(args, types, items, item_types)` with keywords, sorted by name so keywords in any order share
-/// one slot. No two shapes are equal: a lone argument is an int or a str, never a tuple; an untyped
-/// tuple holds no type and no tuple; the two- and four-item typed keys start with a type, the
-/// others with a tuple.
-fn memo_key_of<'py>(
+/// The lock-free hit looks this key up, and the decorator's slow path memoises its entry under it
+/// (`_memo_key` in decorators/wrapper.py), so both compute one key.
+///
+/// The admission rules: every value an exact int, float, bool, None, str or bytes; every keyword
+/// name an exact str; at most `MEMO_MAX_ARGS` arguments; at most `MEMO_MAX_LEN` characters or bytes
+/// in the str and bytes values and the keyword names together. Two equal values of one of these
+/// types always produce the same cache key, as their MessagePack is the same (0.0 and -0.0 both
+/// normalise to 0.0). A subclass (an `IntEnum`, a str subclass) or a container never matches, so it
+/// takes the full key path on every call.
+///
+/// The shapes, when [`admit`] needs no types: a lone int or str positional argument itself, which
+/// hashes and compares without a tuple around it, and the argument tuple itself otherwise (a lone
+/// None too, as None means no key). With types: `(t, a)` and `(t, a, u, b)` for one and two
+/// positional arguments, `(args, types)` for more, and `(args, types, items, item_types)` with
+/// keywords, sorted by name so keywords in any order share one slot. No two shapes are equal: a
+/// lone argument is an int or a str, never a tuple; an untyped tuple holds no type and no tuple; the
+/// two- and four-item typed keys start with a type, the others with a tuple.
+#[pyfunction]
+#[pyo3(name = "memo_key")]
+pub fn memo_key_of<'py>(
     args: &Bound<'py, PyTuple>,
     kwargs: &Bound<'py, PyDict>,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -260,25 +273,16 @@ fn memo_key_of<'py>(
     ))
 }
 
-/// The memo key of a call's arguments, or None when the memo does not take the call.
-///
-/// The key the lock-free hit looks up, for the decorator's slow path to memoise its entry under.
-#[pyfunction]
-pub fn memo_key<'py>(
-    args: &Bound<'py, PyTuple>,
-    kwargs: &Bound<'py, PyDict>,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    memo_key_of(args, kwargs)
-}
-
 // ── Entries and the memo ─────────────────────────────────────────────────────────────────────
 
 /// What a lock-free hit needs of one `ObjectCache` entry: its value, the time before which it may be
 /// served without the cache's lock, whether it is still stored, and when such a hit last read it.
 ///
 /// The value and deadline never change: the cache stores a new `HitEntry` when it refreshes an entry.
-/// The cache kills an entry under its lock when it removes it, and a hit reads `alive` after it
-/// found the entry, with acquire ordering, so a removal that has returned before a hit starts is seen.
+/// The memo kills an entry, under the cache's lock, when the cache forgets it, repoints its slots or
+/// clears the memo ([`HitMemo::forget`], [`HitMemo::repoint`], [`HitMemo::clear`]), and a hit reads
+/// `alive` after it found the entry, with acquire ordering, so a removal that has returned before a
+/// hit starts is seen.
 #[pyclass(frozen, module = "cachekit._rust_serializer")]
 pub struct HitEntry {
     value: Py<PyAny>,
@@ -288,7 +292,9 @@ pub struct HitEntry {
     used_at: AtomicU64,
     /// The memo keys whose slots hold this entry. Only [`HitMemo`] writes it, under the cache's lock,
     /// and never calls into Python while it holds the mutex; the mutex makes the entry shareable
-    /// between threads and lets the garbage collector read the list.
+    /// between threads and lets the garbage collector read the list. No thread holds it at a fork, so
+    /// the at-fork hook's forget never waits on it: it is held only in Rust code with no point where
+    /// a thread can be paused, and `os.fork()` holds the GIL or, free-threaded, stops the world first.
     keys: Mutex<Vec<Py<PyAny>>>,
 }
 
@@ -300,6 +306,11 @@ impl HitEntry {
     /// Take the key list, leaving it empty.
     fn take_keys(&self) -> Vec<Py<PyAny>> {
         std::mem::take(&mut *self.keys())
+    }
+
+    /// End the entry for lock-free hits.
+    fn kill(&self) {
+        self.alive.store(false, Ordering::Release);
     }
 }
 
@@ -316,12 +327,7 @@ impl HitEntry {
         }
     }
 
-    /// End the entry for lock-free hits; the cache calls this, under its lock, on every removal.
-    fn kill(&self) {
-        self.alive.store(false, Ordering::Release);
-    }
-
-    /// Whether the entry is still stored.
+    /// Whether the entry can still be served without the lock: false once the memo forgot it.
     #[getter]
     fn alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
@@ -331,18 +337,6 @@ impl HitEntry {
     #[getter]
     fn used_at(&self) -> f64 {
         f64::from_bits(self.used_at.load(Ordering::Relaxed))
-    }
-
-    /// The time before which a lock-free hit may serve the value.
-    #[getter]
-    fn fresh_until(&self) -> f64 {
-        self.fresh_until
-    }
-
-    /// The stored object, as a hit returns it.
-    #[getter]
-    fn value(&self, py: Python<'_>) -> Py<PyAny> {
-        self.value.clone_ref(py)
     }
 
     /// The memo keys whose slots hold the entry, as a snapshot.
@@ -368,14 +362,18 @@ impl HitEntry {
 /// One decorated function's memo: memo key -> the `HitEntry` the function's `ObjectCache` holds for
 /// that call, and the lock-free hit that reads it.
 ///
-/// Only the cache writes the memo, under its lock (`set`, `forget`, `repoint`, `clear`), and each
-/// write keeps the key lists of the entries it touches equal to their slots; `get` only reads it,
-/// which CPython's dict allows from any thread. A memo answers only while the function's
+/// Only the cache writes the memo, under its lock (`set`, `forget`, `repoint`, `clear`), and each write keeps
+/// the key lists of the entries it touches equal to their slots; `get` only reads it, which
+/// CPython's dict allows from any thread. A slot is read back as a `HitEntry` with a type check, not
+/// on trust: code can reach the dict through the garbage collector (`gc.get_referents`) and plant
+/// another object, which must cost a miss or an error, never memory safety. A memo answers only while the function's
 /// `__module__` and `__qualname__` are the objects it was built with, which its cache keys embed:
 /// renaming the function re-keys its calls, as the key generator reads the names on every call.
 #[pyclass(frozen, module = "cachekit._rust_serializer")]
 pub struct HitMemo {
     memo: Py<PyDict>,
+    /// `HitEntry`'s type, held so a hit checks a slot's type with one comparison.
+    entry_type: Py<PyType>,
     counter: Py<PyHitCounter>,
     func: Py<PyAny>,
     module: Py<PyAny>,
@@ -520,7 +518,14 @@ impl HitMemo {
         let Some(found) = self.memo.bind(py).get_item(&key)? else {
             return Ok(miss.unbind());
         };
-        // SAFETY: set() stores HitEntry objects only.
+        // A slot holds a HitEntry unless code planted another object (see HitMemo): a miss.
+        if !ptr::eq(
+            unsafe { ffi::Py_TYPE(found.as_ptr()) },
+            self.entry_type.as_ptr().cast(),
+        ) {
+            return Ok(miss.unbind());
+        }
+        // SAFETY: found's type is exactly HitEntry, which cannot be subclassed.
         let entry = unsafe { found.cast_unchecked::<HitEntry>() }.get();
         if !entry.alive.load(Ordering::Acquire) {
             return Ok(miss.unbind());
@@ -533,6 +538,23 @@ impl HitMemo {
             return Ok(entry.value.clone_ref(py));
         }
         Ok(miss.unbind())
+    }
+
+    /// Drop every slot and every entry's key list, and kill the entries too when `kill`. A full memo
+    /// empties without killing before it takes a new key: its entries stay stored, for the lock to
+    /// serve.
+    fn drop_slots(&self, py: Python<'_>, kill: bool) {
+        let memo = self.memo.bind(py);
+        for held in memo.values() {
+            if let Ok(held) = held.cast_exact::<HitEntry>() {
+                let held = held.get();
+                if kill {
+                    held.kill();
+                }
+                drop(held.take_keys());
+            }
+        }
+        memo.clear();
     }
 }
 
@@ -606,6 +628,7 @@ impl HitMemo {
         let descriptors = NameDescriptors::of(func.bind(py));
         Self {
             memo: PyDict::new(py).unbind(),
+            entry_type: py.get_type::<HitEntry>().unbind(),
             counter,
             func,
             module,
@@ -648,8 +671,7 @@ impl HitMemo {
         match memo.get_item(key)? {
             Some(held) if held.is(entry) => return Ok(()),
             Some(held) => {
-                // SAFETY: the memo holds HitEntry objects only.
-                let held = unsafe { held.cast_unchecked::<HitEntry>() }.get();
+                let held = held.cast_exact::<HitEntry>()?.get();
                 let mut kept = Vec::new();
                 let mut failed = None;
                 for k in held.take_keys() {
@@ -667,7 +689,7 @@ impl HitMemo {
                     return Err(e);
                 }
             }
-            None if memo.len() >= MEMO_MAX_ENTRIES => self.clear(py),
+            None if memo.len() >= MEMO_MAX_ENTRIES => self.drop_slots(py, false),
             None => {}
         }
         memo.set_item(key, entry)?;
@@ -675,10 +697,16 @@ impl HitMemo {
         Ok(())
     }
 
-    /// Drop every slot that holds `entry`, as the cache removes it. Call under the cache's lock.
+    /// Kill `entry`, then drop every slot that holds it, as the cache removes it. Call under the
+    /// cache's lock.
+    ///
+    /// The kill comes first, so a hit that found the entry before its slots go reads it dead, and
+    /// the slots go next, so the memo holds no removed value.
     fn forget(&self, py: Python<'_>, entry: &Bound<'_, HitEntry>) -> PyResult<()> {
+        let entry_ref = entry.get();
+        entry_ref.kill();
         let memo = self.memo.bind(py);
-        for key in entry.get().take_keys() {
+        for key in entry_ref.take_keys() {
             let key = key.bind(py);
             if memo.get_item(key)?.is_some_and(|held| held.is(entry)) {
                 memo.del_item(key)?;
@@ -687,8 +715,11 @@ impl HitMemo {
         Ok(())
     }
 
-    /// Point every slot that holds `stale` at `fresh`, as the cache refreshes an entry. Call under
-    /// the cache's lock.
+    /// Point every slot that holds `stale` at `fresh`, then kill `stale`, as the cache refreshes an
+    /// entry. Call under the cache's lock.
+    ///
+    /// A hit that finds either entry reads it alive or misses, and none serves the stale value once
+    /// this returns, a failed write included.
     fn repoint(
         &self,
         py: Python<'_>,
@@ -697,25 +728,21 @@ impl HitMemo {
     ) -> PyResult<()> {
         let memo = self.memo.bind(py);
         let keys = stale.get().take_keys();
-        for key in &keys {
-            memo.set_item(key.bind(py), fresh)?;
-        }
+        let moved = keys
+            .iter()
+            .try_for_each(|key| memo.set_item(key.bind(py), fresh));
         fresh.get().keys().extend(keys);
-        Ok(())
+        stale.get().kill();
+        moved
     }
 
-    /// Drop every slot, and with them every entry's key list. Call under the cache's lock.
+    /// Kill every entry the memo holds and drop every slot. Call under the cache's lock.
+    ///
+    /// The cache's clear and the at-fork reset call this after they forget every stored entry, so it
+    /// also ends an entry no stored entry points at: one a refresh or a memo write had in hand when
+    /// a fork interrupted it.
     fn clear(&self, py: Python<'_>) {
-        let memo = self.memo.bind(py);
-        for held in memo.values() {
-            // SAFETY: the memo holds HitEntry objects only.
-            drop(
-                unsafe { held.cast_unchecked::<HitEntry>() }
-                    .get()
-                    .take_keys(),
-            );
-        }
-        memo.clear();
+        self.drop_slots(py, true);
     }
 
     /// The memo keys with a slot, for tests.
@@ -729,6 +756,7 @@ impl HitMemo {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.memo)?;
+        visit.call(&self.entry_type)?;
         visit.call(&self.counter)?;
         visit.call(&self.func)?;
         visit.call(&self.module)?;

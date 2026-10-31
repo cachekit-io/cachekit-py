@@ -11,7 +11,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Hashable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
@@ -19,6 +19,10 @@ from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation, l1_cache
 from .._rust_serializer import HitCounter, HitMemo
+
+# _memo_key, the memo key of a call's arguments or None when the memo (create_cache_wrapper's HitMemo)
+# does not take the call, is the extension's memo_key, so the lock-free hit and the slow path that
+# memoises compute one key. rust/src/l1_hit.rs documents which calls it takes and the memo's bounds.
 from .._rust_serializer import memo_key as _memo_key
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
@@ -611,27 +615,6 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 )
 
 
-# The memo (create_cache_wrapper's HitMemo) takes a call only when every argument's exact type is int,
-# float, bool, NoneType, str or bytes. Two equal values of one of these types always produce the same
-# key: their MessagePack is the same, 0.0 and -0.0 included, since both normalise to 0.0. Types are
-# tested by identity, as the key generator's fast path does, so an argument's type is never hashed or
-# compared through its metaclass. A subclass (IntEnum, a str subclass) or a container never matches,
-# so it takes the full key path on every call.
-# The memo keeps what it is keyed by, keyword names included, so a call's str and bytes arguments and
-# keyword names may hold at most _MEMO_MAX_LEN characters or bytes between them. That bounds an entry
-# at a few KiB: a str of 4-byte characters also keeps its UTF-8 copy once the key generator encodes
-# it. It also bounds the hashing a lookup repeats for strings that are new to each call.
-# _memo_key, the memo key of a call's arguments or None, is the extension's memo_key
-# (rust/src/l1_hit.rs), so the lock-free hit and the slow path that memoises compute one key. A call
-# of only ints, strs and Nones is keyed by its argument tuple itself: those never compare equal
-# across types. A float or bool (1, 1.0 and True are equal) or a bytes puts every type in the key.
-# These mirror the extension's constants.
-_MEMO_MAX_LEN = 256
-# Arguments per call, positional and keyword together.
-_MEMO_MAX_ARGS = 8
-# Slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a hit
-# writes nothing to it.
-_MEMO_MAX_ENTRIES = 1024
 # What HitMemo.get returns when it cannot answer a call.
 _MISS = object()
 
@@ -1892,30 +1875,27 @@ def create_cache_wrapper(
         finally:
             _forget_flights(cache_keys)
 
-    def _l1_only_fill(
-        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
-    ) -> Any:
+    def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None) -> Any:
         """Run the function for an L1-only miss and store its result, memoised under memo_key (see
-        _call_key). A miss is a call that runs it."""
+        _call_key). A miss is a call that runs it. The key is not recorded in _cached_keys: an L1-only
+        function has nothing in L2, and its whole-function invalidation clears the cache whole."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
         result = func(*call_args, **call_kwargs)
         _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
-        _cached_keys.add((_l2_scope(), cache_key))
         return result
 
     async def _l1_only_fill_async(
-        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
+        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None
     ) -> Any:
         """_l1_only_fill for a coroutine function."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
         result = await func(*call_args, **call_kwargs)
         _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
-        _cached_keys.add((_l2_scope(), cache_key))
         return result
 
-    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, tuple[Any, ...] | None]:
+    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, Hashable | None]:
         """A call's cache key, and for an L1-only function with a memo the memo key to memoise its
         entry under, or None.
 
@@ -3261,7 +3241,8 @@ def create_cache_wrapper(
         while this runs, stays in _cached_keys for the next attempt. Keys other processes
         wrote and this one never saw stay in L2 until their TTL. Another tenant's entry keeps
         its L2 value and stays tracked; only its L1 copy is evicted, because L1 is not
-        tenant-scoped.
+        tenant-scoped. An L1-only function records no keys (_l1_only_fill); its ObjectCache is
+        cleared whole.
 
         Failed deletes are logged once per call with their count: the call never raises, so
         this record is the caller's only signal, and a per-key record would flood during an
@@ -3287,10 +3268,12 @@ def create_cache_wrapper(
                         _cached_keys.discard(entry)
                         if entry in watch:  # rewritten meanwhile: its new value may still be in L2
                             _cached_keys.add(entry)
-                    if _object_cache:
-                        _object_cache.delete(key)
-                    elif _l1_cache:
+                    if _object_cache is None and _l1_cache:
                         _l1_cache.invalidate(key)
+            if _object_cache:
+                # An L1-only function records no keys (_l1_only_fill), so its cache goes whole: L1 is
+                # not tenant-scoped, and it has nothing in L2.
+                _object_cache.clear()
         if fallbacks:
             # Once per call, like the ERROR below. A backend whose multi-key delete always fails
             # (e.g. an ACL that denies UNLINK) otherwise silently pays one round trip per key.
@@ -3409,12 +3392,9 @@ def create_cache_wrapper(
             invalidation.publish(_backend, _registry_id, None if custom_key_func is not None else cache_keys[0])
         return outcome
 
-    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
-        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
-        takes parameters, every entry of the function. Never raises on a backend failure.
-
-        Returns the call's InvalidationOutcome for one entry, and None for every entry.
-        """
+    def _ready_to_invalidate() -> None:
+        """What every invalidation does first: settle a zero-config function, resolve a backed function's
+        lazy backend, and apply the interop guard reads and writes apply."""
         nonlocal _backend
 
         if _zero_config_pending:
@@ -3435,6 +3415,14 @@ def create_cache_wrapper(
         if interop is not None:
             ensure_interop_backend_compatible(_backend)
 
+    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
+        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
+        takes parameters, every entry of the function. Never raises on a backend failure.
+
+        Returns the call's InvalidationOutcome for one entry, and None for every entry.
+        """
+        _ready_to_invalidate()
+
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
@@ -3451,23 +3439,7 @@ def create_cache_wrapper(
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
         """Async invalidate_cache: the same deletes, run off the event loop, and the same return value."""
-        nonlocal _backend
-
-        if _zero_config_pending:
-            _settle_zero_config()
-
-        # L1-ONLY MODE: Skip backend lookup entirely
-        # This fixes the sentinel problem: when backend=None is explicitly passed,
-        # we should NOT try to get a backend from the provider
-        if not _l1_only_mode and _backend is None:
-            try:
-                _backend = _resolve_lazy_backend()
-            except Exception as e:
-                # If backend creation fails, can't invalidate L2
-                _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
-
-        if interop is not None:  # interop guard, as in invalidate_cache
-            ensure_interop_backend_compatible(_backend)
+        _ready_to_invalidate()
 
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
@@ -3528,13 +3500,22 @@ def create_cache_wrapper(
         return _stats.get_info()
 
     def cache_clear() -> None:
-        """Clear cache statistics and invalidate all cached entries."""
+        """Clear cache statistics and invalidate cached entries.
+
+        An L1-only function loses every entry, in every context: on a function without parameters, a
+        key= that reads its context can file the one call under many keys. A backed function loses what
+        invalidate_cache() with no arguments deletes: every entry when it takes parameters, and without
+        parameters the calling context's key and its pre-0.20.0 twin, in L2 too.
+        """
         _stats.clear()
         if _zero_config_pending:
             _settle_zero_config()
-        # In L1-only mode, invalidation is synchronous (no backend I/O needed)
-        # so cache_clear() works for both sync and async functions.
-        if inspect.iscoroutinefunction(func) and not _l1_only_mode:
+        # In L1-only mode, invalidation is synchronous (no backend I/O needed), so cache_clear() works
+        # for both sync and async functions.
+        if _l1_only_mode:
+            _delete_then_forget(None)
+            return
+        if inspect.iscoroutinefunction(func):
             raise TypeError(
                 "cache_clear() cannot clear cache for async functions with a backend. Use 'await fn.ainvalidate_cache()' instead."
             )
