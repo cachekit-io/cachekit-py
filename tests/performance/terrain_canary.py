@@ -363,8 +363,10 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--origin-ms must not be negative")
     if not args.out.parent.is_dir():
         p.error(f"--out: {args.out.parent} is not a directory")
-    if not args.l2_where.strip():
-        # The recording's L2 label is copy on a public page: a blank one would print as "Redis 8.x, ".
+    # The recording's L2 label is copy on a public page: padding would print as is, and a blank one
+    # as "Redis 8.x, ".
+    args.l2_where = args.l2_where.strip()
+    if not args.l2_where:
         p.error("--l2-where must say where the Redis runs")
     doc = run(args)
     text = json.dumps(doc, separators=(",", ":"), allow_nan=False)
