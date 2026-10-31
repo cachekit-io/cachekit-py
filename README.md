@@ -266,13 +266,13 @@ What a call costs inside your process, from the wall-clock guards in `tests/perf
 
 | Path | Time per call |
 |:-----|--------------:|
-| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.906 ± 0.007 µs |
-| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.91 ± 0.01 µs |
-| L1 hit with an L2 backend configured, same dict | 310 ± 20 µs |
-| Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 551 ± 18 µs |
+| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.311 ± 0.000 µs |
+| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.31 ± 0.00 µs |
+| L1 hit with an L2 backend configured, same dict | 284 ± 2 µs |
+| Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 539 ± 3 µs |
 
-- With no backend, L1 keeps the returned object itself, whatever the payload's size, and a repeat call with a few short scalar arguments finds its cache key in a per-function memo instead of building it again ([which calls](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#decorator--l1-hit-hot-path)). Any other call builds its key every time, as does every call to a function with a backend.
-- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 340 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 10 ± 21 µs, inside the noise.
+- With no backend, L1 keeps the returned object itself, whatever the payload's size, and a repeat call with a few short scalar arguments is answered by one call into the Rust extension that takes no lock ([which calls](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#decorator--l1-hit-hot-path)). Any other call builds its key every time, as does every call to a function with a backend.
+- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 910 times the L1-only hit. Encryption adds a decrypt to each such hit; on this run that added 9.3 ± 1.0 µs, though an earlier run could not tell it from noise.
 - An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
 
 Hosted runners come with other CPU models too: in a run of an earlier commit, an EPYC 9V45 runner took about half as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.

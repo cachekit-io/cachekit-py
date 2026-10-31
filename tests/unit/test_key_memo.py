@@ -365,6 +365,25 @@ class TestKeyBytesUnchanged:
         assert reads[1:] == [renamed, moved, moved]
         assert ":elsewhere.renamed:" in moved
 
+    def test_a_rename_rekeys_a_callable_that_is_not_a_plain_function(self) -> None:
+        """A plain function's names are read through the descriptors on its type; any other callable,
+        here a bound method reporting its function's names, through its own attribute access."""
+
+        class Service:
+            def lookup(self, x: int) -> int:
+                return x
+
+        fn = cache(backend=None, ttl=60, namespace="memo", encryption=False)(Service().lookup)
+        reads = _l1_reads(fn)
+        fn(1)
+        fn(1)  # a lock-free hit: no read under the lock
+        Service.lookup.__qualname__ = "renamed"
+        renamed = _key_now(fn, (1,), {}, "memo")
+        fn(1)
+        fn(1)
+        assert ":renamed:" not in reads[0]
+        assert reads[1:] == [renamed, renamed]  # the memo answers only for the names it was built with
+
     def test_names_that_are_not_exact_str_are_never_memoised(self) -> None:
         """The generator formats __module__ and __qualname__ on every call, and an object can format
         another way while it stays the same object, so no memo entry may answer for it."""

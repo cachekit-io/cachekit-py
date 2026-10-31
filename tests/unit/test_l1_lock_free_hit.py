@@ -478,6 +478,11 @@ class TestMemoKeyMatchesItsReference:
             return
         assert (new_a == new_b) == (old_a == old_b)
 
+    def test_a_lone_int_or_str_argument_is_its_own_key(self) -> None:
+        """The commonest call keys without a tuple to hash and compare on every hit; None cannot be its
+        own key, as None means the memo does not take the call."""
+        assert (_memo_key((7,), {}), _memo_key(("bob",), {}), _memo_key((None,), {})) == (7, "bob", (None,))
+
     def test_equal_calls_of_different_value_types_never_share_a_slot(self) -> None:
         for make in (lambda v: (v,), lambda v: (v, "a"), lambda v: ("a", v), lambda v: (v, 2, 3)):
             assert len({_memo_key(make(v), {}) for v in (1, 1.0, True)}) == 3
