@@ -69,6 +69,7 @@ from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, Backpres
     refresh_ttl_on_get=False,
     ttl_refresh_threshold=0.5,
     write_behind=False,
+    distributed_lock=True,
     # Nested configuration groups (see sections below for details)
     l1=L1CacheConfig(enabled=True),
     circuit_breaker=CircuitBreakerConfig(enabled=True),
@@ -92,6 +93,7 @@ def your_function(args):
 - **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on async L2 hits when below threshold, in the background (no extra round trip on the hit). On CachekitIO the threshold is checked against the hit's remaining freshness; see [CachekitIO TTL inspection](backends/cachekitio.md#ttl-inspection-async-only)
 - **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Minimum remaining TTL fraction (0.0–1.0) to trigger refresh
 - **`write_behind`** (`bool`, default: `False`; set by no preset; any non-bool raises `ConfigurationError`) - Return a miss once its value is serialized and in L1; the L2 write follows on a bounded background writer. Until it lands, other processes miss the key, a process killed first loses it, and a write queued before another process's invalidation can land after it, so do not use it for values that must not outlive an invalidation. The async distributed-lock path and a sync miss's streaming write stay synchronous. See [Write-Behind](features/write-behind.md)
+- **`distributed_lock`** (`bool`, default: `True`; set off by no preset; any non-bool raises `ConfigurationError`) - Take the backend's distributed lock around an async miss. `False` skips it: no lock round trips, and write-behind, when on, applies to the miss. Concurrent misses on the event loop running the key's call still share it; every other process computes the key, and so does every caller on another thread's event loop while that call runs. Sync functions never take the lock. See [Distributed Locking](features/distributed-locking.md#turning-it-off-distributed_lockfalse)
 - **`l1`** (`L1CacheConfig`, default: `L1CacheConfig()`) - L1 in-memory cache configuration
 
 #### Reliability Parameters

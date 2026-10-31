@@ -43,6 +43,7 @@ report = await get_report("2025-01-15")
 >
 > 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call, sync or async ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
+> 3. The function has not opted out with `distributed_lock=False` — see [Turning It Off](#turning-it-off-distributed_lockfalse).
 
 ---
 
@@ -66,7 +67,7 @@ Sync callers share a call across the threads of one process; async callers share
 - **Circuit breaker.** A joined caller makes no backend request and records no outcome. In HALF_OPEN it hands its probe slot straight back, so a herd spends one probe.
 - **Event loops.** Async callers share a call only on the event loop running it; a caller on another thread's loop runs its own.
 - **Task and context.** Every async miss runs the function in its own task, a lone caller's miss included, in a copy of the starting caller's context. A context variable the function sets is not visible to its caller afterwards. Anything scoped by `asyncio.current_task()` binds to that short-lived task, not to the caller's: SQLAlchemy's `async_scoped_session(scopefunc=current_task)`, used inside the function, creates a new session per miss, which the caller's `remove()` at the end of its request never cleans up. Pass such resources in as arguments, or scope them by a context variable instead.
-- **Waiting on yourself.** A call that misses its own key again from inside itself runs that inner call on its own instead of waiting on itself: a recursive call, a call through other cached functions (`a(1)` awaiting `b(1)`, which awaits `a(1)`), and, in async code, a call from a task it starts, until the call ends. In async backed mode that inner call still asks for the distributed lock its own outer trip holds: it waits up to `blocking_timeout` (5 s), logs "Failed to acquire lock", and then runs. Anything else that waits on its own key's call never returns: a sync function must not wait on a thread it starts that calls it with the same arguments (an async function called from that thread runs on that thread's own event loop, so it returns), two calls must not miss each other's keys at once (`a(1)` awaiting `b(1)` while another caller's `b(1)` awaits `a(1)`), and a sync caller must not hold a lock the function itself takes, such as an application lock, or the import lock of a module whose top level calls the function while the function imports that module. A caller that joins the call waits for it while still holding that lock.
+- **Waiting on yourself.** A call that misses its own key again from inside itself runs that inner call on its own instead of waiting on itself: a recursive call, a call through other cached functions (`a(1)` awaiting `b(1)`, which awaits `a(1)`), and, in async code, a call from a task it starts, until the call ends. In async backed mode with the lock on, that inner call still asks for the distributed lock its own outer trip holds: it waits up to `blocking_timeout` (5 s), logs "Failed to acquire lock", and then runs. Anything else that waits on its own key's call never returns: a sync function must not wait on a thread it starts that calls it with the same arguments (an async function called from that thread runs on that thread's own event loop, so it returns), two calls must not miss each other's keys at once (`a(1)` awaiting `b(1)` while another caller's `b(1)` awaits `a(1)`), and a sync caller must not hold a lock the function itself takes, such as an application lock, or the import lock of a module whose top level calls the function while the function imports that module. A caller that joins the call waits for it while still holding that lock.
 
 ---
 
@@ -142,7 +143,7 @@ degradation paths.
 > 2. **Low concurrency** (1-2 pods): No stampede risk
 > 3. **Cache always hits** (TTL never expires): Locking never used
 
-When locking overhead matters, use a backend that doesn't implement `LockableBackend`, or raise the issue — per-decorator toggle is being tracked.
+When locking overhead matters, turn it off for that function with `distributed_lock=False` ([Turning It Off](#turning-it-off-distributed_lockfalse)). The default stays on.
 
 ---
 
@@ -214,7 +215,9 @@ thing the process does, and even if `close_http_clients()` runs straight after. 
 ### Request Count on CachekitIO
 
 On `CachekitIOBackend`, an uncontended async miss makes three requests the caller
-waits on: the read, the lock `POST`, and the write. Two steps are trimmed:
+waits on: the read, the lock `POST`, and the write. With `distributed_lock=False`
+it makes two, the read and the write, and sends no lock request at all. With the
+lock on, two steps are trimmed:
 
 - **No re-read when nobody else held the lock.** The post-lock re-read only
   runs when the lock was granted after a wait, or when the first read failed
@@ -290,17 +293,35 @@ async def generate_stats(date):
 The SaaS lock is available to every authenticated API key — no extra
 configuration or plan tier required.
 
-### Disabling for Cheap Operations
-```python notest
-# Use a non-LockableBackend for operations where stampede isn't a concern,
-# or just accept the minimal overhead — locking only activates on cache miss.
-# (A sync function like this never locks anyway — zero lock overhead.)
+### Turning It Off (`distributed_lock=False`)
 
-@cache(ttl=300)
-def cheap_lookup(x):
-    # <1ms operation; even if 1000 pods hit simultaneously, DB load is trivial
-    return simple_dict.get(x)
+The lock is on by default. Pass `distributed_lock=False` to skip it for one function:
+
+```python notest
+from cachekit import cache
+
+@cache.io(ttl=300, distributed_lock=False)
+async def cheap_lookup(x):
+    # Cheap to recompute: a cross-process stampede costs little, the lock's round trips cost every miss
+    return await db.lookup(x)
 ```
+
+Every serialized preset and `DecoratorConfig(distributed_lock=False)` take it; any non-bool raises `ConfigurationError`.
+`@cache.local()` takes no lock and does not accept it.
+
+What changes on an async miss:
+
+| | `distributed_lock=True` (default) | `distributed_lock=False` |
+|---|---|---|
+| Lock requests (CachekitIO) | Uncontended: one `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
+| Concurrent misses on one event loop | One call ([single-flight](#in-process-single-flight-before-the-lock)) | One call (single-flight is unchanged) |
+| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CachekitIO, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#request-count-on-cachekitio)) | At least one call per process that misses, each computing and writing. Within a process, only callers on the event loop running the key's call share it: while it runs, every caller on another thread's loop runs its own call (ten such callers, ten calls) |
+| [Write-behind](write-behind.md) | Not applied while the lock is held: the write lands inside it | Applied when on: the L2 write leaves the caller's path |
+
+The trade-off is cross-process stampede protection. Turn it off when the function is cheap or idempotent and a
+recompute per process is acceptable, and keep it on for an expensive function behind many processes. Stale-while-revalidate
+is unaffected: its background revalidation still takes its own non-blocking lease, off the caller's path. A sync
+function never takes the lock, so the option changes nothing there.
 
 ---
 
@@ -408,9 +429,10 @@ record nothing, so treat it as a proxy, not an exact miss count — see
 A: Your function takes longer than the 5 s `blocking_timeout`, so waiting processes fall through and recompute. Keep execution time under 5 s for full single-flight behaviour (and under 30 s so the lock doesn't self-expire mid-computation).
 
 **Q: Locking doesn't seem to be working**
-A: Two things to check:
+A: Three things to check:
 1. The decorated function must be **async** — sync wrappers never lock ([Async-only](#async-only-sync-functions-are-never-lock-protected)).
 2. The backend must implement `LockableBackend` (`CachekitIOBackend`, or the env-resolved / `RedisBackendProvider(...).get_shared_backend()` Redis backend — a bare `RedisBackend()` does not). Check it the way the SDK does: `hasattr(backend, "acquire_lock")`. Avoid `isinstance(backend, LockableBackend)` — from CPython 3.12 a `runtime_checkable` protocol check resolves members with `inspect.getattr_static`, so it reports `False` for a backend that delegates `acquire_lock` through `__getattr__`.
+3. The function (or its `DecoratorConfig`) must not set `distributed_lock=False` ([Turning It Off](#turning-it-off-distributed_lockfalse)). An opted-out miss logs nothing about the lock.
 
 **Q: How do I know if stampedes are happening?**
 A: Check Prometheus: a spike in `rate(cache_operations_total{operation="set"}[1m])` (a cache-write proxy — misses write back) suggests stampede risk. See [Prometheus Metrics](prometheus-metrics.md).

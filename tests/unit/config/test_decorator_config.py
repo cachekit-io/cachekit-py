@@ -788,6 +788,7 @@ _FIELD_VALUES: dict[str, tuple[object, ...]] = {
     "refresh_ttl_on_get": (True,),
     "ttl_refresh_threshold": (0.25,),
     "write_behind": (True,),
+    "distributed_lock": (False,),
     "backend": (None,),
     "encryption": (EncryptionConfig(enabled=False),),
     **{name: (value,) for name, value in _NESTED_OVERRIDES.items()},

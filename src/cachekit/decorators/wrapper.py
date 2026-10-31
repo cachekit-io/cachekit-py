@@ -746,6 +746,8 @@ def create_cache_wrapper(
     enable_structured_logging: bool = True,
     # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
     interop: str | None = None,
+    # Last, so existing positional calls keep their bindings
+    distributed_lock: bool = True,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -812,6 +814,10 @@ def create_cache_wrapper(
                 and plain-MessagePack values shared byte-identically with
                 cachekit-rs / cachekit-ts. Requires namespace; mutually
                 exclusive with key= and fast_mode. None (default) = auto mode.
+        distributed_lock: Take the backend's distributed lock around an async miss (default True). False
+                     skips it: concurrent misses on the event loop running the key's call still share it, but other
+                     processes, and every caller on another thread's event loop while that call runs, compute
+                     the key. Sync functions never take it.
 
     Security Note:
         When encryption=True and tenant_extractor is provided: a failed extraction is logged
@@ -847,6 +853,7 @@ def create_cache_wrapper(
         refresh_ttl_on_get = config.refresh_ttl_on_get
         ttl_refresh_threshold = config.ttl_refresh_threshold
         write_behind = config.write_behind
+        distributed_lock = config.distributed_lock
         # config.backend None is an explicit L1-only request; UNSET leaves the backend to resolve at first call.
         if backend is None and config.backend is None:
             _l1_only_mode = True
@@ -917,6 +924,10 @@ def create_cache_wrapper(
     if isinstance(namespace, str):
         _legacy_namespace = f"{namespace}"
         namespace = str.__str__(namespace)
+
+    # DecoratorConfig checks this too; a direct create_cache_wrapper call does not go through it.
+    if not isinstance(distributed_lock, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
+        raise ConfigurationError(f"distributed_lock must be a bool, got {type(distributed_lock).__name__}")
 
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
@@ -3048,7 +3059,7 @@ def create_cache_wrapper(
         blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
         # Check if backend supports distributed locking
-        if supports_locking(_backend):
+        if distributed_lock and supports_locking(_backend):
             func_error: Exception | None = None
             lock_phase = _LockPhase()
             try:
@@ -3243,8 +3254,8 @@ def create_cache_wrapper(
                 # The function's own exception, unchanged and never recorded (as before).
                 raise func_error
 
-        # Execute without locking (either backend doesn't support it or lock failed)
-        if not supports_locking(_backend):
+        # Execute without locking (opted out, the backend doesn't support it, or the lock failed)
+        if distributed_lock and not supports_locking(_backend):
             logger().debug(
                 f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
             )

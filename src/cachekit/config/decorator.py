@@ -161,6 +161,11 @@ class DecoratorConfig:
                       queued before another process's invalidation can land after it. Not on the async
                       distributed-lock path or a sync miss's streaming (File + Arrow) write, which stay
                       synchronous. See docs/features/write-behind.md.
+        distributed_lock: Take the backend's distributed lock around an async miss (default: True). False
+                      skips the lock's round trips: concurrent misses on the event loop running the key's
+                      call still share it, but other processes, and every caller on another thread's
+                      event loop while that call runs, compute the key themselves.
+                      Sync functions never take the lock. See docs/features/distributed-locking.md.
         backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
                  @cache(backend=None) does. The default, UNSET, resolves per "Backend Resolution Priority".
         l1: L1 in-memory cache configuration
@@ -189,10 +194,11 @@ class DecoratorConfig:
     # values shared byte-identically with cachekit-rs / cachekit-ts. None = auto mode.
     interop: str | None = None
 
-    # Performance (3 fields)
+    # Performance (4 fields)
     refresh_ttl_on_get: bool = False
     ttl_refresh_threshold: float = 0.5
     write_behind: bool = False
+    distributed_lock: bool = field(default=True, kw_only=True)  # keyword-only: positional calls keep their bindings
 
     # Backend abstraction (1 field)
     backend: BaseBackend | None | Literal[_Unset.UNSET] = UNSET  # L2 backend; None = L1-only; UNSET = resolve
@@ -239,6 +245,9 @@ class DecoratorConfig:
 
         if not isinstance(self.write_behind, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
             raise ConfigurationError(f"write_behind must be a bool, got {type(self.write_behind).__name__}")
+
+        if not isinstance(self.distributed_lock, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
+            raise ConfigurationError(f"distributed_lock must be a bool, got {type(self.distributed_lock).__name__}")
 
         # Under encryption integrity_checking becomes the AAD's `compressed` component, whose
         # tokens are frozen as exactly True / False (spec/encryption.md). A truthy 1 would seal
@@ -310,6 +319,7 @@ class DecoratorConfig:
             "refresh_ttl_on_get": self.refresh_ttl_on_get,
             "ttl_refresh_threshold": self.ttl_refresh_threshold,
             "write_behind": self.write_behind,
+            "distributed_lock": self.distributed_lock,
             "backend": None if self.backend is UNSET else self.backend,  # the legacy dict's "unset" was None
             # L1 cache (flattened)
             "l1_enabled": self.l1.enabled,

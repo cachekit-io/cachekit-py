@@ -70,6 +70,7 @@ _PREFIX = "/v1/cache/"
 # a background request would read as blocking: the pinned list fails, it does not pass by mistake.
 _SETTLE_TURNS = 100
 _GUARD_SECONDS = 10.0  # hang guard only: hitting it fails the test, it never classifies a request
+_WRITER = "cachekit-write-behind"  # the threads write_behind=True sends deferred writes from
 
 
 @dataclass
@@ -288,6 +289,7 @@ class _Gate:
     async def run_async(self, call: Awaitable[Any]) -> _Shape:
         self.shape = shape = _Shape()
         self.arrivals, self._jobs = [], []
+        writers_before = _writers()
         self._loop = loop = asyncio.get_running_loop()
         loop.run_in_executor = self._run_in_executor  # type: ignore[method-assign]
         loop.call_at = self._call_at  # type: ignore[method-assign]
@@ -311,6 +313,8 @@ class _Gate:
                     await self._next_event({caller})
             caller.result()
             # The caller has returned: whatever it left running is background. Drain it to the end.
+            writers: set[threading.Thread] = set()
+            exits: list[asyncio.Future[None]] = []
             while True:
                 await _settle()
                 if self._parked:
@@ -319,9 +323,16 @@ class _Gate:
                         parked.release()
                     self._parked.clear()
                     continue
-                # Background work is a Task, or an executor job (the lock release runs in a thread).
+                # Background work is a Task, an executor job (the lock release runs in a thread), or a write-behind thread.
+                # A writer sends outside any task or job, so the drain joins each one the run started, as run_sync does,
+                # including one a background task started during the drain. The join runs off the loop, which must stay
+                # free to release the writer's requests.
+                for writer in _writers() - writers_before - writers:
+                    writers.add(writer)
+                    exits.append(type(loop).run_in_executor(loop, None, writer.join, _GUARD_SECONDS))
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
-                if not (pending := tasks | {job.inner for job in self._jobs if not job.inner.done()}):
+                jobs = {job.inner for job in self._jobs if not job.inner.done()}
+                if not (pending := tasks | jobs | {exited for exited in exits if not exited.done()}):
                     break
                 await self._next_event(pending)
         finally:
@@ -331,6 +342,8 @@ class _Gate:
             del loop.run_in_executor, loop.call_at
             self._loop = self._waiting = None
         assert not self.errors, self.errors
+        for writer in writers:
+            assert not writer.is_alive(), f"background thread {writer.name} did not finish"
         return shape
 
     async def _next_event(self, tasks: set[Any]) -> None:
@@ -341,6 +354,10 @@ class _Gate:
         arrived.cancel()
         await asyncio.gather(arrived, return_exceptions=True)
         assert done, "nothing finished and no request arrived"
+
+
+def _writers() -> set[threading.Thread]:
+    return {thread for thread in threading.enumerate() if thread.name == _WRITER}
 
 
 async def _settle() -> None:
@@ -466,6 +483,39 @@ class TestAsyncCallShape:
         # Deferred, the PUT would land after the release, and a waiter's re-read would miss and recompute.
         assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
+    async def test_cold_miss_without_distributed_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, distributed_lock=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET", "PUT"])
+
+    async def test_cold_miss_write_behind_without_distributed_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, write_behind=True, distributed_lock=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        shape = await gate.run_async(fn(1))
+        # No lock for a waiter to re-read under, so the PUT leaves the caller's path as on the sync side.
+        assert shape == _Shape(blocking=["GET"], background=["PUT"])
+
+    async def test_herd_without_distributed_lock_runs_once(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        """An invariant, not a pinned list: 10 concurrent callers on one cold key share one in-process trip."""
+        calls: list[int] = []
+
+        @cache(backend=backend, ttl=60, distributed_lock=False)
+        async def fn(x: int) -> int:
+            calls.append(x)
+            return x * 2
+
+        async def herd() -> list[int]:
+            return await asyncio.gather(*(fn(1) for _ in range(10)))
+
+        shape = await gate.run_async(herd())
+        assert calls == [1]
+        assert _op_counts(shape) == {"GET": 1, "PUT": 1}
+
     async def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, l1_enabled=False)
         async def fn(x: int) -> int:
@@ -475,8 +525,11 @@ class TestAsyncCallShape:
         shape = await gate.run_async(fn(1))
         assert shape == _Shape(blocking=["GET"])
 
-    async def test_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
-        @cache(backend=backend, ttl=60, stale_ttl=60, l1_enabled=False)
+    @pytest.mark.parametrize("distributed_lock", [True, False])
+    async def test_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, distributed_lock: bool) -> None:
+        """The revalidation lease runs off the caller's path, so the miss-path option leaves it alone."""
+
+        @cache(backend=backend, ttl=60, stale_ttl=60, l1_enabled=False, distributed_lock=distributed_lock)
         async def fn(x: int) -> int:
             return x * 2
 
