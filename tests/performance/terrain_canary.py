@@ -20,8 +20,8 @@ The workload: keys drawn from a Zipf distribution (exponent 0.99, the YCSB defau
 ``--keys`` keys; each key's value is a seeded dict, about 1 KB as MessagePack (range roughly
 0.2-6 KB). One caller makes the calls one at a time, at arrival times drawn as a Poisson process at
 ``--rate`` per second. A call that outlasts the gap to the next arrival makes the caller late; it
-then drops the backlog and draws the next gap from when it is free (``next_arrival``), so it never
-runs above ``--rate`` to catch up. While misses dominate, the achieved rate is lower; the recording
+then starts the next call as soon as it is free and draws the following gap from there
+(``next_arrival``), so it never runs above ``--rate`` to catch up. While misses dominate, the achieved rate is lower; the recording
 states it, and the busiest slice's rate. A figure is the time one call took, not a response time
 under load.
 
@@ -103,17 +103,23 @@ def payload(key: int) -> dict[str, Any]:
 
 
 def next_arrival(due: float, now: float, gap: float) -> float:
-    """When the next call starts: ``gap`` after the later of its schedule and now.
+    """When the next call starts: ``gap`` after the last call's start, or now if that has passed.
 
-    A caller still busy past ``due`` drops that backlog instead of firing calls back to back to
-    catch up, so the call rate never runs above the arrival process's.
+    ``due`` is when the last call was due to start and ``now`` is when the caller came free. A
+    caller that keeps up starts every call on the Poisson schedule. One that is late starts the next
+    call at once and draws the following gap from there: it drops the rest of the backlog instead of
+    firing calls back to back to catch up, so every gap between starts is at least the drawn one and
+    the call rate never runs above the arrival rate.
 
-    >>> next_arrival(due=10.0, now=9.0, gap=0.5)  # on time: the schedule holds
-    10.5
-    >>> next_arrival(due=10.0, now=12.0, gap=0.5)  # late: start from now, no burst
-    12.5
+    >>> starts, due, free = [], 0.0, 0.0
+    >>> for gap, service in [(1.0, 0.2), (1.0, 2.5), (1.0, 0.2), (1.0, 0.2)]:
+    ...     due = next_arrival(due, free, gap)
+    ...     starts.append(due)
+    ...     free = due + service
+    >>> starts  # on schedule, on schedule, late (starts when free), then one gap on
+    [1.0, 2.0, 4.5, 5.5]
     """
-    return max(due, now) + gap
+    return max(due + gap, now)
 
 
 class Slices:
