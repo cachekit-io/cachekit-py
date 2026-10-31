@@ -192,7 +192,7 @@ def get_historical_data(symbol: str, date: str):
 - `cache_operation_duration_ms`: operation latency histogram, in milliseconds (buckets 0.01 to 1000)
 - `cache_operation_size_bytes`: payload size histogram, in bytes
 
-`circuit_breaker_state` counts live circuit breakers per namespace and state. No series carries a hit/miss label, and the only tier label is `serializer` (`l1_memory` for an L1 hit, `rust` for the L2 path), so read the hit rate from `cache_info()`. An L1-only decorator records none of the three series: one with `backend=None`, or one that resolves no backend ([Backend Resolution Priority](backends/README.md#backend-resolution-priority)). `MonitoringConfig(collect_stats=False)` turns them off, as `@cache.minimal` and `@cache.test` do. cachekit starts no HTTP server; your app exposes the registry. See [Prometheus Metrics](features/prometheus-metrics.md) for exposition, queries and alerts.
+`circuit_breaker_state` counts live circuit breakers per namespace and state. No series carries a hit/miss label, and the only tier label is `serializer` (`l1_memory` for an L1 hit, `rust` for the L2 path), so read the hit rate from `cache_info()`. An L1-only decorator records no `get` or `set` operations in the three series: one with `backend=None`, or one that resolves no backend ([Backend Resolution Priority](backends/README.md#backend-resolution-priority)). `MonitoringConfig(collect_stats=False)` turns the three series off, as `@cache.minimal` and `@cache.test` do. cachekit starts no HTTP server; your app exposes the registry. See [Prometheus Metrics](features/prometheus-metrics.md) for exposition, queries and alerts.
 
 ## Performance Bottlenecks and Mitigations
 

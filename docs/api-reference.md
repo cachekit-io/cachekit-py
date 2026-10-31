@@ -870,9 +870,9 @@ names carry no `cachekit_` prefix:
 - `circuit_breaker_state` - Gauge: number of live circuit breakers in each state. Labels: `namespace`, `state` (`CLOSED`, `OPEN`, `HALF_OPEN`)
 
 The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
-preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
-emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
-rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
+preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a failure
+record from the error path. `redis_cache_operations_total` is emitted only when a full request
+queue rejects a call (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
 
 Each histogram records one observation per operation whose value is above zero, so its `_count` can be
 lower than `cache_operations_total`. Releases before these bucket bounds used

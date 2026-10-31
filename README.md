@@ -196,7 +196,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Backend unreachable² | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
-> ¹ A preset with a ✅ records the cache-operation series only when it has a backend: in L1-only mode it records none. `circuit_breaker_state` is recorded for every function whose circuit breaker is enabled. See [Which Decorators Record](docs/features/prometheus-metrics.md#which-decorators-record).
+> ¹ A preset with a ✅ records `get` and `set` operations only when it has a backend: in L1-only mode it records none. `circuit_breaker_state` is recorded for every function whose circuit breaker is enabled. See [Which Decorators Record](docs/features/prometheus-metrics.md#which-decorators-record).
 >
 > ² A backend that is down or unreachable never raises to the caller, on any preset (`@cache.io` included): the call logs the failure and runs your function. What gets cached meanwhile is in [Connection Errors](docs/error-codes.md#connection-errors).
 >

@@ -253,7 +253,7 @@ def get_user(id):
 info = get_user.cache_info()  # Hits, misses and the L1/L2 split, no scrape needed
 ```
 
-The series carry no hit/miss label; `cache_info()` has those counts. cachekit starts no HTTP server: your app exposes the default `prometheus_client` registry ([how](features/prometheus-metrics.md#quick-start)). An L1-only decorator (`backend=None`) records `cache_info()` counts but none of the three cache-operation series.
+The series carry no hit/miss label; `cache_info()` has those counts. cachekit starts no HTTP server: your app exposes the default `prometheus_client` registry ([how](features/prometheus-metrics.md#quick-start)). An L1-only decorator (`backend=None`) records `cache_info()` counts but no `get` or `set` operations in these series.
 
 **Limitations of alternatives**:
 - `lru_cache`: No metrics at all
