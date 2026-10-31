@@ -458,6 +458,19 @@ def test_fork_waits_for_a_thread_mid_read_and_the_child_does_not_hang():
         holder.join()
 
 
+def test_a_thread_state_freed_once_the_interpreter_is_exiting_retires_nothing(monkeypatch):
+    # The atexit hook has emptied _live. The subprocess test below covers the teardown itself, which coverage cannot see.
+    monkeypatch.setattr(async_metrics, "_live", [])
+    state = async_metrics._ThreadState()
+    ops = state.ops
+    del state
+    try:
+        assert async_metrics._deferred == [] and async_metrics._thread_ops.get(id(ops)) is ops
+    finally:
+        with async_metrics._locked():
+            async_metrics._thread_ops.pop(id(ops), None)
+
+
 def test_a_thread_state_freed_at_interpreter_teardown_exits_silently():
     # Pinning the module on sys keeps it alive until teardown clears its globals; clearing _tls then frees this
     # thread's state, whose __del__ runs with _retire_thread and its helpers already None.
