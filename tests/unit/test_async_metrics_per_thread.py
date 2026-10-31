@@ -14,6 +14,8 @@ import multiprocessing
 import os
 import queue
 import random
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -454,3 +456,17 @@ def test_fork_waits_for_a_thread_mid_read_and_the_child_does_not_hang():
     finally:
         process.join(timeout=5)
         holder.join()
+
+
+def test_a_thread_state_freed_at_interpreter_teardown_exits_silently():
+    # Pinning the module on sys keeps it alive until teardown clears its globals; clearing _tls then frees this
+    # thread's state, whose __del__ runs with _retire_thread and its helpers already None.
+    script = (
+        "import sys\n"
+        "from cachekit.reliability import async_metrics\n"
+        "sys._pinned_async_metrics = async_metrics\n"
+        "async_metrics._new_thread_state()\n"
+    )
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)  # noqa: S603 (trusted: sys.executable + literal code)
+    assert out.returncode == 0, out.stderr
+    assert "Exception ignored" not in out.stderr, out.stderr
