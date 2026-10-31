@@ -491,7 +491,7 @@ L1-only mode (`backend=None`) skips this layer: it stores the Python object itse
 - **After refactor**: Stores bytes (encrypted or plaintext) → `len(bytes)` for size estimation
 - **Performance improvement**: O(1) size calculation vs recursive traversal
 - **Security improvement**: Encrypted bytes at rest (decrypt-at-read-time only)
-- **Kept entries**: L1 stores, admits and evicts envelopes. The first L1 hit on a plaintext entry of the default serializer with integrity checking on decodes the envelope as every read does: `ByteStorage.retrieve()` verifies the MessagePack, and the Rust decode (`unpackb_standard`) bounds and decodes it in one pass. When the verified MessagePack is no longer than the envelope, L1 then holds it in the envelope's place (`VerifiedMsgpack`, same expiry and LRU place), and later hits skip the decompress and checksum; otherwise L1 keeps the envelope. Every hit still runs the bounded decode. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. The swap never grows an entry, so L1 never holds fewer entries than it would hold envelopes, and it never touches an entry stored or removed since the hit read it. Bytes from L2, and bytes still held as bytes, never skip `retrieve()`: L1 marks a kept entry by its type, which no backend returns
+- **Kept entries**: L1 stores, admits and evicts envelopes. The first L1 hit on a plaintext entry of the default serializer with integrity checking on decodes the envelope as every read does: `ByteStorage.retrieve()` checks the envelope and returns the MessagePack its checksum covers, and the Rust decode (`unpackb_standard`) bounds and decodes it in one pass. When the verified MessagePack is no longer than the envelope, L1 then holds it in the envelope's place (`VerifiedMsgpack`, same expiry and LRU place), and later hits skip the decompress and checksum; otherwise L1 keeps the envelope. Every hit still runs the bounded decode. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. The swap never grows an entry, so L1 never holds fewer entries than it would hold envelopes, and it never touches an entry stored or removed since the hit read it. Bytes from L2, and bytes still held as bytes, never skip `retrieve()`: L1 marks a kept entry by its type, which no backend returns
 
 **Hierarchical Read Path:**
 1. Check L1 cache (bytes) → if hit, deserialize and return (the first hit on a plaintext entry of the default serializer with integrity checking on marks it as verified, so later hits on held MessagePack skip the decompress and checksum)
@@ -740,7 +740,8 @@ def deserialize(data: bytes, metadata) -> Any:
 
     # MessagePack decode (StandardSerializer): one Rust pass that enforces the untrusted-decode
     # bounds (nesting <= 1,024; no header claiming more than the input can back), builds the
-    # Python objects, and runs the datetime hook only on maps holding a marker key.
+    # Python objects, and runs the datetime hook only on maps holding a marker key. A decode that
+    # fails re-runs the structure walk over the whole input, so the walk's error wins.
     return unpackb_standard(original_data, MSGPACK_MAX_NESTING, _standard_object_hook)  # illustrative
 ```
 
