@@ -309,7 +309,7 @@ def _measure_leaks() -> list[int]:
         for data in (*CASES.values(), _pack({"k": ["v" * 40, datetime(2024, 1, 15), b"b"] * 3}, True)):
             try:
                 rust(data)
-            except Exception:  # noqa: BLE001, S110 - every path is the point, not its result
+            except (ValueError, SerializationError, TypeError):  # noqa: S110 - every refusal CASES pins; any other error fails
                 pass
 
     for _ in range(50):  # warm caches and lazily imported msgpack classes
