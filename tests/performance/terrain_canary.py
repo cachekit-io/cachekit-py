@@ -158,7 +158,7 @@ def cpu_model() -> str:
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
     except OSError:
-        pass
+        pass  # no /proc (macOS, Windows) or unreadable: fall back to what platform reports
     return platform.processor() or platform.machine()
 
 
@@ -187,7 +187,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     rng = random.Random(args.seed)
     zipf = Zipf(args.keys, ZIPF_EXPONENT, rng)
-    redis_version = redis.Redis.from_url(args.redis).info("server")["redis_version"]
+    try:
+        redis_version = redis.Redis.from_url(args.redis, socket_connect_timeout=5, socket_timeout=5).info("server")[
+            "redis_version"
+        ]
+    except redis.RedisError as e:
+        raise SystemExit(f"terrain_canary: cannot reach Redis at {args.redis}: {e}") from e
     # Whole slices only: the run lasts a whole number of them, and a call still running when
     # the last one closes is not recorded, so no slice holds a partial window.
     n_slices = max(1, round(args.minutes * 60 / args.slice))
@@ -244,8 +249,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "recordedAt": datetime.fromtimestamp(start_wall, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sdk": f"cachekit {cachekit.__version__} (Python {platform.python_version()})",
             "l2": f"Redis {redis_version}, {args.l2_where}",
+            # Arrivals are scheduled at --rate, but one caller cannot keep up while misses dominate:
+            # it falls behind during warm-up and catches up after, so record what it achieved.
             "workload": (
-                f"Zipf {ZIPF_EXPONENT} over {args.keys:,} keys, {args.rate:g} calls/s, ttl {args.ttl} s, "
+                f"Zipf {ZIPF_EXPONENT} over {args.keys:,} keys, up to {args.rate:g} calls/s "
+                f"(achieved {(attributed + unattributed) / duration:.1f} over the run), ttl {args.ttl} s, "
                 f"L1 budget {args.l1_mb} MB"
             ),
             "origin": f"{args.origin_ms:g} ms sleep standing in for a database call",
@@ -256,7 +264,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "sliceSeconds": args.slice,
         "layers": list(LAYERS),
         "slices": slices.to_json(),
-        "summary": {"attributed": attributed, "unattributed": unattributed, "layers": summary},
+        "summary": {
+            "attributed": attributed,
+            "unattributed": unattributed,
+            "achieved_rate": (attributed + unattributed) / duration,
+            "layers": summary,
+        },
     }
 
 
@@ -275,8 +288,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--harness", required=True, help="pinned URL of this file, recorded as the source")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args(argv)
+    for name in ("minutes", "rate", "keys", "ttl", "l1_mb", "slice"):
+        if getattr(args, name) <= 0:
+            p.error(f"--{name.replace('_', '-')} must be positive")
+    if args.origin_ms < 0:
+        p.error("--origin-ms must not be negative")
+    if not args.out.parent.is_dir():
+        p.error(f"--out: {args.out.parent} is not a directory")
     doc = run(args)
-    args.out.write_text(json.dumps(doc, separators=(",", ":"), allow_nan=False))
+    text = json.dumps(doc, separators=(",", ":"), allow_nan=False)
+    try:
+        args.out.write_text(text)
+    except OSError as e:
+        # A run takes minutes: print the recording rather than lose it.
+        print(text)
+        print(f"terrain_canary: could not write {args.out} ({e}); the recording is on stdout above", file=sys.stderr)
+        return 2
     s = doc["summary"]
     print(f"{s['attributed']:,} calls attributed, {s['unattributed']:,} unattributed -> {args.out}")
     for name, row in s["layers"].items():
