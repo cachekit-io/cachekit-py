@@ -150,14 +150,15 @@ pub fn check_msgpack_structure_py(
     max_depth: usize,
 ) -> PyResult<()> {
     let view = bytes_view(py, data)?;
-    check_msgpack_structure(view.as_slice(), max_depth).map_err(|what| {
-        PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
-    })
+    check_msgpack_structure(view.as_slice(), max_depth)
+        .map_err(crate::msgpack_decode::structure_error)
 }
 
 /// Decode one untrusted MessagePack document as StandardSerializer reads it, under the bounds
 /// `check_msgpack_structure` enforces, in one pass (`crate::msgpack_decode`). `object_hook` runs
-/// only on maps holding a `__datetime__`, `__date__` or `__time__` str key.
+/// only on maps holding a `__datetime__`, `__date__` or `__time__` str key. `data` goes through
+/// the strict `bytes_view`, so a `memoryview` of any format but `B`/`c` raises BufferError where
+/// `unpackb_bounded` accepts it: callers pass `bytes`, or normalise with `immutable_buffer` first.
 #[pyfunction]
 #[pyo3(name = "unpackb_standard")]
 pub fn unpackb_standard_py(
@@ -172,7 +173,7 @@ pub fn unpackb_standard_py(
 
 /// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
 /// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
-/// touches the Python heap). It covers `retrieve` and `check_msgpack_structure`, and the exact
+/// touches the Python heap). It covers `retrieve`, `check_msgpack_structure` and `unpackb_standard`, and the exact
 /// `bytes` and `B`/`c` `memoryview` inputs the decrypt bindings read through `ciphertext_view`;
 /// that function's `bytes(obj)` route for every other input is outside it. It does not pin how a
 /// caller uses the view: that the callers pass `as_slice()` on without copying it is held by
@@ -280,8 +281,8 @@ use zeroize::Zeroizing;
 /// hands the wrapper, go through `bytes_view` (borrowed when the storage is immutable `bytes`).
 /// Every other input (a `bytes` subclass, a `bytearray`, a custom exporter) is read by
 /// `bytes(obj)` itself, so it gets exactly the semantics of the `bytes(data)` coercion these
-/// bindings replaced: `__bytes__` first, then a single export. `retrieve` and
-/// `check_msgpack_structure` keep the strict `bytes_view` on purpose.
+/// bindings replaced: `__bytes__` first, then a single export. `retrieve`,
+/// `check_msgpack_structure` and `unpackb_standard` keep the strict `bytes_view` on purpose.
 #[cfg(feature = "encryption")]
 fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
     if !(obj.is_exact_instance_of::<PyBytes>() || obj.is_exact_instance_of::<PyMemoryView>()) {

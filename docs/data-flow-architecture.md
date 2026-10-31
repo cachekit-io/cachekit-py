@@ -134,7 +134,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  STEP 6: DESERIALIZATION (Bytes → Python Objects)                           │
 │  File: src/cachekit/cache_handler.py (_deserialize_bytes)                   │
 │  File: src/cachekit/serializers/standard_serializer.py                       │
-│  File: rust/src/byte_storage.rs                                             │
+│  File: rust/src/python_bindings.rs (cachekit-core ByteStorage)              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  _deserialize_bytes(data: bytes) → Python object                            │
 │                                                                             │
@@ -153,7 +153,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  ┌────────────────────────────────────────────────────────────┐             │
 │  │ Path 2: Rust ByteStorage (Compressed MessagePack)          │             │
 │  │   ByteStorage.retrieve(envelope_bytes)                     │             │
-│  │     ↓ Rust layer (byte_storage.rs)                         │             │
+│  │     ↓ Rust layer (cachekit-core)                           │             │
 │  │   1. Deserialize envelope (MessagePack)                    │             │
 │  │   2. Security checks (size limits, compression ratio)      │             │
 │  │   3. LZ4 decompress                                        │             │
@@ -238,7 +238,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  STEP 14: SERIALIZATION (Python Objects → Redis)                            │
 │  File: src/cachekit/serializers/standard_serializer.py                       │
-│  File: rust/src/byte_storage.rs                                             │
+│  File: rust/src/python_bindings.rs (cachekit-core ByteStorage)              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  StandardSerializer.serialize(result) → (bytes, metadata)                    │
 │                                                                             │
@@ -594,7 +594,7 @@ def observability_function():
 
 ## Serialization Path
 
-**Files:** `src/cachekit/serializers/standard_serializer.py`, `rust/src/byte_storage.rs`
+**Files:** `src/cachekit/serializers/standard_serializer.py`, `rust/src/python_bindings.rs` (cachekit-core's ByteStorage)
 
 cachekit v0.1.0 uses only:
 
@@ -641,7 +641,7 @@ import msgpack
 # Python layer
 msgpack_data = msgpack.packb(obj)
 
-# Rust layer (byte_storage.rs) - conceptual flow:
+# Rust layer (cachekit-core ByteStorage) - conceptual flow:
 # 1. LZ4 compress
 # 2. xxHash3-64 checksum
 # 3. Create StorageEnvelope {
@@ -715,7 +715,7 @@ except BackendError as e:
 
 ## Deserialization Path
 
-**Files:** `src/cachekit/serializers/standard_serializer.py`, `rust/src/byte_storage.rs`
+**Files:** `src/cachekit/serializers/standard_serializer.py`, `rust/src/python_bindings.rs` (cachekit-core's ByteStorage), `rust/src/msgpack_decode.rs`
 
 ### Deserialization Flow
 
@@ -824,8 +824,8 @@ For measured latencies, see the Performance Guide's [GitHub-Hosted Runner](perfo
 **Serialization Layer:**
 - `src/cachekit/serializers/standard_serializer.py` - StandardSerializer (MessagePack + ByteStorage)
 - `src/cachekit/serializers/encryption_wrapper.py` - EncryptionWrapper (AES-256-GCM)
-- `rust/src/byte_storage.rs` - Rust ByteStorage (LZ4 + xxHash3-64)
-- `rust/src/encryption/` - Rust encryption module
+- `rust/src/python_bindings.rs` - bindings to cachekit-core's ByteStorage (LZ4 + xxHash3-64) and encryption
+- `rust/src/msgpack_decode.rs` - StandardSerializer's bounded one-pass MessagePack decode
 
 **Connection Layer:**
 - `src/cachekit/connection.py` - Redis connection pooling (used by RedisBackend)

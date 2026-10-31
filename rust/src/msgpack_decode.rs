@@ -466,13 +466,20 @@ pub fn unpackb_standard(
             ));
         }
         Err(Fail::Py) => PyErr::fetch(py),
-        Err(Fail::Bound) => {
-            PyValueError::new_err("Unpack failed: MessagePack document breaks a decode bound")
-        }
+        // Only reachable if this decoder's inline accounting drifts from the walk: the walk below
+        // then accepts what the decode refused. Fails closed, without the guard's own prefix, so a
+        // drift cannot pass for a refused hostile document.
+        Err(Fail::Bound) => PyValueError::new_err(
+            "MessagePack decode bound disagrees with the structure walk (internal error)",
+        ),
     };
     // The walk's verdict wins over anything the decode raised, as it does when it runs first.
-    check_msgpack_structure(data, max_depth).map_err(|what| {
-        PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
-    })?;
+    check_msgpack_structure(data, max_depth).map_err(structure_error)?;
     Err(failure)
+}
+
+/// The ValueError for a document `check_msgpack_structure` refused: `Unpack failed: MessagePack
+/// document <what>`, the text the bounds tests pin as the guard's own.
+pub(crate) fn structure_error(what: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
 }
