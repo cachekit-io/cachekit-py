@@ -160,10 +160,8 @@ class TestIntentBasedSecure:
 class TestIntentBasedDev:
     """Dev profile: Verbose logging, easy debugging."""
 
-    def test_dev_config_prometheus_disabled(self):
-        """Dev preset disables Prometheus for local development."""
-        config = DecoratorConfig.dev(backend=None)
-        assert config.monitoring.enable_prometheus_metrics is False
+    # That @cache.dev records no cache-operation series is checked by behaviour in
+    # tests/unit/test_prometheus_metrics_switch.py.
 
     def test_dev_config_structured_logging_enabled(self):
         """Dev preset enables structured logging."""

@@ -296,9 +296,13 @@ class MonitoringConfig:
     Controls collection of statistics, structured logging, and metrics export.
 
     Attributes:
-        collect_stats: Collect cache hit/miss statistics (default: True)
+        collect_stats: Record the three Prometheus cache-operation series (default: True)
         enable_structured_logging: Log cache operations at INFO, with their fields on each record (default: True)
-        enable_prometheus_metrics: Export Prometheus metrics (default: True)
+        enable_prometheus_metrics: Record the three Prometheus cache-operation series (default: True)
+
+    collect_stats and enable_prometheus_metrics each gate the three cache-operation series
+    (cache_operations_total, cache_operation_duration_ms, cache_operation_size_bytes): either one
+    False stops them. cache_info() counts hits and misses regardless.
 
     Examples:
         Create with defaults (all monitoring enabled):

@@ -66,11 +66,12 @@ scrape_configs:
 
 ### Which Decorators Record
 
-The three cache-operation series record for a decorator that has a backend and
-`MonitoringConfig.collect_stats=True`, the default: `cache_operations_total` and
+The three cache-operation series record for a decorator that has a backend and both
+`MonitoringConfig.collect_stats` and `MonitoringConfig.enable_prometheus_metrics` set to `True`, the
+defaults: `cache_operations_total` and
 `cache_operation_duration_ms` record `get` and `set` operations, and `cache_operation_size_bytes`
 records `get` hits only. That covers `@cache`,
-`@cache.production`, `@cache.secure`, `@cache.dev` and `@cache.io`. The rest record less:
+`@cache.production`, `@cache.secure` and `@cache.io`. The rest record less:
 
 - An L1-only decorator records only failures in them, such as
   `cache_operations_total{operation="key_generation",success="False",serializer="unknown"}` when
@@ -78,6 +79,7 @@ records `get` hits only. That covers `@cache`,
   ([Backend Resolution Priority](../backends/README.md#backend-resolution-priority)).
 - `@cache.minimal` and `@cache.test` record nothing in them: they set `collect_stats=False`
   ([Configuration](#configuration)). Neither does `@cache.local`.
+- `@cache.dev` records nothing in them: it sets `enable_prometheus_metrics=False`.
 
 `cache_info()` counts hits and misses on every decorator, these included.
 
@@ -291,9 +293,10 @@ sum by (namespace) (circuit_breaker_state{state="OPEN"})
 
 ### Disable Metrics
 
-`MonitoringConfig.collect_stats` (default: `True`) controls the three cache-operation series.
-Setting it to `False` stops that decorator recording them; `cache_info()` keeps counting. It has
-no effect on exposition, which your app owns regardless.
+`MonitoringConfig.collect_stats` and `MonitoringConfig.enable_prometheus_metrics` (both default
+`True`) each control the three cache-operation series. Setting either to `False` stops that
+decorator recording them; `cache_info()` keeps counting. Neither has any effect on exposition,
+which your app owns regardless.
 
 ```python
 from cachekit import cache
@@ -307,9 +310,17 @@ def operation(x):
     return compute(x)
 ```
 
-> `MonitoringConfig.enable_prometheus_metrics` is not read at runtime: setting it to `False`
-> leaves every series recording. The presets that set it are no exception, so `@cache.dev`
-> records the cache-operation series as `@cache.production` does. Use `collect_stats`.
+`@cache.dev` sets `enable_prometheus_metrics=False`, so it records none of the three series. To
+record them on a dev decorator, pass a monitoring config back:
+
+```python
+from cachekit import cache
+from cachekit.config.nested import MonitoringConfig
+
+@cache.dev(monitoring=MonitoringConfig())  # Cache-operation series back on
+def debug_operation(x):
+    return compute(x)
+```
 
 ### Series That Ignore `MonitoringConfig`
 
