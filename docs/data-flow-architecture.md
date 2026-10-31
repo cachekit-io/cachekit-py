@@ -485,10 +485,10 @@ L1-only mode (`backend=None`) skips this layer: it stores the Python object itse
 - **After refactor**: Stores bytes (encrypted or plaintext) → `len(bytes)` for size estimation
 - **Performance improvement**: O(1) size calculation vs recursive traversal
 - **Security improvement**: Encrypted bytes at rest (decrypt-at-read-time only)
-- **Kept entries**: L1 stores, admits and evicts envelopes. The first L1 hit on a plaintext entry of the default serializer with integrity checking on decodes the envelope as every read does: `ByteStorage.retrieve()` verifies the MessagePack, the structure walk (`check_msgpack_structure`) bounds it, and the decoder's object hook restores datetimes. L1 then holds the entry marked as walked from then on (same expiry and LRU place): the verified MessagePack (`VerifiedMsgpack`) when it is no longer than the envelope, else the envelope itself (`WalkedEnvelope`). Each records whether any of the strings `__datetime__`, `__date__` or `__time__` (or text starting `__date`) appears anywhere in the MessagePack. Later hits skip the walk, since the bytes cannot change, and skip the object hook only when none appears, since the hook would then return every map unchanged; held MessagePack also skips the decompress and checksum. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. The swap never grows an entry, so L1 never holds fewer entries than it would hold envelopes, and it never touches an entry stored or removed since the hit read it. Bytes from L2, and bytes still held as bytes, never take this path: L1 marks a kept entry by its type, which no backend returns, so they are walked on every decode
+- **Kept entries**: L1 stores, admits and evicts envelopes. The first L1 hit on a plaintext entry of the default serializer with integrity checking on decodes the envelope as every read does: `ByteStorage.retrieve()` verifies the MessagePack, and the Rust decode (`unpackb_standard`) bounds and decodes it in one pass. L1 then holds the entry marked as verified from then on (same expiry and LRU place): the verified MessagePack (`VerifiedMsgpack`) when it is no longer than the envelope, else the envelope itself (`WalkedEnvelope`). Held MessagePack skips the decompress and checksum on later hits; a held envelope skips the frame's header checks. Every hit still runs the bounded decode. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. The swap never grows an entry, so L1 never holds fewer entries than it would hold envelopes, and it never touches an entry stored or removed since the hit read it. Bytes from L2, and bytes still held as bytes, never skip `retrieve()`: L1 marks a kept entry by its type, which no backend returns
 
 **Hierarchical Read Path:**
-1. Check L1 cache (bytes) → if hit, deserialize and return (the first hit on a plaintext entry of the default serializer with integrity checking on marks it as walked, so later hits skip the structure walk, and the object hook when no datetime marker string appears in it)
+1. Check L1 cache (bytes) → if hit, deserialize and return (the first hit on a plaintext entry of the default serializer with integrity checking on marks it as verified, so later hits on held MessagePack skip the decompress and checksum)
 2. If L1 miss, check L2 backend (bytes) → if hit, deserialize, populate L1 with bytes, return
 3. If L2 miss, execute function → serialize to bytes → store in L2 and L1 → return
 
@@ -733,8 +733,10 @@ def deserialize(data: bytes, metadata) -> Any:
     #   4. xxHash3-64 validate
     #   5. Size validate
 
-    # MessagePack unpack
-    return msgpack.unpackb(original_data)
+    # MessagePack decode (StandardSerializer): one Rust pass that enforces the untrusted-decode
+    # bounds (nesting <= 1,024; no header claiming more than the input can back), builds the
+    # Python objects, and runs the datetime hook only on maps holding a marker key.
+    return unpackb_standard(original_data, MSGPACK_MAX_NESTING, _standard_object_hook)  # illustrative
 ```
 
 ### Security Protections
