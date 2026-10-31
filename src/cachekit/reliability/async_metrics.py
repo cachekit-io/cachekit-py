@@ -5,6 +5,7 @@ shared lock and a scrape is exact at once. Generic counters and histograms recor
 batching worker.
 """
 
+import atexit
 import logging
 import math
 import numbers
@@ -549,6 +550,8 @@ class _ThreadState:
         return slots
 
     def __del__(self) -> None:
+        if not _live:  # the interpreter is exiting, so nothing can read the counts; its teardown may have cleared our globals
+            return
         move = partial(_retire_thread, self.ops, list(self.slots.values()))
         if not _defer_if_nested(move):
             with _locked():
@@ -570,6 +573,10 @@ def _retire_thread(ops: dict[object, int], slots: list[list[Optional[_Slot]]]) -
 
 
 _tls = threading.local()
+# Non-empty until exit. atexit runs after non-daemon threads are joined and before teardown sets module globals to None,
+# after which a _ThreadState freed by the teardown (_live is None then) could not retire its counts.
+_live = [True]
+atexit.register(_live.clear)
 # Every live thread's operation counts, keyed by id() of its _ThreadState's ops dict, and the counts of threads that
 # exited, per collector token. Both guarded by _shard_lock(). A forked child keeps its parent's threads' counts here.
 _thread_ops: dict[int, dict[object, int]] = {}
