@@ -9,8 +9,6 @@ import gc
 import os
 import signal
 import threading
-import time
-import types
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
@@ -19,17 +17,13 @@ from typing import Any
 import pytest
 
 from cachekit import cache, object_cache
+from cachekit._rust_serializer import monotonic
 from cachekit.config import L1CacheConfig
 from cachekit.object_cache import ObjectCache, _estimate_object_size
+from tests.utils.clock import fake_clock as _fake_clock
+from tests.utils.clock import shared_clock
 from tests.utils.fork_helpers import child_outcome, on_new_thread, report
 from tests.utils.timing_helper import TimingHelper
-
-
-def _fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> types.SimpleNamespace:
-    """Replace ObjectCache's clock with one that reads start until the test sets its monotonic."""
-    fake_time = types.SimpleNamespace(monotonic=lambda: start)
-    monkeypatch.setattr("cachekit.object_cache.time", fake_time)
-    return fake_time
 
 
 @pytest.mark.unit
@@ -78,8 +72,7 @@ class TestObjectCacheTTL:
 
     def test_expired_entry_returns_miss(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Entry past its TTL must be treated as a miss and removed."""
-        fake_time = types.SimpleNamespace(monotonic=lambda: 1000.0)
-        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
+        fake_time = _fake_clock(monkeypatch)
 
         oc = ObjectCache()
         oc.put("k", "value", ttl=10)  # expires_at = 1010.0
@@ -101,8 +94,7 @@ class TestObjectCacheTTL:
 
     def test_put_evicts_expired_before_lru(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When full, expired entries are evicted before the LRU fresh entry."""
-        fake_time = types.SimpleNamespace(monotonic=lambda: 1000.0)
-        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
+        fake_time = _fake_clock(monkeypatch)
 
         oc = ObjectCache(max_entries=3)
         oc.put("a", "A", ttl=10)  # expires_at = 1010.0 (will expire)
@@ -967,11 +959,11 @@ class TestObjectCacheFork:
 
         def fork_here() -> float:  # get() reads the clock inside its critical section
             nonlocal child
-            monkeypatch.setattr("cachekit.object_cache.time", time)
+            shared_clock.fake = None  # the real clock again, so only this read forks
             child = os.fork()
-            return time.monotonic()
+            return monotonic()
 
-        monkeypatch.setattr("cachekit.object_cache.time", types.SimpleNamespace(monotonic=fork_here))
+        monkeypatch.setattr(shared_clock, "fake", fork_here)
         try:
             found = oc.get("k")
         except BaseException as e:
@@ -1002,7 +994,7 @@ class TestObjectCacheFork:
 
         def fork_here() -> float:
             nonlocal child
-            monkeypatch.setattr("cachekit.object_cache.time", time)
+            shared_clock.fake = None
             child = os.fork()
             if child == 0:
                 try:  # this thread holds the old lock for good, so new threads must not need it
@@ -1013,9 +1005,9 @@ class TestObjectCacheFork:
                 except BaseException as e:
                     outcome = {"error": repr(e)}
                 report(w, outcome)
-            return time.monotonic()
+            return monotonic()
 
-        monkeypatch.setattr("cachekit.object_cache.time", types.SimpleNamespace(monotonic=fork_here))
+        monkeypatch.setattr(shared_clock, "fake", fork_here)
         assert oc.get("pre-fork") == (True, "v")
         os.close(w)
         assert child, "get() no longer reads the clock"
@@ -1034,8 +1026,7 @@ class TestSWRJitterDraw:
     """get_with_swr draws its ±10% jitter only where the draw can change the answer."""
 
     def test_no_draw_below_the_jittered_threshold_and_a_draw_above_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        clock = types.SimpleNamespace(monotonic=lambda: 1000.0)
-        monkeypatch.setattr("cachekit.object_cache.time", clock)
+        clock = _fake_clock(monkeypatch)
         draws: list[tuple[float, float]] = []
 
         def uniform(a: float, b: float) -> float:

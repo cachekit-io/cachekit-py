@@ -24,7 +24,6 @@ import sys
 import threading
 import time
 import traceback
-import types
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -35,7 +34,6 @@ import pytest
 import time_machine
 
 from cachekit import cache
-from cachekit import object_cache as object_cache_module
 from cachekit.backends.errors import BackendError
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.nested import L1CacheConfig
@@ -45,6 +43,7 @@ from cachekit.decorators.tenant_context import ContextVarExtractor
 from cachekit.l1_cache import L1Cache, get_l1_cache_manager
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitState
 from cachekit.serializers.standard_serializer import VerifiedMsgpack
+from tests.utils.clock import shared_clock
 
 pytestmark = pytest.mark.unit
 
@@ -152,14 +151,14 @@ def _clear_l1() -> Iterator[None]:
 
 @pytest.fixture
 def advance(monkeypatch: pytest.MonkeyPatch) -> Callable[[float], None]:
-    """Move ObjectCache's clock forward, and nothing else's (the event loop keeps real time)."""
+    """Move the clock ObjectCache and the lock-free hit share forward, and nothing else's (the event
+    loop keeps real time)."""
     offset = 0.0
-    real = time.monotonic
 
-    def monotonic() -> float:
-        return real() + offset
+    def clock() -> float:
+        return time.monotonic() + offset  # not monotonic(): that reads this clock once installed
 
-    monkeypatch.setattr(object_cache_module, "time", types.SimpleNamespace(monotonic=monotonic))
+    monkeypatch.setattr(shared_clock, "fake", clock)
 
     def shift(seconds: float) -> None:
         nonlocal offset

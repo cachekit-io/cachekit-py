@@ -22,6 +22,10 @@ pub mod python_bindings;
 // own tests run in the pure-Rust test build too.
 pub mod hit_counter;
 
+// The decorator's memoised L1-only hit, answered without a lock (decorators/wrapper.py).
+#[cfg(feature = "python")]
+pub mod l1_hit;
+
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
@@ -33,8 +37,12 @@ use pyo3::prelude::*;
 /// exposes only `&self` methods except `Keyring.for_tenant`, whose `&mut self` borrow
 /// PyO3 checks at run time (a concurrent call raises, never races), and in the features enabled here
 /// cachekit-core's only shared state is its `AtomicU64` nonce counters (its
-/// `Mutex` handle registry is behind the `ffi` feature, which is off) — no
-/// interior mutability the GIL was papering over. PyO3
+/// `Mutex` handle registry is behind the `ffi` feature, which is off). `l1_hit`'s
+/// shared state is atomics (an entry's liveness and recency, the tests' clock
+/// override), a `OnceLock` (the clock's zero), one `Mutex` per entry (its memo
+/// keys, written only under ObjectCache's lock and never held across Python
+/// code), and each memo's Python dict, whose single operations free-threaded
+/// CPython runs atomically — no interior mutability the GIL was papering over. PyO3
 /// enforces `Send + Sync` on every pyclass at compile time.
 #[cfg(feature = "python")]
 #[pymodule(gil_used = false)]
@@ -44,6 +52,13 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Per-function L1-hit statistics, counted without a lock (decorators/wrapper.py)
     m.add_class::<hit_counter::PyHitCounter>()?;
+
+    // The memoised L1-only hit, its entries and their clock (decorators/wrapper.py, object_cache.py)
+    m.add_class::<l1_hit::HitMemo>()?;
+    m.add_class::<l1_hit::HitEntry>()?;
+    m.add_function(wrap_pyfunction!(l1_hit::memo_key, m)?)?;
+    m.add_function(wrap_pyfunction!(l1_hit::monotonic, m)?)?;
+    m.add_function(wrap_pyfunction!(l1_hit::set_clock, m)?)?;
 
     // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the

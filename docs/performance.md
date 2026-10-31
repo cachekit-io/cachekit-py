@@ -9,11 +9,11 @@
 ## Key Numbers
 
 > [!TIP]
-> **Key numbers** (mean of five run medians; GitHub-hosted `ubuntu-latest` runner, AMD EPYC 7763, CPython 3.14.7, 2026-10-23; see [GitHub-Hosted Runner](#github-hosted-runner)):
-> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 0.906 ± 0.007μs (about 10,900 instructions per call on CPython 3.14, see [Instruction Budgets](#instruction-budgets))
-> - **Same hit, 10K-row DataFrame**: 0.91 ± 0.01μs. An L1-only hit never serializes, so payload size barely matters
-> - **Decorator + L1 hit with an L2 backend configured, same dict**: 310 ± 20μs. With a backend, L1 holds bytes and every hit deserializes them. This dict compresses, so L1 holds its envelope. Measured before hits stopped re-checking bytes they had already checked, which took about 20% off this hit; see [Why an L1-Only Hit Costs the Same for Any Payload](#why-an-l1-only-hit-costs-the-same-for-any-payload)
-> - **Redis L2 hit**, L1 disabled, same dict, Redis in a container on the same runner: 551 ± 18μs
+> **Key numbers** (mean of five run medians; GitHub-hosted `ubuntu-latest` runner, AMD EPYC 7763, CPython 3.14.7, 2026-10-31; see [GitHub-Hosted Runner](#github-hosted-runner)):
+> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 0.311 ± 0.000μs (about 2,500 instructions per call on CPython 3.14, see [Instruction Budgets](#instruction-budgets))
+> - **Same hit, 10K-row DataFrame**: 0.31 ± 0.00μs. An L1-only hit never serializes, so payload size barely matters
+> - **Decorator + L1 hit with an L2 backend configured, same dict**: 284 ± 2μs. With a backend, L1 holds bytes and every hit deserializes them. This dict compresses, so L1 holds its envelope. Measured before hits stopped re-checking bytes they had already checked, which took about 20% off this hit; see [Why an L1-Only Hit Costs the Same for Any Payload](#why-an-l1-only-hit-costs-the-same-for-any-payload)
+> - **Redis L2 hit**, L1 disabled, same dict, Redis in a container on the same runner: 539 ± 3μs
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns on a shared x86_64 Linux host (see [Measured Figures](#measured-figures))
 
 ## Measurement Methodology
@@ -44,19 +44,19 @@ uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_sta
 
 ### GitHub-Hosted Runner
 
-The `Bench` workflow (`.github/workflows/bench.yml`) runs five guards from `tests/performance/` on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. [Its run on 2026-10-23](https://github.com/cachekit-io/cachekit-py/actions/runs/39987019881) used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
+The `Bench` workflow (`.github/workflows/bench.yml`) runs five guards from `tests/performance/` on a GitHub-hosted `ubuntu-latest` runner and writes their run medians into its job summary; run it from the Actions tab to refresh this table. The README quotes it. [Its run on 2026-10-31](https://github.com/cachekit-io/cachekit-py/actions/runs/41178786512) used an AMD EPYC 7763 (4 vCPUs), CPython 3.14.7 and Redis 7 in a container on the same runner. That is a different machine from the table above, so compare figures within one table.
 
 | Path | Guard (`tests/performance/`) | Run median |
 |------|------------------------------|-----------:|
-| Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as MessagePack) | `test_production_realism.py::test_decorator_overhead_complex_dict` | 0.906 ± 0.007μs |
-| Decorator + L1 hit, `@cache(backend=None, serializer="auto")`, 10K-row DataFrame | `test_production_realism.py::test_decorator_overhead_dataframe` | 0.91 ± 0.01μs |
-| Decorator + L1 hit with an L2 backend configured (in-process, never reached), same 100-user dict | `test_production_realism.py::test_decorator_overhead_l1_hit_with_backend` | 310 ± 20μs (before the walk skip, see [Key Numbers](#key-numbers)) |
-| Same hit, plaintext and encrypted arms, interleaved | `test_production_realism.py::test_encryption_overhead` | 313 ± 10μs and 323 ± 20μs |
-| Redis L2 hit, L1 disabled, same 100-user dict | `test_production_realism.py::test_redis_l2_roundtrip` | 551 ± 18μs |
+| Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as MessagePack) | `test_production_realism.py::test_decorator_overhead_complex_dict` | 0.311 ± 0.000μs |
+| Decorator + L1 hit, `@cache(backend=None, serializer="auto")`, 10K-row DataFrame | `test_production_realism.py::test_decorator_overhead_dataframe` | 0.31 ± 0.00μs |
+| Decorator + L1 hit with an L2 backend configured (in-process, never reached), same 100-user dict | `test_production_realism.py::test_decorator_overhead_l1_hit_with_backend` | 284 ± 2μs (before the walk skip, see [Key Numbers](#key-numbers)) |
+| Same hit, plaintext and encrypted arms, interleaved | `test_production_realism.py::test_encryption_overhead` | 286 ± 1μs and 295 ± 1μs (before the walk skip) |
+| Redis L2 hit, L1 disabled, same 100-user dict | `test_production_realism.py::test_redis_l2_roundtrip` | 539 ± 3μs |
 
 The job summary prints each figure in the unit its guard reports: the dict's L1-only hit, the hit with a backend configured and the encryption arms in ns, the DataFrame hit and the Redis L2 hit in μs. This table is in μs, so divide the ns figures by 1,000 when you copy them in.
 
-The encryption guard's arms differ by 10 ± 21μs (Welch 95%), inside the noise: an encrypted hit adds a decrypt, and no hosted run has pinned that cost down (see [Not Measured Here](#not-measured-here)). Hosted runners do not always get the same CPU model: [a run of an earlier commit on an AMD EPYC 9V45 runner](https://github.com/cachekit-io/cachekit-py/actions/runs/39964388582/attempts/2) took 44-59% as long on every row (0.529μs for the dict's L1-only hit, 242 ± 12μs for the Redis L2 hit).
+The dict's L1-only hit timed 311ns in every one of its five runs. The encryption guard's arms differ by 9.3 ± 1.0μs (Welch 95%): an encrypted hit adds a decrypt. Both arms were measured before the walk skip, which plaintext hits take and encrypted hits do not (see [Why an L1-Only Hit Costs the Same for Any Payload](#why-an-l1-only-hit-costs-the-same-for-any-payload)). That is the first hosted run whose band excludes zero, and [the 2026-10-23 run](https://github.com/cachekit-io/cachekit-py/actions/runs/39987019881) put the difference at 10 ± 21μs, so one run does not pin the cost down (see [Not Measured Here](#not-measured-here)). Under the object cache's lock, as it ran until the lock-free hit, that hit took 0.906 ± 0.007μs in the 2026-10-23 run and 0.874 ± 0.005μs in [a run on an EPYC 7763 the same day as the table's](https://github.com/cachekit-io/cachekit-py/actions/runs/41177503539). Hosted runners do not always get the same CPU model: [a run of an earlier commit on an AMD EPYC 9V45 runner](https://github.com/cachekit-io/cachekit-py/actions/runs/39964388582/attempts/2) took 44-59% as long on every row (0.529μs for the dict's L1-only hit, 242 ± 12μs for the Redis L2 hit).
 
 The workflow runs these guards with this command, against a Redis it starts on the runner:
 
@@ -69,41 +69,47 @@ Without `REDIS_URL`, the Redis guard uses the pytest-redis server the suite star
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
 
-With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict and a 10K-row DataFrame cost about the same: 0.906μs and 0.91μs on the hosted EPYC 7763, for finding the key, the lookup and the decorator's bookkeeping.
+With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict and a 10K-row DataFrame cost about the same: 0.311μs and 0.31μs on the hosted EPYC 7763, for the wrapper's call and one lookup in the extension (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path)).
 
-With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. For the 100-user dict it took 310 ± 20μs on the same runner, measured before the walk skip described below, about 340 times an L1-only hit of the same dict. Nearly all of the difference is deserializing 23.5KB of MessagePack back into about 400 nested dicts. It is still about half of a Redis L2 hit there (551 ± 18μs), which deserializes the same bytes after the round trip.
+With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. For the 100-user dict it took 284 ± 2μs on the same runner, measured before the walk skip described below, about 910 times an L1-only hit of the same dict. Nearly all of the difference is deserializing 23.5KB of MessagePack back into about 400 nested dicts. It is still about half of a Redis L2 hit there (539 ± 3μs), which deserializes the same bytes after the round trip.
 
 For a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit decodes it as every read does, under the structure walk that bounds untrusted MessagePack, and then L1 holds the entry marked as walked: its verified MessagePack when that is no longer than the envelope, which is true of small values and incompressible ones, and otherwise the envelope itself. Later hits skip the walk, because the bytes it passed cannot change. They also skip the decoder's object hook when none of the strings `__datetime__`, `__date__` or `__time__` (or any text starting `__date`) appears anywhere in the MessagePack, because the hook would then hand back every map unchanged, and a hit on held MessagePack skips the envelope's LZ4 decompress and xxHash3-64 checksum as well. Bytes read from L2 are walked on every read. The 100-user dict compresses to a 3,171-byte envelope from 23.5KB of MessagePack, so L1 keeps its envelope, and its hits skip the walk and the hook: on CPython 3.14.3 the hit fell from 2,731,277 to 2,192,392 instructions (−19.7%, callgrind with the [Instruction Budgets](#instruction-budgets) method; no budget gates this path yet), and an interleaved wall-clock run on a shared x86_64 Linux host put it 20.9% faster (median of 12 paired processes; the base against itself, −1.2%). The same dict with datetimes in it keeps the hook and fell 5.6%. The hosted figures above were measured before this change. Encrypted caches always keep the ciphertext envelope, and every hit on one still decrypts, walks and runs the hook.
 
 ### Decorator + L1 Hit (Hot Path)
 
-An L1-only hit takes 0.906μs for the 100-user dict and 0.91μs for the DataFrame on the hosted EPYC 7763 ([GitHub-Hosted Runner](#github-hosted-runner)). What it runs:
+An L1-only hit takes 0.311μs for the 100-user dict and 0.31μs for the DataFrame on the hosted EPYC 7763 ([GitHub-Hosted Runner](#github-hosted-runner)). The wrapper makes one call into the extension (`HitMemo.get`), which takes no lock and runs:
 
-- **The key, from a memo.** Each L1-only function remembers the cache key it built for each argument tuple, so a repeat call skips key generation (normalising the arguments, MessagePack, BLAKE2b). The memo takes a call only when it has at most 8 arguments, every one an `int`, `float`, `bool`, `None`, `str` or `bytes` matched by its exact type, and its strings, bytes and keyword names hold at most 256 characters between them. Matching exact types keeps `1`, `1.0` and `True`, which compare equal, on their own keys. The memo holds up to 1,024 argument tuples per function and is emptied when full. Any other call (a list, a dict, a `datetime`, an `IntEnum`, longer strings) builds its key every time: a hit with one list argument costs about seven times the instructions of a memoised one. The keys themselves are unchanged.
-- **The lookup** in the object cache, which also keeps its LRU order and checks the entry's TTL.
-- **The hit count** for `cache_info()`, on a lock-free counter.
+- **The memo key.** The call's arguments become a key: one `int` or `str` argument is its own key, and any other call's key holds its argument tuple. The memo takes a call only when it has at most 8 arguments, every one an `int`, `float`, `bool`, `None`, `str` or `bytes` matched by its exact type, and its strings, bytes and keyword names hold at most 256 characters between them. A `float`, `bool` or `bytes` puts the argument types in the key, so `1`, `1.0` and `True`, which compare equal, keep their own slots. Any other call (a list, a dict, a `datetime`, an `IntEnum`, longer strings) builds its cache key every time and looks it up under the object cache's lock: a hit with one list argument costs about 22 times the instructions of a memoised one. The cache keys themselves are unchanged.
+- **One dict lookup** in the function's memo, for the entry the object cache stored for that key.
+- **Its liveness and deadline.** The entry must still be stored, and its deadline not yet reached: its hard expiry, or with SWR the earliest point a refresh could be flagged (`ttl * swr_threshold_ratio * 0.9` after it was stored), past which the hit goes to the lock, which decides on the refresh.
+- **The function's names.** The memo answers only while the function's `__module__` and `__qualname__` are the objects it was built with, as its cache keys embed them: renaming the function re-keys its calls.
+- **The use time** for the cache's LRU order, and **the hit count** for `cache_info()`, both atomic.
 
-A memoised L1-only hit runs nothing that reads the stats context backend calls use, so it does not set one, and it records no Prometheus metric. A miss takes one more Python frame than it used to, so a recursive `@cache(backend=None)` function reaches the recursion limit sooner: on CPython 3.14 at the default limit of 1,000, it recurses 198 levels deep instead of 247.
+A memoised L1-only hit runs nothing that reads the stats context backend calls use, so it does not set one, and it records no Prometheus metric. A miss takes more Python frames than it did before the memo, so a recursive `@cache(backend=None)` function reaches the recursion limit sooner: on CPython 3.14 at the default limit of 1,000, it recurses 197 levels deep instead of 247.
 
-The memo keeps the arguments it is keyed by until an invalidation erases their key: `invalidate_cache()` with any arguments that build that key (a `Path` builds the same key as its string), `invalidate_cache()` with none, or `cache_clear()`. Full, it holds about 330KiB when each call passes one `int`, and under 4.5MiB when every call fills its 256 characters with 4-byte ones, the most a call can make it keep (3.7 to 4.0MiB measured on CPython 3.10, 3.12, 3.14 and free-threaded 3.14).
+The object cache keeps the memo in step under its lock. A store, or a read under the lock, points the call's slot at its entry, and every removal (expiry, eviction, `invalidate_cache()`, `cache_clear()`, the reset in a forked child) ends the entry's hits and drops its slots before it returns. So a hit never serves a value once its removal has returned, and the memo keeps no removed value. It keeps a call's arguments only while their slot lasts, and at most 1,024 slots per function: a full memo empties before it takes a new key. Full, it holds about 110 to 140KiB when each call passes one `int`, and under 4.5MiB when every call fills its 256 characters with 4-byte ones, the most a call can make it keep (3.5 to 3.8MiB measured on CPython 3.12, 3.14 and free-threaded 3.14 and 3.15).
 
 Only an L1-only function keeps a memo. A function with a backend builds its key on every call, as it did before the memo: other processes can invalidate its entries, and the memo would keep the arguments they erase; with L1 off, the process keeps nothing else from a call; and an encrypted function must keep no plaintext argument. Its key is also a small part of what its hit costs.
 
 With ten threads calling one function on the same key at once, `test_concurrent_cache_access` times each call once its thread is running: execution time after scheduling, not request latency. Each sample starts inside its thread's loop, so on a GIL build, where only one thread runs Python at a time, the time a thread waits for its turn falls outside every sample. Its last figures predate the memo, and the hosted workflow does not run it. No guard measures how long a request waits under contention.
 
-The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **10,900 instructions per call** on CPython 3.14 and 11,600 on 3.12, against about 60,000 before the memo and the fast path.
+The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **2,500 instructions per call** on CPython 3.14 and 2,600 on 3.12, against 10,900 and 11,600 when the hit took the object cache's lock, and about 60,000 before the memo and the fast path.
 
-The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-only hit uses a separate object cache, whose lookup no guard times on its own.
+The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-only hit does not use that cache.
 
 ### L1-Only Miss at a Full Budget
 
-An L1-only miss stores its result in the object cache. Once the function's byte budget (`l1_max_size_mb`, 100MB by default) is full, each store first removes the entries that have expired, then evicts least-recently-used ones until the new value fits. Expired entries go first wherever they sit in LRU order, so an entry read just before it expired never pushes out a live one. A min-heap of deadlines finds them: when nothing has expired, the store looks at the earliest deadline and evicts, without scanning the cache for expired entries. The one exception is the heap rebuild described below. Before the heap, every such store scanned every entry while holding the lock the function's hits wait on, so with `ttl=None` (stored for a year, so nothing expires) each one cost time in proportion to the number of entries cached.
+An L1-only miss stores its result in the object cache. Once the function's byte budget (`l1_max_size_mb`, 100MB by default) is full, each store first removes the entries that have expired, then evicts least-recently-used ones until the new value fits. Expired entries go first wherever they sit in LRU order, so an entry read just before it expired never pushes out a live one. A min-heap of deadlines finds them: when nothing has expired, the store looks at the earliest deadline and evicts, without scanning the cache for expired entries. The one exception is the heap rebuild described below. Before the heap, every such store scanned every entry while holding the lock the function's misses and its hits under the lock wait on, so with `ttl=None` (stored for a year, so nothing expires) each one cost time in proportion to the number of entries cached.
 
-The `object_cache_put_full` row of the [instruction budgets](#instruction-budgets) measures a store into a full budget of 10,000 entries: about 160,000 instructions on CPython 3.14, most of it the size estimate of the stored value, against 5.64 million when every store scanned. The heap is memory the budget does not count: about 64 bytes per entry on CPython 3.12 and 72 on 3.14, plus one stale record for each entry removed or refreshed since the heap was last rebuilt. Once the stale records outnumber the entries, the store that finds it rebuilds the heap from the cache: one pass over the entries, about once per as many stores as there are entries.
+The least recently used entry is found without a scan too. A lock-free hit records the time of its use on the entry but cannot reorder the cache, so the cache of an L1-only function with a memo (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path)) keeps one LRU record per entry: each store files its entry's record in clock order, and an eviction that reaches an entry used since its record was filed re-files the record at that use, in a min-heap, and moves on. Evicting an entry unused since its store costs O(1), and each re-filed record O(log n). A cache whose hits all take the lock, as `@cache.local()`'s do, keeps its LRU order in the cache itself, as before.
+
+The `object_cache_put_full` row of the [instruction budgets](#instruction-budgets) measures a store into a full budget of 10,000 entries: about 160,000 instructions on CPython 3.14, most of it the size estimate of the stored value, against 5.64 million when every store scanned. A whole L1-only miss into a full 1MB budget, decorator and function included, costs about 238,800 instructions on CPython 3.14, 1.6% more than before the lock-free hit: each store also creates the record its hits read and points the memo at it, and each eviction ends them.
+
+The heap is memory the budget does not count: about 64 bytes per entry on CPython 3.12 and 72 on 3.14, plus one stale record for each entry removed or refreshed since the heap was last rebuilt. Once the stale records outnumber the entries, the store that finds it rebuilds the heap from the cache: one pass over the entries, about once per as many stores as there are entries. With a memo, each entry also carries the record its hits read and its LRU record, about 170 to 180 bytes per entry the budget does not count (CPython 3.12 and 3.14), and the LRU records are rebuilt the same way, sorted back into clock order.
 
 ## L2 Backend (Redis) Performance
 
-An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis in a container on the same runner takes 551 ± 18μs on the hosted EPYC 7763: the decorator, the round trip and deserialization. That is about 610 times an L1-only hit of the same dict on the same runner. A Redis on another machine adds its network latency on top; no guard measures that.
+An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis in a container on the same runner takes 539 ± 3μs on the hosted EPYC 7763: the decorator, the round trip and deserialization. That is about 1,730 times an L1-only hit of the same dict on the same runner. A Redis on another machine adds its network latency on top; no guard measures that.
 
 ## Latency by Serving Layer
 
@@ -120,7 +126,7 @@ uv run python tests/performance/terrain_canary.py --redis redis://localhost:6379
 ## Not Measured Here
 
 These have no figure from the run-level harness that supports a claim:
-- **Encryption overhead through the decorator**: `test_encryption_overhead` interleaves its plaintext and encrypted runs and prints both results, but the difference between the arms' run medians has stayed inside its own band in every pass on the 100-user dict, on a shared host and on the hosted runner ([GitHub-Hosted Runner](#github-hosted-runner)). That bounds nothing: decryption may cost little next to deserialization, or the noise may hide it. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
+- **Encryption overhead through the decorator**: `test_encryption_overhead` interleaves its plaintext and encrypted runs and prints both results. On the 100-user dict, the difference between the arms' run medians stayed inside its own band in every pass on a shared host and on the hosted runner until the 2026-10-31 hosted run, which put it at 9.3 ± 1.0μs ([GitHub-Hosted Runner](#github-hosted-runner)). One run that resolves it, after runs that did not, does not pin the cost down. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
 - **Request latency under contention**: the 10-thread guard times each call after its thread is scheduled (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
 - **The async decorator, serializer comparisons and a Redis on another machine**
 
@@ -141,8 +147,8 @@ def expensive_function(user_id: int):
 
 **L1 gives you** (hosted EPYC 7763 figures, [GitHub-Hosted Runner](#github-hosted-runner)):
 - No network round trip on a hit
-- An L1-only hit in 0.906μs, against 551μs for a Redis L2 hit of the same 100-user dict
-- With an L2 backend configured, an L1 hit of the 100-user dict in 310μs, measured before hits stopped re-checking bytes they had already checked (about 20% less since): it skips the round trip but still deserializes
+- An L1-only hit in 0.311μs, against 539μs for a Redis L2 hit of the same 100-user dict
+- With an L2 backend configured, an L1 hit of the 100-user dict in 284μs, measured before hits stopped re-checking bytes they had already checked (about 20% less since): it skips the round trip but still deserializes
 
 ### 2. Choose the Right Serializer
 
@@ -210,7 +216,7 @@ def get_historical_data(symbol: str, date: str):
 
 ### Bottleneck 1: The L2 Round Trip
 
-**Problem:** a Redis L2 hit takes 551μs on the hosted EPYC 7763, about 610 times an L1-only hit of the same 100-user dict (23.5KB as MessagePack). A Redis on another machine adds its network latency.
+**Problem:** a Redis L2 hit takes 539μs on the hosted EPYC 7763, about 1,730 times an L1-only hit of the same 100-user dict (23.5KB as MessagePack). A Redis on another machine adds its network latency.
 
 **Mitigations:**
 - **Keep L1 on** (the default), so repeat reads skip the round trip
@@ -220,11 +226,11 @@ def get_historical_data(symbol: str, date: str):
 
 ### Bottleneck 2: Decorator Overhead
 
-**Problem:** every decorated call pays for its cache key and the decorator's bookkeeping: 0.906μs per L1-only hit on the hosted EPYC 7763 when the key memo holds the call's key, and more when the memo does not take the call, so its key is built every time.
+**Problem:** every decorated call pays for its cache key and the decorator's bookkeeping: 0.311μs per L1-only hit on the hosted EPYC 7763 when the memo answers it, and more when the memo does not take the call, so its key is built every time.
 
 **Mitigations:**
 - **This is acceptable** for any function slow enough to be worth caching
-- **Pass scalar arguments** (`int`, short `str`, ...) to hot `backend=None` functions, so the key memo serves them (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
+- **Pass scalar arguments** (`int`, short `str`, ...) to hot `backend=None` functions, so the memo answers them (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
 - **Batch queries:** one call that returns many items pays the overhead once
 
 ### Bottleneck 3: Page Faults on Large Values
@@ -292,8 +298,8 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 11,614 | 10,904 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 10,496 | 9,788 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 2,594 | 2,482 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,594 | 2,479 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 171,988 | 167,408 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 211,434 | 203,521 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 139,943 | 140,926 |
