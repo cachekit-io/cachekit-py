@@ -202,9 +202,10 @@ class TestRemovalRoutes:
         assert fn(1).n == 1
 
     def test_cache_clear_removes_every_entry_of_a_function_without_parameters(self) -> None:
-        """On a function without parameters, invalidate_cache() with no arguments deletes the entry of
-        the call without arguments, but a key= that reads its context files that call under many keys:
-        cache_clear() removes every one, not only the clearing context's."""
+        """On an L1-only function without parameters, invalidate_cache() with no arguments deletes the
+        entry of the call without arguments, but a key= that reads its context files that call under many
+        keys: cache_clear() removes every one, not only the clearing context's. (A backed function keeps
+        invalidate_cache()'s meaning; see test_invalidate_no_args.py.)"""
         tenant: contextvars.ContextVar[str] = contextvars.ContextVar("tenant")
         calls: list[str] = []
 

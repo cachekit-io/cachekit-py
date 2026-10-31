@@ -3241,8 +3241,8 @@ def create_cache_wrapper(
         while this runs, stays in _cached_keys for the next attempt. Keys other processes
         wrote and this one never saw stay in L2 until their TTL. Another tenant's entry keeps
         its L2 value and stays tracked; only its L1 copy is evicted, because L1 is not
-        tenant-scoped. An L1-only function's ObjectCache is cleared whole, so every entry stored
-        before this call goes, recorded or not.
+        tenant-scoped. An L1-only function records no keys (_l1_only_fill); its ObjectCache is
+        cleared whole.
 
         Failed deletes are logged once per call with their count: the call never raises, so
         this record is the caller's only signal, and a per-key record would flood during an
@@ -3500,23 +3500,26 @@ def create_cache_wrapper(
         return _stats.get_info()
 
     def cache_clear() -> None:
-        """Clear cache statistics and invalidate all cached entries.
+        """Clear cache statistics and invalidate cached entries.
 
-        All of them on a function without parameters too, where invalidate_cache() with no arguments
-        deletes only the entry of the call without arguments, though a key= that reads its context can
-        file that call under many keys.
+        An L1-only function loses every entry, in every context: on a function without parameters, a
+        key= that reads its context can file the one call under many keys. A backed function loses what
+        invalidate_cache() with no arguments deletes: every entry when it takes parameters, and without
+        parameters the calling context's key and its pre-0.20.0 twin, in L2 too.
         """
         _stats.clear()
         if _zero_config_pending:
             _settle_zero_config()
-        # In L1-only mode, invalidation is synchronous (no backend I/O needed)
-        # so cache_clear() works for both sync and async functions.
-        if inspect.iscoroutinefunction(func) and not _l1_only_mode:
+        # In L1-only mode, invalidation is synchronous (no backend I/O needed), so cache_clear() works
+        # for both sync and async functions.
+        if _l1_only_mode:
+            _delete_then_forget(None)
+            return
+        if inspect.iscoroutinefunction(func):
             raise TypeError(
                 "cache_clear() cannot clear cache for async functions with a backend. Use 'await fn.ainvalidate_cache()' instead."
             )
-        _ready_to_invalidate()
-        _delete_then_forget(None)
+        invalidate_cache()
 
     # Other processes' invalidations reach this function's L1 through the process's listener. Only a
     # backed wrapper with an L1 registers: in L1-only mode nothing is shared, so nothing is announced.
