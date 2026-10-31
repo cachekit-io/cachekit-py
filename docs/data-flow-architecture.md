@@ -200,8 +200,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  result. With write-behind (features/write-behind.md), a sync miss or an    │
 │  unlocked async miss can defer the write, so the trip ends before L2 holds  │
 │  the value; the lock path writes synchronously. A trip with no serialized   │
-│  value to share sends each of them on its own trip afterwards (which trips  │
-│  those are, per path: features/distributed-locking.md, In-Process           │
+│  value to share sends each joined caller on its own trip afterwards (which  │
+│  trips those are, per path: features/distributed-locking.md, In-Process     │
 │  Single-Flight). In L1-only mode it is the function call.                   │
 │                                                                             │
 │  lock_key = f"{cache_key}:lock"                                             │
