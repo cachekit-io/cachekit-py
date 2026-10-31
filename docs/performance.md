@@ -10,7 +10,7 @@
 
 > [!TIP]
 > **Key numbers** (mean of five run medians; GitHub-hosted `ubuntu-latest` runner, AMD EPYC 7763, CPython 3.14.7, 2026-10-31; see [GitHub-Hosted Runner](#github-hosted-runner)):
-> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 0.311 ± 0.000μs (about 2,500 instructions per call on CPython 3.14, see [Instruction Budgets](#instruction-budgets))
+> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 0.311 ± 0.000μs (about 2,760 instructions per call on CPython 3.14, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 0.31 ± 0.00μs. An L1-only hit never serializes, so payload size barely matters
 > - **Decorator + L1 hit with an L2 backend configured, same dict**: 284 ± 2μs. With a backend, L1 holds bytes and every hit deserializes them. This dict compresses, so L1 holds its envelope. Measured before hits stopped re-checking bytes they had already checked, which took about 20% off this hit; see [Why an L1-Only Hit Costs the Same for Any Payload](#why-an-l1-only-hit-costs-the-same-for-any-payload)
 > - **Redis L2 hit**, L1 disabled, same dict, Redis in a container on the same runner: 539 ± 3μs
@@ -93,7 +93,7 @@ Only an L1-only function keeps a memo. A function with a backend builds its key 
 
 With ten threads calling one function on the same key at once, `test_concurrent_cache_access` times each call once its thread is running: execution time after scheduling, not request latency. Each sample starts inside its thread's loop, so on a GIL build, where only one thread runs Python at a time, the time a thread waits for its turn falls outside every sample. Its last figures predate the memo, and the hosted workflow does not run it. No guard measures how long a request waits under contention.
 
-The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **2,500 instructions per call** on CPython 3.14 and 2,600 on 3.12, against 10,900 and 11,600 when the hit took the object cache's lock, and about 60,000 before the memo and the fast path.
+The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **2,760 instructions per call** on CPython 3.14 and 2,940 on 3.12, against 10,900 and 11,600 when the hit took the object cache's lock, and about 60,000 before the memo and the fast path. The extension holds no `unsafe` code, so the hit reads the function's names as any attribute access does: those two reads take about 280 of its instructions on 3.14.
 
 The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-only hit does not use that cache.
 
@@ -298,8 +298,8 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 2,594 | 2,482 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,594 | 2,479 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 2,935 | 2,758 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,936 | 2,758 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 171,988 | 167,408 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 211,434 | 203,521 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 139,943 | 140,926 |

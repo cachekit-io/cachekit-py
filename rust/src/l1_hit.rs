@@ -19,19 +19,19 @@
 //! therefore kept only while their slot is: at most [`MEMO_MAX_ENTRIES`] keys per function.
 //!
 //! Deadlines are read on one clock, [`now`] (`monotonic` in Python), which `ObjectCache` uses too.
+//!
+//! Like the rest of this crate, the module is safe Rust: every object it touches goes through PyO3's
+//! checked API.
 
-use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
-use pyo3::exceptions::PyTypeError;
-use pyo3::ffi;
 use pyo3::gc::PyVisit;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple, PyType};
-use pyo3::PyTraverseError;
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString, PyTuple};
+use pyo3::{PyTraverseError, PyTypeInfo};
 
 use crate::hit_counter::PyHitCounter;
 
@@ -41,7 +41,7 @@ use crate::hit_counter::PyHitCounter;
 /// between them, as the memo keeps what it is keyed by. That bounds an entry at a few KiB (a str of
 /// 4-byte characters also keeps its UTF-8 copy once the key generator encodes it), and it bounds the
 /// hashing a lookup repeats for strings that are new to each call.
-pub(crate) const MEMO_MAX_LEN: ffi::Py_ssize_t = 256;
+pub(crate) const MEMO_MAX_LEN: usize = 256;
 /// Arguments per call, positional and keyword together.
 pub(crate) const MEMO_MAX_ARGS: usize = 8;
 /// Memo slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a
@@ -55,10 +55,18 @@ pub(crate) const MEMO_MAX_ENTRIES: usize = 1024;
 /// inherits the zero with the rest of its memory, so readings stay comparable across a fork.
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// A test's replacement clock, a Python callable returning seconds, or null for the real one.
-/// Installed only by tests, through `_set_clock`. A replaced callable is never released, so a
-/// reader that loaded the pointer before a replacement still holds a live object.
-static CLOCK_OVERRIDE: AtomicPtr<ffi::PyObject> = AtomicPtr::new(ptr::null_mut());
+/// A test's replacement clock, a Python callable returning seconds, or None for the real one.
+/// Installed only by tests, through `_set_clock`. Held only to copy or swap the reference, never
+/// while Python code runs.
+static CLOCK_OVERRIDE: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+
+/// Whether a replacement clock is installed, so a reading of the real clock takes no lock.
+static CLOCK_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Seconds since the clock's zero.
+fn real_now() -> f64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
 
 /// Seconds on the clock `ObjectCache` and the lock-free hit share, from an arbitrary zero.
 ///
@@ -69,39 +77,41 @@ static CLOCK_OVERRIDE: AtomicPtr<ffi::PyObject> = AtomicPtr::new(ptr::null_mut()
 #[pyfunction]
 #[pyo3(name = "monotonic")]
 pub fn now(py: Python<'_>) -> PyResult<f64> {
-    let fake = CLOCK_OVERRIDE.load(Ordering::Acquire);
-    if fake.is_null() {
-        return Ok(EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64());
+    if !CLOCK_OVERRIDDEN.load(Ordering::Acquire) {
+        return Ok(real_now());
     }
-    // SAFETY: a non-null override is a strong reference this module owns and never releases.
-    unsafe { Bound::from_borrowed_ptr(py, fake) }
-        .call0()?
-        .extract()
+    let clock = CLOCK_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|clock| clock.clone_ref(py));
+    // None when a restore landed between the two reads.
+    match clock {
+        Some(clock) => clock.call0(py)?.extract(py),
+        None => Ok(real_now()),
+    }
 }
 
 /// Replace the shared clock with a callable returning seconds, or restore the real one with None.
 ///
 /// For tests only: the real clock cannot be moved, and a test of expiry or refresh needs both the
-/// cache and the lock-free hit to see the same moved time. Each replaced callable is kept alive for
-/// the rest of the process.
+/// cache and the lock-free hit to see the same moved time.
 #[pyfunction]
 #[pyo3(name = "_set_clock")]
 pub fn set_clock(clock: Option<Bound<'_, PyAny>>) {
-    let new = clock.map_or(ptr::null_mut(), Bound::into_ptr);
-    CLOCK_OVERRIDE.store(new, Ordering::Release);
+    let installed = clock.is_some();
+    let replaced = std::mem::replace(
+        &mut *CLOCK_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        clock.map(Bound::unbind),
+    );
+    CLOCK_OVERRIDDEN.store(installed, Ordering::Release);
+    // Released after the lock: releasing the old clock can run Python code that reads the clock.
+    drop(replaced);
 }
 
 // ── The memo key ─────────────────────────────────────────────────────────────────────────────
-
-/// The `i`th item of a tuple, borrowed: the item macro where the build has the tuple's layout, a
-/// call to `PyTuple_GetItem` on the stable ABI.
-///
-/// # Safety
-/// `i` must be in bounds.
-#[inline]
-unsafe fn tuple_item(t: &Bound<'_, PyTuple>, i: usize) -> *mut ffi::PyObject {
-    t.get_borrowed_item_unchecked(i).as_ptr()
-}
 
 /// What an argument spends of its call's [`MEMO_MAX_LEN`], and whether its type must be part of
 /// the key; None for anything the memo never takes.
@@ -111,31 +121,26 @@ unsafe fn tuple_item(t: &Bound<'_, PyTuple>, i: usize) -> *mut ffi::PyObject {
 /// str or None never compares equal to a value of another of those types, so a call of only those
 /// can be keyed by its argument tuple as it is. A float or bool can (1, 1.0 and True are equal), and
 /// a bytes compared with an equal str warns under `python -b`, so their types go in the key.
-///
-/// # Safety
-/// `a` must be a valid object pointer.
 #[inline]
-unsafe fn admit(a: *mut ffi::PyObject) -> Option<(ffi::Py_ssize_t, bool)> {
-    let t = ffi::Py_TYPE(a);
-    if t == &raw mut ffi::PyLong_Type || a == ffi::Py_None() {
+fn admit(a: &Bound<'_, PyAny>) -> PyResult<Option<(usize, bool)>> {
+    let py = a.py();
+    let t = a.get_type_ptr();
+    Ok(if t == PyInt::type_object_raw(py) || a.is_none() {
         Some((0, false))
-    } else if t == &raw mut ffi::PyUnicode_Type {
-        Some((ffi::PyUnicode_GetLength(a), false))
-    } else if t == &raw mut ffi::PyFloat_Type || t == &raw mut ffi::PyBool_Type {
+    } else if t == PyString::type_object_raw(py) {
+        Some((a.len()?, false))
+    } else if t == PyFloat::type_object_raw(py) || t == PyBool::type_object_raw(py) {
         Some((0, true))
-    } else if t == &raw mut ffi::PyBytes_Type {
-        Some((ffi::PyBytes_Size(a), true))
+    } else if t == PyBytes::type_object_raw(py) {
+        Some((a.len()?, true))
     } else {
         None
-    }
+    })
 }
 
 /// An object's type, as a new reference.
-///
-/// # Safety
-/// `a` must be a valid object pointer.
-unsafe fn type_of<'py>(py: Python<'py>, a: *mut ffi::PyObject) -> Bound<'py, PyAny> {
-    Bound::from_borrowed_ptr(py, ffi::Py_TYPE(a).cast())
+fn type_of<'py>(a: &Bound<'py, PyAny>) -> Bound<'py, PyAny> {
+    a.get_type().into_any()
 }
 
 /// The memo key of a call's arguments, or None when the memo does not take the call.
@@ -169,11 +174,10 @@ pub fn memo_key_of<'py>(
     if n + nk > MEMO_MAX_ARGS {
         return Ok(None);
     }
-    let mut size: ffi::Py_ssize_t = 0;
+    let mut size = 0;
     let mut typed = false;
-    for i in 0..n {
-        // SAFETY: i < n = len(args), and args holds valid objects.
-        match unsafe { admit(tuple_item(args, i)) } {
+    for a in args.iter_borrowed() {
+        match admit(&a)? {
             Some((cost, needs_type)) => {
                 size += cost;
                 typed |= needs_type;
@@ -187,49 +191,39 @@ pub fn memo_key_of<'py>(
         }
         if !typed {
             if n == 1 {
-                // SAFETY: n = 1 = len(args).
-                let lone = unsafe { args.get_borrowed_item_unchecked(0) };
+                let lone = args.get_borrowed_item(0)?;
                 if !lone.is_none() {
                     return Ok(Some(lone.to_owned()));
                 }
             }
             return Ok(Some(args.clone().into_any()));
         }
-        // SAFETY: as above.
-        unsafe {
-            if n == 1 {
-                let a = tuple_item(args, 0);
-                return Ok(Some(
-                    PyTuple::new(py, [type_of(py, a), Bound::from_borrowed_ptr(py, a)])?.into_any(),
-                ));
-            }
-            if n == 2 {
-                let (a, b) = (tuple_item(args, 0), tuple_item(args, 1));
-                let items = [
-                    type_of(py, a),
-                    Bound::from_borrowed_ptr(py, a),
-                    type_of(py, b),
-                    Bound::from_borrowed_ptr(py, b),
-                ];
-                return Ok(Some(PyTuple::new(py, items)?.into_any()));
-            }
-            let types = PyTuple::new(py, (0..n).map(|i| type_of(py, tuple_item(args, i))))?;
-            return Ok(Some(
-                PyTuple::new(py, [args.as_any(), types.as_any()])?.into_any(),
-            ));
+        if n == 1 {
+            let a = args.get_borrowed_item(0)?.to_owned();
+            return Ok(Some(PyTuple::new(py, [type_of(&a), a])?.into_any()));
         }
+        if n == 2 {
+            let a = args.get_borrowed_item(0)?.to_owned();
+            let b = args.get_borrowed_item(1)?.to_owned();
+            let items = [type_of(&a), a, type_of(&b), b];
+            return Ok(Some(PyTuple::new(py, items)?.into_any()));
+        }
+        let types = PyTuple::new(py, args.iter_borrowed().map(|a| type_of(&a)))?;
+        return Ok(Some(
+            PyTuple::new(py, [args.as_any(), types.as_any()])?.into_any(),
+        ));
     }
     let mut items: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> = Vec::with_capacity(nk);
     for (name, value) in kwargs.iter() {
-        // SAFETY: both are valid objects. A str subclass name equals its str and so would share the
-        // slot, but the key generator refuses it, so it must take the full path.
-        let Some((cost, _)) = (unsafe { admit(value.as_ptr()) }) else {
+        // A str subclass name equals its str and so would share the slot, but the key generator
+        // refuses it, so it must take the full path.
+        let Some((cost, _)) = admit(&value)? else {
             return Ok(None);
         };
-        if unsafe { ffi::Py_TYPE(name.as_ptr()) } != &raw mut ffi::PyUnicode_Type {
+        if !name.is_exact_instance_of::<PyString>() {
             return Ok(None);
         }
-        size += unsafe { ffi::PyUnicode_GetLength(name.as_ptr()) } + cost;
+        size += name.len()? + cost;
         items.push((name, value));
     }
     if size > MEMO_MAX_LEN {
@@ -246,11 +240,7 @@ pub fn memo_key_of<'py>(
     if let Some(e) = failed {
         return Err(e);
     }
-    // SAFETY: args holds valid objects, and i < n.
-    let types = PyTuple::new(
-        py,
-        (0..n).map(|i| unsafe { type_of(py, tuple_item(args, i)) }),
-    )?;
+    let types = PyTuple::new(py, args.iter_borrowed().map(|a| type_of(&a)))?;
     let item_types = PyTuple::new(py, items.iter().map(|(_, v)| v.get_type().into_any()))?;
     let pairs = PyTuple::new(
         py,
@@ -372,8 +362,6 @@ impl HitEntry {
 #[pyclass(frozen, module = "cachekit._rust_serializer")]
 pub struct HitMemo {
     memo: Py<PyDict>,
-    /// `HitEntry`'s type, held so a hit checks a slot's type with one comparison.
-    entry_type: Py<PyType>,
     counter: Py<PyHitCounter>,
     func: Py<PyAny>,
     module: Py<PyAny>,
@@ -381,163 +369,57 @@ pub struct HitMemo {
     /// The attribute names `__module__` and `__qualname__`, held so a hit looks neither up.
     module_attr: Py<PyString>,
     qualname_attr: Py<PyString>,
-    /// For a plain Python function, the descriptors its names are read through.
-    descriptors: Option<NameDescriptors>,
-}
-
-/// The descriptors `PyObject_GetAttr` reads a plain Python function's `__module__` and
-/// `__qualname__` through, with their getters.
-///
-/// Calling a getter directly is the same read without the type lookup that takes most of the
-/// attribute access: both are data descriptors on `types.FunctionType`, an immutable type, so an
-/// attribute access on an exact function always resolves to them.
-struct NameDescriptors {
-    module: Py<PyAny>,
-    module_get: ffi::descrgetfunc,
-    qualname: Py<PyAny>,
-    qualname_get: ffi::descrgetfunc,
-}
-
-impl NameDescriptors {
-    /// The descriptors for `func`, or None when it is not an exact `types.FunctionType` or a lookup
-    /// fails; the memo then reads its names with `PyObject_GetAttr`, as any attribute access does.
-    fn of(func: &Bound<'_, PyAny>) -> Option<Self> {
-        let py = func.py();
-        let ty = func.get_type();
-        let function_type = py.import("types").ok()?.getattr("FunctionType").ok()?;
-        if !ty.is(&function_type) {
-            return None;
-        }
-        let namespace = ty.getattr("__dict__").ok()?;
-        let descriptor = |name: &str| -> Option<(Py<PyAny>, ffi::descrgetfunc)> {
-            let d = namespace.get_item(name).ok()?;
-            // SAFETY: d's type is a valid type object; PyType_GetSlot accepts static types since 3.10.
-            let slot =
-                unsafe { ffi::PyType_GetSlot(d.get_type().as_type_ptr(), ffi::Py_tp_descr_get) };
-            if slot.is_null() {
-                return None;
-            }
-            // SAFETY: the tp_descr_get slot holds a descrgetfunc.
-            Some((d.unbind(), unsafe {
-                std::mem::transmute::<*mut std::ffi::c_void, ffi::descrgetfunc>(slot)
-            }))
-        };
-        let (module, module_get) = descriptor("__module__")?;
-        let (qualname, qualname_get) = descriptor("__qualname__")?;
-        Some(Self {
-            module,
-            module_get,
-            qualname,
-            qualname_get,
-        })
-    }
-}
-
-/// Whether `get(descr, obj)` is the object `held` (a read that fails counts as changed).
-///
-/// # Safety
-/// As [`attr_is`], and `get` must be `descr`'s type's `tp_descr_get`.
-#[inline]
-unsafe fn got_is(
-    get: ffi::descrgetfunc,
-    descr: *mut ffi::PyObject,
-    obj: *mut ffi::PyObject,
-    held: *mut ffi::PyObject,
-) -> bool {
-    let value = get(descr, obj, ffi::Py_TYPE(obj).cast());
-    if value.is_null() {
-        ffi::PyErr_Clear();
-        return false;
-    }
-    let same = value == held;
-    ffi::Py_DECREF(value);
-    same
-}
-
-/// Whether `obj.name` is the object `held` (an attribute that cannot be read counts as changed).
-///
-/// # Safety
-/// The thread must be attached to the interpreter, and the three pointers valid objects.
-#[inline]
-unsafe fn attr_is(
-    obj: *mut ffi::PyObject,
-    name: *mut ffi::PyObject,
-    held: *mut ffi::PyObject,
-) -> bool {
-    let value = ffi::PyObject_GetAttr(obj, name);
-    if value.is_null() {
-        ffi::PyErr_Clear();
-        return false;
-    }
-    let same = value == held;
-    ffi::Py_DECREF(value);
-    same
 }
 
 impl HitMemo {
     /// Whether the function still has the names the memo was built with (an attribute that cannot
     /// be read counts as changed).
-    fn names_hold(&self, _py: Python<'_>) -> bool {
-        let f = self.func.as_ptr();
-        // SAFETY: the token attaches this thread, the memo owns every object passed, and each
-        // getter is its descriptor's (NameDescriptors::of).
-        unsafe {
-            match &self.descriptors {
-                Some(d) => {
-                    got_is(d.module_get, d.module.as_ptr(), f, self.module.as_ptr())
-                        && got_is(
-                            d.qualname_get,
-                            d.qualname.as_ptr(),
-                            f,
-                            self.qualname.as_ptr(),
-                        )
-                }
-                None => {
-                    attr_is(f, self.module_attr.as_ptr(), self.module.as_ptr())
-                        && attr_is(f, self.qualname_attr.as_ptr(), self.qualname.as_ptr())
-                }
-            }
-        }
+    ///
+    /// Two attribute reads, about a tenth of the hit's instructions, most of it the type lookup
+    /// each read makes. Calling the names' descriptors directly would skip that lookup, but only
+    /// through unsafe code, which this crate forbids.
+    fn names_hold(&self, py: Python<'_>) -> bool {
+        let func = self.func.bind(py);
+        let holds = |name: &Py<PyString>, held: &Py<PyAny>| {
+            func.getattr(name.bind(py))
+                .is_ok_and(|value| value.is(held))
+        };
+        holds(&self.module_attr, &self.module) && holds(&self.qualname_attr, &self.qualname)
     }
 
-    /// The call's cached value, or `miss` when this memo cannot answer for it.
+    /// The call's cached value, or None when this memo cannot answer for it.
     ///
     /// Answers when the call's memo key has a slot, its entry is alive and before its deadline, and
     /// the function has its names; then it stamps the entry's LRU recency and counts the hit. Any
-    /// other call, a stale or expired one included, gets `miss` and goes to the cache's lock.
+    /// other call, a stale or expired one included, gets None and goes to the cache's lock.
     fn lookup(
         &self,
         py: Python<'_>,
         args: &Bound<'_, PyTuple>,
         kwargs: &Bound<'_, PyDict>,
-        miss: Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let Some(key) = memo_key_of(args, kwargs)? else {
-            return Ok(miss.unbind());
+            return Ok(None);
         };
         let Some(found) = self.memo.bind(py).get_item(&key)? else {
-            return Ok(miss.unbind());
+            return Ok(None);
         };
         // A slot holds a HitEntry unless code planted another object (see HitMemo): a miss.
-        if !ptr::eq(
-            unsafe { ffi::Py_TYPE(found.as_ptr()) },
-            self.entry_type.as_ptr().cast(),
-        ) {
-            return Ok(miss.unbind());
-        }
-        // SAFETY: found's type is exactly HitEntry, which cannot be subclassed.
-        let entry = unsafe { found.cast_unchecked::<HitEntry>() }.get();
+        let Ok(entry) = found.cast_exact::<HitEntry>() else {
+            return Ok(None);
+        };
+        let entry = entry.get();
         if !entry.alive.load(Ordering::Acquire) {
-            return Ok(miss.unbind());
+            return Ok(None);
         }
         let now = now(py)?;
         // `<`, not a negated `>=`: a NaN on either side is a miss
         if now < entry.fresh_until && self.names_hold(py) {
             entry.used_at.store(now.to_bits(), Ordering::Relaxed);
             self.counter.get().hit();
-            return Ok(entry.value.clone_ref(py));
+            return Ok(Some(entry.value.clone_ref(py)));
         }
-        Ok(miss.unbind())
+        Ok(None)
     }
 
     /// Drop every slot and every entry's key list, and kill the entries too when `kill`. A full memo
@@ -558,62 +440,6 @@ impl HitMemo {
     }
 }
 
-/// [`HitMemo::lookup`] as a builtin function bound to its memo: `HitMemo.get` makes one, and the
-/// wrapper calls it on every call. A vectorcall with no argument parsing, as PyO3's method
-/// trampoline costs a tenth of the hit.
-struct HitDef(ffi::PyMethodDef);
-
-// SAFETY: CPython only reads a method definition, and this one never changes.
-unsafe impl Sync for HitDef {}
-
-static HIT_DEF: HitDef = HitDef(ffi::PyMethodDef {
-    ml_name: c"get".as_ptr(),
-    ml_meth: ffi::PyMethodDefPointer {
-        PyCFunctionFast: hit,
-    },
-    ml_flags: ffi::METH_FASTCALL,
-    ml_doc: c"get(args, kwargs, miss, /)\n--\n\nThe call's cached value, or miss when the memo cannot answer for it.".as_ptr(),
-});
-
-/// The body of the builtin `HitMemo.get` returns: `(args, kwargs, miss)`, positional.
-///
-/// # Safety
-/// CPython calls it attached to the interpreter, with `slf` the `HitMemo` that `HitMemo.get` bound
-/// and `nargs` valid objects at `args`.
-unsafe extern "C" fn hit(
-    slf: *mut ffi::PyObject,
-    args: *mut *mut ffi::PyObject,
-    nargs: ffi::Py_ssize_t,
-) -> *mut ffi::PyObject {
-    let py = Python::assume_attached();
-    let result = if nargs == 3 {
-        let arg = |i: usize| Bound::from_borrowed_ptr(py, *args.add(i));
-        // SAFETY (memo): HitMemo.get binds this function to a HitMemo, and to nothing else.
-        let memo = Bound::from_borrowed_ptr(py, slf);
-        match (arg(0).cast_into::<PyTuple>(), arg(1).cast_into::<PyDict>()) {
-            (Ok(call_args), Ok(call_kwargs)) => {
-                memo.cast_unchecked::<HitMemo>()
-                    .get()
-                    .lookup(py, &call_args, &call_kwargs, arg(2))
-            }
-            _ => Err(PyTypeError::new_err(
-                "get() takes a tuple, a dict and a miss sentinel",
-            )),
-        }
-    } else {
-        Err(PyTypeError::new_err(format!(
-            "get() takes 3 positional arguments ({nargs} given)"
-        )))
-    };
-    match result {
-        Ok(value) => value.into_ptr(),
-        Err(e) => {
-            e.restore(py);
-            ptr::null_mut()
-        }
-    }
-}
-
 #[pymethods]
 impl HitMemo {
     /// A memo for `func`, counting its hits on `counter`, answering while `func` has these names.
@@ -625,36 +451,31 @@ impl HitMemo {
         module: Py<PyAny>,
         qualname: Py<PyAny>,
     ) -> Self {
-        let descriptors = NameDescriptors::of(func.bind(py));
         Self {
             memo: PyDict::new(py).unbind(),
-            entry_type: py.get_type::<HitEntry>().unbind(),
             counter,
             func,
             module,
             qualname,
             module_attr: intern!(py, "__module__").clone().unbind(),
             qualname_attr: intern!(py, "__qualname__").clone().unbind(),
-            descriptors,
         }
     }
 
-    /// The lock-free hit, `get(args, kwargs, miss)`: the call's cached value, or `miss` when this
-    /// memo cannot answer for it (see `lookup`). A builtin bound to this memo; the wrapper keeps one.
-    #[getter]
-    fn get<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
-        // SAFETY: HIT_DEF lives for the process and CPython never writes to it; slf is a HitMemo,
-        // which the new function holds a reference to.
-        unsafe {
-            Bound::from_owned_ptr_or_err(
-                slf.py(),
-                ffi::PyCFunction_NewEx(
-                    ptr::addr_of!(HIT_DEF.0).cast_mut(),
-                    slf.as_ptr(),
-                    ptr::null_mut(),
-                ),
-            )
-        }
+    /// The lock-free hit: the call's cached value, or `miss` when this memo cannot answer for it
+    /// (see `lookup`). The wrapper keeps the bound method and calls it first on every call.
+    #[pyo3(signature = (args, kwargs, miss, /))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: &Bound<'_, PyDict>,
+        miss: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        Ok(match self.lookup(py, args, kwargs)? {
+            Some(value) => value,
+            None => miss.clone().unbind(),
+        })
     }
 
     /// Point `key`'s slot at `entry`. Call under the cache's lock.
@@ -756,17 +577,12 @@ impl HitMemo {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.memo)?;
-        visit.call(&self.entry_type)?;
         visit.call(&self.counter)?;
         visit.call(&self.func)?;
         visit.call(&self.module)?;
         visit.call(&self.qualname)?;
         visit.call(&self.module_attr)?;
         visit.call(&self.qualname_attr)?;
-        if let Some(d) = &self.descriptors {
-            visit.call(&d.module)?;
-            visit.call(&d.qualname)?;
-        }
         Ok(())
     }
 }

@@ -3,6 +3,10 @@
 //! This crate provides thin Python wrappers around the cachekit-core library.
 //! Business logic lives in cachekit-core, including the untrusted msgpack decode bound
 //! (`cachekit_core::check_msgpack_structure`).
+//!
+//! The crate is safe Rust: unsafe code belongs in cachekit-core, whose CI verifies it, so a build
+//! rejects any here rather than leaving it to the post-merge cargo-geiger count (SECURITY.md).
+#![forbid(unsafe_code)]
 
 // Re-export core types for use in Python bindings
 pub use cachekit_core::{ByteStorage, StorageEnvelope};
@@ -38,8 +42,9 @@ use pyo3::prelude::*;
 /// PyO3 checks at run time (a concurrent call raises, never races), and in the features enabled here
 /// cachekit-core's only shared state is its `AtomicU64` nonce counters (its
 /// `Mutex` handle registry is behind the `ffi` feature, which is off). `l1_hit`'s
-/// shared state is atomics (an entry's liveness and recency, the tests' clock
-/// override), a `OnceLock` (the clock's zero), one `Mutex` per entry (its memo
+/// shared state is atomics (an entry's liveness and recency), a `OnceLock` (the
+/// clock's zero), the tests' clock override (a `Mutex` with an atomic flag beside
+/// it, held only to copy or swap the reference), one `Mutex` per entry (its memo
 /// keys, written only under ObjectCache's lock and never held across Python
 /// code), and each memo's Python dict, whose single operations free-threaded
 /// CPython runs atomically — no interior mutability the GIL was papering over. PyO3

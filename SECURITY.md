@@ -309,7 +309,7 @@ On the tenant-scoped Redis backend, every successful invalidation is announced o
 
 | Tier | Timing | Trigger | Checks |
 |:-----|:------:|:--------|:-------|
-| **Fast** | < 3 min | Every PR | cargo-audit, cargo-deny, clippy, machete, pip-audit |
+| **Fast** | < 3 min | Every PR | cargo-audit, cargo-deny, clippy, machete, pip-audit. cachekit-rs declares `#![forbid(unsafe_code)]`, so any build of a PR that adds unsafe code to it fails |
 | **Medium** | < 15 min | Post-merge | cargo-geiger (zero unsafe functions in cachekit-rs). The Miri job runs no tests: this crate has none, and byte_storage and encryption are re-exports from cachekit-core |
 | **Deep** | < 2 hr | Nightly | Sanitizers (ASan, TSan, MSan), security report |
 
