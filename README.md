@@ -266,8 +266,8 @@ What a call costs inside your process, from the wall-clock guards in `tests/perf
 
 | Path | Time per call |
 |:-----|--------------:|
-| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.311 ± 0.000 µs |
-| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.31 ± 0.00 µs |
+| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.341 ± 0.001 µs |
+| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.34 ± 0.00 µs |
 | L1 hit with an L2 backend configured, same dict | 284 ± 2 µs |
 | Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 539 ± 3 µs |
 

@@ -228,7 +228,7 @@ assert calls == ["EUR", "EUR"]
 
 ## Characteristics
 
-- Latency: 0.31μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)), one call into the Rust extension that takes no lock; a call the [memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key, looks it up under the cache's lock and costs about 22 times the instructions; in-memory, no network
+- Latency: 0.34μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)), one call into the Rust extension that takes no lock; a call the [memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key, looks it up under the cache's lock and costs about 22 times the instructions; in-memory, no network
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
