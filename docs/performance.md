@@ -105,6 +105,18 @@ The `object_cache_put_full` row of the [instruction budgets](#instruction-budget
 
 An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis in a container on the same runner takes 551 ± 18μs on the hosted EPYC 7763: the decorator, the round trip and deserialization. That is about 610 times an L1-only hit of the same dict on the same runner. A Redis on another machine adds its network latency on top; no guard measures that.
 
+## Latency by Serving Layer
+
+`tests/performance/terrain_canary.py` records what each call of a cached read workload costs, split by the layer that answered it. It drives a Zipf workload (by default exponent 0.99 over 10,000 keys) through one unencrypted `@cache` function with L1 and a Redis L2. One caller makes the calls one at a time, at Poisson arrival times (200/s by default); when a slow call makes it late, it starts the next call as soon as it is free and drops the rest of the backlog, so it never runs above `--rate` to catch up. Each miss outlasts several arrival gaps, so the caller runs below schedule all run, most during warm-up; the recording states the rate it achieved, overall and in its busiest slice. It also states the values' size as MessagePack, for the median call and the 95th percentile (0.9 KB and 4.4 KB with the default 10,000 keys). It times each call with `perf_counter_ns` and attributes it to an L1 hit, an L2 hit or a miss by the change in `cache_info()`, cross-checked by a flag the function sets; a call whose counters and flag disagree is counted as unattributed, never guessed. The function sleeps 20 ms in place of a database call, so a miss's figure is that sleep plus the cache's own work.
+
+It writes per-layer latency histograms (16 log-spaced bins per decade from 100 ns to 1 s) for each slice of time (3 s by default) as JSON, and prints each layer's share with its exact p50 and p99. The run starts from an empty cache under a fresh namespace and deletes nothing: entries expire after their ttl. The recording names where the Redis runs in the words `--l2-where` gives, which every run must pass: a URL cannot tell, since a tunnel or port-forward on `localhost` can reach a remote Redis. Its figures are one run on one host, not a guard:
+
+```bash
+uv run python tests/performance/terrain_canary.py --redis redis://localhost:6379/0 \
+  --l2-where "same host, loopback TCP" --minutes 10 --out terrain.json \
+  --harness https://github.com/cachekit-io/cachekit-py/blob/<sha>/tests/performance/terrain_canary.py
+```
+
 ## Not Measured Here
 
 These have no figure from the run-level harness that supports a claim:
