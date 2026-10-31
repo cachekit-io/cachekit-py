@@ -17,13 +17,14 @@ What one figure covers:
   miss   the L2 lookup missing, the function itself, serializing and the L2 write
 
 The workload: keys drawn from a Zipf distribution (exponent 0.99, the YCSB default) over
-``--keys`` keys; each key's value is a seeded dict, about 1 KB as MessagePack (range roughly
-0.2-6 KB). One caller makes the calls one at a time, at arrival times drawn as a Poisson process at
-``--rate`` per second. A call that outlasts the gap to the next arrival makes the caller late; it
-then starts the next call as soon as it is free and draws the following gap from there
-(``next_arrival``), so it never runs above ``--rate`` to catch up. While misses dominate, the achieved rate is lower; the recording
-states it, and the busiest slice's rate. A figure is the time one call took, not a response time
-under load.
+``--keys`` keys; each key's value is a seeded dict, and the recording states their size as
+MessagePack for the median call and the 95th percentile (``value_size_quantiles``). One caller makes
+the calls one at a time, at arrival times drawn as a Poisson process at ``--rate`` per second. A
+call that outlasts the gap to the next arrival makes the caller late; it then starts the next call
+as soon as it is free and draws the following gap from there (``next_arrival``), so it never runs
+above ``--rate`` to catch up. Each miss outlasts several arrival gaps, so the caller runs below
+schedule all run, most during warm-up; the recording states the rate it achieved, overall and in
+its busiest slice. A figure is the time one call took, not a response time under load.
 
 The function stands in for a database call with a fixed ``--origin-ms`` sleep, so a miss's figure is
 that sleep plus the cache's own work. L1 gets a ``--l1-mb`` budget, smaller than the working set, so
@@ -58,6 +59,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+import msgpack
+
 SCHEMA = "cachekit.terrain/v1"
 LO = -7  # log10 seconds of the first bin's lower edge: 100 ns
 PER_DECADE = 16
@@ -65,6 +68,7 @@ DECADES = 7  # up to 1 s
 NBINS = DECADES * PER_DECADE
 LAYERS = ("l1", "l2", "miss")
 ZIPF_EXPONENT = 0.99
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 WORDS = (
     "cache layer tenant region shard replica index ledger order invoice customer product catalog price "
     "stock warehouse route session token profile avatar settings feed post comment thread reaction"
@@ -100,6 +104,38 @@ def payload(key: int) -> dict[str, Any]:
             for _ in range(n)
         ],
     }
+
+
+def value_size_quantiles(n_keys: int, qs: tuple[float, ...] = (0.5, 0.95)) -> list[int]:
+    """Quantiles of the cached values' size as MessagePack, in bytes, weighted by requests.
+
+    Each key counts by its Zipf share of the calls, so the median is the size of a typical call's
+    value, not of a typical key's.
+
+    >>> value_size_quantiles(10_000)
+    [855, 4430]
+    """
+    weights = [1.0 / (r + 1) ** ZIPF_EXPONENT for r in range(n_keys)]
+    sized = sorted(zip((len(msgpack.packb(payload(k))) for k in range(n_keys)), weights, strict=True))
+    total = sum(weights)
+    out: list[int] = []
+    seen = 0.0
+    for size, weight in sized:
+        seen += weight
+        while len(out) < len(qs) and seen >= qs[len(out)] * total:
+            out.append(size)
+    return out
+
+
+def loopback_l2_where(redis_url: str) -> str | None:
+    """What ``--l2-where`` records when it is not given: only a loopback Redis is known to be local.
+
+    >>> loopback_l2_where("redis://127.0.0.1:6379/0"), loopback_l2_where("rediss://[::1]:6380")
+    ('same host, loopback TCP', 'same host, loopback TCP')
+    >>> loopback_l2_where("redis://db.example:6379") is None, loopback_l2_where("unix:///run/redis.sock") is None
+    (True, True)
+    """
+    return "same host, loopback TCP" if urlsplit(redis_url).hostname in LOOPBACK_HOSTS else None
 
 
 def next_arrival(due: float, now: float, gap: float) -> float:
@@ -187,6 +223,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     namespace = f"terrain-canary-{uuid.uuid4().hex[:12]}"
     executed = [False]
+    value_p50, value_p95 = value_size_quantiles(args.keys)
 
     @cache(
         backend=RedisBackend(redis_url=args.redis),
@@ -271,9 +308,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "recordedAt": datetime.fromtimestamp(start_wall, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sdk": f"cachekit {cachekit.__version__} (Python {platform.python_version()})",
             "l2": f"Redis {redis_version}, {args.l2_where}",
-            "cache": f"L1 budget {args.l1_mb} MB, ttl {args.ttl} s, unencrypted (plain @cache; @cache.secure encrypts)",
-            # One caller cannot keep up while misses dominate, so the run states what it achieved,
-            # overall and in its busiest slice, beside the arrival rate it was given.
+            "cache": (
+                f"L1 budget {args.l1_mb} MB, ttl {args.ttl} s, values {value_p50 / 1000:.1f} KB median as MessagePack "
+                f"(p95 {value_p95 / 1000:.1f} KB), unencrypted (plain @cache; @cache.secure encrypts)"
+            ),
+            # Each miss outlasts several arrival gaps, so the caller runs below schedule all run, most
+            # during warm-up: the run states what it achieved, overall and in its busiest slice, beside
+            # the arrival rate it was given.
             "workload": (
                 f"Zipf {ZIPF_EXPONENT} over {args.keys:,} keys; one caller, one call at a time, Poisson arrivals "
                 f"at {args.rate:g}/s (achieved {achieved:.0f}/s, busiest {args.slice:g} s slice {busiest:.0f}/s)"
@@ -300,7 +341,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
     p.add_argument("--redis", required=True, help="Redis URL to use as L2 (the run writes under a fresh namespace)")
-    p.add_argument("--l2-where", default="same host, loopback TCP", help="where the Redis runs, for the record")
+    p.add_argument(
+        "--l2-where",
+        help="where the Redis runs, for the record; required unless the --redis host is loopback",
+    )
     p.add_argument("--minutes", type=float, default=10.0)
     p.add_argument("--rate", type=float, default=200.0, help="calls per second (Poisson arrivals)")
     p.add_argument("--keys", type=int, default=10_000)
@@ -319,6 +363,11 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--origin-ms must not be negative")
     if not args.out.parent.is_dir():
         p.error(f"--out: {args.out.parent} is not a directory")
+    if args.l2_where is None:
+        # The recording's L2 label is copy on a public page: never guess it for a Redis elsewhere.
+        args.l2_where = loopback_l2_where(args.redis)
+        if args.l2_where is None:
+            p.error("--l2-where is required when the --redis host is not loopback: say where the Redis runs")
     doc = run(args)
     text = json.dumps(doc, separators=(",", ":"), allow_nan=False)
     try:
