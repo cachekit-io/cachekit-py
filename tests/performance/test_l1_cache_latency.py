@@ -216,3 +216,68 @@ def test_l1_cache_mixed_workload_hit_counts(record_property) -> None:
 
     # Every key in the 19-of-20 slots is stored, every other key never was.
     assert (len(hit_latencies), len(miss_latencies)) == (total_iterations * 19 // 20, total_iterations // 20)
+
+
+@pytest.mark.performance
+def test_l1_expiry_sweep_lock_holds(record_property) -> None:
+    """Time each lock hold of a sweep removing 100k expired entries, and gets on another thread meanwhile.
+
+    The entries share one deadline, the costliest heap order: ties compare keys. Holds are timed in
+    thread CPU time, so a loaded host's descheduling does not count as lock work; the gets are wall time.
+    """
+    n = 100_000
+    cache = L1Cache(max_memory_mb=1024, ttl_buffer_seconds=0)
+    deadline = time.time() + 0.5
+    for i in range(n):
+        cache.put(f"sweep:key:{i}", b"x", expires_at=deadline)
+    cache.put("sweep:hot", b"h", redis_ttl=3600)
+    time.sleep(max(0.0, deadline - time.time()))
+
+    state = cache._state
+    inner, holds, sweeper = state.lock, [], threading.get_ident()
+
+    class TimedLock:
+        depth = 0
+
+        def __enter__(self):
+            inner.acquire()
+            if threading.get_ident() == sweeper:
+                self.depth += 1
+                if self.depth == 1:
+                    self.start = time.thread_time_ns()
+            return self
+
+        def __exit__(self, *exc):
+            if threading.get_ident() == sweeper:
+                self.depth -= 1
+                if self.depth == 0:
+                    holds.append(time.thread_time_ns() - self.start)
+            inner.release()
+
+    state.lock = TimedLock()
+    get_latencies: list[int] = []
+    done = threading.Event()
+
+    def getter() -> None:
+        while not done.is_set():
+            start = time.perf_counter_ns()
+            assert cache.get("sweep:hot") == (True, b"h")
+            get_latencies.append(time.perf_counter_ns() - start)
+            time.sleep(0)
+
+    thread = threading.Thread(target=getter)
+    thread.start()
+    try:
+        removed = cache.cleanup_expired()
+    finally:
+        done.set()
+        thread.join()
+
+    report(record_property, f"L1 sweep lock hold ({n:,} expired)", holds, "hold_")
+    report(record_property, "L1 get during the sweep", get_latencies, "get_")
+    print(f"max hold {max(holds) / 1e6:.3f} ms over {len(holds)} holds; max get {max(get_latencies) / 1e6:.3f} ms")
+    record_property("hold_max_ns", max(holds))
+    record_property("get_max_ns", max(get_latencies))
+
+    assert removed == n
+    assert len(holds) >= n // 128  # batched: no hold covers the cache

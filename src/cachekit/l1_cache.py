@@ -4,6 +4,7 @@ This module provides a thread-safe L1 cache that sits in front of the L2 backend
 hit skips the backend's round trip while L2 stays the source of truth.
 """
 
+import heapq
 import logging
 import math
 import os
@@ -27,8 +28,14 @@ if TYPE_CHECKING:
 # SHORTEN the L1 lifetime relative to this default, never extend it.
 DEFAULT_L1_TTL_SECONDS = 300
 
-# Keys removed per lock acquisition in invalidate_many.
+# Keys removed per lock acquisition in invalidate_many, and expiry-heap tuples filtered or pushed back per
+# acquisition when cleanup_expired compacts the heap.
 _INVALIDATE_BATCH = 1_000
+
+# Due expiry-heap tuples popped per lock acquisition in cleanup_expired; every get and put in the namespace
+# waits on that lock. A pop costs 2-4 us at 100k entries (more when deadlines tie, as the keys are then
+# compared), so a batch holds the lock for about 0.5 ms. Compaction's cheaper steps take _INVALIDATE_BATCH.
+_SWEEP_BATCH = 128
 
 # The largest share of max_memory_bytes one entry may take. Storing an entry first evicts whole LRU
 # entries until it fits, and an entry read back from L2 is stored again each time it falls out, so a
@@ -63,19 +70,25 @@ class CacheEntry:
 
 
 class _L1State:
-    """The entries, their byte total, and the lock guarding both.
+    """The entries, their byte total, their expiry heap, and the lock guarding them.
 
-    One object so a fork reset can replace all three with a single attribute store: a thread
+    One object so a fork reset can replace them all with a single attribute store: a thread
     still inside a critical section finishes on the state it bound, and nothing is shared across
     the swap.
     """
 
-    __slots__ = ("cache", "lock", "memory_bytes")
+    __slots__ = ("cache", "expiry", "lock", "memory_bytes")
 
     def __init__(self) -> None:
         self.cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self.lock = threading.RLock()
         self.memory_bytes = 0
+        # Min-heap of (expires_at, key), one per put, so the sweep visits only due entries instead of
+        # scanning them all under the lock. Deletion is lazy: a removal, eviction or overwrite leaves its
+        # tuple behind. A tuple is live while its key holds an entry with that deadline, and every entry
+        # has one, so a dead tuple is safe to drop. cleanup_expired compacts the heap once dead tuples
+        # outnumber the entries; push() rebuilds it where no sweep runs.
+        self.expiry: list[tuple[float, str]] = []
 
     def remove(self, key: str) -> None:
         """Remove key if present, keeping memory_bytes in step; call with lock held."""
@@ -92,6 +105,42 @@ class _L1State:
         """Remove every entry; call with lock held."""
         self.cache.clear()
         self.memory_bytes = 0
+        self.expiry = []
+
+    def push(self, expires_at: float, key: str) -> None:
+        """Record a stored entry's deadline; call with lock held, after the cache write.
+
+        Where no sweep runs (a child forked without at-fork hooks starts no thread), nothing compacts
+        the heap, so a put rebuilds it from the cache once dead tuples outnumber the entries eight to
+        one. That is one pass over the entries per at least seven puts per entry, O(1) amortised. The
+        sweep compacts at two to one, so with it running a put rebuilds only if puts outrun it.
+        """
+        if len(self.expiry) >= 8 * len(self.cache) + _INVALIDATE_BATCH:
+            self.expiry = [(e.expires_at, k) for k, e in self.cache.items()]
+            heapq.heapify(self.expiry)
+        else:
+            heapq.heappush(self.expiry, (expires_at, key))
+
+    def is_live(self, expires_at: float, key: str) -> bool:
+        """Whether an expiry-heap tuple belongs to the key's current entry; call with lock held."""
+        entry = self.cache.get(key)
+        return entry is not None and entry.expires_at == expires_at
+
+    def remove_due(self, now: float) -> tuple[int, bool]:
+        """Pop at most _SWEEP_BATCH due heap tuples, removing their live entries; call with lock held.
+
+        Returns the entries removed and whether due tuples remain.
+        """
+        heap = self.expiry
+        removed = 0
+        for _ in range(_SWEEP_BATCH):
+            if not heap or heap[0][0] > now:
+                return removed, False
+            expires_at, key = heapq.heappop(heap)
+            if self.is_live(expires_at, key):
+                self.remove(key)
+                removed += 1
+        return removed, True
 
 
 class L1Cache:
@@ -324,6 +373,7 @@ class L1Cache:
             entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size)
             s.cache[key] = entry
             s.memory_bytes += size
+            s.push(expiry, key)
 
             # Move to end (most recently used)
             s.cache.move_to_end(key)
@@ -425,28 +475,79 @@ class L1Cache:
         logger.info("L1Cache cleared for namespace: %s", self.namespace)
 
     def cleanup_expired(self) -> int:
-        """Remove expired entries from cache.
+        """Remove expired entries, holding the lock for at most _SWEEP_BATCH expiry-heap tuples at a time.
+
+        Every get and put in this namespace waits on the lock, so no single hold covers the cache,
+        and the GIL is given up between holds so a waiting get takes the lock before the next one.
+        The expiry heap is popped only while its earliest deadline is due, so live entries are
+        never scanned. Once dead tuples outnumber the entries, the heap is compacted in batches too
+        (_compact_expiry); a whole rebuild would hold the lock for O(n).
 
         Returns:
             Number of entries removed
+
+        Examples:
+            >>> l1 = L1Cache(namespace="docs")
+            >>> l1.put("a", b"1", expires_at=time.time() + 1.1)  # L1 drops it 1 s (ttl_buffer_seconds) early
+            >>> l1.put("b", b"2", redis_ttl=60)
+            >>> time.sleep(0.2)
+            >>> l1.cleanup_expired()
+            1
+            >>> l1.get("b")
+            (True, b'2')
         """
-        current_time = time.time()
-        expired_keys = []
-
+        now = time.time()
         s = self._state
+        removed = 0
+        more = True
+        while more:
+            with s.lock:
+                batch, more = s.remove_due(now)
+                removed += batch
+                self._expired_evictions += batch
+            time.sleep(0)
+        removed += self._compact_expiry(s, now)
+
+        if removed:
+            logger.debug("L1Cache cleaned up %d expired entries", removed)
+
+        return removed
+
+    def _compact_expiry(self, s: _L1State, now: float) -> int:
+        """Drop dead expiry-heap tuples once they outnumber the entries, in lock holds of _INVALIDATE_BATCH tuples.
+
+        Detaches the heap, so puts meanwhile push onto a fresh one, filters the detached tuples, and
+        pushes the live ones back. A live entry's tuple is in one of the two throughout, so no entry
+        loses its deadline; one that dies before its tuple is pushed back leaves a dead tuple, dropped
+        later like any other. An expired entry found on the way is removed.
+
+        Returns:
+            Number of expired entries removed
+        """
         with s.lock:
-            for key, entry in s.cache.items():
-                if current_time >= entry.expires_at:
-                    expired_keys.append(key)
-
-            for key in expired_keys:
-                s.remove(key)
-                self._expired_evictions += 1
-
-        if expired_keys:
-            logger.debug("L1Cache cleaned up %d expired entries", len(expired_keys))
-
-        return len(expired_keys)
+            if len(s.expiry) <= 2 * len(s.cache) + _INVALIDATE_BATCH:
+                return 0
+            old, s.expiry = s.expiry, []
+        removed = 0
+        kept: list[tuple[float, str]] = []
+        for start in range(0, len(old), _INVALIDATE_BATCH):
+            with s.lock:
+                for expires_at, key in old[start : start + _INVALIDATE_BATCH]:
+                    if not s.is_live(expires_at, key):
+                        continue
+                    if expires_at <= now:
+                        s.remove(key)
+                        removed += 1
+                        self._expired_evictions += 1
+                    else:
+                        kept.append((expires_at, key))
+            time.sleep(0)
+        for start in range(0, len(kept), _INVALIDATE_BATCH):
+            with s.lock:
+                for item in kept[start : start + _INVALIDATE_BATCH]:
+                    heapq.heappush(s.expiry, item)
+            time.sleep(0)
+        return removed
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics.
@@ -778,6 +879,9 @@ def _release_inherited_states() -> None:
             while state.cache:
                 for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
                     state.cache.popitem()
+                time.sleep(0)
+            while state.expiry:  # its tuples hold the keys
+                del state.expiry[-_INVALIDATE_BATCH:]
                 time.sleep(0)
         finally:
             state.lock.release()
