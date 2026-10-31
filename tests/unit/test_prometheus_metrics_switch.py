@@ -6,6 +6,8 @@
 """
 
 import uuid
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -32,7 +34,11 @@ def _operations(namespace: str) -> float:
     )
 
 
-def _drive(decorate: Any, tmp_path: Any) -> tuple[float, int]:
+# cache() or cache.dev: called with keyword overrides, it returns the decorator
+DecoratorFactory = Callable[..., Callable[[Callable[[int], int]], Any]]
+
+
+def _drive(decorate: DecoratorFactory, tmp_path: Path) -> tuple[float, int]:
     """Make three calls (a miss, then two hits) and return the namespace's operation count and cache_info's."""
     namespace = f"switch-{uuid.uuid4().hex}"
     backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / namespace))
@@ -49,7 +55,7 @@ def _drive(decorate: Any, tmp_path: Any) -> tuple[float, int]:
     return _operations(namespace), (after.hits + after.misses) - (before.hits + before.misses)
 
 
-def test_enable_prometheus_metrics_false_records_no_cache_operations(tmp_path):
+def test_enable_prometheus_metrics_false_records_no_cache_operations(tmp_path: Path) -> None:
     recorded, counted = _drive(
         lambda **kw: cache(monitoring=MonitoringConfig(collect_stats=True, enable_prometheus_metrics=False), **kw), tmp_path
     )
@@ -57,13 +63,13 @@ def test_enable_prometheus_metrics_false_records_no_cache_operations(tmp_path):
     assert counted == 3
 
 
-def test_default_monitoring_records_cache_operations(tmp_path):
+def test_default_monitoring_records_cache_operations(tmp_path: Path) -> None:
     recorded, counted = _drive(lambda **kw: cache(monitoring=MonitoringConfig(), **kw), tmp_path)
     assert recorded > 0
     assert counted == 3
 
 
-def test_dev_preset_records_no_cache_operations(tmp_path):
+def test_dev_preset_records_no_cache_operations(tmp_path: Path) -> None:
     recorded, counted = _drive(cache.dev, tmp_path)
     assert recorded == 0
     assert counted == 3
