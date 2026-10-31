@@ -311,7 +311,8 @@ def operation(x):
 ```
 
 `@cache.dev` sets `enable_prometheus_metrics=False`, so it records none of the three series. To
-record them on a dev decorator, pass a monitoring config back:
+record them on a dev decorator, pass a monitoring config back. As on any decorator, `get` and `set`
+operations then record only when it has a backend ([Which Decorators Record](#which-decorators-record)):
 
 ```python
 from cachekit import cache

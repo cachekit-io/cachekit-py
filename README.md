@@ -196,7 +196,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Backend unreachable² | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
-> ¹ A preset with a ✅ records `get` and `set` operations only when it has a backend: in L1-only mode it records none. `@cache.dev` records none of them: it sets `enable_prometheus_metrics=False`. `circuit_breaker_state` is recorded for every function whose circuit breaker is enabled, `@cache.dev` included. See [Which Decorators Record](docs/features/prometheus-metrics.md#which-decorators-record).
+> ¹ A preset with a ✅ records `get` and `set` operations only when it has a backend: in L1-only mode it records none. `@cache.dev` records none of them: it sets `enable_prometheus_metrics=False`. Every preset still records the [series that ignore `MonitoringConfig`](docs/features/prometheus-metrics.md#series-that-ignore-monitoringconfig), such as `circuit_breaker_state`. See [Which Decorators Record](docs/features/prometheus-metrics.md#which-decorators-record).
 >
 > ² A backend that is down or unreachable never raises to the caller, on any preset (`@cache.io` included): the call logs the failure and runs your function. What gets cached meanwhile is in [Connection Errors](docs/error-codes.md#connection-errors).
 >
@@ -216,7 +216,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 `@cache.dev` and `@cache.test` are Python-only, SDK-local presets. See the comparison table above for the exact feature set of each preset.
 
 ```python
-# Development: verbose logging, integrity checks on, Prometheus off except circuit_breaker_state
+# Development: verbose logging, integrity checks on, no cache-operation Prometheus series
 @cache.dev
 def debug_expensive_call():
     return complex_computation()

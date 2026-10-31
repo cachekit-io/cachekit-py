@@ -45,7 +45,7 @@ def custom_function():
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
 - **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, backpressure, monitoring)
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
-- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, integrity checking on, Prometheus cache-operation series off (`circuit_breaker_state` still records)
+- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, integrity checking on, Prometheus cache-operation series off ([series that ignore `MonitoringConfig`](features/prometheus-metrics.md#series-that-ignore-monitoringconfig) still record)
 - **`@cache.test`** - SDK-local, Python-only testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
 - **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
 - **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
@@ -147,7 +147,7 @@ def analyze_dataset(dataset_id, filters=None):
 def critical_business_function():
     return important_computation()
 
-@cache.dev  # Development: verbose logging, Prometheus off except circuit_breaker_state
+@cache.dev  # Development: verbose logging, no cache-operation Prometheus series
 def debug_function():
     return process_data()
 
