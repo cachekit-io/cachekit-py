@@ -496,7 +496,7 @@ class TestL1OnlyFastPath:
         fn("bob@example.com")
         assert len(memo) == 2
         fn.invalidate_cache("alice@example.com")
-        assert memo.keys() == [("bob@example.com",)]
+        assert memo.keys() == [_memo_key(("bob@example.com",), {})]
         fn.cache_clear()
         assert len(memo) == 0
 
@@ -527,7 +527,7 @@ class TestL1OnlyFastPath:
         fn("alice@example.com")
         fn("bob@example.com")
         fn.invalidate_cache(Path("alice@example.com"))
-        assert memo.keys() == [("bob@example.com",)]
+        assert memo.keys() == [_memo_key(("bob@example.com",), {})]
         fn.invalidate_cache("bob@example.com", _bypass_cache=True)
         assert len(memo) == 0
         fn("alice@example.com")

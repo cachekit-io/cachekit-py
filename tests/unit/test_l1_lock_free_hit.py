@@ -102,7 +102,7 @@ class TestRemovalRoutes:
         fn(2)
         fn(3)  # evicts 1, the least recently used
         assert oc.size == 2
-        assert ((1,) in memo.keys(), len(memo)) == (False, 2)
+        assert (_memo_key((1,), {}) in memo.keys(), len(memo)) == (False, 2)
         assert _gone(ref)
         fn(1)
         assert calls == [1, 2, 3, 1]
@@ -120,7 +120,7 @@ class TestRemovalRoutes:
         _put(oc, "d", _Value("d"))  # evicts a
         assert (_hit(memo, "a"), _hit(memo, "b")) == (_MISS, _MISS)
         assert _hit(memo, "c").n == "c"
-        assert sorted(memo.keys()) == [("c",), ("d",)]
+        assert sorted(memo.keys()) == sorted([_memo_key(("c",), {}), _memo_key(("d",), {})])
         assert _gone(ref)
 
     @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
