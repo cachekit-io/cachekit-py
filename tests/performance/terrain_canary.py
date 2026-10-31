@@ -36,8 +36,13 @@ cache warming. Nothing is deleted: entries expire after ``--ttl`` seconds.
 
 Run (from a checkout, after ``uv sync``, against a Redis you can write to)::
 
-  uv run python tests/performance/terrain_canary.py --redis redis://127.0.0.1:6379/0 --minutes 10 \\
-      --out terrain.json --harness https://github.com/cachekit-io/cachekit-py/blob/<sha>/tests/performance/terrain_canary.py
+  uv run python tests/performance/terrain_canary.py --redis redis://127.0.0.1:6379/0 \\
+      --l2-where "same host, loopback TCP" --minutes 10 --out terrain.json \\
+      --harness https://github.com/cachekit-io/cachekit-py/blob/<sha>/tests/performance/terrain_canary.py
+
+``--l2-where`` is the recording's own words for where the Redis runs, printed beside its figures.
+The harness cannot tell from the URL (a tunnel or port-forward on localhost reaches a remote Redis),
+so it always asks.
 
 The summary printed at the end gives each layer's share and its exact p50 and p99 from the raw
 samples; the histograms' own percentiles are only good to a bin (about 15%).
@@ -46,6 +51,7 @@ samples; the histograms' own percentiles are only good to a bin (about 15%).
 from __future__ import annotations
 
 import argparse
+import bisect
 import itertools
 import json
 import math
@@ -68,7 +74,6 @@ DECADES = 7  # up to 1 s
 NBINS = DECADES * PER_DECADE
 LAYERS = ("l1", "l2", "miss")
 ZIPF_EXPONENT = 0.99
-LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 WORDS = (
     "cache layer tenant region shard replica index ledger order invoice customer product catalog price "
     "stock warehouse route session token profile avatar settings feed post comment thread reaction"
@@ -106,36 +111,31 @@ def payload(key: int) -> dict[str, Any]:
     }
 
 
-def value_size_quantiles(n_keys: int, qs: tuple[float, ...] = (0.5, 0.95)) -> list[int]:
-    """Quantiles of the cached values' size as MessagePack, in bytes, weighted by requests.
+def zipf_weights(n_keys: int) -> list[float]:
+    """Each key's share of the calls, unnormalised: rank r in proportion to 1 / (r + 1) ** ZIPF_EXPONENT.
+
+    The workload draws keys with these weights and the value sizes are weighted by them, so the
+    sizes the recording states describe the calls it made.
+    """
+    return [1.0 / (r + 1) ** ZIPF_EXPONENT for r in range(n_keys)]
+
+
+def value_size_quantiles(n_keys: int) -> tuple[int, int]:
+    """The cached values' size as MessagePack, in bytes, at the median call and the 95th percentile.
 
     Each key counts by its Zipf share of the calls, so the median is the size of a typical call's
     value, not of a typical key's.
 
     >>> value_size_quantiles(10_000)
-    [855, 4430]
+    (855, 4430)
     """
-    weights = [1.0 / (r + 1) ** ZIPF_EXPONENT for r in range(n_keys)]
-    sized = sorted(zip((len(msgpack.packb(payload(k))) for k in range(n_keys)), weights, strict=True))
-    total = sum(weights)
-    out: list[int] = []
-    seen = 0.0
-    for size, weight in sized:
-        seen += weight
-        while len(out) < len(qs) and seen >= qs[len(out)] * total:
-            out.append(size)
-    return out
+    sized = sorted(zip((len(msgpack.packb(payload(k))) for k in range(n_keys)), zipf_weights(n_keys), strict=True))
+    seen = list(itertools.accumulate(weight for _, weight in sized))
 
+    def size_at(q: float) -> int:
+        return sized[bisect.bisect_left(seen, q * seen[-1])][0]
 
-def loopback_l2_where(redis_url: str) -> str | None:
-    """What ``--l2-where`` records when it is not given: only a loopback Redis is known to be local.
-
-    >>> loopback_l2_where("redis://127.0.0.1:6379/0"), loopback_l2_where("rediss://[::1]:6380")
-    ('same host, loopback TCP', 'same host, loopback TCP')
-    >>> loopback_l2_where("redis://db.example:6379") is None, loopback_l2_where("unix:///run/redis.sock") is None
-    (True, True)
-    """
-    return "same host, loopback TCP" if urlsplit(redis_url).hostname in LOOPBACK_HOSTS else None
+    return size_at(0.5), size_at(0.95)
 
 
 def next_arrival(due: float, now: float, gap: float) -> float:
@@ -144,8 +144,8 @@ def next_arrival(due: float, now: float, gap: float) -> float:
     ``due`` is when the last call was due to start and ``now`` is when the caller came free. A
     caller that keeps up starts every call on the Poisson schedule. One that is late starts the next
     call at once and draws the following gap from there: it drops the rest of the backlog instead of
-    firing calls back to back to catch up, so every gap between starts is at least the drawn one and
-    the call rate never runs above the arrival rate.
+    firing calls back to back, so every gap between starts is at least the drawn one, and it never
+    runs above ``--rate`` to catch up.
 
     >>> starts, due, free = [], 0.0, 0.0
     >>> for gap, service in [(1.0, 0.2), (1.0, 2.5), (1.0, 0.2), (1.0, 0.2)]:
@@ -239,8 +239,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     rng = random.Random(args.seed)
     keys = range(args.keys)
-    # Zipf: rank r drawn with probability proportional to 1 / (r + 1) ** ZIPF_EXPONENT.
-    zipf_cdf = list(itertools.accumulate(1.0 / (r + 1) ** ZIPF_EXPONENT for r in keys))
+    zipf_cdf = list(itertools.accumulate(zipf_weights(args.keys)))
     try:
         redis_version = redis.Redis.from_url(args.redis, socket_connect_timeout=5, socket_timeout=5).info("server")[
             "redis_version"
@@ -343,7 +342,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--redis", required=True, help="Redis URL to use as L2 (the run writes under a fresh namespace)")
     p.add_argument(
         "--l2-where",
-        help="where the Redis runs, for the record; required unless the --redis host is loopback",
+        required=True,
+        help='where the Redis runs, in the words the recording prints, e.g. "same host, loopback TCP"',
     )
     p.add_argument("--minutes", type=float, default=10.0)
     p.add_argument("--rate", type=float, default=200.0, help="calls per second (Poisson arrivals)")
@@ -363,11 +363,9 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--origin-ms must not be negative")
     if not args.out.parent.is_dir():
         p.error(f"--out: {args.out.parent} is not a directory")
-    if args.l2_where is None:
-        # The recording's L2 label is copy on a public page: never guess it for a Redis elsewhere.
-        args.l2_where = loopback_l2_where(args.redis)
-        if args.l2_where is None:
-            p.error("--l2-where is required when the --redis host is not loopback: say where the Redis runs")
+    if not args.l2_where.strip():
+        # The recording's L2 label is copy on a public page: a blank one would print as "Redis 8.x, ".
+        p.error("--l2-where must say where the Redis runs")
     doc = run(args)
     text = json.dumps(doc, separators=(",", ":"), allow_nan=False)
     try:
