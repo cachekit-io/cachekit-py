@@ -36,13 +36,13 @@ import msgpack
 import pytest
 
 import cachekit.serializers.base as serializers_base
-from cachekit._rust_serializer import ByteStorage, check_msgpack_structure
+from cachekit._rust_serializer import ByteStorage, check_msgpack_structure, unpackb_standard
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.interop import decode_interop_value
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import MSGPACK_MAX_NESTING, SerializationError, unpackb_bounded
 from cachekit.serializers.interop_serializer import InteropSerializer
-from cachekit.serializers.standard_serializer import StandardSerializer
+from cachekit.serializers.standard_serializer import StandardSerializer, _standard_object_hook
 from cachekit.serializers.wrapper import SerializationWrapper
 from tests.utils.tracemalloc_isolation import measure_in_subprocess
 
@@ -84,9 +84,16 @@ def _forged_entry(payload: bytes, serializer: str = "default") -> bytes:
     return SerializationWrapper.wrap(_envelope(payload), metadata, serializer_name)
 
 
-# Every path that decodes backend-supplied MessagePack. Each must reach unpackb_bounded.
+def _standard_decode(data: bytes | bytearray | memoryview) -> Any:
+    """StandardSerializer's decode: the walk's bounds and the decode in one Rust pass."""
+    return unpackb_standard(data, MSGPACK_MAX_NESTING, _standard_object_hook)
+
+
+# Every path that decodes backend-supplied MessagePack. Each must reach unpackb_bounded, or for
+# StandardSerializer the Rust decode that enforces the same bounds in its one pass.
 DECODE_PATHS: dict[str, Callable[[bytes], Any]] = {
     "unpackb_bounded": lambda b: unpackb_bounded(b, raw=False),
+    "unpackb_standard": _standard_decode,
     "interop": decode_interop_value,
     "interop_serializer": InteropSerializer().deserialize,
     "standard/plain": StandardSerializer(enable_integrity_checking=False).deserialize,
@@ -237,16 +244,23 @@ class TestEnvelopeEntryPoint:
         assert AutoSerializer().deserialize(doc) == msgpack.unpackb(doc)
 
 
+# The two bounded decoders: unpackb_bounded (walk, then msgpack-python) and StandardSerializer's one-pass decode.
+BOUNDED_DECODERS = pytest.mark.parametrize(
+    "decode", [unpackb_bounded, _standard_decode], ids=["unpackb_bounded", "unpackb_standard"]
+)
+
+
 class TestOwnedBounds:
     """SDK-local guards that go beyond the shared vectors."""
 
-    def test_nesting_ceiling_is_exactly_the_pinned_constant(self) -> None:
+    @BOUNDED_DECODERS
+    def test_nesting_ceiling_is_exactly_the_pinned_constant(self, decode: Callable[[bytes], Any]) -> None:
         # The walk rejects one level past MSGPACK_MAX_NESTING; a document AT the ceiling
         # must still decode, so the constant may not exceed msgpack-python's C stack.
         at_bound = b"\x91" * MSGPACK_MAX_NESTING + b"\xc0"
         # Walked iteratively, not compared with `==`: nested-list equality recurses in CPython
         # too, and would blow the same recursion limit this test is bounding.
-        value: object = unpackb_bounded(at_bound)
+        value: object = decode(at_bound)
         depth = 0
         while isinstance(value, list):
             assert len(value) == 1
@@ -254,9 +268,10 @@ class TestOwnedBounds:
         assert depth == MSGPACK_MAX_NESTING
         assert value is None
         with pytest.raises(ValueError, match=f"nests deeper than {MSGPACK_MAX_NESTING} levels"):
-            unpackb_bounded(b"\x91" * (MSGPACK_MAX_NESTING + 1) + b"\xc0")
+            decode(b"\x91" * (MSGPACK_MAX_NESTING + 1) + b"\xc0")
 
-    def test_an_empty_innermost_collection_counts_toward_the_ceiling(self) -> None:
+    @BOUNDED_DECODERS
+    def test_an_empty_innermost_collection_counts_toward_the_ceiling(self, decode: Callable[[bytes], Any]) -> None:
         # Every array header is a level, an empty one included, so one level past the ceiling is the
         # guard's rejection, not msgpack-python's StackError (also a ValueError) after the walk let it by.
         check_msgpack_structure(b"\x91" * (MSGPACK_MAX_NESTING - 1) + b"\x90", MSGPACK_MAX_NESTING)
@@ -265,25 +280,33 @@ class TestOwnedBounds:
             check_msgpack_structure(too_deep, MSGPACK_MAX_NESTING)
         assert str(excinfo.value).startswith(GUARD_ERROR_PREFIX)
         with pytest.raises(ValueError) as excinfo:
-            unpackb_bounded(too_deep)
+            decode(too_deep)
         _assert_guard_rejected(excinfo.value)
 
-    def test_trailing_bytes_still_rejected(self) -> None:
+    @BOUNDED_DECODERS
+    def test_trailing_bytes_still_rejected(self, decode: Callable[[bytes], Any]) -> None:
         with pytest.raises(msgpack.exceptions.ExtraData):
-            unpackb_bounded(b"\xc0\xc0")
+            decode(b"\xc0\xc0")
 
-    def test_mutable_exporters_are_accepted(self) -> None:
+    @BOUNDED_DECODERS
+    def test_mutable_exporters_are_accepted(self, decode: Callable[..., Any]) -> None:
         # A bytearray (or a memoryview over one) is snapshotted so the walk and the decode see one
         # immutable document; a memoryview of bytes stays zero-copy. All three must decode.
         doc = msgpack.packb({"t": 1})
-        assert unpackb_bounded(bytearray(doc), raw=False) == {"t": 1}
-        assert unpackb_bounded(memoryview(bytearray(doc)), raw=False) == {"t": 1}
-        assert unpackb_bounded(memoryview(doc)[0:], raw=False) == {"t": 1}
+        assert decode(bytearray(doc)) == {"t": 1}
+        assert decode(memoryview(bytearray(doc))) == {"t": 1}
+        assert decode(memoryview(doc)[0:]) == {"t": 1}
 
-    def test_memoryview_shapes_and_formats_decode_like_bytes(self) -> None:
+    @pytest.mark.parametrize(
+        "decode",
+        [lambda b: unpackb_bounded(b, raw=False), StandardSerializer(enable_integrity_checking=False).deserialize],
+        ids=["unpackb_bounded", "standard/plain"],
+    )
+    def test_memoryview_shapes_and_formats_decode_like_bytes(self, decode: Callable[..., Any]) -> None:
         # The Rust walk takes PyBuffer<u8>; msgpack takes any itemsize-1 buffer. Views are normalised
         # to a flat "B" view first so the two agree, len(data) is the byte count the caps need, and a
         # legitimate document is never rejected for the shape or format of the view it arrived in.
+        # StandardSerializer's Rust decode takes PyBuffer<u8> too, so its plain read normalises the same way.
         doc = next(
             d
             for d in (msgpack.packb({"k": b"x" * m, "l": [1, 2, 3]}, use_bin_type=True) for m in range(1, 9))
@@ -297,10 +320,10 @@ class TestOwnedBounds:
             "uint16": memoryview(doc).cast("H"),
         }
         for name, view in views.items():
-            assert unpackb_bounded(view, raw=False) == expected, name
+            assert decode(view) == expected, name
         # A non-contiguous view has no flat form: it is copied, then decoded like the bytes it selects.
         interleaved = bytes(b for pair in zip(doc, doc, strict=True) for b in pair)
-        assert unpackb_bounded(memoryview(interleaved)[::2], raw=False) == expected
+        assert decode(memoryview(interleaved)[::2]) == expected
 
     # One exact-width document per fixed-width marker family: float32/64, uint8..64, int8..64,
     # fixext 1/2/4/8/16, ext8/16/32 (2-byte payload), str8/16/32 + fixstr, bin8/16/32.
@@ -332,15 +355,19 @@ class TestOwnedBounds:
         b"\xc6\x00\x00\x00\x01x",
     ]
 
+    @BOUNDED_DECODERS
     @pytest.mark.parametrize("doc", FIXED_WIDTH_DOCS, ids=lambda d: f"0x{d[0]:02x}")
-    def test_every_marker_is_walked_to_its_exact_width(self, doc: bytes) -> None:
+    def test_every_marker_is_walked_to_its_exact_width(self, doc: bytes, decode: Callable[[bytes], Any]) -> None:
         # Exact length passes the walk; one byte short is a truncation; a trailing byte reaches the
         # decoder as ExtraData — together they pin that the walk consumed exactly the marker's width.
         check_msgpack_structure(doc, MSGPACK_MAX_NESTING)
         with pytest.raises(ValueError, match="Unpack failed"):
             check_msgpack_structure(doc[:-1], MSGPACK_MAX_NESTING)
+        decode(doc)
+        with pytest.raises(ValueError, match=GUARD_ERROR_PREFIX):
+            decode(doc[:-1])
         with pytest.raises(msgpack.exceptions.ExtraData):
-            unpackb_bounded(doc + b"\xc0")
+            decode(doc + b"\xc0")
 
     def test_reserved_marker_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="reserved marker 0xc1"):

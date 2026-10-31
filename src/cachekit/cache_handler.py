@@ -64,7 +64,7 @@ from cachekit.serializers.encryption_wrapper import (
     KeyringConfigurationError,
     require_cross_sdk_serializer,
 )
-from cachekit.serializers.standard_serializer import KeptEntry, StandardSerializer, VerifiedMsgpack, WalkedEnvelope
+from cachekit.serializers.standard_serializer import StandardSerializer, VerifiedMsgpack
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
@@ -1345,47 +1345,40 @@ class CacheSerializationHandler:
 
     def deserialize_l1(
         self,
-        data: bytes | VerifiedMsgpack | WalkedEnvelope,
+        data: bytes | VerifiedMsgpack,
         cache_key: str = "",
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> tuple[Any, VerifiedMsgpack | WalkedEnvelope | None]:
+    ) -> tuple[Any, VerifiedMsgpack | None]:
         """:meth:`deserialize_data` for an entry read from L1, plus what L1 should hold in its place, if anything.
 
-        When this handler keeps MessagePack (``keeps_msgpack_in_l1``) and the entry is its own plaintext
-        envelope, that is what this decode verified and walked: the MessagePack (:class:`VerifiedMsgpack`) when it
-        is no longer than the entry, else the entry marked as walked (:class:`WalkedEnvelope`). Either records
-        whether the MessagePack may hold a marker map. The caller's swap (``L1Cache.shrink_if_held``) costs no
-        second decode, and later hits skip the structure walk, the object hook when no marker map can be present,
-        and, for VerifiedMsgpack, retrieve(). Everything else gets None: a kept entry decodes that way, and any
-        other entry goes to deserialize_data, which refuses another handler's kept entry. Raises as
+        When this handler keeps MessagePack (``keeps_msgpack_in_l1``), the entry is its own plaintext envelope, and
+        the MessagePack this decode verified is no longer than the entry, that MessagePack (:class:`VerifiedMsgpack`),
+        for the caller to swap in (``L1Cache.shrink_if_held``) at no second decode: later hits skip the envelope's
+        retrieve(), its decompress and checksum. Everything else gets None: a kept entry decodes that way, a longer
+        MessagePack would grow the entry so L1 keeps the envelope, and any other entry goes to deserialize_data,
+        which refuses another handler's kept entry. Every decode, kept or not, runs the bounded decode. Raises as
         deserialize_data.
 
         Examples:
             >>> handler = CacheSerializationHandler()
             >>> envelope = handler.serialize_data("hello", cache_key="greeting")
             >>> value, entry = handler.deserialize_l1(envelope, cache_key="greeting")
-            >>> value, type(entry).__name__, len(entry) <= len(envelope), entry.hook
-            ('hello', 'VerifiedMsgpack', True, False)
-            >>> handler.deserialize_l1(entry, cache_key="greeting")  # already walked MessagePack
+            >>> value, type(entry).__name__, len(entry) <= len(envelope)
+            ('hello', 'VerifiedMsgpack', True)
+            >>> handler.deserialize_l1(entry, cache_key="greeting")  # already verified MessagePack
             ('hello', None)
             >>> compressible = handler.serialize_data("ab" * 600, cache_key="k")
-            >>> value, entry = handler.deserialize_l1(compressible, cache_key="k")  # its MessagePack is longer
-            >>> type(entry).__name__, entry.frame is compressible
-            ('WalkedEnvelope', True)
-            >>> handler.deserialize_l1(entry, cache_key="k") == (value, None)
+            >>> handler.deserialize_l1(compressible, cache_key="k")[1] is None  # its MessagePack is longer: L1 keeps the envelope
             True
         """
         # Inline, not helpers: this is every L1 hit's decode, and an envelope it keeps must cost what
         # deserialize_data costs.
         if not self.keeps_msgpack_in_l1:
             return self.deserialize_data(data, cache_key, args, kwargs), None
-        # Only L1 holds these types, and only such a handler swapped them in, after a decode that walked them.
+        # Only L1 holds this type, and only such a handler swapped it in, after a decode that accepted it.
         if type(data) is VerifiedMsgpack:
-            return self._base_serializer._deserialize_verified(data.data, data.hook), None  # type: ignore[union-attr]
-        if type(data) is WalkedEnvelope:
-            payload = SerializationWrapper.unwrap_metadata(data.frame)[0]  # parsed when it was walked: cannot fail
-            return self._base_serializer._deserialize_walked(payload, data.hook), None  # type: ignore[union-attr]
+            return self._base_serializer._deserialize_verified(data.data), None  # type: ignore[union-attr]
         try:
             payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -1396,11 +1389,11 @@ class CacheSerializationHandler:
         if serializer_name != self._serializer_string_name or metadata.encrypted or not metadata.compressed:
             return self.deserialize_data(data, cache_key, args, kwargs), None
         value, kept = self._base_serializer._deserialize_keeping_msgpack(payload)  # type: ignore[union-attr]
-        return value, kept if len(kept) <= len(data) else WalkedEnvelope(data, kept.hook)
+        return value, kept if len(kept) <= len(data) else None
 
     def deserialize_data(
         self,
-        data: str | bytes | memoryview | KeptEntry,
+        data: str | bytes | memoryview | VerifiedMsgpack,
         cache_key: str = "",
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
@@ -1477,7 +1470,7 @@ class CacheSerializationHandler:
             True
         """
         if self.interop_mode:
-            # A KeptEntry here is another handler's swapped L1 entry: the bytes-only decode refuses it.
+            # A VerifiedMsgpack here is another handler's swapped L1 entry: the bytes-only decode refuses it.
             return self._deserialize_interop(data, cache_key)  # pyright: ignore[reportArgumentType]
 
         try:
@@ -1489,11 +1482,11 @@ class CacheSerializationHandler:
                 # A custom SerializerProtocol may write to the metadata it is handed, so it gets its own
                 # copy rather than the header memo's shared, read-only instance.
                 serialized_data, metadata, serializer_name = SerializationWrapper.unwrap_metadata(
-                    data,  # pyright: ignore[reportArgumentType]  # a KeptEntry raises here and is refused below
+                    data,  # pyright: ignore[reportArgumentType]  # a VerifiedMsgpack raises here and is refused below
                     shared=not self._custom_serializer,
                 )
             except (AttributeError, KeyError, TypeError, ValueError) as e:
-                if self.encryption and type(data) in (VerifiedMsgpack, WalkedEnvelope):
+                if self.encryption and type(data) is VerifiedMsgpack:
                     # A plaintext handler's swapped L1 entry under this key: refused as the plaintext
                     # envelope it replaced would be, and counted the same way (suspicious_envelope).
                     raise SuspiciousCacheEntryError(

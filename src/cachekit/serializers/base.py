@@ -365,7 +365,10 @@ class EnvelopeShapeError(SerializationError):
 # ---------------------------------------------------------------------------
 
 #: cachekit's own nesting ceiling, enforced by cachekit-core's ``check_msgpack_structure``
-#: walk (through the Rust extension) before msgpack-python ever sees the document. Every
+#: walk (through the Rust extension) before msgpack-python ever sees the document, and by
+#: StandardSerializer's one-pass Rust decode (``unpackb_standard``), which repeats the walk's accounting
+#: inline and runs the walk itself only after a failure (tests/unit/test_standard_decode.py holds the
+#: two to the same verdicts). Every
 #: array or map header on the path counts as a level, an empty one included. Two
 #: constraints pin it: the protocol requires every SDK's bound to sit in 32..=1024, and
 #: it must not exceed msgpack-python's C unpacker stack (a document at the ceiling has to
