@@ -56,9 +56,12 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The memoised L1-only hit, its entries and their clock (decorators/wrapper.py, object_cache.py)
     m.add_class::<l1_hit::HitMemo>()?;
     m.add_class::<l1_hit::HitEntry>()?;
-    m.add_function(wrap_pyfunction!(l1_hit::memo_key, m)?)?;
-    m.add_function(wrap_pyfunction!(l1_hit::monotonic, m)?)?;
+    m.add_function(wrap_pyfunction!(l1_hit::memo_key_of, m)?)?;
+    m.add_function(wrap_pyfunction!(l1_hit::now, m)?)?;
     m.add_function(wrap_pyfunction!(l1_hit::set_clock, m)?)?;
+    m.add("MEMO_MAX_LEN", l1_hit::MEMO_MAX_LEN)?;
+    m.add("MEMO_MAX_ARGS", l1_hit::MEMO_MAX_ARGS)?;
+    m.add("MEMO_MAX_ENTRIES", l1_hit::MEMO_MAX_ENTRIES)?;
 
     // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the

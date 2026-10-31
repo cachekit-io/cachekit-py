@@ -202,6 +202,30 @@ get_origin()
 assert len(calls) == 2  # ran on both calls: nothing was stored
 ```
 
+## TTLs Follow the OS Monotonic Clock
+
+An L1-only entry expires on the OS monotonic clock, which the Rust extension reads itself, so the lock-free hit and the cache judge every deadline on one clock. Patching `time.monotonic` (pytest's `monkeypatch`, freezegun's `freeze_time` or `tick`) does not move it, so a test cannot expire an entry by moving fake time. `@cache.local()` expires its entries on the same clock. A cache with a backend is unchanged.
+
+To test what happens after an entry expires, remove it instead:
+
+```python
+from cachekit import cache
+
+calls = []
+
+
+@cache(backend=None, ttl=60)
+def get_rate(currency: str) -> float:
+    calls.append(currency)
+    return 1.08
+
+
+get_rate("EUR")
+get_rate.invalidate_cache("EUR")  # in place of moving time past ttl; cache_clear() removes every entry
+get_rate("EUR")
+assert calls == ["EUR", "EUR"]
+```
+
 ## Characteristics
 
 - Latency: 0.31μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)), one call into the Rust extension that takes no lock; a call the [memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key, looks it up under the cache's lock and costs about 22 times the instructions; in-memory, no network

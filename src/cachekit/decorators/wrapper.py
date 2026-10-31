@@ -11,7 +11,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Hashable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
@@ -611,27 +611,9 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 )
 
 
-# The memo (create_cache_wrapper's HitMemo) takes a call only when every argument's exact type is int,
-# float, bool, NoneType, str or bytes. Two equal values of one of these types always produce the same
-# key: their MessagePack is the same, 0.0 and -0.0 included, since both normalise to 0.0. Types are
-# tested by identity, as the key generator's fast path does, so an argument's type is never hashed or
-# compared through its metaclass. A subclass (IntEnum, a str subclass) or a container never matches,
-# so it takes the full key path on every call.
-# The memo keeps what it is keyed by, keyword names included, so a call's str and bytes arguments and
-# keyword names may hold at most _MEMO_MAX_LEN characters or bytes between them. That bounds an entry
-# at a few KiB: a str of 4-byte characters also keeps its UTF-8 copy once the key generator encodes
-# it. It also bounds the hashing a lookup repeats for strings that are new to each call.
-# _memo_key, the memo key of a call's arguments or None, is the extension's memo_key
-# (rust/src/l1_hit.rs), so the lock-free hit and the slow path that memoises compute one key. A call
-# of only ints, strs and Nones is keyed by its argument tuple itself: those never compare equal
-# across types. A float or bool (1, 1.0 and True are equal) or a bytes puts every type in the key.
-# These mirror the extension's constants.
-_MEMO_MAX_LEN = 256
-# Arguments per call, positional and keyword together.
-_MEMO_MAX_ARGS = 8
-# Slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a hit
-# writes nothing to it.
-_MEMO_MAX_ENTRIES = 1024
+# _memo_key, the memo key of a call's arguments or None when the memo (create_cache_wrapper's HitMemo)
+# does not take the call, is the extension's memo_key, so the lock-free hit and the slow path that
+# memoises compute one key. rust/src/l1_hit.rs documents which calls it takes and the memo's bounds.
 # What HitMemo.get returns when it cannot answer a call.
 _MISS = object()
 
@@ -1892,9 +1874,7 @@ def create_cache_wrapper(
         finally:
             _forget_flights(cache_keys)
 
-    def _l1_only_fill(
-        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
-    ) -> Any:
+    def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None) -> Any:
         """Run the function for an L1-only miss and store its result, memoised under memo_key (see
         _call_key). A miss is a call that runs it."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
@@ -1905,7 +1885,7 @@ def create_cache_wrapper(
         return result
 
     async def _l1_only_fill_async(
-        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
+        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None
     ) -> Any:
         """_l1_only_fill for a coroutine function."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
@@ -1915,7 +1895,7 @@ def create_cache_wrapper(
         _cached_keys.add((_l2_scope(), cache_key))
         return result
 
-    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, tuple[Any, ...] | None]:
+    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, Hashable | None]:
         """A call's cache key, and for an L1-only function with a memo the memo key to memoise its
         entry under, or None.
 
@@ -3261,7 +3241,8 @@ def create_cache_wrapper(
         while this runs, stays in _cached_keys for the next attempt. Keys other processes
         wrote and this one never saw stay in L2 until their TTL. Another tenant's entry keeps
         its L2 value and stays tracked; only its L1 copy is evicted, because L1 is not
-        tenant-scoped.
+        tenant-scoped. An L1-only function's ObjectCache is cleared whole, so every entry stored
+        before this call goes, recorded or not.
 
         Failed deletes are logged once per call with their count: the call never raises, so
         this record is the caller's only signal, and a per-key record would flood during an
@@ -3287,10 +3268,14 @@ def create_cache_wrapper(
                         _cached_keys.discard(entry)
                         if entry in watch:  # rewritten meanwhile: its new value may still be in L2
                             _cached_keys.add(entry)
-                    if _object_cache:
-                        _object_cache.delete(key)
-                    elif _l1_cache:
+                    if _object_cache is None and _l1_cache:
                         _l1_cache.invalidate(key)
+            if _object_cache:
+                # An L1-only function's cache goes whole, not key by key from the snapshot: a fill
+                # records its key only after its put, and a single-key invalidation untracks its key
+                # before its delete, so the snapshot can miss an entry stored before this call. L1
+                # is not tenant-scoped, and an L1-only function has nothing in L2.
+                _object_cache.clear()
         if fallbacks:
             # Once per call, like the ERROR below. A backend whose multi-key delete always fails
             # (e.g. an ACL that denies UNLINK) otherwise silently pays one round trip per key.
