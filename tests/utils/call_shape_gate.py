@@ -3,7 +3,7 @@
 A call-shape test pins two things for one decorated call: the ordered list of requests the caller waits on,
 and the requests that run in the background after it returns. The backend's transport calls
 ``CallShapeGate.observe(op)`` for each request before sending it (tests/unit/test_cachekitio_call_shape.py
-hooks the fake urllib3 pool, tests/integration/test_redis_call_shape.py the redis-py client).
+hooks the fake urllib3 pool, tests/unit/test_redis_call_shape.py the redis-py client).
 
 Blocking is decided by state, never by a clock: a request blocks if the caller is still waiting on it.
 The thread a request arrives on cannot tell that for an async caller. The async backend methods send on
