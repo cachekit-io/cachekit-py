@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.26.0](https://github.com/cachekit-io/cachekit-py/compare/v0.25.1...v0.26.0) (2026-10-31)
+
+
+### Features
+
+* **decorators:** let async [@cache](https://github.com/cache) opt out of the miss-path distributed lock (LAB-7166) ([#667](https://github.com/cachekit-io/cachekit-py/issues/667)) ([1e2295d](https://github.com/cachekit-io/cachekit-py/commit/1e2295d5f0a6ed894805685caa30cdcae5b3efc0))
+
+
+### Performance Improvements
+
+* **decorators:** answer the L1-only hit in one lock-free call into the extension (LAB-12024) ([#673](https://github.com/cachekit-io/cachekit-py/issues/673)) ([8b17e51](https://github.com/cachekit-io/cachekit-py/commit/8b17e5109a00b3332252af40930c9cd966eb51e8))
+* **l1:** skip the structure walk and object hook on a kept L1 entry (LAB-12023) ([#671](https://github.com/cachekit-io/cachekit-py/issues/671)) ([7fbdfbe](https://github.com/cachekit-io/cachekit-py/commit/7fbdfbee51268198fae736245653a44f8fd7b2c8))
+
 ## [0.25.1](https://github.com/cachekit-io/cachekit-py/compare/v0.25.0...v0.25.1) (2026-10-30)
 
 
