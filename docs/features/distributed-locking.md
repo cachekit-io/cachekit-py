@@ -400,9 +400,9 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 async def operation(x):
     # L2 backend down: lock acquisition fails too (the lock lives in L2),
     # so callers on the event loop running the key's call share it without the
-    # lock, and a caller on another thread's loop runs its own (see In-Process
-    # Single-Flight above).
-    # and the function keeps serving. Locking resumes when the backend recovers.
+    # lock, a caller on another thread's loop runs its own (see In-Process
+    # Single-Flight above), and the function keeps serving. Locking resumes
+    # when the backend recovers.
     return compute(x)
 ```
 
