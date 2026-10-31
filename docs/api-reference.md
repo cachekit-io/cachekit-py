@@ -45,7 +45,7 @@ def custom_function():
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
 - **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, backpressure, monitoring)
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
-- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, Prometheus metrics disabled except `circuit_breaker_state`
+- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, integrity checking on
 - **`@cache.test`** - SDK-local, Python-only testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
 - **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
 - **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
@@ -113,9 +113,9 @@ def your_function(args):
 #### Monitoring Parameters
 
 - **`monitoring`** (`MonitoringConfig`, default: `MonitoringConfig()`) - Observability configuration:
-  - `collect_stats` (`bool`, default: `True`) - Collect cache hit/miss statistics
+  - `collect_stats` (`bool`, default: `True`) - Record the Prometheus cache-operation series ([which decorators](features/prometheus-metrics.md#which-decorators-record)). `cache_info()` counts either way
   - `enable_structured_logging` (`bool`, default: `True`) - Log cache operations at INFO, with their fields on each record ([Structured Logging](#structured-logging))
-  - `enable_prometheus_metrics` (`bool`, default: `True`) - Export Prometheus metrics
+  - `enable_prometheus_metrics` (`bool`, default: `True`) - Not read at runtime: `False` stops no series. Use `collect_stats`
 
 #### Encryption Parameters
 
@@ -147,7 +147,7 @@ def analyze_dataset(dataset_id, filters=None):
 def critical_business_function():
     return important_computation()
 
-@cache.dev  # Development: verbose logging, no Prometheus except circuit_breaker_state
+@cache.dev  # Development: verbose logging, integrity checks on
 def debug_function():
     return process_data()
 
@@ -856,9 +856,10 @@ def cache_stats():
 
 ### Prometheus Metrics
 
-The library records metrics on the default `prometheus_client` registry (enabled by
-default). **Exposition is the application's responsibility** — cachekit does not start an
-HTTP server or register a `/metrics` route; wire up `prometheus_client` exposition
+The library records metrics on the default `prometheus_client` registry (by default, for
+every decorator with a backend: [which decorators](features/prometheus-metrics.md#which-decorators-record)).
+**Exposition is the application's responsibility** — cachekit does not start an HTTP server
+or register a `/metrics` route; wire up `prometheus_client` exposition
 (`start_http_server` or `make_wsgi_app`/`make_asgi_app`) in your app. The emitted series
 names carry no `cachekit_` prefix:
 
@@ -869,9 +870,9 @@ names carry no `cachekit_` prefix:
 - `circuit_breaker_state` - Gauge: number of live circuit breakers in each state. Labels: `namespace`, `state` (`CLOSED`, `OPEN`, `HALF_OPEN`)
 
 The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
-preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
-emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
-rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
+preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a failure
+record from the error path. `redis_cache_operations_total` is emitted only when a full request
+queue rejects a call (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
 
 Each histogram records one observation per operation whose value is above zero, so its `_count` can be
 lower than `cache_operations_total`. Releases before these bucket bounds used

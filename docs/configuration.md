@@ -387,7 +387,7 @@ def secure_function():
 |--------|-------------|-----|----------|----------------------|-------|
 | `minimal()` | 300 s | ❌ | 100 MB | Function runs, no error | Speed-first, no integrity check |
 | `test()` | 300 s | ❌ | 100 MB | Function runs, no error | Deterministic, no monitoring |
-| `dev()` | 300 s | L1-only¹ | 100 MB | Function runs, no error | Verbose logs, no Prometheus except `circuit_breaker_state` |
+| `dev()` | 300 s | L1-only¹ | 100 MB | Function runs, no error | Verbose logs, integrity checking on |
 | `production()` | 600 s | L1-only¹ | 100 MB | Function runs, no error | Full observability |
 | `secure()` | 600 s | ❌ | 100 MB | Function runs, no error | AES-256-GCM encryption required; refuses `backend=None`, so no L1-only SWR |
 | `io()` | 3600 s | ✓ | 100 MB | Function runs, no error | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |

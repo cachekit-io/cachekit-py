@@ -946,19 +946,30 @@ def test_sync_backed_recheck_after_a_trip_settled_since_the_callers_l1_lookup(
         assert counts == (1, 0, 1)
 
 
-@pytest.fixture
-def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
-    """The type of every entry an L1 hit or a joined caller decodes (deserialize_l1): VerifiedMsgpack, or bytes for
-    an envelope."""
+def _record_types(monkeypatch: pytest.MonkeyPatch, method: str) -> list[type]:
+    """The type of every entry CacheSerializationHandler.<method> decodes."""
     seen: list[type] = []
-    real = CacheSerializationHandler.deserialize_l1
+    real = getattr(CacheSerializationHandler, method)
 
     def recording(self: CacheSerializationHandler, data: Any, *args: Any, **kwargs: Any) -> Any:
         seen.append(type(data))
         return real(self, data, *args, **kwargs)
 
-    monkeypatch.setattr(CacheSerializationHandler, "deserialize_l1", recording)
+    monkeypatch.setattr(CacheSerializationHandler, method, recording)
     return seen
+
+
+@pytest.fixture
+def decoded(monkeypatch: pytest.MonkeyPatch) -> list[type]:
+    """The type of every entry an L1 hit or a joined caller decodes through deserialize_l1: a kept entry, or bytes for
+    an envelope an L1 hit reads."""
+    return _record_types(monkeypatch, "deserialize_l1")
+
+
+@pytest.fixture
+def decoded_data(monkeypatch: pytest.MonkeyPatch) -> list[type]:
+    """The type of every entry deserialize_data decodes, as a joined caller decodes the trip's envelope."""
+    return _record_types(monkeypatch, "deserialize_data")
 
 
 def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
@@ -993,8 +1004,12 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
     assert decoded == [bytes, VerifiedMsgpack]  # the other caller's hit, then this caller's re-check
 
 
-def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(waiting: list[int], decoded: list[type]) -> None:
-    """Each joined caller decodes the trip's envelope once, for its own copy, as before."""
+def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(
+    waiting: list[int], decoded: list[type], decoded_data: list[type], walks: list[str]
+) -> None:
+    """Each joined caller decodes the trip's envelope once, for its own copy, as before. It goes to
+    deserialize_data: a joiner keeps nothing in L1, so it builds no kept entry (deserialize_l1). The envelope
+    came from the trip, not from a decode in this process, so each joiner's decode walks it."""
 
     def compute(x: int) -> dict[str, int]:
         _until(lambda: waiting[0] == HERD - 1)
@@ -1006,7 +1021,9 @@ def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(wa
     assert results == [{"x": 1}] * HERD
     assert len({id(result) for result in results}) == HERD
     assert backend.requests == ["get", "set"]
-    assert decoded == [bytes] * (HERD - 1)
+    assert decoded == []
+    assert decoded_data == [bytes] * (HERD - 1)
+    assert walks == ["ok"] * (HERD - 1)
 
 
 def test_sync_backed_recheck_hit_hands_its_half_open_probe_slot_back(
