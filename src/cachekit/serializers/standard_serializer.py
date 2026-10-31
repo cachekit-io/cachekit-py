@@ -34,7 +34,6 @@ from .base import (
     SerializationMetadata,
     immutable_buffer,
     unpackb_bounded,
-    unpackb_capped,
 )
 
 # Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
@@ -486,8 +485,14 @@ class StandardSerializer:
     def _deserialize_verified(self, msgpack_data: bytes, hook: bool) -> Any:
         """Decode MessagePack a decode in this process already verified and walked (:meth:`_deserialize_keeping_msgpack`):
         no retrieve(), no walk, and no object hook unless ``hook``. Raises SerializationError as deserialize does."""
+        # unpackb_bounded's caps, inline rather than through a shared helper: the extra call cost every walked
+        # decode about 2,000 instructions. test_kept_decodes_use_unpackb_bounded_caps pins the two together.
+        n = len(msgpack_data)
+        opts = self._msgpack_unpack_opts if hook else self._msgpack_unpack_opts_hookless
         try:
-            return unpackb_capped(msgpack_data, **(self._msgpack_unpack_opts if hook else self._msgpack_unpack_opts_hookless))
+            return msgpack.unpackb(
+                msgpack_data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **opts
+            )
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 

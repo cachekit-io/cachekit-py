@@ -428,6 +428,21 @@ def test_hits_on_a_kept_entry_run_no_walk_and_no_hook_unless_a_marker_may_be_pre
     assert (walks, hooks, backend.gets) == ([], [hook, hook], 1)
 
 
+def test_kept_decodes_use_unpackb_bounded_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A kept entry's decode passes msgpack.unpackb exactly the max_*_len caps a walked decode passes."""
+    calls: list[dict[str, Any]] = []
+    real = msgpack.unpackb
+    monkeypatch.setattr(msgpack, "unpackb", lambda data, **kw: calls.append(kw) or real(data, **kw))
+    handler = CacheSerializationHandler()
+    for value in (_PLAIN, _COMPRESSIBLE):
+        envelope = handler.serialize_data(value, cache_key="k")
+        _, kept = handler.deserialize_l1(envelope, cache_key="k")
+        handler.deserialize_l1(kept, cache_key="k")  # type: ignore[arg-type]
+    assert len(calls) == 4
+    caps = [{k: v for k, v in kw.items() if k.startswith("max_")} for kw in calls]
+    assert caps[0] == caps[1] and caps[2] == caps[3] and len(caps[0]) == 5
+
+
 def test_bytes_in_l1_are_walked_on_every_hit_until_kept(walks: list[str]) -> None:
     """The type is the mark: an entry still held as bytes is walked, whoever put it there. A nesting bomb put in L1
     directly is refused by the walk, and the call reads L2 instead."""
