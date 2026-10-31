@@ -235,7 +235,7 @@ def expensive_compute(key):
 
 **Why cachekit wins**:
 
-Prometheus metrics, recorded by every decorator with a backend:
+Prometheus metrics, recorded by default by a decorator with a backend:
 ```prometheus
 cache_operations_total{operation="get",namespace="users",success="True",serializer="l1_memory"} 31022
 cache_operations_total{operation="get",namespace="users",success="True",serializer="rust"} 9847

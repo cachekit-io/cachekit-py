@@ -406,7 +406,7 @@ See [SECURITY.md][security-url] for vulnerability reporting and detailed documen
 ### Monitoring & Observability
 
 - **Per-function statistics** - `cache_info()` on every decorated function, modelled on `functools.lru_cache`
-- **Prometheus metrics** - Recorded by default by every decorator with a backend (your app owns exposition)
+- **Prometheus metrics** - Recorded by default by a decorator with a backend (your app owns exposition)
 - **Structured logging** - Context-aware, per-operation fields
 - **Health checks** - Comprehensive status endpoints
 
