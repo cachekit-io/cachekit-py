@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation, l1_cache
-from .._rust_serializer import HitCounter
+from .._rust_serializer import HitCounter, HitMemo
+from .._rust_serializer import memo_key as _memo_key
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHandlerStrategy,
@@ -610,7 +611,7 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 )
 
 
-# The key memo (create_cache_wrapper's _key_memo) takes an argument only when its exact type is int,
+# The memo (create_cache_wrapper's HitMemo) takes a call only when every argument's exact type is int,
 # float, bool, NoneType, str or bytes. Two equal values of one of these types always produce the same
 # key: their MessagePack is the same, 0.0 and -0.0 included, since both normalise to 0.0. Types are
 # tested by identity, as the key generator's fast path does, so an argument's type is never hashed or
@@ -620,92 +621,19 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 # keyword names may hold at most _MEMO_MAX_LEN characters or bytes between them. That bounds an entry
 # at a few KiB: a str of 4-byte characters also keeps its UTF-8 copy once the key generator encodes
 # it. It also bounds the hashing a lookup repeats for strings that are new to each call.
+# _memo_key, the memo key of a call's arguments or None, is the extension's memo_key
+# (rust/src/l1_hit.rs), so the lock-free hit and the slow path that memoises compute one key. A call
+# of only ints, strs and Nones is keyed by its argument tuple itself: those never compare equal
+# across types. A float or bool (1, 1.0 and True are equal) or a bytes puts every type in the key.
+# These mirror the extension's constants.
 _MEMO_MAX_LEN = 256
 # Arguments per call, positional and keyword together.
 _MEMO_MAX_ARGS = 8
-# Entries per decorated function. A full memo is emptied rather than evicted entry by entry, so a hit
-# writes nothing.
+# Slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a hit
+# writes nothing to it.
 _MEMO_MAX_ENTRIES = 1024
-
-
-def _memo_size(a: Any) -> int:
-    """What an argument spends of its call's _MEMO_MAX_LEN: a str's or bytes' length, 0 for an int, float,
-    bool or None, and -1 for anything the memo never takes. _memo_key inlines it for one and two arguments."""
-    t = type(a)
-    if t is str or t is bytes:
-        return len(a)
-    return 0 if t is int or t is float or t is bool or a is None else -1
-
-
-def _memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] | None:
-    """The key-memo key of a call's arguments, or None when the memo does not take the call.
-
-    Each value is paired with its exact type, so 1, 1.0 and True, which compare equal, never share an
-    entry. One or two positional arguments, the common calls, get flat (type, value, ...) tuples; any
-    other call a tuple of tuples. No two shapes can be equal: they differ in length or in their first
-    item, a type in one and a tuple in the other, and a type never equals a tuple.
-
-    >>> _memo_key((1,), {}) == _memo_key((True,), {})
-    False
-    >>> _memo_key((1, "a"), {})
-    (<class 'int'>, 1, <class 'str'>, 'a')
-    >>> _memo_key((1, "a"), {"b": 2.0})
-    ((1, 'a'), (<class 'int'>, <class 'str'>), (('b', 2.0),), (<class 'float'>,))
-    >>> _memo_key((), {"b": 1, "a": 2}) == _memo_key((), {"a": 2, "b": 1})
-    True
-    >>> _memo_key(([1],), {}) is None
-    True
-    >>> _memo_key(("x" * 200, "y" * 56), {}) is None, _memo_key(("x" * 200, "y" * 57), {}) is None
-    (False, True)
-    """
-    if not kwargs:
-        n = len(args)
-        if n == 1:
-            a = args[0]
-            t = type(a)
-            if t is int or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN) or t is float or t is bool or a is None:
-                return (t, a)
-            return None
-        if n == 2:
-            a, b = args
-            t = type(a)
-            u = type(b)
-            # A pair with one str or bytes checks that one's length; only two add theirs up. Laid
-            # out so the common pair, a scalar then a string, takes the fewest checks.
-            if t is int or t is float or t is bool or a is None:
-                if u is int or ((u is str or u is bytes) and len(b) <= _MEMO_MAX_LEN) or u is float or u is bool or b is None:
-                    return (t, a, u, b)
-            elif t is str or t is bytes:
-                if u is int or u is float or u is bool or b is None:
-                    if len(a) <= _MEMO_MAX_LEN:
-                        return (t, a, u, b)
-                elif (u is str or u is bytes) and len(a) + len(b) <= _MEMO_MAX_LEN:
-                    return (t, a, u, b)
-            return None
-    if len(args) + len(kwargs) > _MEMO_MAX_ARGS:
-        return None
-    # No zip(): its strict= keyword alone costs more to parse than these loops.
-    size = 0
-    for a in args:
-        cost = _memo_size(a)
-        if cost < 0:
-            return None
-        size += cost
-    if not kwargs:
-        return (args, tuple(map(type, args))) if size <= _MEMO_MAX_LEN else None
-    for name, a in kwargs.items():
-        # A str subclass name equals its str and so would share the entry, but the key generator
-        # refuses it, so it must take the full path. **kwargs takes names of any length.
-        cost = _memo_size(a)
-        if type(name) is not str or cost < 0:
-            return None
-        size += len(name) + cost
-    if size > _MEMO_MAX_LEN:
-        return None
-    # Sorted by name, as the key generator sorts them: keywords in any order share one entry, and an
-    # invalidation in any order finds it. Names are distinct str, so no value is ever compared.
-    items = tuple(sorted(kwargs.items()))
-    return (args, tuple(map(type, args)), items, tuple([type(value) for _, value in items]))
+# What HitMemo.get returns when it cannot answer a call.
+_MISS = object()
 
 
 def _is_encrypting_serializer(serializer: object) -> bool:
@@ -1176,10 +1104,12 @@ def create_cache_wrapper(
 
     # Set by _enter_l1_only(), below: backed wrappers keep these.
     _object_cache: ObjectCache | None = None
-    # _object_cache for an L1-only function on generated keys, else None; set last by _enter_l1_only.
-    # It is the key memo's on/off switch (_resolve_cache_key), and lets a memoised L1-only hit skip
-    # the stats context (sync_wrapper, async_wrapper).
-    _l1_fast_cache: ObjectCache | None = None
+    # The lock-free hit of an L1-only function on generated keys (see _enter_l1_only), else None: its
+    # memo, the bound HitMemo.get the wrappers call first, and the func.__module__ and func.__qualname__
+    # objects its keys are built with. _l1_hit is set last.
+    _l1_memo: HitMemo | None = None
+    _l1_hit: Callable[[tuple[Any, ...], dict[str, Any], object], Any] | None = None
+    _l1_memo_names: tuple[Any, Any] = (None, None)
     _l1_swr_active = False
     # SWR needs a TTL: freshness is measured against ttl * swr_threshold_ratio.
     # With ttl=None entries never go stale, so there is nothing to revalidate.
@@ -1652,49 +1582,11 @@ def create_cache_wrapper(
     # computed for a key the write path did not generate.
     _generated_key_mode = interop is None and custom_key_func is None and not fast_mode
 
-    # Generated keys by argument tuple (see _memo_key): memo key -> (cache key, and the
-    # func.__module__ and func.__qualname__ str objects it was built from). An entry answers only
-    # while both names are still those objects, so renaming the function re-keys it as before.
-    # The memo holds its callers' arguments in memory, so it is kept only in L1-only mode, where
-    # _l1_fast_cache is set and every invalidation runs in this process and can forget what it
-    # erases. A backed function builds its key on every call: other processes invalidate its L1
-    # (_evict), with L1 off nothing else in the process holds a call's data, and an encrypting
-    # function must not keep plaintext arguments. Its hit also costs far more than its key.
-    _key_memo: dict[tuple[Any, ...], tuple[str, str, str]] = {}
-
-    def _forget_memoised(cache_key: str) -> None:
-        """Drop every memo entry for this cache key: an invalidation can be an erasure, and the memo
-        would otherwise keep the arguments it was given. An entry goes whatever arguments built the
-        key, so an invalidation spelled another way (a Path for its str, say) forgets it too. A scan
-        of at most _MEMO_MAX_ENTRIES entries, on invalidation only."""
-        # A snapshot, as calls on other threads add entries meanwhile. dict.copy() runs no Python
-        # code, so on a GIL build no other thread runs mid-copy, and a free-threaded build copies
-        # under the dict's lock. (list(d.items()) can let another thread in on 3.10 and 3.11, where
-        # allocating its tuples can run the collector.)
-        for memo_key, entry in _key_memo.copy().items():
-            if entry[0] == cache_key:
-                _key_memo.pop(memo_key, None)
-
     def _resolve_cache_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str:
         """Single key derivation shared by the read/write and invalidate paths."""
         # Standard key generation with type-aware handling
         if _generated_key_mode:
-            memo_key = _memo_key(call_args, call_kwargs) if _l1_fast_cache is not None else None
-            if memo_key is None:
-                return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
-            entry = _key_memo.get(memo_key)
-            if entry is not None and entry[1] is func.__module__ and entry[2] is func.__qualname__:
-                return entry[0]
-            # Read before the key is built: a rename in between leaves an entry that never answers.
-            module, qualname = func.__module__, func.__qualname__
-            cache_key = operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
-            # Exact str names only: the key generator formats them, and only an immutable name formats
-            # the same way every time it is the same object. __module__ can be any object.
-            if type(module) is str and type(qualname) is str:
-                if len(_key_memo) >= _MEMO_MAX_ENTRIES:
-                    _key_memo.clear()  # emptied, not evicted entry by entry, so a hit writes nothing
-                _key_memo[memo_key] = (cache_key, module, qualname)
-            return cache_key
+            return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
         # Interop: decoration rejects it together with key= or fast_mode, so it never
         # competes with the branches below
         if interop is not None:
@@ -1777,10 +1669,30 @@ def create_cache_wrapper(
         serialization_handler.serializer_key_name
     ) != key_generator.serializer_code("default")
 
+    # Shared stats tracker from the process-global registry (session ID lazy-initialized
+    # on first use). Re-decoration reuses the same counters — see _get_function_stats.
+    _stats = _get_function_stats(function_identifier, l1_enabled)
+
     def _enter_l1_only() -> None:
         """Set every piece of state L1-only mode derives, in one place: for backend=None at decoration,
         and for a zero-config candidate at its first call (_settle_zero_config)."""
-        nonlocal _l1_only_mode, _object_cache, _l1_swr_active, _records_twin, _l1_fast_cache
+        nonlocal _l1_only_mode, _object_cache, _l1_swr_active, _records_twin, _l1_memo, _l1_hit, _l1_memo_names
+        # On generated keys the hit is one call into the extension (HitMemo.get), which reads the memo
+        # the cache keeps in step under its lock. The memo holds its callers' arguments in memory, so
+        # it is kept only in L1-only mode, where every invalidation runs in this process and drops what
+        # it erases. A backed function builds its key on every call: other processes invalidate its L1
+        # (_evict), with L1 off nothing else in the process holds a call's data, and an encrypting
+        # function must not keep plaintext arguments. Its hit also costs far more than its key.
+        # The memo answers only while func.__module__ and func.__qualname__ are the objects read here:
+        # the key generator reads them on every call, so renaming the function re-keys it as before.
+        # Exact str names only: the key generator formats them, and only an immutable name formats
+        # the same way every time it is the same object. __module__ can be any object.
+        names = func.__module__, func.__qualname__
+        memo = (
+            HitMemo(func, _stats.l1_hit_counter, *names)
+            if l1_enabled and _generated_key_mode and type(names[0]) is str and type(names[1]) is str
+            else None
+        )
         # l1_enabled already merges the decorator param with config.l1.enabled (see config handling
         # above): with it False there is no cache at all and the wrappers call the function directly.
         _object_cache = (
@@ -1789,6 +1701,8 @@ def create_cache_wrapper(
                 max_size_bytes=_l1_budget_mb * 1024 * 1024,
                 swr_threshold_ratio=_l1_config.swr_threshold_ratio,
                 swr_retry_interval=_l1_config.swr_retry_interval,
+                memo=memo,
+                swr=_l1_swr_wanted,  # reads go through get_with_swr exactly when _l1_swr_active
             )
             if l1_enabled
             else None
@@ -1796,7 +1710,8 @@ def create_cache_wrapper(
         _l1_swr_active = _object_cache is not None and _l1_swr_wanted
         _records_twin = False  # L1-only writes no L2 entry, so it has no twin to record
         _l1_only_mode = True
-        _l1_fast_cache = _object_cache if _generated_key_mode else None
+        _l1_memo, _l1_memo_names = memo, names
+        _l1_hit = None if memo is None else memo.get
 
     if _l1_only_mode:
         _enter_l1_only()
@@ -1891,12 +1806,6 @@ def create_cache_wrapper(
         """
         _cancel_writes(match, group=_registry_id if whole_function else None, wait=wait)
 
-    # Shared stats tracker from the process-global registry (session ID lazy-initialized
-    # on first use). Re-decoration reuses the same counters — see _get_function_stats.
-    _stats = _get_function_stats(function_identifier, l1_enabled)
-    # The fast paths below record their hits through this, without record_l1_hit's Python frame.
-    _record_l1_hit = _stats.l1_hit_counter.hit
-
     # Per-key suppression alone doesn't bound refresh concurrency: a workload
     # crossing the SWR threshold on many distinct keys at once would spawn one
     # task/thread per key. This pool caps in-flight refreshes per wrapped
@@ -1969,10 +1878,11 @@ def create_cache_wrapper(
         _thread_flights.forget(cache_keys)
 
     def _delete_then_forget(cache_keys: list[str] | None) -> InvalidationOutcome | None:
-        """Delete these keys (all, for None), then forget their calls in flight and their memoised
-        arguments: a call made before the delete ended may have read the old entry, and may have
-        memoised its arguments again. One call, so the forgets run after the delete wherever the
-        delete runs, even in a worker an async caller stopped waiting for.
+        """Delete these keys (all, for None), then forget their calls in flight: a call made before the
+        delete ended may have read the old entry. One call, so the forgets run after the delete wherever
+        the delete runs, even in a worker an async caller stopped waiting for. An invalidation can be an
+        erasure, and the memo holds the arguments it was given: deleting an entry drops its memo slots,
+        whatever arguments they were spelled with (ObjectCache, "Lock-free hits").
         Returns the current-format key's outcome (see _invalidate_keys); None for all."""
         try:
             if cache_keys is None:
@@ -1981,28 +1891,44 @@ def create_cache_wrapper(
             return _invalidate_keys(cache_keys)
         finally:
             _forget_flights(cache_keys)
-            if cache_keys is None:
-                _key_memo.clear()
-            else:
-                _forget_memoised(cache_keys[0])  # the memo holds current-format keys only
 
-    def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> Any:
-        """Run the function for an L1-only miss and store its result. A miss is a call that runs it."""
+    def _l1_only_fill(
+        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
+    ) -> Any:
+        """Run the function for an L1-only miss and store its result, memoised under memo_key (see
+        _call_key). A miss is a call that runs it."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
         result = func(*call_args, **call_kwargs)
-        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
+        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
         _cached_keys.add((_l2_scope(), cache_key))
         return result
 
-    async def _l1_only_fill_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> Any:
+    async def _l1_only_fill_async(
+        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
+    ) -> Any:
         """_l1_only_fill for a coroutine function."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
         result = await func(*call_args, **call_kwargs)
-        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
+        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
         _cached_keys.add((_l2_scope(), cache_key))
         return result
+
+    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, tuple[Any, ...] | None]:
+        """A call's cache key, and for an L1-only function with a memo the memo key to memoise its
+        entry under, or None.
+
+        A call is memoised only when its key was built with the names the memo answers for (see
+        _enter_l1_only). They are read before the key is built, so a rename in between leaves the
+        call unmemoised."""
+        if _l1_memo is None:
+            return _resolve_cache_key(call_args, call_kwargs), None
+        module, qualname = func.__module__, func.__qualname__
+        cache_key = _resolve_cache_key(call_args, call_kwargs)
+        if module is not _l1_memo_names[0] or qualname is not _l1_memo_names[1]:
+            return cache_key, None
+        return cache_key, _memo_key(call_args, call_kwargs)
 
     def _l1_swr_acquire(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
@@ -2138,18 +2064,15 @@ def create_cache_wrapper(
             # Last: a caller that reads it False without the lock then reads the state set above.
             _zero_config_pending = False
 
-    def _sync_call(  # noqa: PLR0912
-        args: tuple[Any, ...], kwargs: dict[str, Any], cache_key: str | None, l1_lookup: tuple[bool, Any, bool, int] | None
-    ) -> Any:
-        """sync_wrapper's call past its fast path. cache_key and l1_lookup are what that path found, or None."""
+    def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:  # noqa: PLR0912
+        """sync_wrapper's call past its lock-free hit."""
         # SET stats context before any backend operations
         token = set_current_function_stats(_stats)
 
         try:
             # Key generation - needed for both L1-only and L1+L2 modes
             try:
-                if cache_key is None:
-                    cache_key = _resolve_cache_key(args, kwargs)
+                cache_key, memo_key = _call_key(args, kwargs)
             except Exception as e:
                 if interop is not None:
                     # Interop/v1: out-of-model arguments MUST be rejected with an
@@ -2175,12 +2098,10 @@ def create_cache_wrapper(
                 # L1 disabled in L1-only mode -> no cache anywhere; call through
                 return func(*args, **kwargs)
             if _l1_only_mode and _object_cache:
-                if l1_lookup is not None:
-                    found, cached_value, needs_refresh, version = l1_lookup
-                elif _l1_swr_active and ttl is not None:
-                    found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl)
+                if _l1_swr_active and ttl is not None:
+                    found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl, memo_key)
                 else:
-                    found, cached_value = _object_cache.get(cache_key)
+                    found, cached_value = _object_cache.get(cache_key, memo_key)
                     needs_refresh, version = False, 0
                 if found:
                     _stats.record_l1_hit()
@@ -2214,7 +2135,7 @@ def create_cache_wrapper(
                 # that joins gets the same object, as a later hit does, and counts as a hit.
                 result, joined = _thread_flights.run(
                     (cache_key,),
-                    functools.partial(_l1_only_fill, cache_key, args, kwargs),
+                    functools.partial(_l1_only_fill, cache_key, args, kwargs, memo_key),
                     functools.partial(_object_cache.peek, cache_key),
                 )
                 if joined:
@@ -2639,48 +2560,30 @@ def create_cache_wrapper(
 
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        # A memoised L1-only hit is one call into the extension: memo key, memo lookup, liveness,
+        # deadline and hit count, with no lock and no stats context, as nothing it runs reads that
+        # context (ObjectCache, "Lock-free hits"). It runs first: a _bypass_cache call is never
+        # memoised, so it misses. This wrapper stays small because CPython sets up a function's whole
+        # frame on every call, and _sync_call's costs more than this hit.
+        if _l1_hit is not None:
+            value = _l1_hit(args, kwargs, _MISS)
+            if value is not _MISS:
+                return value
         # _bypass_cache: call through, uncached
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return func(*args, **kwargs)
+        return _sync_call(args, kwargs)
 
-        # An L1-only hit on a memoised key returns here, before the stats context is set: nothing
-        # it runs reads that context. This wrapper stays small because CPython sets up a function's
-        # whole frame on every call, and _sync_call's costs more than this hit. An L1 miss on a
-        # memoised key, or a hit due a refresh, hands its key and lookup on, so neither is repeated;
-        # a call the memo does not answer has its key resolved in _sync_call.
-        cache_key = None
-        l1_lookup = None
-        if _l1_fast_cache is not None:
-            memo_key = _memo_key(args, kwargs)
-            entry = None if memo_key is None else _key_memo.get(memo_key)
-            if entry is not None and entry[1] is func.__module__ and entry[2] is func.__qualname__:
-                cache_key = entry[0]
-                if _l1_swr_active and ttl is not None:
-                    l1_lookup = _l1_fast_cache.get_with_swr(cache_key, ttl)
-                    if l1_lookup[0] and not l1_lookup[2]:
-                        _record_l1_hit()
-                        return l1_lookup[1]
-                else:
-                    found, cached_value = _l1_fast_cache.get(cache_key)
-                    if found:
-                        _record_l1_hit()
-                        return cached_value
-                    l1_lookup = (False, None, False, 0)
-        return _sync_call(args, kwargs, cache_key, l1_lookup)
-
-    async def _async_call(
-        args: tuple[Any, ...], kwargs: dict[str, Any], cache_key: str | None, l1_lookup: tuple[bool, Any, bool, int] | None
-    ) -> Any:
-        """async_wrapper's call past its fast path. cache_key and l1_lookup are what that path found, or None."""
+    async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """async_wrapper's call past its lock-free hit."""
         # SET stats context before any backend operations
         token = set_current_function_stats(_stats)
 
         try:
             # Get cache key early for consistent usage - note this may fail for complex types
             try:
-                if cache_key is None:
-                    cache_key = _resolve_cache_key(args, kwargs)
+                cache_key, memo_key = _call_key(args, kwargs)
             except Exception as e:
                 if interop is not None:
                     # Interop/v1: out-of-model arguments MUST be rejected with an
@@ -2708,12 +2611,10 @@ def create_cache_wrapper(
                 # (outer finally resets stats context)
                 return await func(*args, **kwargs)
             if _l1_only_mode and _object_cache:
-                if l1_lookup is not None:
-                    found, cached_value, needs_refresh, version = l1_lookup
-                elif _l1_swr_active and ttl is not None:
-                    found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl)
+                if _l1_swr_active and ttl is not None:
+                    found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl, memo_key)
                 else:
-                    found, cached_value = _object_cache.get(cache_key)
+                    found, cached_value = _object_cache.get(cache_key, memo_key)
                     needs_refresh, version = False, 0
                 if found:
                     _stats.record_l1_hit()
@@ -2733,7 +2634,7 @@ def create_cache_wrapper(
                 # Cache miss: run the function once for every concurrent miss on this key, as the
                 # sync wrapper does.
                 result, joined = await _flights.run(
-                    (cache_key,), functools.partial(_l1_only_fill_async, cache_key, args, kwargs)
+                    (cache_key,), functools.partial(_l1_only_fill_async, cache_key, args, kwargs, memo_key)
                 )
                 if joined:
                     _stats.record_l1_hit()
@@ -2907,31 +2808,16 @@ def create_cache_wrapper(
 
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+        # The lock-free hit, as in sync_wrapper.
+        if _l1_hit is not None:
+            value = _l1_hit(args, kwargs, _MISS)
+            if value is not _MISS:
+                return value
         # _bypass_cache: call through, uncached
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return await func(*args, **kwargs)
-
-        # The L1-only fast path, as in sync_wrapper.
-        cache_key = None
-        l1_lookup = None
-        if _l1_fast_cache is not None:
-            memo_key = _memo_key(args, kwargs)
-            entry = None if memo_key is None else _key_memo.get(memo_key)
-            if entry is not None and entry[1] is func.__module__ and entry[2] is func.__qualname__:
-                cache_key = entry[0]
-                if _l1_swr_active and ttl is not None:
-                    l1_lookup = _l1_fast_cache.get_with_swr(cache_key, ttl)
-                    if l1_lookup[0] and not l1_lookup[2]:
-                        _record_l1_hit()
-                        return l1_lookup[1]
-                else:
-                    found, cached_value = _l1_fast_cache.get(cache_key)
-                    if found:
-                        _record_l1_hit()
-                        return cached_value
-                    l1_lookup = (False, None, False, 0)
-        return await _async_call(args, kwargs, cache_key, l1_lookup)
+        return await _async_call(args, kwargs)
 
     def _log_breaker_rejection(cache_key: str) -> None:
         """Log a call the circuit breaker rejected. Never recorded as a failure: a rejection is not one."""

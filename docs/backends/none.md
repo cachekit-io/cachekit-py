@@ -54,7 +54,7 @@ With `backend=None`, cachekit skips L2 entirely. The data flow is:
 
 No network calls. No serialization to bytes. No backend initialization.
 
-Concurrent misses on one key, cold or past `ttl`, run the function once: threads for a sync function, tasks on one event loop for an async one. The callers that join that call get its object and count as hits in `cache_info()`; if it raises, they all get the exception and nothing is cached. See [in-process single-flight](../features/distributed-locking.md#in-process-single-flight-before-the-lock).
+Concurrent misses on one key, cold or past `ttl`, run the function once: threads for a sync function; for an async one, only callers on the event loop running the key's call share it, and a caller on another thread's loop runs its own. The callers that join that call get its object and count as hits in `cache_info()`; if it raises, they all get the exception and nothing is cached. See [in-process single-flight](../features/distributed-locking.md#in-process-single-flight-before-the-lock).
 
 ## Callers Share the Cached Object
 
@@ -204,7 +204,7 @@ assert len(calls) == 2  # ran on both calls: nothing was stored
 
 ## Characteristics
 
-- Latency: 0.91μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)); a call the [key memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key and costs several times that; in-memory, no network
+- Latency: 0.31μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)), one call into the Rust extension that takes no lock; a call the [memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key, looks it up under the cache's lock and costs about 22 times the instructions; in-memory, no network
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes

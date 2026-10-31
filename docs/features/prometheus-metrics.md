@@ -7,10 +7,11 @@
 ## TL;DR
 
 cachekit records Prometheus metrics for cache operations, latency, payload size, and
-circuit-breaker state. Collection is on by default — no per-call instrumentation code is
-needed. **Exposition is your responsibility**: cachekit does not start an HTTP server or
-register a `/metrics` route. Wire up `prometheus_client` exposition in your app and the
-metrics show up on your existing scrape endpoint.
+circuit-breaker state. Collection is on by default for a decorator with a backend — no
+per-call instrumentation code is needed. An L1-only decorator records no `get` or `set`
+operations ([details](#which-decorators-record)). **Exposition is your responsibility**: cachekit does not
+start an HTTP server or register a `/metrics` route. Wire up `prometheus_client` exposition in
+your app and the metrics show up on your existing scrape endpoint.
 
 ```prometheus
 cache_operations_total{operation="get",namespace="users",success="True",serializer="l1_memory"} 31022
@@ -21,12 +22,12 @@ cache_operations_total{operation="get",namespace="users",success="True",serializ
 
 ## Quick Start
 
-Metrics are recorded automatically once a decorated function runs:
+Metrics are recorded automatically once a decorated function with a backend runs:
 
-```python notest
+```python
 from cachekit import cache
 
-@cache(ttl=300)  # Metrics recorded by default
+@cache(ttl=300)  # Records metrics once it resolves a backend, e.g. with REDIS_URL set
 def get_user(user_id):
     return db.query(User).get(user_id)
 ```
@@ -63,18 +64,34 @@ scrape_configs:
     metrics_path: '/metrics'         # Whatever path you mounted exposition on
 ```
 
+### Which Decorators Record
+
+The three cache-operation series record for a decorator that has a backend and
+`MonitoringConfig.collect_stats=True`, the default: `cache_operations_total` and
+`cache_operation_duration_ms` record `get` and `set` operations, and `cache_operation_size_bytes`
+records `get` hits only. That covers `@cache`,
+`@cache.production`, `@cache.secure`, `@cache.dev` and `@cache.io`. The rest record less:
+
+- An L1-only decorator records only failures in them, such as
+  `cache_operations_total{operation="key_generation",success="False",serializer="unknown"}` when
+  it cannot build a key. It is L1-only when it has `backend=None`, or when it resolves no backend
+  ([Backend Resolution Priority](../backends/README.md#backend-resolution-priority)).
+- `@cache.minimal` and `@cache.test` record nothing in them: they set `collect_stats=False`
+  ([Configuration](#configuration)). Neither does `@cache.local`.
+
+`cache_info()` counts hits and misses on every decorator, these included.
+
 ---
 
 ## Available Metrics
 
 cachekit emits the following metrics on the default `prometheus_client` registry. The names
-below are the **actual** series names — none carry a `cachekit_` prefix.
+below are the **actual** series names. Only the two security counters carry a `cachekit_` prefix.
 
 > The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
-> preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` is the value
-> recorded when the emitting call site passes no serializer (an instrumentation gap, not a
-> tier). Only failure records (`success="False"`) can carry `unknown`: every success record
-> names its tier.
+> preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit. `unknown` is not a tier:
+> every failure the error path records (`success="False"`, such as `operation="key_generation"`)
+> carries it, whatever the call site. Every success record names its tier.
 
 ### Counters (always increasing)
 
@@ -113,7 +130,7 @@ cachekit_config_drift_reads_total{reason="encryption_disabled"}
 > `operation`, `namespace`, `success`, and `serializer` — `success` is operation success
 > across reads, writes, and other operations, **not** a cache hit, and there is no `hit`
 > label. `redis_cache_operations_total` carries no hit/miss status either — it counts
-> backpressure rejections only. For a miss signal, use `operation="set"` as a cache-write
+> full-queue backpressure rejections only. For a miss signal, use `operation="set"` as a cache-write
 > proxy (see [Query Examples](#query-examples)), not a hit/miss series.
 
 ### Histograms (latency and size)
@@ -146,12 +163,13 @@ What each `cache_operation_duration_ms` series times, measured with a monotonic 
 | Series | Span |
 |---|---|
 | `operation="get"`, `serializer="l1_memory"` | The L1 lookup plus deserialization (decryption included for an encrypted cache) |
-| `operation="get"`, `serializer="rust"` | The L2 read of a hit |
-| `operation="set"` | Serialization plus the L2 write: not the miss read, the function, a lock wait, the L1 put or key tracking |
+| `operation="get"`, `serializer="rust"` | The L2 read of a hit plus deserialization (decryption included for an encrypted cache) |
+| `operation="set"` | Serialization plus the L2 write: not the miss read, the function, a lock wait or the L1 put. On the tenant-scoped Redis backend it includes the key-registry write, which goes in the same pipeline |
+| `operation="set"`, a write `write_behind=True` deferred | The backend write alone, recorded when it lands. A write-behind miss that writes on the caller's thread instead is timed as the row above: an async miss under the distributed lock, a sync streaming write ([What stays on the caller's path](write-behind.md#what-stays-on-the-callers-path)), or a value the full writer queue refused ([The writer](write-behind.md#the-writer)) |
 
-`cache_operation_size_bytes` records the length of the bytes the operation read or wrote. For an L1 `get`, that is the L1 entry:
+`cache_operation_size_bytes` records the length of the bytes a `get` hit read; a `set` records no size. For an L1 `get`, that is the L1 entry:
 on a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit swaps its envelope for its
-MessagePack when that is no longer, so later L1 `get`s of it record a smaller size than its L2 `get`. Earlier releases recorded
+MessagePack when the MessagePack is no longer than the envelope, so later L1 `get`s of it record a size no larger than its L2 `get`. Earlier releases recorded
 the envelope's length on every hit.
 
 > **Changed durations.** Earlier releases recorded every L1 hit as a constant 0.001 ms, and timed
@@ -191,8 +209,11 @@ other operations, so this is an operation-success rate, not a hit rate.
 ```
 
 For a miss-rate proxy, watch cache writes: `operation="set"` is recorded when a miss
-writes back, but it is a write proxy — it records nothing for a failed write — so treat it
-as a proxy, not an exact miss count.
+writes back. It counts write attempts: a failed backend write is logged, not raised, so it
+still records `success="True"`. Only a write that `write_behind=True` actually deferred records
+`success="False"` when it fails. A write-behind miss written on the caller's thread (see the
+`set` rows under [Histograms](#histograms-latency-and-size)) records `success="True"` like any
+other. Treat it as a proxy, not an exact miss count.
 
 ```promql
 # Cache-write rate as a miss-rate proxy (see caveats above)
@@ -268,59 +289,40 @@ sum by (namespace) (circuit_breaker_state{state="OPEN"})
 
 ## Configuration
 
-### Enable/Disable Metrics
-
-Metric collection is controlled by `MonitoringConfig.enable_prometheus_metrics` (default:
-`True`). Disabling it stops cachekit from recording series; it has no effect on exposition,
-which your app owns regardless.
-
-```python notest
-from cachekit import cache
-from cachekit.config.nested import MonitoringConfig
-
-@cache(
-    ttl=300,
-    monitoring=MonitoringConfig(enable_prometheus_metrics=True),  # Default: True
-)
-def operation(x):
-    return compute(x)
-```
-
 ### Disable Metrics
 
-```python notest
+`MonitoringConfig.collect_stats` (default: `True`) controls the three cache-operation series.
+Setting it to `False` stops that decorator recording them; `cache_info()` keeps counting. It has
+no effect on exposition, which your app owns regardless.
+
+```python
 from cachekit import cache
 from cachekit.config.nested import MonitoringConfig
 
 @cache(
     ttl=300,
-    monitoring=MonitoringConfig(enable_prometheus_metrics=False),
+    monitoring=MonitoringConfig(collect_stats=False),  # No cache-operation series
 )
 def operation(x):
     return compute(x)
 ```
 
-### Disable All Observability
+> `MonitoringConfig.enable_prometheus_metrics` is not read at runtime: setting it to `False`
+> leaves every series recording. The presets that set it are no exception, so `@cache.dev`
+> records the cache-operation series as `@cache.production` does. Use `collect_stats`.
 
-```python notest
-from cachekit import cache
-from cachekit.config.nested import MonitoringConfig
+### Series That Ignore `MonitoringConfig`
 
-@cache(
-    ttl=300,
-    monitoring=MonitoringConfig(
-        collect_stats=False,
-        enable_structured_logging=False,
-        enable_prometheus_metrics=False,
-    ),
-)
-def operation(x):
-    return compute(x)
-```
+These are recorded whatever `MonitoringConfig` says:
 
-`circuit_breaker_state` is the exception: it is recorded for every function whose circuit
-breaker is enabled, whatever `MonitoringConfig` says. To leave a function out of it, pass
-`circuit_breaker=CircuitBreakerConfig(enabled=False)` (from `cachekit.config.nested`).
+- `circuit_breaker_state`, for every function whose circuit breaker is enabled. To leave a
+  function out of it, pass `circuit_breaker=CircuitBreakerConfig(enabled=False)` (from
+  `cachekit.config.nested`).
+- `redis_cache_operations_total`, each time a full request queue rejects a call. A call that
+  times out waiting for a permit is rejected without counting. A function with
+  `backpressure=BackpressureConfig(enabled=False)` never rejects, so never adds to it.
+- `cachekit_decrypt_failures_total` and `cachekit_config_drift_reads_total`, the security
+  counters, on every failure they count.
 
 ---
 
@@ -348,7 +350,9 @@ Each thread records a cache operation into cells of its own, and the series add 
 A: cachekit does not expose metrics for you. Confirm your app starts
 `prometheus_client` exposition (`start_http_server` or `make_wsgi_app`/`make_asgi_app`) on
 the **default** registry, and that at least one decorated function has run — series are
-created lazily on first use.
+created lazily on first use. The function must have a backend and `collect_stats=True`: an
+L1-only decorator records no `get` or `set` operations, and `@cache.minimal` and `@cache.test`
+record none at all ([Which Decorators Record](#which-decorators-record)).
 
 **Q: A log says "Metric '…' is already registered outside cachekit; not recording it"**
 A: Your application (or another library) registered a metric with the same name on the

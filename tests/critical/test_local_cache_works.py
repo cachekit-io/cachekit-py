@@ -44,10 +44,10 @@ class TestLocalCacheBasic:
 
     def test_ttl_expiry(self, monkeypatch):
         """Entry expires after TTL."""
-        import cachekit.object_cache as oc_mod
+        from tests.utils.clock import shared_clock
 
         current_time = [100.0]
-        monkeypatch.setattr(oc_mod.time, "monotonic", lambda: current_time[0])
+        monkeypatch.setattr(shared_clock, "fake", lambda: current_time[0])
 
         @cache.local(ttl=10)
         def value():

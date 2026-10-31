@@ -1,8 +1,9 @@
-"""The generated-key memo and the L1-only fast path.
+"""The L1-only memo and its lock-free hit.
 
-An L1-only function remembers the key of each argument tuple it has generated one for, and a hit on
-a remembered key returns without setting the stats context. These pin what must not change: the key
-bytes, the counters, which arguments may never share a memo entry, and which functions keep none.
+An L1-only function memoises, by argument tuple, the ObjectCache entry each call stored or found
+(cachekit._rust_serializer.HitMemo), and a hit on a memoised call is one call into the extension that
+takes no lock and sets no stats context. These pin what must not change: the key bytes, the counters,
+which arguments may never share a memo slot, and which functions keep no memo.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _memo_key
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
 
 
@@ -96,56 +96,61 @@ class _RecordingBackend:
         return True, {}
 
 
-class _RecordingObjectCache(ObjectCache):
-    """An L1-only function's object cache that records the key of every lookup. Each call looks up
-    once: a memoised call under the memo's key, any other call under the key it generated."""
-
-    def __init__(self) -> None:
-        super().__init__(max_entries=None, max_size_bytes=1 << 20)
-        self.reads: list[str] = []
-
-    def get(self, key: str) -> tuple[bool, Any]:
-        self.reads.append(key)
-        return super().get(key)
-
-    def get_with_swr(self, key: str, ttl: float) -> tuple[bool, Any, bool, int]:
-        self.reads.append(key)
-        return super().get_with_swr(key, ttl)
-
-
 def _l1_reads(fn: Any) -> list[str]:
-    """Give an L1-only function a recording object cache; returns the keys it looks up."""
-    recording = _RecordingObjectCache()
-    for name in ("_object_cache", "_l1_fast_cache"):
-        _closure_cell(fn, name).cell_contents = recording
-    return recording.reads
+    """Record the key of every lookup an L1-only function makes under its cache's lock; returns them.
+
+    A call the memo does not answer looks up once, under the key it built; a lock-free hit makes no
+    lookup, and the key it was served under is the one its entry was memoised by (see _key_used)."""
+    oc = _closure_cell(fn, "_object_cache").cell_contents
+    reads: list[str] = []
+    for name in ("get", "get_with_swr"):
+        method = getattr(oc, name)
+
+        def recording(key: str, *rest: Any, _method: Any = method, **kwargs: Any) -> Any:
+            reads.append(key)
+            return _method(key, *rest, **kwargs)
+
+        setattr(oc, name, recording)  # an instance attribute, so the cache keeps its memo wiring
+    return reads
 
 
-def _memo(fn: Any) -> dict[tuple[Any, ...], tuple[str, str, str]]:
-    return _closure_cell(fn, "_key_memo").cell_contents
+def _memo(fn: Any) -> Any:
+    """An L1-only function's HitMemo: len() counts its slots, keys() lists their memo keys."""
+    return _closure_cell(fn, "_l1_memo").cell_contents
 
 
-class _GatedObjectCache(ObjectCache):
-    """An L1-only function's object cache whose delete waits for the test, so an invalidation can be
-    held between deciding to erase an entry and erasing it while the test makes another call."""
+def _key_used(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+    """The cache key a lock-free hit for this call is served under: the key of the stored entry its
+    memo slot points at, or None when the call has no slot."""
+    memo_key = _memo_key(args, kwargs)
+    store = _closure_cell(fn, "_object_cache").cell_contents._state.store
+    for key, entry in store.items():
+        if entry.hit is not None and memo_key in entry.hit.memo_keys:
+            return key
+    return None
 
-    def __init__(self) -> None:
-        super().__init__(max_entries=None, max_size_bytes=1 << 20)
+
+class _Gate:
+    """An L1-only function's cache whose delete waits for the test, so an invalidation can be held
+    between deciding to erase an entry and erasing it while the test makes another call."""
+
+    def __init__(self, fn: Any) -> None:
         self.deleting = threading.Event()
         self.release = threading.Event()
+        oc = _closure_cell(fn, "_object_cache").cell_contents
+        delete = oc.delete
 
-    def delete(self, key: str) -> bool:
-        self.deleting.set()
-        assert self.release.wait(10), "the test never released the delete"
-        return super().delete(key)
+        def gated(key: str) -> bool:
+            self.deleting.set()
+            assert self.release.wait(10), "the test never released the delete"
+            return delete(key)
+
+        oc.delete = gated
 
 
-def _gate(fn: Any) -> _GatedObjectCache:
-    """Give an L1-only function a gated object cache, before its first call."""
-    gated = _GatedObjectCache()
-    for name in ("_object_cache", "_l1_fast_cache"):
-        _closure_cell(fn, name).cell_contents = gated
-    return gated
+def _gate(fn: Any) -> _Gate:
+    """Gate an L1-only function's cache deletes, before its first call."""
+    return _Gate(fn)
 
 
 def _deep_size(obj: Any, seen: set[int] | None = None) -> int:
@@ -292,9 +297,16 @@ class TestKeyBytesUnchanged:
             return 1
 
         reads = _l1_reads(fn)
+        hits = fn.cache_info().l1_hits  # counted per function identity, which every row's fn shares
         for _ in range(3):
             fn(*args, **kwargs)
-        assert reads == [_key_now(fn, args, kwargs, "memo")] * 3
+        key = _key_now(fn, args, kwargs, "memo")
+        if memoised:
+            assert reads == [key]  # the second and third calls are lock-free hits on that entry
+            assert _key_used(fn, args, kwargs) == key
+            assert fn.cache_info().l1_hits - hits == 2
+        else:
+            assert reads == [key] * 3
         assert len(_memo(fn)) == (1 if memoised else 0)
 
     # Values that compare equal across types (1, 1.0, True; 0, 0.0, -0.0, False), values just past
@@ -316,8 +328,12 @@ class TestKeyBytesUnchanged:
 
         reads = _l1_reads(fn)
         for args, kwargs in calls:
+            before = len(reads)
             fn(*args, **kwargs)
-            assert reads[-1] == _key_now(fn, tuple(args), kwargs, "memo")
+            key = _key_now(fn, tuple(args), kwargs, "memo")
+            # A lookup under the lock reads the key the call built; a lock-free hit makes none and is
+            # served under its memoised entry's key.
+            assert (reads[-1] if len(reads) > before else _key_used(fn, tuple(args), kwargs)) == key
 
     def test_keyword_order_does_not_change_the_key(self) -> None:
         @cache(backend=None, ttl=60, namespace="memo", encryption=False)
@@ -328,11 +344,13 @@ class TestKeyBytesUnchanged:
         fn(a=1, b=2)
         fn(b=2, a=1)
         fn(a=1, b=2)
-        assert reads == [_key_now(fn, (), {"a": 1, "b": 2}, "memo")] * 3
+        key = _key_now(fn, (), {"a": 1, "b": 2}, "memo")
+        assert reads == [key]  # one memo slot answers both orders
+        assert _key_used(fn, (), {"b": 2, "a": 1}) == key
 
     @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
     def test_a_rename_after_the_first_call_rekeys(self, is_async: bool) -> None:
-        """sync_wrapper and async_wrapper each check an entry's names before they use its key."""
+        """The lock-free hit answers only while the function has the names its memo was built with."""
         fn, call = _l1_only(is_async)
         reads = _l1_reads(fn)
         call(1)
@@ -346,6 +364,25 @@ class TestKeyBytesUnchanged:
         assert ":renamed:" not in reads[0]
         assert reads[1:] == [renamed, moved, moved]
         assert ":elsewhere.renamed:" in moved
+
+    def test_a_rename_rekeys_a_callable_that_is_not_a_plain_function(self) -> None:
+        """A plain function's names are read through the descriptors on its type; any other callable,
+        here a bound method reporting its function's names, through its own attribute access."""
+
+        class Service:
+            def lookup(self, x: int) -> int:
+                return x
+
+        fn = cache(backend=None, ttl=60, namespace="memo", encryption=False)(Service().lookup)
+        reads = _l1_reads(fn)
+        fn(1)
+        fn(1)  # a lock-free hit: no read under the lock
+        Service.lookup.__qualname__ = "renamed"
+        renamed = _key_now(fn, (1,), {}, "memo")
+        fn(1)
+        fn(1)
+        assert ":renamed:" not in reads[0]
+        assert reads[1:] == [renamed, renamed]  # the memo answers only for the names it was built with
 
     def test_names_that_are_not_exact_str_are_never_memoised(self) -> None:
         """The generator formats __module__ and __qualname__ on every call, and an object can format
@@ -367,7 +404,7 @@ class TestKeyBytesUnchanged:
         fn.__wrapped__.__module__ = "plain"
         fn.__wrapped__.__qualname__ = _Str("fn")
         fn(1)
-        assert _memo(fn) == {}
+        assert len(_memo(fn)) == 0
 
     @pytest.mark.parametrize(
         "decorate",
@@ -389,7 +426,7 @@ class TestKeyBytesUnchanged:
 
         for _ in range(3):
             assert fn("alice@example.com") == "alice@example.com"
-        assert _memo(fn) == {}
+        assert _memo(fn) is None
         assert len(set(backend.reads)) == 1
 
 
@@ -478,9 +515,9 @@ class TestL1OnlyFastPath:
         fn("bob@example.com")
         assert len(memo) == 2
         fn.invalidate_cache("alice@example.com")
-        assert list(memo) == [(str, "bob@example.com")]
+        assert memo.keys() == [_memo_key(("bob@example.com",), {})]
         fn.cache_clear()
-        assert memo == {}
+        assert len(memo) == 0
 
     def test_invalidation_with_keywords_in_another_order_forgets_the_entry(self) -> None:
         @cache(backend=None, encryption=False)
@@ -492,7 +529,7 @@ class TestL1OnlyFastPath:
         fn(org="a", user="alice@example.com")
         assert len(memo) == 1
         fn.invalidate_cache(org="a", user="alice@example.com")
-        assert memo == {}
+        assert len(memo) == 0
 
     def test_invalidation_spelled_another_way_forgets_the_memoised_arguments(self) -> None:
         """A Path keys like its str, and invalidate_cache keys without _bypass_cache: each erases the
@@ -509,9 +546,9 @@ class TestL1OnlyFastPath:
         fn("alice@example.com")
         fn("bob@example.com")
         fn.invalidate_cache(Path("alice@example.com"))
-        assert list(memo) == [(str, "bob@example.com")]
+        assert memo.keys() == [_memo_key(("bob@example.com",), {})]
         fn.invalidate_cache("bob@example.com", _bypass_cache=True)
-        assert memo == {}
+        assert len(memo) == 0
         fn("alice@example.com")
         fn("bob@example.com")
         assert calls == 4
@@ -540,7 +577,7 @@ class TestL1OnlyFastPath:
         gated.release.set()
         worker.join(10)
         assert not worker.is_alive()
-        assert _memo(fn) == {}
+        assert len(_memo(fn)) == 0
         fn("alice@example.com")
         assert calls == 2
 
@@ -566,7 +603,7 @@ class TestL1OnlyFastPath:
 
         asyncio.run(run())
         assert calls == 1
-        assert _memo(fn) == {}
+        assert len(_memo(fn)) == 0
 
     def test_a_full_memo_at_every_cap_stays_small(self) -> None:
         """Every call at every cap: eight keyword names and eight values of 4-byte characters, sharing
@@ -584,7 +621,7 @@ class TestL1OnlyFastPath:
             fn(**{tag + chr(97 + j) + wide * (each - 5): tag + wide * (each - 4) for j in range(_MEMO_MAX_ARGS)})
         memo = _memo(fn)
         assert len(memo) == _MEMO_MAX_ENTRIES
-        assert _deep_size(memo) < 4.5 * 2**20
+        assert _deep_size(memo.keys()) < 4.5 * 2**20  # what the memo keeps beyond the cache's entries
 
     def test_keyword_names_past_the_cap_cache_without_the_memo(self) -> None:
         calls = 0
@@ -599,7 +636,7 @@ class TestL1OnlyFastPath:
         for _ in range(3):
             fn(**{name: 1})
         assert calls == 1
-        assert _memo(fn) == {}
+        assert len(_memo(fn)) == 0
 
     def test_bypass_and_invalidation_reach_a_memoised_call(self) -> None:
         calls = 0

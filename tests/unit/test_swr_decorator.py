@@ -339,10 +339,11 @@ def _forked_stale_hit_outcome(fork: str) -> object:
     fork: one waiting for the GIL at a fork from C hangs the child in no cachekit code.
     """
     import ctypes
-    import types
 
-    from cachekit import l1_cache, object_cache
+    from cachekit import l1_cache
+    from cachekit._rust_serializer import monotonic
     from cachekit.config import L1CacheConfig
+    from tests.utils.clock import shared_clock
 
     backend = FakeSWRBackend()
     calls = {"l1": 0, "l2": 0}
@@ -384,8 +385,8 @@ def _forked_stale_hit_outcome(fork: str) -> object:
 
             threading.Thread = _RecordingThread  # the child's copy only; it never returns
             logging.getLogger("cachekit").addHandler(_Recorder(logging.WARNING))  # where the refresh paths report
-            now = time.monotonic()
-            object_cache.time = types.SimpleNamespace(monotonic=lambda: now + 60)  # past ttl * ratio, short of ttl
+            now = monotonic()
+            shared_clock.fake = lambda: now + 60  # past ttl * ratio, short of ttl (the child's clock only)
             backend.stale = True
             outcome: object = {
                 "hookless": l1_cache._forked_without_hooks(),

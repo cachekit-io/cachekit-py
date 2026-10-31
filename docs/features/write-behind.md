@@ -50,7 +50,7 @@ Each decorated function gets one writer, shared by its sync and async callers.
 | Invalidation | In this process, `invalidate_cache()` drops the queued writes it covers and waits for those being sent, so its delete comes after every write this process made before the call. That covers every decoration of the same function and namespace in the process, whichever one invalidates; an exact-key invalidation also covers another function writing the same key (interop), and a whole-function one does not. The wait has no timeout of its own, so on a backend with no operation timeout it lasts as long as the slowest of those writes |
 | Key registry | A key is tracked (whole-function invalidation across processes) only after its write succeeds |
 | Failures | A failed write is a WARNING (throttled) and a failed `set` operation in the metrics. The value stays in this process's L1 |
-| Metrics | A deferred write records its `set` sample when it finishes, on the writer thread. The sample times the backend write alone (serialization ran on the caller) and reports `success=False` when the backend refused or failed it. Without the option, the sample covers serialization plus the write and is recorded before the call returns |
+| Metrics | A deferred write records its `set` sample when it finishes, on the writer thread. The sample times the backend write alone (serialization ran on the caller) and reports `success=False` when the backend refused or failed it. Without the option, or for a write that stays on the caller's path or that the full queue refused, the sample covers serialization plus the write, is recorded before the call returns and reports `success=True` even when the write failed |
 
 ### Invalidation
 

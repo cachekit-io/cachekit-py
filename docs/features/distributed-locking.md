@@ -8,7 +8,7 @@
 
 ## TL;DR
 
-Distributed locking prevents "cache stampede" - when multiple pods simultaneously call an expensive function on cache miss. With locking, only one pod calls the function; others wait for the cache result. Inside one pod, concurrent misses on a key never reach the lock more than once: they share one trip ([in-process single-flight](#in-process-single-flight-before-the-lock)), so the lock only dedups across processes.
+Distributed locking prevents "cache stampede" - when multiple pods simultaneously call an expensive function on cache miss. With locking, only one pod calls the function; others wait for the cache result. Inside one pod, callers that miss a key while its call runs share that call's trip instead of each reaching the lock ([in-process single-flight](#in-process-single-flight-before-the-lock)). For async callers, sharing holds only on the event loop running the key's call: a caller on another thread's loop runs its own trip and takes the lock itself.
 
 ```python
 @cache(ttl=300)  # Distributed locking enabled by default (via LockableBackend)
@@ -41,7 +41,7 @@ report = await get_report("2025-01-15")
 > [!NOTE]
 > Locking requires **both** of:
 >
-> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call, sync or async ([in-process single-flight](#in-process-single-flight-before-the-lock)).
+> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. `FileBackend` and pure-L1 (zero-config) caching do not either. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call: sync callers across the process's threads, async callers only on the event loop running the key's call ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
 > 3. The function has not opted out with `distributed_lock=False` — see [Turning It Off](#turning-it-off-distributed_lockfalse).
 
@@ -49,7 +49,7 @@ report = await get_report("2025-01-15")
 
 ## In-Process Single-Flight (Before the Lock)
 
-Concurrent misses on one key inside one process share one call. The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In backed mode the shared call is the whole trip after the L1 miss: the L2 read, the lock (async functions only, see [Async-only](#async-only-sync-functions-are-never-lock-protected)), the function and the write. A herd in one process costs one trip, so the lock only has to dedup across processes. It is always on and costs no round trip. The exception is a trip that leaves no serialized value to share. On either path that is a value the serializer rejects. On the async path it is also a lock release that failed after the locked work finished. On the sync path it is also a hit read through the mmap fast path, or a value streamed to the backend. A backend that is down does not count: its failed read is a miss and its failed write still leaves the serialized value, so the herd shares that trip. Each joined caller then takes its own trip once the first one ends. That herd costs one trip per caller, as it did before, but a joined caller waits for the first trip before it starts its own.
+Concurrent misses on one key inside one process share one call, except that async callers share it only on the event loop running the key's call (see Event loops below). The first caller to miss starts it, and every caller that misses the same key while it runs waits for its outcome instead of starting its own. In backed mode the shared call is the whole trip after the L1 miss: the L2 read, the lock (async functions only, see [Async-only](#async-only-sync-functions-are-never-lock-protected)), the function and the write. The exception is [write-behind](write-behind.md): on a sync miss, or an async miss that falls through to the unlocked path, it can hand the write to the writer, so the trip ends before L2 holds the value and another process that misses meanwhile recomputes. The lock path's write stays synchronous. A herd of sync threads in one process, or of async tasks on the loop running the call, costs one trip, so the lock only has to dedup the trips that are left. It is always on and costs no round trip. The exception is a trip that leaves no serialized value to share. On either path that is a value the serializer rejects. On the async path it is also a lock release that failed after the locked work finished. On the sync path it is also a hit read through the mmap fast path, or a value streamed to the backend. In those cases each joined caller takes its own trip once the first one ends. That herd costs one trip per caller, as it did before, but a joined caller waits for the first trip before it starts its own. A backend that is down does not count: its failed read is a miss and its failed write still leaves the serialized value, so the herd shares that trip.
 
 | Mode | Sync | Async | A caller that joins gets |
 |------|------|-------|--------------------------|
@@ -57,7 +57,7 @@ Concurrent misses on one key inside one process share one call. The first caller
 | `@cache.local()` | Yes | Yes | The starter's object, as a later hit does |
 | Backed (`@cache` with a backend, `@cache.io`, `@cache.secure`, ...) | Yes | Yes | Its own copy, decoded from the starter's serialized value, as an L1 hit does |
 
-Sync callers share a call across the threads of one process; async callers share one across the tasks of one event loop. The sync backed path takes no distributed lock, so its trip dedups misses within a process only (see [Async-only](#async-only-sync-functions-are-never-lock-protected)).
+Sync callers share a call across the threads of one process; async callers share one only with the tasks on the event loop running the key's call. The sync backed path takes no distributed lock, so its trip dedups misses within a process only (see [Async-only](#async-only-sync-functions-are-never-lock-protected)).
 
 - **Failure.** If the call raises, every caller waiting on it gets that exception, nothing is cached, and the next call starts a new one.
 - **Cancellation.** Cancelling an async caller (a timeout, a dropped client) cancels only its own wait: the call runs on for the callers still waiting. Once every waiting caller is cancelled, the call is cancelled too, and the last caller returns once it has unwound, as an unshared call would. A joined caller whose shared call was cancelled under it (the function raised `CancelledError`), without being cancelled itself, runs its own call, as it would have alone.
@@ -161,10 +161,13 @@ Three behavioural edges to design around:
 
 1. **Waiter fallthrough at 5 s.** A waiter that can't acquire the lock within
    5 seconds re-checks the cache one last time and, if it's still empty,
-   **executes the function itself without the lock**. Only one caller per
-   process waits on the lock (the others share its trip), so the bound is one
-   recompute per waiting process: for a function slower than 5 seconds, every
-   waiting process times out and recomputes, so cross-process protection is
+   **executes the function itself without the lock**. Callers that share a
+   trip wait on the lock once ([in-process single-flight](#in-process-single-flight-before-the-lock)),
+   and only callers on the event loop running the key's call share it, so the
+   bound is one recompute per waiting trip: one per process whose callers all
+   miss on that loop, plus one per caller on another thread's loop. For a
+   function slower than 5 seconds, every waiting trip times out and
+   recomputes, so cross-process protection is
    effectively nil. Keep execution time under 5 s for full single-flight
    behaviour.
 2. **Lock self-expiry at 30 s.** If the function runs longer than 30 seconds,
@@ -176,8 +179,9 @@ Three behavioural edges to design around:
 3. **Lock backend errors degrade to no lock.** If lock acquisition raises a
    backend error (lock backend outage, authentication failure), the wrapper
    logs a warning and **executes the function without the lock** — once per
-   process, since a process's concurrent callers share one trip, i.e. a
-   stampede across processes. A failed lock request is not retried; only a
+   trip, i.e. a stampede across processes. Only callers on the event loop
+   running the key's call share its trip; a caller on another thread's loop
+   runs its own ([in-process single-flight](#in-process-single-flight-before-the-lock)). A failed lock request is not retried; only a
    lock another caller holds is waited on. A failed release never runs the
    function again: the Redis and CachekitIO backends swallow a backend error
    on release, any other release failure is logged and the call keeps its
@@ -314,9 +318,9 @@ What changes on an async miss:
 | | `distributed_lock=True` (default) | `distributed_lock=False` |
 |---|---|---|
 | Lock requests (CachekitIO) | Uncontended: one `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
-| Concurrent misses on one event loop | One call ([single-flight](#in-process-single-flight-before-the-lock)) | One call (single-flight is unchanged) |
-| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CachekitIO, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#request-count-on-cachekitio)) | At least one call per process that misses, each computing and writing. Within a process, only callers on the event loop running the key's call share it: while it runs, every caller on another thread's loop runs its own call (ten such callers, ten calls) |
-| [Write-behind](write-behind.md) | Not applied while the lock is held: the write lands inside it | Applied when on: the L2 write leaves the caller's path |
+| Concurrent misses on one event loop | One call ([single-flight](#in-process-single-flight-before-the-lock)) | Single-flight is unchanged: within a process, only callers on the event loop running the key's call share it. While it runs, every caller on another thread's loop runs its own call (ten such callers, ten calls) |
+| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CachekitIO, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#request-count-on-cachekitio)) | At least one call per process that misses, each computing and writing |
+| [Write-behind](write-behind.md) | Not applied on the lock path: the L2 write stays synchronous, including after a timed-out lock wait. Write-behind can defer it only when the miss falls through to the unlocked path: a backend error while acquiring the lock, or a backend that cannot lock | Applied when on: the L2 write leaves the caller's path |
 
 The trade-off is cross-process stampede protection. Turn it off when the function is cheap or idempotent and a
 recompute per process is acceptable, and keep it on for an expensive function behind many processes. Stale-while-revalidate
@@ -395,8 +399,10 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 @cache(ttl=300)  # Both enabled
 async def operation(x):
     # L2 backend down: lock acquisition fails too (the lock lives in L2),
-    # so each process's concurrent callers share one call without the lock
-    # and the function keeps serving. Locking resumes when the backend recovers.
+    # so callers on the event loop running the key's call share it without the
+    # lock, a caller on another thread's loop runs its own (see In-Process
+    # Single-Flight above), and the function keeps serving. Locking resumes
+    # when the backend recovers.
     return compute(x)
 ```
 
