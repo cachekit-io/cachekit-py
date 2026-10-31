@@ -684,11 +684,14 @@ class PerRequestRedisBackend:
                     await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
 
                 def _release_detached() -> None:
-                    # Nothing reads a background release's future, so it must never hold an exception:
-                    # asyncio would report one only as an unredacted "exception was never retrieved".
+                    # On an executor thread nothing awaits, so every outcome ends here: anything left on the future
+                    # would reach asyncio's "exception was never retrieved" report with its traceback whole, and an
+                    # interrupt raised in the worker (a gevent.Timeout) mid-reconnect carries redis-py's auth_args.
+                    # Its frames are cleared first; it reaches no caller either way, so it is logged and dropped.
                     try:
-                        _release_sync()
-                    except Exception as e:
+                        with _ClearedOnInterrupt():
+                            _release_sync()
+                    except BaseException as e:
                         _log_release_failure(key, e)
 
                 first_attempt = True
@@ -732,7 +735,11 @@ class PerRequestRedisBackend:
                                 redact_cache_key(key),
                                 redact_error_for_log(e),
                             )
-                            _release_detached()
+                            # On the loop's thread: an interrupt propagates, its frames cleared by the enclosing guard.
+                            try:
+                                _release_sync()
+                            except Exception as exc:
+                                _log_release_failure(key, exc)
                     elif acquired:
                         await _release()
                 return

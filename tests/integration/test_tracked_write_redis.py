@@ -271,7 +271,8 @@ class TestDelegationWritesWhereItReads:
         await fn(1)
         await fn(1)
         assert calls == 1
-        assert client.keys("t:source:*") == []
+        # The fill lock is the facade's own (not delegated) and is released in the background: its key may linger.
+        assert [k for k in client.keys("t:source:*") if not k.endswith(b":lock")] == []
 
 
 class TestFuseDecision:
