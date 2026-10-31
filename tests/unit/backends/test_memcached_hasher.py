@@ -6,6 +6,8 @@ itself rather than against recorded values.
 
 from __future__ import annotations
 
+from enum import Enum, StrEnum
+
 import pytest
 
 pytest.importorskip("pymemcache")
@@ -76,6 +78,57 @@ def test_no_nodes_and_one_node() -> None:
     native.add_node("mc1:11211")
     assert native.get_node("k") == "mc1:11211"
     native.remove_node("mc1:11211")
+    assert native.get_node("k") is None
+
+
+class CacheKey(str, Enum):  # noqa: UP042 - the mixin formats as "CacheKey.USER"; StrEnum does not
+    USER = "user"
+
+
+class StrKey(StrEnum):
+    USER = "user"
+
+
+class Name(str):
+    def __format__(self, spec: str) -> str:
+        return "renamed"
+
+
+THREE = ["mc1:11211", "mc2:11211", "mc3:11211"]
+
+
+def test_str_subclass_key_is_formatted_as_pymemcache_formats_it() -> None:
+    # pymemcache hashes f"{node}-{key}", so a (str, Enum) key hashes as "CacheKey.USER", not "user".
+    reference, native = both(THREE)
+    for key in (CacheKey.USER, StrKey.USER, Name("user")):
+        assert native.get_node(key) == reference.get_node(key)
+    assert reference.get_node(CacheKey.USER) != reference.get_node("user")  # the case that moved
+
+
+def test_str_subclass_node_is_formatted_as_pymemcache_formats_it() -> None:
+    reference, native = RendezvousHash(), NativeRendezvousHash()
+    for node in [Name("mc1:11211"), "mc2:11211", "mc3:11211"]:
+        reference.add_node(node)
+        native.add_node(node)
+    for key in ("a", "b", "c", "d"):
+        assert native.get_node(key) == reference.get_node(key)
+
+
+def test_backend_routes_a_str_enum_key_like_a_default_hash_client() -> None:
+    backend = MemcachedBackend(MemcachedBackendConfig(servers=THREE))
+    default = HashClient(servers=[_parse_server(n) for n in THREE], use_pooling=True)
+    assert backend._client._get_client(CacheKey.USER).server == default._get_client(CacheKey.USER).server
+
+
+def test_last_server_removed_after_the_length_check_picks_no_server() -> None:
+    class Emptied(list):
+        """A node list another thread emptied between get_node's length check and its index."""
+
+        def __len__(self) -> int:
+            return 1
+
+    native = NativeRendezvousHash()
+    native.nodes = Emptied()
     assert native.get_node("k") is None
 
 
