@@ -164,7 +164,7 @@ What each `cache_operation_duration_ms` series times, measured with a monotonic 
 | `operation="get"`, `serializer="l1_memory"` | The L1 lookup plus deserialization (decryption included for an encrypted cache) |
 | `operation="get"`, `serializer="rust"` | The L2 read of a hit plus deserialization (decryption included for an encrypted cache) |
 | `operation="set"` | Serialization plus the L2 write: not the miss read, the function, a lock wait or the L1 put. On the tenant-scoped Redis backend it includes the key-registry write, which goes in the same pipeline |
-| `operation="set"`, `write_behind=True` | The backend write alone, recorded when it lands |
+| `operation="set"`, a write `write_behind=True` deferred | The backend write alone, recorded when it lands. A write-behind miss that writes on the caller's thread instead is timed as the row above: an async miss under the distributed lock, a sync streaming write ([What stays on the caller's path](write-behind.md#what-stays-on-the-callers-path)), or a value the full writer queue refused ([The writer](write-behind.md#the-writer)) |
 
 `cache_operation_size_bytes` records the length of the bytes a `get` hit read; a `set` records no size. For an L1 `get`, that is the L1 entry:
 on a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit swaps its envelope for its
@@ -209,8 +209,10 @@ other operations, so this is an operation-success rate, not a hit rate.
 
 For a miss-rate proxy, watch cache writes: `operation="set"` is recorded when a miss
 writes back. It counts write attempts: a failed backend write is logged, not raised, so it
-still records `success="True"`, except under `write_behind=True`, where it records
-`success="False"`. Treat it as a proxy, not an exact miss count.
+still records `success="True"`. Only a write that `write_behind=True` actually deferred records
+`success="False"` when it fails. A write-behind miss written on the caller's thread (see the
+`set` rows under [Histograms](#histograms-latency-and-size)) records `success="True"` like any
+other. Treat it as a proxy, not an exact miss count.
 
 ```promql
 # Cache-write rate as a miss-rate proxy (see caveats above)
