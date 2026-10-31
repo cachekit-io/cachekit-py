@@ -18,11 +18,17 @@ What one figure covers:
 
 The workload: keys drawn from a Zipf distribution (exponent 0.99, the YCSB default) over
 ``--keys`` keys; each key's value is a seeded dict, about 1 KB as MessagePack (range roughly
-0.2-6 KB); calls arrive at ``--rate`` per second as a Poisson process. The function stands in for a
-database call with a fixed ``--origin-ms`` sleep, so a miss's figure is that sleep plus the cache's
-own work. L1 gets a ``--l1-mb`` budget, smaller than the working set, so the long tail falls through
-to L2. Calls are sequential (open loop, one caller): a figure is the time one call took, not a
-response time under load, and a slow call delays the arrivals behind it.
+0.2-6 KB). One caller makes the calls one at a time, at arrival times drawn as a Poisson process at
+``--rate`` per second. A call that outlasts the gap to the next arrival makes the caller late; it
+then drops the backlog and draws the next gap from when it is free (``next_arrival``), so it never
+runs above ``--rate`` to catch up. While misses dominate, the achieved rate is lower; the recording
+states it, and the busiest slice's rate. A figure is the time one call took, not a response time
+under load.
+
+The function stands in for a database call with a fixed ``--origin-ms`` sleep, so a miss's figure is
+that sleep plus the cache's own work. L1 gets a ``--l1-mb`` budget, smaller than the working set, so
+the long tail falls through to L2. Values are stored unencrypted, as plain ``@cache`` stores them
+(``@cache.secure`` encrypts).
 
 Every run uses a fresh namespace, so it starts with L1 and L2 empty and the recording shows the
 cache warming. Nothing is deleted: entries expire after ``--ttl`` seconds.
@@ -39,7 +45,6 @@ samples; the histograms' own percentiles are only good to a bin (about 15%).
 from __future__ import annotations
 
 import argparse
-import bisect
 import itertools
 import json
 import math
@@ -97,15 +102,18 @@ def payload(key: int) -> dict[str, Any]:
     }
 
 
-class Zipf:
-    """Ranks 0..n-1 drawn with probability proportional to 1 / (rank + 1) ** exponent."""
+def next_arrival(due: float, now: float, gap: float) -> float:
+    """When the next call starts: ``gap`` after the later of its schedule and now.
 
-    def __init__(self, n: int, exponent: float, rng: random.Random) -> None:
-        self.cdf = list(itertools.accumulate(1.0 / (r + 1) ** exponent for r in range(n)))
-        self.rng = rng
+    A caller still busy past ``due`` drops that backlog instead of firing calls back to back to
+    catch up, so the call rate never runs above the arrival process's.
 
-    def draw(self) -> int:
-        return bisect.bisect_left(self.cdf, self.rng.random() * self.cdf[-1])
+    >>> next_arrival(due=10.0, now=9.0, gap=0.5)  # on time: the schedule holds
+    10.5
+    >>> next_arrival(due=10.0, now=12.0, gap=0.5)  # late: start from now, no burst
+    12.5
+    """
+    return max(due, now) + gap
 
 
 class Slices:
@@ -187,7 +195,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return payload(key)
 
     rng = random.Random(args.seed)
-    zipf = Zipf(args.keys, ZIPF_EXPONENT, rng)
+    keys = range(args.keys)
+    # Zipf: rank r drawn with probability proportional to 1 / (r + 1) ** ZIPF_EXPONENT.
+    zipf_cdf = list(itertools.accumulate(1.0 / (r + 1) ** ZIPF_EXPONENT for r in keys))
     try:
         redis_version = redis.Redis.from_url(args.redis, socket_connect_timeout=5, socket_timeout=5).info("server")[
             "redis_version"
@@ -210,13 +220,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     before = fetch.cache_info()
     due = start
     while True:
-        due += rng.expovariate(args.rate)
+        due = next_arrival(due, time.perf_counter(), rng.expovariate(args.rate))
         if due >= end:
             break
         lag = due - time.perf_counter()
         if lag > 0:
             time.sleep(lag)
-        key = zipf.draw()
+        key = rng.choices(keys, cum_weights=zipf_cdf)[0]
         executed[0] = False
         t0 = time.perf_counter_ns()
         fetch(key)
@@ -237,6 +247,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     slices.pad(n_slices)
 
     attributed = sum(len(v) for v in samples.values())
+    achieved = (attributed + unattributed) / duration
+    busiest = max(sum(sum(row[name]) for name in LAYERS) for row in slices.rows) / args.slice
     summary = {}
     for name in LAYERS:
         values = sorted(samples[name])
@@ -253,12 +265,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "recordedAt": datetime.fromtimestamp(start_wall, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sdk": f"cachekit {cachekit.__version__} (Python {platform.python_version()})",
             "l2": f"Redis {redis_version}, {args.l2_where}",
-            # Arrivals are scheduled at --rate, but one caller cannot keep up while misses dominate:
-            # it falls behind during warm-up and catches up after, so record what it achieved.
+            "cache": f"L1 budget {args.l1_mb} MB, ttl {args.ttl} s, unencrypted (plain @cache; @cache.secure encrypts)",
+            # One caller cannot keep up while misses dominate, so the run states what it achieved,
+            # overall and in its busiest slice, beside the arrival rate it was given.
             "workload": (
-                f"Zipf {ZIPF_EXPONENT} over {args.keys:,} keys, up to {args.rate:g} calls/s "
-                f"(achieved {(attributed + unattributed) / duration:.1f} over the run), ttl {args.ttl} s, "
-                f"L1 budget {args.l1_mb} MB"
+                f"Zipf {ZIPF_EXPONENT} over {args.keys:,} keys; one caller, one call at a time, Poisson arrivals "
+                f"at {args.rate:g}/s (achieved {achieved:.0f}/s, busiest {args.slice:g} s slice {busiest:.0f}/s)"
             ),
             "origin": f"{args.origin_ms:g} ms sleep standing in for a database call",
             "host": f"{cpu_model()}, {platform.system()}",
@@ -271,7 +283,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "summary": {
             "attributed": attributed,
             "unattributed": unattributed,
-            "achieved_rate": (attributed + unattributed) / duration,
+            "target_rate": args.rate,
+            "achieved_rate": achieved,
+            "busiest_slice_rate": busiest,
             "layers": summary,
         },
     }
