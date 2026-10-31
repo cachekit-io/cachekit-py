@@ -22,6 +22,10 @@ pub mod python_bindings;
 // own tests run in the pure-Rust test build too.
 pub mod hit_counter;
 
+// The decorator's memoised L1-only hit, answered without a lock (decorators/wrapper.py).
+#[cfg(feature = "python")]
+pub mod l1_hit;
+
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
@@ -44,6 +48,13 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Per-function L1-hit statistics, counted without a lock (decorators/wrapper.py)
     m.add_class::<hit_counter::PyHitCounter>()?;
+
+    // The memoised L1-only hit, its entries and their clock (decorators/wrapper.py, object_cache.py)
+    m.add_class::<l1_hit::HitMemo>()?;
+    m.add_class::<l1_hit::HitEntry>()?;
+    m.add_function(wrap_pyfunction!(l1_hit::memo_key, m)?)?;
+    m.add_function(wrap_pyfunction!(l1_hit::monotonic, m)?)?;
+    m.add_function(wrap_pyfunction!(l1_hit::set_clock, m)?)?;
 
     // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the

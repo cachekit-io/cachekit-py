@@ -612,17 +612,15 @@ class TestL1OnlySizeBound:
 class TestL1OnlySWRRetryBackoff:
     """A failed L1-only refresh is not retried on every read (swr_retry_interval).
 
-    The ObjectCache clock is faked so the band/back-off/expiry boundaries are exact;
-    the refresh itself still runs on a real thread or task.
+    The clock ObjectCache and the lock-free hit share is faked so the band/back-off/expiry
+    boundaries are exact; the refresh itself still runs on a real thread or task.
     """
 
     @staticmethod
     def _fake_clock(monkeypatch, start: float = 1000.0):
-        import types
+        from tests.utils.clock import fake_clock
 
-        fake_time = types.SimpleNamespace(monotonic=lambda: start)
-        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
-        return fake_time
+        return fake_clock(monkeypatch, start)
 
     @staticmethod
     def _wait_sync(get_calls, expected: int, timeout: float = 2.0) -> None:
