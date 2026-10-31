@@ -14,6 +14,7 @@ import random
 import sys
 import threading
 import weakref
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -63,7 +64,7 @@ class _Entry:
     value: Any
     expires_at: float  # clock (_monotonic) hard-expiry deadline
     cached_at: float  # clock write timestamp (SWR freshness clock)
-    used_at: float  # clock reading of the latest read under the lock, or the write: LRU recency
+    used_at: float  # clock reading of the latest read under the lock, or the write (recency, with hit.used_at)
     size_bytes: int  # 0 when the cache is not byte-bounded
     generation: int  # anti-resurrection token: allocated per stored entry, never reused
     hit: HitEntry | None = None  # what a lock-free hit reads, in a cache with a memo; replaced on refresh
@@ -72,23 +73,26 @@ class _Entry:
 
 
 def _used_at(entry: _Entry) -> float:
-    """An entry's LRU recency: its latest use under the lock or, if later, by a lock-free hit."""
+    """An entry's recency in a cache with a memo: its latest use under the lock or, if later, by a lock-free hit."""
     hit = entry.hit
-    return entry.used_at if hit is None else max(entry.used_at, hit.used_at)
+    assert hit is not None  # noqa: S101 - every entry of a cache with a memo has a hit
+    return max(entry.used_at, hit.used_at)
 
 
 class _ObjectCacheState:
-    """The entries, their byte total, their heaps, their in-flight refresh markers, and the lock guarding them.
+    """The entries, their byte total, their deadline and recency records, their in-flight refresh markers, and the lock.
 
     One object so the at-fork hook can replace all of it with a single attribute store: a thread
     still inside a critical section finishes on the state it bound. The stats, the generation
     counter and the memo stay with the cache, so a swap keeps them.
     """
 
-    __slots__ = ("expiry", "lock", "memo", "recency", "refreshing", "size_bytes", "store")
+    __slots__ = ("expiry", "filed", "lock", "memo", "refiled", "refreshing", "size_bytes", "store")
 
     def __init__(self, memo: HitMemo | None) -> None:
-        self.store: dict[str, _Entry] = {}
+        # Without a memo every read takes the lock, so the store's order is the LRU order: a put
+        # appends its entry and a read moves its entry to the end.
+        self.store: OrderedDict[str, _Entry] = OrderedDict()
         self.size_bytes = 0
         # Min-heap of (expires_at, key), one per stored or refreshed deadline, so the over-bound
         # eviction finds expired entries without scanning the store. Deletion is lazy: a removal or a
@@ -96,14 +100,18 @@ class _ObjectCacheState:
         # deadline, and every entry's current deadline has one, so a dead tuple is safe to drop.
         # push() rebuilds the heap from the store once dead tuples outnumber live entries.
         self.expiry: list[tuple[float, str]] = []
-        # Min-heap of (used_at, generation, key), exactly one live record per entry: the LRU order. A
-        # read stamps only its entry, so a record can hold a time older than its entry's latest use.
-        # evict_lru() re-files such a record at that use when it reaches the top, and evicts the first
-        # entry whose record is current: every other entry was used at or after its own record's time,
-        # which is no earlier than the top's, so that entry is the least recently used. A removed or
-        # replaced entry's record is dead (its key holds no entry of its generation) and is dropped
-        # where it surfaces; push() rebuilds this heap as it does the expiry heap.
-        self.recency: list[tuple[float, int, str]] = []
+        # With a memo, a lock-free hit stamps its entry's HitEntry but cannot move the entry in the
+        # store, so recency records hold the LRU order instead: (used_at, generation, key), exactly one
+        # live record per entry. A put files its entry's record at the end of `filed`, so `filed` runs
+        # in clock order. A use stamps only its entry, so a record can hold a time older than its
+        # entry's latest use: evict_lru() re-files such a record at that use when it is the oldest, in
+        # the min-heap `refiled`, and evicts the first entry whose record is current. Every other entry
+        # was used at or after its own record's time, which is no earlier than that one's, so that
+        # entry is the least recently used. A removed or replaced entry's record is dead (its key holds
+        # no entry of its generation) and is dropped where it surfaces; push() rebuilds the records as
+        # it does the expiry heap.
+        self.filed: deque[tuple[float, int, str]] = deque()
+        self.refiled: list[tuple[float, int, str]] = []
         # In-flight refresh ownership: key -> owning generation. A refresh captures the entry's
         # generation at read time and only lands — or clears/cancels its marker — for that exact
         # generation, so a stale refresh from a replaced entry can neither resurrect data nor
@@ -141,22 +149,27 @@ class _ObjectCacheState:
         self.size_bytes -= entry.size_bytes
         self.refreshing.pop(key, None)
 
-    def push(self, key: str, entry: _Entry) -> None:
-        """Record a stored entry's deadline and recency; call with lock held, after the store write.
+    def push(self, key: str, entry: _Entry, *, new: bool = True) -> None:
+        """Record an entry's deadline and, when it is new and the cache has a memo, its recency; call with lock held.
 
-        A rebuild from the store drops a heap's dead records once they outnumber the live entries. It
-        costs O(n) in the entries left, and it at least halves the heap, so it amortises to O(1) per push.
+        Call after the store write. A refreshed entry (new=False) keeps its recency record, which is
+        re-filed at the refresh when it is the oldest, as at any use. A rebuild from the store drops
+        the dead records once they outnumber the live entries. It costs O(n) in the entries left for
+        the deadlines and O(n log n) for the recency records, which it sorts back into clock order, and
+        it at least halves the records, so it amortises to O(1) or O(log n) per push.
         """
         if len(self.expiry) >= 2 * len(self.store):
             self.expiry = [(e.expires_at, k) for k, e in self.store.items()]
             heapq.heapify(self.expiry)
         else:
             heapq.heappush(self.expiry, (entry.expires_at, key))
-        if len(self.recency) >= 2 * len(self.store):
-            self.recency = [(_used_at(e), e.generation, k) for k, e in self.store.items()]
-            heapq.heapify(self.recency)
+        if self.memo is None or not new:
+            return
+        if len(self.filed) + len(self.refiled) >= 2 * len(self.store):
+            self.filed = deque(sorted((_used_at(e), e.generation, k) for k, e in self.store.items()))
+            self.refiled = []
         else:
-            heapq.heappush(self.recency, (entry.used_at, entry.generation, key))
+            self.filed.append((entry.used_at, entry.generation, key))
 
     def remove_expired(self, now: float) -> None:
         """Remove every entry whose deadline has passed; call with lock held.
@@ -175,25 +188,32 @@ class _ObjectCacheState:
     def evict_lru(self) -> None:
         """Remove the least recently used entry; call with lock held and at least one entry stored.
 
-        O(log n) per record it pops or re-files. Without concurrent lock-free hits each live record is
-        re-filed at most once per call, as its entry's use time holds still. Such hits can move it
-        while this runs, so after as many re-files as there are entries the top entry goes, re-filed
-        or not: hits that race an eviction have no order to keep, and the eviction ends.
+        Without a memo that is the store's first entry. With one it is the entry of the oldest
+        current recency record, the older of the first filed and the first re-filed: O(1) per record
+        popped from `filed`, O(log n) per record re-filed or popped from `refiled`. Without concurrent
+        lock-free hits each live record is re-filed at most once per call, as its entry's use time
+        holds still. Such hits can move it while this runs, so after as many re-files as there are
+        entries the oldest record's entry goes, re-filed or not: hits that race an eviction have no
+        order to keep, and the eviction ends.
         """
-        heap, store = self.recency, self.store
+        if self.memo is None:
+            self.remove(next(iter(self.store)))
+            return
+        filed, refiled, store = self.filed, self.refiled, self.store
         refiles = len(store)
         while True:
-            used_at, generation, key = heap[0]
+            if refiled and (not filed or refiled[0] < filed[0]):
+                used_at, generation, key = heapq.heappop(refiled)
+            else:
+                used_at, generation, key = filed.popleft()
             entry = store.get(key)
             if entry is None or entry.generation != generation:
-                heapq.heappop(heap)  # a removed or replaced entry's record
-                continue
+                continue  # a removed or replaced entry's record
             last_used = _used_at(entry)
             if last_used > used_at and refiles:
                 refiles -= 1
-                heapq.heapreplace(heap, (last_used, generation, key))  # used since it was filed
+                heapq.heappush(refiled, (last_used, generation, key))  # used since it was filed
                 continue
-            heapq.heappop(heap)
             self.remove(key)
             return
 
@@ -214,14 +234,20 @@ class ObjectCache:
 
     On a put() when a bound is exceeded, expired entries are removed first; if
     still over, the least recently used fresh entries are evicted. A min-heap of
-    deadlines finds the expired entries and a min-heap of use times the least
-    recently used one, so a put at capacity costs O(log n) per entry it removes
-    and scans no entry. The heaps are memory the byte bound does not count: on
-    64-bit CPython about 64 to 72 bytes per entry for the deadline record and 72
-    to 80 for the recency record (a tuple and its list slot), plus the records
-    of removed or refreshed entries. Once those outnumber the live ones, the put
-    that finds it rebuilds the heap: an O(n) pause once per about n puts at
-    capacity, against a full scan on every one before the heaps.
+    deadlines finds the expired entries, so a put at capacity costs O(log n) per
+    expired entry it removes and does not scan for them. The least recently used
+    entry is the first in the store, an OrderedDict that every read reorders:
+    O(1). A cache with a memo (lock-free hits, below) keeps recency records
+    instead, as a lock-free hit cannot reorder the store: one per entry, filed
+    in clock order at its put, and re-filed in a min-heap once an eviction finds
+    the entry used since. Evicting an entry unused since its put costs O(1), and
+    each re-filed record O(log n). The records are memory the byte bound does
+    not count: on 64-bit CPython about 64 to 72 bytes per entry for the deadline
+    record and, with a memo, 80 to 100 for the recency record (a tuple, its slot,
+    and the time it was re-filed at), plus the records of removed or replaced
+    entries. Once those outnumber the live ones, the put that finds it rebuilds
+    them: an O(n) pause once per about n puts at capacity (O(n log n) for the
+    recency records), against a full scan on every one before the heap.
 
     Bounds (at least one required):
     - max_entries: entry-count bound (default 256, pass None to disable)
@@ -231,10 +257,10 @@ class ObjectCache:
 
     Times are read on ``cachekit._rust_serializer.monotonic``, the clock a
     lock-free hit (below) reads too, so a deadline means the same instant to
-    both. An entry's LRU recency is the clock reading of its latest use: exact
-    wherever the clock advances between two uses, as the OS monotonic clock it
-    reads does within nanoseconds. Of two entries last used at one reading, the
-    one stored first is evicted first.
+    both. With a memo, an entry's LRU recency is the clock reading of its latest
+    use: exact wherever the clock advances between two uses, as the OS monotonic
+    clock it reads does within nanoseconds. Of two entries last used at one
+    reading, the one stored first is evicted first.
 
     Stale-while-revalidate (SWR): ``get_with_swr`` serves a fresh-enough entry
     while flagging it for background refresh once past
@@ -387,7 +413,9 @@ class ObjectCache:
                 return False, None
 
             entry.used_at = now  # most recently used
-            if memo_key is not None:
+            if s.memo is None:
+                s.store.move_to_end(key)
+            elif memo_key is not None:
                 self._memoise(s, entry, memo_key)
             self._hits += 1
             return True, entry.value
@@ -450,7 +478,9 @@ class ObjectCache:
                 return False, None, False, 0
 
             entry.used_at = now
-            if memo_key is not None:
+            if s.memo is None:
+                s.store.move_to_end(key)
+            elif memo_key is not None:
                 self._memoise(s, entry, memo_key)
             self._hits += 1
 
@@ -538,7 +568,9 @@ class ObjectCache:
                 for memo_key in memo_keys:
                     self._memoise(s, entry, memo_key)
                 stale.kill()
-            s.push(key, entry)  # the old deadline's tuple is now dead
+            else:
+                s.store.move_to_end(key)
+            s.push(key, entry, new=False)  # the old deadline's record is now dead
             # New value may be larger — restore the byte bound by evicting LRU others
             self._evict(s, extra_bytes=0, need_slot=False)
             return True
@@ -669,7 +701,8 @@ class ObjectCache:
             s.store.clear()
             s.size_bytes = 0
             s.expiry.clear()
-            s.recency.clear()
+            s.filed.clear()
+            s.refiled.clear()
             s.refreshing.clear()
 
     # ------------------------------------------------------------------
@@ -743,7 +776,7 @@ class ObjectCache:
         Strategy:
         1. If any bound is exceeded, remove all expired entries first, popping them off the
            expiry heap: one comparison when none has expired, never a scan of the store.
-        2. While still over a bound, evict the least recently used fresh entry (the recency heap).
+        2. While still over a bound, evict the least recently used fresh entry (evict_lru).
 
         Args:
             s: The state the caller bound and holds the lock of.

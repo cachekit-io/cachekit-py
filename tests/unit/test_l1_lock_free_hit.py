@@ -221,6 +221,55 @@ class TestRemovalRoutes:
 
 
 @pytest.mark.unit
+class TestTheCacheKeepsTheMemoInStep:
+    """ObjectCache-level: every change to an entry reaches the memo before it returns."""
+
+    def test_clear_ends_every_lock_free_hit(self) -> None:
+        oc, memo = _memo_cache(max_entries=8)
+        a, b = _Value("a"), _Value("b")
+        refs = [weakref.ref(a), weakref.ref(b)]
+        hits = [_put_and_hit_entry(oc, "a", a), _put_and_hit_entry(oc, "b", b)]
+        del a, b
+        oc.clear()
+        assert (_hit(memo, "a"), _hit(memo, "b"), len(memo)) == (_MISS, _MISS, 0)
+        assert not any(entry_hit.alive for entry_hit in hits)
+        del hits
+        assert all(_gone(ref) for ref in refs)
+
+    def test_a_refresh_points_the_memo_at_the_new_value_and_ends_the_old(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = fake_clock(monkeypatch)
+        oc, memo = _memo_cache(max_entries=8)
+        old = _Value("old")
+        ref = weakref.ref(old)
+        stale = _put_and_hit_entry(oc, "k", old, ttl=100)
+        clock.monotonic = lambda: 1060.0  # in the refresh band: the lock-free hit leaves it to the lock
+        assert _hit(memo, "k") is old  # fresh_until is the hard expiry here: this cache was built without swr
+        hit, value, needs_refresh, version = oc.get_with_swr("key:k", 100, _memo_key(("k",), {}))
+        assert (hit, value, needs_refresh) == (True, old, True)
+        new = _Value("new")
+        assert oc.complete_refresh("key:k", version, new, ttl=100) is True
+        assert _hit(memo, "k") is new
+        assert stale.alive is False
+        del old, value, stale
+        assert _gone(ref)
+
+    def test_a_slot_left_on_a_removed_entry_still_misses(self) -> None:
+        """The cache forgets a removed entry's slots; the hit's liveness check is the second guard, for
+        a slot that outlived its entry."""
+        oc, memo = _memo_cache(max_entries=8)
+        entry_hit = _put_and_hit_entry(oc, "k", _Value("k"))
+        oc.delete("key:k")
+        memo.set(_memo_key(("k",), {}), entry_hit)  # what no cache does: a slot on a removed entry
+        assert _hit(memo, "k") is _MISS
+
+
+def _put_and_hit_entry(oc: ObjectCache, k: str, value: Any, ttl: int = 3600) -> Any:
+    """Store value under k, memoised, and return the HitEntry the memo now holds for it."""
+    oc.put(f"key:{k}", value, ttl, memo_key=_memo_key((k,), {}))
+    return oc._state.store[f"key:{k}"].hit
+
+
+@pytest.mark.unit
 class TestOneClock:
     """ObjectCache sets the deadlines and the extension compares against them, on one clock."""
 
@@ -441,49 +490,86 @@ def _hit(memo: HitMemo, k: str) -> Any:
 
 
 _LRU_OPS = st.lists(
-    st.tuples(st.sampled_from(["put", "get", "hit"]), st.sampled_from("abcdefgh"), st.sampled_from([2, 3, 4, 5, 8, 16, 64])),
-    max_size=120,
+    st.tuples(
+        st.sampled_from(["put", "get", "hit", "swr", "land", "delete"]),
+        st.sampled_from("abcdefgh"),
+        st.sampled_from([2, 3, 4, 5, 8, 16, 64]),
+    ),
+    min_size=60,  # long enough that evictions meet entries used since they were filed
+    max_size=200,
 )
 
 
 @pytest.mark.unit
 class TestExactLRU:
-    """Drive an ObjectCache with a memo through puts, hits under its lock (get) and lock-free hits
-    (HitMemo.get), against an OrderedDict LRU. Every access must hit or miss as the reference does,
-    and the same keys must stay stored: no trace loses a hit to exact LRU. The clock advances on every
-    read, as the OS monotonic clock does between two accesses."""
+    """Drive an ObjectCache through puts, reads under its lock (get, get_with_swr), lock-free hits
+    (HitMemo.get, with a memo), refreshes landed some operations after they were flagged, and deletes,
+    against an OrderedDict LRU. Every access must hit or miss as the reference does, and the same keys
+    must stay stored: no trace loses a hit to exact LRU. Deletes, replacements and refreshes leave
+    dead records behind, so traces also run their rebuild. The clock advances on every read, as the OS
+    monotonic clock does between two accesses."""
 
+    @pytest.mark.parametrize("with_memo", [True, False], ids=["memo", "no-memo"])
     @pytest.mark.parametrize("budget", [1 << 20, 100 << 20], ids=["1MiB", "default-100MiB"])
     @settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(ops=_LRU_OPS)
-    def test_every_trace_matches_exact_lru(self, budget: int, ops: list[tuple[str, str, int]]) -> None:
+    def test_every_trace_matches_exact_lru(self, with_memo: bool, budget: int, ops: list[tuple[str, str, int]]) -> None:
         ticks = itertools.count()
         shared_clock.fake = lambda: 1000.0 + next(ticks) * 1e-6
         try:
-            oc, memo = _memo_cache(max_entries=None, max_size_bytes=budget)
+            if with_memo:
+                oc, memo = _memo_cache(max_entries=None, max_size_bytes=budget)
+            else:
+                oc, memo = ObjectCache(max_entries=None, max_size_bytes=budget), None
             reference: OrderedDict[str, int] = OrderedDict()
             values: dict[str, _Sized] = {}
+            stored = itertools.count()
+            stores: dict[str, int] = {}  # key -> which store of it the reference holds
+            flagged: dict[str, tuple[int, int]] = {}  # key -> (version, store) of a refresh in flight
+
+            def evict_over(extra: int) -> None:
+                while reference and sum(reference.values()) + extra > budget:
+                    reference.popitem(last=False)
+
             for op, k, divisor in ops:
+                size = budget // divisor + 1  # no two fit at divisor 2
                 if op == "put":
-                    size = budget // divisor + 1  # no two fit at divisor 2
                     values[k] = value = _Sized(size)
                     _put(oc, k, value)
                     reference.pop(k, None)
-                    while reference and sum(reference.values()) + _sized(value) > budget:
-                        reference.popitem(last=False)
+                    evict_over(_sized(value))
                     reference[k] = _sized(value)
-                    continue
-                expected = k in reference
-                if expected:
-                    reference.move_to_end(k)
-                if op == "get":
-                    found, got = oc.get(f"key:{k}", _memo_key((k,), {}))
+                    stores[k] = next(stored)
+                elif op == "delete":
+                    assert oc.delete(f"key:{k}") is (reference.pop(k, None) is not None)
+                elif op == "land":
+                    if k not in flagged:
+                        continue
+                    version, store = flagged.pop(k)
+                    expected = k in reference and stores[k] == store  # the entry it was flagged on is stored
+                    value = _Sized(size)
+                    assert oc.complete_refresh(f"key:{k}", version, value, 3600) is expected, (op, k)
+                    if expected:
+                        values[k] = value
+                        reference[k] = _sized(value)
+                        reference.move_to_end(k)  # a refresh is a use; others go while over the budget
+                        evict_over(0)
                 else:
-                    got = _hit(memo, k)
-                    found = got is not _MISS
-                assert found is expected, (op, k)
-                if found:
-                    assert got is values[k]
+                    expected = k in reference
+                    if expected:
+                        reference.move_to_end(k)
+                    if op == "hit" and memo is not None:
+                        got = _hit(memo, k)
+                        found = got is not _MISS
+                    elif op == "swr":
+                        found, got, _, version = oc.get_with_swr(f"key:{k}", 3600, _memo_key((k,), {}))
+                        if found:
+                            flagged[k] = (version, stores[k])
+                    else:
+                        found, got = oc.get(f"key:{k}", _memo_key((k,), {}))
+                    assert found is expected, (op, k)
+                    if found:
+                        assert got is values[k]
                 assert set(oc._state.store) == {f"key:{key}" for key in reference}
         finally:
             shared_clock.fake = None
