@@ -22,7 +22,7 @@ from cachekit import cache
 from cachekit.backends.redis.provider import PerRequestRedisBackend
 from tests.utils.call_shape_gate import CallShapeGate, Shape
 
-pytestmark = pytest.mark.unit
+pytestmark = pytest.mark.integration
 
 _HOLDER = b"another-process"
 
