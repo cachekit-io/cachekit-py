@@ -19,6 +19,10 @@ from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation, l1_cache
 from .._rust_serializer import HitCounter, HitMemo
+
+# _memo_key, the memo key of a call's arguments or None when the memo (create_cache_wrapper's HitMemo)
+# does not take the call, is the extension's memo_key, so the lock-free hit and the slow path that
+# memoises compute one key. rust/src/l1_hit.rs documents which calls it takes and the memo's bounds.
 from .._rust_serializer import memo_key as _memo_key
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
@@ -611,9 +615,6 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 )
 
 
-# _memo_key, the memo key of a call's arguments or None when the memo (create_cache_wrapper's HitMemo)
-# does not take the call, is the extension's memo_key, so the lock-free hit and the slow path that
-# memoises compute one key. rust/src/l1_hit.rs documents which calls it takes and the memo's bounds.
 # What HitMemo.get returns when it cannot answer a call.
 _MISS = object()
 
@@ -1876,12 +1877,12 @@ def create_cache_wrapper(
 
     def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None) -> Any:
         """Run the function for an L1-only miss and store its result, memoised under memo_key (see
-        _call_key). A miss is a call that runs it."""
+        _call_key). A miss is a call that runs it. The key is not recorded in _cached_keys: an L1-only
+        function has nothing in L2, and its whole-function invalidation clears the cache whole."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
         result = func(*call_args, **call_kwargs)
         _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
-        _cached_keys.add((_l2_scope(), cache_key))
         return result
 
     async def _l1_only_fill_async(
@@ -1892,7 +1893,6 @@ def create_cache_wrapper(
         _stats.record_miss()
         result = await func(*call_args, **call_kwargs)
         _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
-        _cached_keys.add((_l2_scope(), cache_key))
         return result
 
     def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, Hashable | None]:
@@ -3271,10 +3271,8 @@ def create_cache_wrapper(
                     if _object_cache is None and _l1_cache:
                         _l1_cache.invalidate(key)
             if _object_cache:
-                # An L1-only function's cache goes whole, not key by key from the snapshot: a fill
-                # records its key only after its put, and a single-key invalidation untracks its key
-                # before its delete, so the snapshot can miss an entry stored before this call. L1
-                # is not tenant-scoped, and an L1-only function has nothing in L2.
+                # An L1-only function records no keys (_l1_only_fill), so its cache goes whole: L1 is
+                # not tenant-scoped, and it has nothing in L2.
                 _object_cache.clear()
         if fallbacks:
             # Once per call, like the ERROR below. A backend whose multi-key delete always fails
@@ -3394,12 +3392,9 @@ def create_cache_wrapper(
             invalidation.publish(_backend, _registry_id, None if custom_key_func is not None else cache_keys[0])
         return outcome
 
-    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
-        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
-        takes parameters, every entry of the function. Never raises on a backend failure.
-
-        Returns the call's InvalidationOutcome for one entry, and None for every entry.
-        """
+    def _ready_to_invalidate() -> None:
+        """What every invalidation does first: settle a zero-config function, resolve a backed function's
+        lazy backend, and apply the interop guard reads and writes apply."""
         nonlocal _backend
 
         if _zero_config_pending:
@@ -3420,6 +3415,14 @@ def create_cache_wrapper(
         if interop is not None:
             ensure_interop_backend_compatible(_backend)
 
+    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
+        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
+        takes parameters, every entry of the function. Never raises on a backend failure.
+
+        Returns the call's InvalidationOutcome for one entry, and None for every entry.
+        """
+        _ready_to_invalidate()
+
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
@@ -3436,23 +3439,7 @@ def create_cache_wrapper(
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
         """Async invalidate_cache: the same deletes, run off the event loop, and the same return value."""
-        nonlocal _backend
-
-        if _zero_config_pending:
-            _settle_zero_config()
-
-        # L1-ONLY MODE: Skip backend lookup entirely
-        # This fixes the sentinel problem: when backend=None is explicitly passed,
-        # we should NOT try to get a backend from the provider
-        if not _l1_only_mode and _backend is None:
-            try:
-                _backend = _resolve_lazy_backend()
-            except Exception as e:
-                # If backend creation fails, can't invalidate L2
-                _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
-
-        if interop is not None:  # interop guard, as in invalidate_cache
-            ensure_interop_backend_compatible(_backend)
+        _ready_to_invalidate()
 
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
@@ -3513,7 +3500,12 @@ def create_cache_wrapper(
         return _stats.get_info()
 
     def cache_clear() -> None:
-        """Clear cache statistics and invalidate all cached entries."""
+        """Clear cache statistics and invalidate all cached entries.
+
+        All of them on a function without parameters too, where invalidate_cache() with no arguments
+        deletes only the entry of the call without arguments, though a key= that reads its context can
+        file that call under many keys.
+        """
         _stats.clear()
         if _zero_config_pending:
             _settle_zero_config()
@@ -3523,7 +3515,8 @@ def create_cache_wrapper(
             raise TypeError(
                 "cache_clear() cannot clear cache for async functions with a backend. Use 'await fn.ainvalidate_cache()' instead."
             )
-        invalidate_cache()
+        _ready_to_invalidate()
+        _delete_then_forget(None)
 
     # Other processes' invalidations reach this function's L1 through the process's listener. Only a
     # backed wrapper with an L1 registers: in L1-only mode nothing is shared, so nothing is announced.

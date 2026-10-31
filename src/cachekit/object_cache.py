@@ -222,8 +222,9 @@ class _ObjectCacheState:
         Every stored entry is killed, memoised or not: a thread that forked inside a critical section
         returns there in the child on the state this retires and may memoise one of its entries
         before _take_back_if_retired forgets it, and a hit in between must find it dead. The memo's
-        clear then kills what it still holds: an entry a refresh or a memo write had in hand when a
-        fork interrupted it, which no stored entry points at yet or any more.
+        clear then drops every slot left, which already leaves no hit a way to an entry a refresh or a
+        memo write had in hand when a fork interrupted it; it kills such an entry too, as defence in
+        depth.
         """
         memo = self.memo
         if memo is None:

@@ -82,7 +82,7 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in. An L1-only cache (`backend=None`, `@cache.local()`) times it on the OS monotonic clock, which a patched `time.monotonic` does not move ([testing expiry](backends/none.md#ttls-follow-the-os-monotonic-clock)).
+- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in. An L1-only cache (`backend=None`, `@cache.local()`, or a bare `@cache` that resolves no backend) times it, and its stale-while-revalidate refresh, on the OS monotonic clock, which a patched `time.monotonic` does not move ([testing expiry](backends/none.md#ttls-follow-the-os-monotonic-clock)).
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
 - **`integrity_checking`** (`bool`, default: `True`; any non-bool raises `ConfigurationError`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Behaviour when a writer and reader disagree on this flag: [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)

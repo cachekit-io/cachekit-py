@@ -10,6 +10,7 @@ implementation had.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import enum
 import gc
 import itertools
@@ -21,6 +22,7 @@ import threading
 import time
 import weakref
 from collections import Counter, OrderedDict
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -199,6 +201,31 @@ class TestRemovalRoutes:
         assert _gone(ref)
         assert fn(1).n == 1
 
+    def test_cache_clear_removes_every_entry_of_a_function_without_parameters(self) -> None:
+        """On a function without parameters, invalidate_cache() with no arguments deletes the entry of
+        the call without arguments, but a key= that reads its context files that call under many keys:
+        cache_clear() removes every one, not only the clearing context's."""
+        tenant: contextvars.ContextVar[str] = contextvars.ContextVar("tenant")
+        calls: list[str] = []
+
+        @cache(backend=None, ttl=300, key=lambda: f"cfg:{tenant.get()}")
+        def config() -> str:
+            calls.append(tenant.get())
+            return tenant.get()
+
+        def in_tenant(name: str, call: Callable[[], Any]) -> Any:
+            def run() -> Any:
+                tenant.set(name)
+                return call()
+
+            return contextvars.copy_context().run(run)
+
+        assert (in_tenant("a", config), in_tenant("b", config)) == ("a", "b")
+        in_tenant("a", config.cache_clear)
+        assert _cache_and_memo(config)[0].size == 0
+        assert in_tenant("b", config) == "b"
+        assert calls == ["a", "b", "b"]
+
     def test_replacement(self) -> None:
         """A put over a stored key replaces its entry, and the old entry's slots go with it whatever memo
         key holds them: the replacing put is memoised under another key here, so it cannot re-point
@@ -327,11 +354,11 @@ class TestTheCacheKeepsTheMemoInStep:
             oc._memoise(s, entry, key)
         assert (len(memo), entry.hit.alive, _hit(memo, "k").n) == (1, False, "child")
 
-    def test_a_fork_inside_a_refresh_leaves_the_child_no_live_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_fork_inside_a_refresh_leaves_the_old_entry_dead(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A refresh stores its new HitEntry on the entry, then has the memo repoint the old one's slots.
         A fork between the two runs the at-fork reset while the old HitEntry holds slots that no stored
-        entry points at; the reset must end it all the same, or a child that never returns to the
-        refresh (a multiprocessing child) serves it."""
+        entry points at. Emptying the memo already leaves the child no slot to reach it; the reset also
+        kills it, as defence in depth, so the child holds no live entry it dropped."""
         clock = fake_clock(monkeypatch)
         oc, memo = _memo_cache(max_entries=8)
         stale = _put_and_hit_entry(oc, "k", _Value("old"), ttl=100)

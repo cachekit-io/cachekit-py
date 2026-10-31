@@ -204,7 +204,7 @@ assert len(calls) == 2  # ran on both calls: nothing was stored
 
 ## TTLs Follow the OS Monotonic Clock
 
-An L1-only entry expires on the OS monotonic clock, which the Rust extension reads itself, so the lock-free hit and the cache judge every deadline on one clock. Patching `time.monotonic` (pytest's `monkeypatch`, freezegun's `freeze_time` or `tick`) does not move it, so a test cannot expire an entry by moving fake time. `@cache.local()` expires its entries on the same clock. A cache with a backend is unchanged.
+An L1-only entry expires, and its stale-while-revalidate refresh and retry back-off come due, on the OS monotonic clock, which the Rust extension reads itself, so the lock-free hit and the cache judge every deadline on one clock. Patching `time.monotonic` (pytest's `monkeypatch`, freezegun's `freeze_time` or `tick`) does not move it, so a test cannot expire an entry or bring a refresh due by moving fake time. The same holds for `@cache.local()`, and for a bare `@cache` that finds no backend configured, as it runs in this mode. A cache with a backend is unchanged.
 
 To test what happens after an entry expires, remove it instead:
 
