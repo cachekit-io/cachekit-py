@@ -1889,8 +1889,8 @@ def create_cache_wrapper(
             return _invalidate_keys(cache_keys)
         finally:
             _forget_flights(cache_keys)
-            if cache_keys is None and _l1_memo is not None:
-                _l1_memo.clear()
+            if cache_keys is None and _object_cache is not None:
+                _object_cache.clear_memo()
 
     def _l1_only_fill(
         cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None

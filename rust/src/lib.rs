@@ -37,8 +37,12 @@ use pyo3::prelude::*;
 /// exposes only `&self` methods except `Keyring.for_tenant`, whose `&mut self` borrow
 /// PyO3 checks at run time (a concurrent call raises, never races), and in the features enabled here
 /// cachekit-core's only shared state is its `AtomicU64` nonce counters (its
-/// `Mutex` handle registry is behind the `ffi` feature, which is off) — no
-/// interior mutability the GIL was papering over. PyO3
+/// `Mutex` handle registry is behind the `ffi` feature, which is off). `l1_hit`'s
+/// shared state is atomics (an entry's liveness and recency, the tests' clock
+/// override), a `OnceLock` (the clock's zero), one `Mutex` per entry (its memo
+/// keys, written only under ObjectCache's lock and never held across Python
+/// code), and each memo's Python dict, whose single operations free-threaded
+/// CPython runs atomically — no interior mutability the GIL was papering over. PyO3
 /// enforces `Send + Sync` on every pyclass at compile time.
 #[cfg(feature = "python")]
 #[pymodule(gil_used = false)]

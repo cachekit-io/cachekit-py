@@ -125,7 +125,7 @@ def _key_used(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | N
     memo_key = _memo_key(args, kwargs)
     store = _closure_cell(fn, "_object_cache").cell_contents._state.store
     for key, entry in store.items():
-        if entry.hit is not None and memo_key in entry.memo_keys:
+        if entry.hit is not None and memo_key in entry.hit.memo_keys:
             return key
     return None
 

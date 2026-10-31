@@ -19,7 +19,7 @@ import signal
 import threading
 import time
 import weakref
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from decimal import Decimal
 from typing import Any
 
@@ -30,7 +30,7 @@ from hypothesis import strategies as st
 from cachekit import cache, object_cache
 from cachekit._rust_serializer import HitCounter, HitMemo, monotonic
 from cachekit.config import L1CacheConfig
-from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_LEN, _memo_key
+from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _memo_key
 from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
 from tests.utils.clock import fake_clock, shared_clock
@@ -253,6 +253,27 @@ class TestTheCacheKeepsTheMemoInStep:
         del old, value, stale
         assert _gone(ref)
 
+    def test_a_full_memo_takes_its_entries_key_lists_with_it(self) -> None:
+        """A full memo empties before it takes a new key, and the entries it held drop their key lists
+        with it: an entry keeps a call's arguments only while that call has a slot, so the memo bounds
+        what all of them keep."""
+        oc, memo = _memo_cache(max_entries=4 * _MEMO_MAX_ENTRIES)
+        for i in range(_MEMO_MAX_ENTRIES + 100):
+            _put_and_hit_entry(oc, f"k{i}", i)
+        assert len(memo) == 100
+        assert _keys_held_by_entries(oc) == Counter(memo.keys())
+
+    def test_a_slot_moved_to_another_entry_leaves_the_first(self) -> None:
+        oc, memo = _memo_cache(max_entries=8)
+        first = _put_and_hit_entry(oc, "a", _Value("a"))
+        oc.put("key:b", _Value("b"), 3600)
+        key = _memo_key(("a",), {})
+        assert oc.get("key:b", key)[0]  # what the decorator never does: one call's slot moved to another entry
+        assert (first.memo_keys, oc._state.store["key:b"].hit.memo_keys) == ((), (key,))
+        oc.delete("key:b")
+        assert len(memo) == 0
+        assert first.alive  # the entry that lost its slot stays stored, for the lock to serve
+
     def test_a_slot_left_on_a_removed_entry_still_misses(self) -> None:
         """The cache forgets a removed entry's slots; the hit's liveness check is the second guard, for
         a slot that outlived its entry."""
@@ -261,6 +282,11 @@ class TestTheCacheKeepsTheMemoInStep:
         oc.delete("key:k")
         memo.set(_memo_key(("k",), {}), entry_hit)  # what no cache does: a slot on a removed entry
         assert _hit(memo, "k") is _MISS
+
+
+def _keys_held_by_entries(oc: ObjectCache) -> Counter[Any]:
+    """The memo keys the stored entries list as theirs: equal to the memo's keys, if the cache kept both in step."""
+    return Counter(key for entry in oc._state.store.values() if entry.hit is not None for key in entry.hit.memo_keys)
 
 
 def _put_and_hit_entry(oc: ObjectCache, k: str, value: Any, ttl: int = 3600) -> Any:
@@ -571,6 +597,8 @@ class TestExactLRU:
                     if found:
                         assert got is values[k]
                 assert set(oc._state.store) == {f"key:{key}" for key in reference}
+                if memo is not None:
+                    assert _keys_held_by_entries(oc) == Counter(memo.keys())
         finally:
             shared_clock.fake = None
 

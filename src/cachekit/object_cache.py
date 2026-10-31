@@ -68,7 +68,6 @@ class _Entry:
     size_bytes: int  # 0 when the cache is not byte-bounded
     generation: int  # anti-resurrection token: allocated per stored entry, never reused
     hit: HitEntry | None = None  # what a lock-free hit reads, in a cache with a memo; replaced on refresh
-    memo_keys: tuple[Any, ...] = ()  # the memo slots pointing at hit, forgotten when it is killed
     refresh_failed_at: float | None = None  # clock time of the last failed SWR refresh (retry back-off)
 
 
@@ -142,9 +141,7 @@ class _ObjectCacheState:
             hit.kill()
             memo = self.memo
             assert memo is not None  # noqa: S101 - an entry has a hit only in a cache with a memo
-            for memo_key in entry.memo_keys:
-                memo.forget(memo_key, hit)
-            entry.memo_keys = ()
+            memo.forget(hit)
         del self.store[key]
         self.size_bytes -= entry.size_bytes
         self.refreshing.pop(key, None)
@@ -225,7 +222,6 @@ class _ObjectCacheState:
         for entry in list(self.store.values()):
             if entry.hit is not None:
                 entry.hit.kill()
-                entry.memo_keys = ()
         memo.clear()
 
 
@@ -562,12 +558,12 @@ class ObjectCache:
                 # A HitEntry's value never changes, so the refresh gets a new one. Its memo slots
                 # point at the new one before the stale one is killed: a lock-free hit that finds
                 # either reads it alive or misses, and none serves the stale value after this returns.
-                memo_keys = entry.memo_keys
-                entry.hit = HitEntry(value, now + ttl * self._fresh_ratio, now)
-                entry.memo_keys = ()
-                for memo_key in memo_keys:
-                    self._memoise(s, entry, memo_key)
+                memo = s.memo
+                assert memo is not None  # noqa: S101 - an entry has a hit only in a cache with a memo
+                fresh = entry.hit = HitEntry(value, now + ttl * self._fresh_ratio, now)
+                memo.repoint(stale, fresh)
                 stale.kill()
+                self._take_back_if_retired(s, fresh)
             else:
                 s.store.move_to_end(key)
             s.push(key, entry, new=False)  # the old deadline's record is now dead
@@ -688,6 +684,14 @@ class ObjectCache:
                 return True
             return False
 
+    def clear_memo(self) -> None:
+        """Empty the memo, keeping the entries: the next read of one under the lock memoises it again."""
+        s = self._state
+        if s.memo is None:
+            return
+        with s.lock:
+            s.memo.clear()
+
     def clear(self) -> None:
         """Remove all entries from the cache.
 
@@ -750,23 +754,25 @@ class ObjectCache:
     # ------------------------------------------------------------------
 
     def _memoise(self, s: _ObjectCacheState, entry: _Entry, memo_key: Any) -> None:
-        """Point memo_key's memo slot at the entry, for the next such call's lock-free hit; call with s.lock held.
-
-        A thread that forked inside this critical section, from a signal handler or a finalizer,
-        returns here in the child on the state the at-fork hook retired, after the hook emptied the
-        memo. The check after the write takes back a slot it set for an entry of that state.
-        """
+        """Point memo_key's memo slot at the entry, for the next such call's lock-free hit; call with s.lock held."""
         hit = entry.hit
         if hit is None:
             return
         memo = s.memo
         assert memo is not None  # noqa: S101 - an entry has a hit only in a cache with a memo
         memo.set(memo_key, hit)
-        if memo_key not in entry.memo_keys:
-            entry.memo_keys += (memo_key,)
+        self._take_back_if_retired(s, hit)
+
+    def _take_back_if_retired(self, s: _ObjectCacheState, hit: HitEntry) -> None:
+        """End hit and drop its memo slots if s is no longer the cache's state; call with s.lock held, after a memo write.
+
+        A thread that forked inside its critical section, from a signal handler or a finalizer,
+        returns there in the child on the state the at-fork hook retired, after the hook emptied the
+        memo. A slot it then set for an entry of that state would outlive every removal.
+        """
         if self._state is not s:
             hit.kill()
-            memo.forget(memo_key, hit)
+            cast("HitMemo", s.memo).forget(hit)
 
     def _evict(self, s: _ObjectCacheState, extra_bytes: int, need_slot: bool) -> None:
         """Evict entries until both bounds accommodate the pending write.
