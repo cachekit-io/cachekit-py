@@ -1,9 +1,9 @@
-"""A non-encrypted backed cache's L1 hit swaps its entry for one marked as verified: the verified MessagePack, where
-that is no longer, else the envelope itself (``WalkedEnvelope``).
+"""A non-encrypted backed cache's L1 hit swaps its envelope for the verified MessagePack (``VerifiedMsgpack``) when
+that is no longer; otherwise L1 keeps the envelope.
 
-The first L1 hit on an entry decodes the envelope as before, and its retrieve() yields the MessagePack;
-L1 then holds the kept entry in place of the envelope (``CacheSerializationHandler.deserialize_l1``,
-``L1Cache.shrink_if_held``). Later hits skip the frame's header checks and, from VerifiedMsgpack, retrieve().
+The first L1 hit on an entry decodes the envelope as before, and its retrieve() yields the MessagePack; when that is
+no longer than the envelope, L1 then holds it in place of the envelope (``CacheSerializationHandler.deserialize_l1``,
+``L1Cache.shrink_if_held``), and later hits skip retrieve(). An envelope L1 keeps is decoded in full on every hit.
 No hit skips the structure bounds: every StandardSerializer decode is one Rust pass (``unpackb_standard``) that
 enforces them as it decodes, kept entry or not. Each rule that keeps this from costing L1 hits or security is
 pinned here:
@@ -27,7 +27,7 @@ import os
 import random
 import uuid
 from collections.abc import Callable, Iterator
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, timedelta, timezone
 from typing import Any
 
 import msgpack
@@ -44,7 +44,7 @@ from cachekit.l1_cache import L1Cache, get_l1_cache
 from cachekit.serializers import base
 from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError, unpackb_bounded
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
-from cachekit.serializers.standard_serializer import VerifiedMsgpack, WalkedEnvelope, _standard_object_hook
+from cachekit.serializers.standard_serializer import VerifiedMsgpack, _standard_object_hook
 from cachekit.serializers.wrapper import SerializationWrapper
 from tests.fixtures.zero_config import clear_cachekit_env
 
@@ -132,7 +132,8 @@ def test_the_first_hit_swaps_an_envelope_for_its_msgpack_when_no_longer(value: A
     assert compute.cache_info().l1_hits == before + 2  # type: ignore[attr-defined]
 
 
-def test_a_value_longer_as_msgpack_keeps_its_envelope_marked_as_walked() -> None:
+def test_a_value_longer_as_msgpack_keeps_its_envelope() -> None:
+    """Swapping in the longer MessagePack would grow the entry, so L1 keeps the envelope bytes it admitted."""
     backend, namespace = _Backend(), _namespace()
 
     @cache(backend=backend, ttl=60, namespace=namespace)
@@ -146,8 +147,8 @@ def test_a_value_longer_as_msgpack_keeps_its_envelope_marked_as_walked() -> None
         assert compute(1) == "ab" * 600
     _, entry = _stored(backend, namespace)
     assert len(msgpack.packb("ab" * 600)) > len(envelope)
-    assert type(entry) is WalkedEnvelope and entry.frame == envelope
-    assert len(entry) == len(envelope) and get_l1_cache(namespace)._state.memory_bytes == held
+    assert type(entry) is bytes and entry == envelope
+    assert get_l1_cache(namespace)._state.memory_bytes == held
     assert backend.gets == 1
 
 
@@ -231,17 +232,18 @@ def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_sam
     expected = handler.deserialize_data(envelope, cache_key="k")
     assert decoded == expected
     if len(msgpack.packb(value, use_bin_type=True)) > len(envelope):
-        assert type(entry) is WalkedEnvelope and entry.frame is envelope
+        assert entry is None
+        assert handler.deserialize_l1(envelope, cache_key="k") == (expected, None)  # every hit on it: the same again
     else:
         assert type(entry) is VerifiedMsgpack and len(entry) <= len(envelope)
-    assert handler.deserialize_l1(entry, cache_key="k") == (expected, None)
+        assert handler.deserialize_l1(entry, cache_key="k") == (expected, None)
 
 
 def test_msgpack_exactly_as_long_as_the_envelope_is_kept_and_one_byte_longer_is_not() -> None:
     """Random bytes followed by k zero bytes: each zero lengthens the MessagePack by one byte, and LZ4 folds the run,
     so the MessagePack overtakes the envelope, passing through both lengths."""
     handler, head = CacheSerializationHandler(), random.Random(0).randbytes(300)
-    for extra, kept in ((0, VerifiedMsgpack), (1, WalkedEnvelope)):
+    for extra, kept in ((0, VerifiedMsgpack), (1, type(None))):
         for k in range(2000):
             value = head + bytes(k)
             envelope = handler.serialize_data(value, cache_key="k")
@@ -263,14 +265,13 @@ _OTHER_HANDLERS: dict[str, tuple[Callable[[], CacheSerializationHandler], tuple[
 }
 
 
-def _planted() -> list[VerifiedMsgpack | WalkedEnvelope]:
-    """A kept entry of each type a plaintext default-serializer handler leaves in L1."""
-    own = CacheSerializationHandler(encryption=False).serialize_data({"x": 2}, cache_key="k")
-    return [VerifiedMsgpack(msgpack.packb({"x": 2})), WalkedEnvelope(own)]
+def _planted() -> VerifiedMsgpack:
+    """The kept entry a plaintext default-serializer handler leaves in L1."""
+    return VerifiedMsgpack(msgpack.packb({"x": 2}))
 
 
 @pytest.mark.parametrize(("make", "refusal"), list(_OTHER_HANDLERS.values()), ids=list(_OTHER_HANDLERS))
-def test_other_handlers_keep_their_envelope_and_refuse_kept_entries(
+def test_other_handlers_keep_their_envelope_and_refuse_a_kept_entry(
     make: Callable[[], CacheSerializationHandler], refusal: tuple[type[Exception], str]
 ) -> None:
     """The L1 hit sites send these handlers' entries to deserialize_data, which refuses a swapped entry another
@@ -280,10 +281,9 @@ def test_other_handlers_keep_their_envelope_and_refuse_kept_entries(
     assert not handler.keeps_msgpack_in_l1
     assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
     error, message = refusal
-    for planted in _planted():
-        for decode in (handler.deserialize_l1, handler.deserialize_data):
-            with pytest.raises(error, match=message):
-                decode(planted, cache_key="k")  # type: ignore[arg-type]
+    for decode in (handler.deserialize_l1, handler.deserialize_data):
+        with pytest.raises(error, match=message):
+            decode(_planted(), cache_key="k")  # type: ignore[arg-type]
 
 
 def _frames() -> dict[str, bytes]:
@@ -366,8 +366,7 @@ def retrieves(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
 
 _PLAIN = {"id": 7, "tags": ["a"]}  # its MessagePack is no longer than its envelope: kept as VerifiedMsgpack
-_COMPRESSIBLE = {"users": [{"name": f"user {i}", "theme": "dark"} for i in range(50)]}  # kept as WalkedEnvelope
-_DATED = {"users": [{"seen": datetime(2024, 1, 15, 12, 30, tzinfo=UTC), "on": date(2024, 1, 15)}] * 50}
+_COMPRESSIBLE = {"users": [{"name": f"user {i}", "theme": "dark"} for i in range(50)]}  # L1 keeps its envelope
 
 
 def _call(fn: Callable[[int], Any], mode: str) -> Any:
@@ -393,18 +392,18 @@ def _decorated(backend: _Backend, namespace: str, value: Any, mode: str) -> Call
 @pytest.mark.parametrize("mode", ["sync", "async"])
 @pytest.mark.parametrize(
     ("value", "kept"),
-    [(_PLAIN, VerifiedMsgpack), (_COMPRESSIBLE, WalkedEnvelope), (_DATED, WalkedEnvelope)],
-    ids=["msgpack", "envelope", "dated-envelope"],
+    [(_PLAIN, VerifiedMsgpack), (_COMPRESSIBLE, bytes)],
+    ids=["msgpack", "envelope"],
 )
 def test_every_hit_runs_the_bounded_decode_and_only_kept_msgpack_skips_retrieve(
     value: Any, kept: type, mode: str, decodes: list[str], retrieves: list[int]
 ) -> None:
-    """A kept entry saves a hit retrieve() (VerifiedMsgpack) or the frame's header checks (WalkedEnvelope), never
-    the structure bounds: each hit's decode is one bounded pass, the first hit's and the kept entry's alike."""
+    """Kept MessagePack saves a hit retrieve(), never the structure bounds: each hit's decode is one bounded pass,
+    the first hit's and the kept entry's alike. An envelope L1 keeps is retrieved and decoded on every hit."""
     backend, namespace = _Backend(), _namespace()
     fn = _decorated(backend, namespace, value, mode)
     assert _call(fn, mode) == value  # miss: L1 holds the envelope
-    assert _call(fn, mode) == value  # first hit: retrieves and decodes the envelope's MessagePack, keeps it marked
+    assert _call(fn, mode) == value  # first hit: retrieves and decodes the envelope's MessagePack, keeps it if no longer
     assert (decodes, len(retrieves)) == (["ok"], 1)
     _, entry = _stored(backend, namespace)
     assert type(entry) is kept
@@ -519,10 +518,15 @@ def _outcome(decode: Callable[[], Any]) -> Any:
         return type(e)
 
 
+def _verified(envelope: bytes) -> VerifiedMsgpack:
+    """``envelope``'s MessagePack as retrieve() verifies it, held as L1 holds a kept entry, whatever its length."""
+    return VerifiedMsgpack(ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])[0])
+
+
 def _walked_hooked(envelope: bytes) -> Any:
     """The outcome of the decode every StandardSerializer read ran before the Rust one: retrieve(), the structure
     walk, then msgpack with the object hook on every map. Any error is SerializationError, as the read paths raise it."""
-    raw, _ = ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])
+    raw = _verified(envelope).data
     outcome = _outcome(lambda: unpackb_bounded(raw, raw=False, use_list=True, object_hook=_standard_object_hook))
     return outcome if isinstance(outcome, str) else SerializationError
 
@@ -530,7 +534,7 @@ def _walked_hooked(envelope: bytes) -> Any:
 @settings(max_examples=500, deadline=None)
 @given(value=_DATED_VALUES)
 def test_every_decode_of_a_kept_entry_equals_the_walked_hooked_decode(value: Any) -> None:
-    """The L2 read, the first L1 hit and both kept forms decode to exactly the walked, hooked decode's outcome,
+    """The L2 read, the first L1 hit and the kept MessagePack decode to exactly the walked, hooked decode's outcome,
     datetimes and look-alike maps at any depth included, though the Rust decode calls the hook only on a map with
     a marker key."""
     handler = CacheSerializationHandler()
@@ -543,10 +547,9 @@ def test_every_decode_of_a_kept_entry_equals_the_walked_hooked_decode(value: Any
         assert expected is SerializationError  # refused as the reference refuses it, and nothing is kept
         return
     assert repr(first) == expected
-    assert kept is not None
-    raw, _ = ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])
-    for entry in (VerifiedMsgpack(raw), WalkedEnvelope(envelope)):
-        assert _outcome(lambda entry=entry: handler.deserialize_l1(entry, cache_key="k")[0]) == expected
+    verified = _verified(envelope)
+    assert kept is None or kept.data == verified.data  # what L1 would hold is what retrieve() verified
+    assert _outcome(lambda: handler.deserialize_l1(verified, cache_key="k")[0]) == expected
 
 
 @pytest.mark.parametrize(
@@ -566,10 +569,9 @@ def test_look_alike_maps_decode_as_the_walked_hooked_decode(value: Any) -> None:
     handler = CacheSerializationHandler()
     envelope = handler.serialize_data(value, cache_key="k")
     expected = _walked_hooked(envelope)
-    first, kept = handler.deserialize_l1(envelope, cache_key="k")
-    assert kept is not None
+    first, _ = handler.deserialize_l1(envelope, cache_key="k")
     assert repr(handler.deserialize_data(envelope, cache_key="k")) == expected
-    assert repr(first) == repr(handler.deserialize_l1(kept, cache_key="k")[0]) == expected
+    assert repr(first) == repr(handler.deserialize_l1(_verified(envelope), cache_key="k")[0]) == expected
 
 
 @pytest.mark.parametrize("sentinel", _MARKER_KEYS)
@@ -687,8 +689,7 @@ def test_every_encrypted_l1_hit_decodes_its_plaintext_through_the_bounded_decode
     assert type(entry) is bytes and entry == envelope
 
 
-@pytest.mark.parametrize("kind", [VerifiedMsgpack, WalkedEnvelope], ids=lambda t: t.__name__)
-def test_an_encrypted_reader_refuses_a_kept_entry_in_its_l1(kind: type) -> None:
+def test_an_encrypted_reader_refuses_a_kept_entry_in_its_l1() -> None:
     """A plaintext wrapper sharing the namespace and key cannot make an encrypted one serve plaintext."""
     backend, namespace = _Backend(), _namespace()
 
@@ -699,11 +700,11 @@ def test_an_encrypted_reader_refuses_a_kept_entry_in_its_l1(kind: type) -> None:
     compute(1)
     ((key, _),) = backend.store.items()
     l1 = get_l1_cache(namespace)
-    (planted,) = [p for p in _planted() if type(p) is kind]
+    planted = _planted()
     held = l1.peek(key)
     assert held is not None and len(planted) <= len(held)
     assert l1.shrink_if_held(key, held, planted)
-    assert type(l1.peek(key)) is kind
+    assert type(l1.peek(key)) is VerifiedMsgpack
     assert compute(1) == {"x": 1}  # read from L2 instead
     assert type(l1.peek(key)) is bytes
 

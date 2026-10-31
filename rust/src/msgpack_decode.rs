@@ -129,17 +129,6 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    #[inline]
-    fn be(&self, at: usize, width: usize) -> Result<u64, Fail> {
-        let end = at
-            .checked_add(width)
-            .filter(|e| *e <= self.data.len())
-            .ok_or(Fail::Bound)?;
-        Ok(self.data[at..end]
-            .iter()
-            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
-    }
-
     /// The walk's per-element accounting, for an element whose prefix is consumed: `payload`
     /// bytes follow and it opens a container of `children` elements.
     #[inline]
@@ -186,13 +175,11 @@ impl<'a> Decoder<'a> {
             // with an exception set, which `check` turns into Fail::Py.
             let mut value = unsafe {
                 match marker {
-                    0x00..=0x7f => self.scalar(0, ffi::PyLong_FromLong(c_long::from(marker)))?,
-                    0xe0..=0xff => {
-                        self.scalar(0, ffi::PyLong_FromLong(c_long::from(marker as i8)))?
-                    }
-                    0xc0 => self.scalar(0, ffi::Py_NewRef(ffi::Py_None()))?,
-                    0xc2 => self.scalar(0, ffi::Py_NewRef(ffi::Py_False()))?,
-                    0xc3 => self.scalar(0, ffi::Py_NewRef(ffi::Py_True()))?,
+                    0x00..=0x7f => self.scalar(ffi::PyLong_FromLong(c_long::from(marker)))?,
+                    0xe0..=0xff => self.scalar(ffi::PyLong_FromLong(c_long::from(marker as i8)))?,
+                    0xc0 => self.scalar(ffi::Py_NewRef(ffi::Py_None()))?,
+                    0xc2 => self.scalar(ffi::Py_NewRef(ffi::Py_False()))?,
+                    0xc3 => self.scalar(ffi::Py_NewRef(ffi::Py_True()))?,
                     0xa0..=0xbf => self.string(u64::from(marker & 0x1f))?,
                     0xd9 => self.prefixed(1).and_then(|n| self.string(n))?,
                     0xda => self.prefixed(2).and_then(|n| self.string(n))?,
@@ -265,26 +252,28 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// A `width`-byte big-endian length prefix.
     #[inline]
     fn prefixed(&mut self, width: usize) -> Result<u64, Fail> {
-        let n = self.be(self.pos, width)?;
-        self.pos += width;
+        let end = self
+            .pos
+            .checked_add(width)
+            .filter(|e| *e <= self.data.len())
+            .ok_or(Fail::Bound)?;
+        let n = big_endian(&self.data[self.pos..end]);
+        self.pos = end;
         Ok(n)
     }
 
+    /// A one-byte element, already built as `obj`.
     #[inline]
-    fn scalar(
-        &mut self,
-        payload: u64,
-        obj: *mut ffi::PyObject,
-    ) -> Result<*mut ffi::PyObject, Fail> {
+    fn scalar(&mut self, obj: *mut ffi::PyObject) -> Result<*mut ffi::PyObject, Fail> {
         // Accounting first: on a bound failure the object is dropped, not leaked.
-        if let Err(e) = self.account(payload, 0) {
+        if let Err(e) = self.account(0, 0) {
             // SAFETY: obj is a new reference or null.
             unsafe { ffi::Py_XDECREF(obj) };
             return Err(e);
         }
-        self.take(payload);
         check(obj)
     }
 
@@ -348,9 +337,7 @@ impl<'a> Decoder<'a> {
     unsafe fn number(&mut self, marker: u8) -> Result<*mut ffi::PyObject, Fail> {
         let width = 1u64 << (marker & 0x03);
         self.account(width, 0)?;
-        let at = self.pos;
-        self.take(width);
-        let raw = self.be(at, width as usize)?;
+        let raw = big_endian(self.take(width));
         check(match marker {
             0xca => ffi::PyFloat_FromDouble(f64::from(f32::from_bits(raw as u32))),
             0xcb => ffi::PyFloat_FromDouble(f64::from_bits(raw)),
@@ -364,13 +351,15 @@ impl<'a> Decoder<'a> {
     }
 
     /// An ext of `len` data bytes after its type byte, decoded as msgpack-python's defaults do:
-    /// type -1 to `msgpack.Timestamp`, any other to `msgpack.ExtType(code, data)`.
+    /// type -1 to `msgpack.Timestamp` (through its own `from_bytes`), any other to
+    /// `msgpack.ExtType(code, data)`. cachekit never writes an ext, so this path is not hot.
     unsafe fn ext(&mut self, py: Python<'_>, len: u64) -> Result<*mut ffi::PyObject, Fail> {
         self.account(len + 1, 0)?;
         let code = self.take(1)[0] as i8;
         let data = self.take(len);
         let made = if code == -1 {
-            timestamp(py, data)
+            msgpack_attr(py, "Timestamp")
+                .and_then(|t| t.call_method1("from_bytes", (PyBytes::new(py, data),)))
         } else {
             msgpack_attr(py, "ExtType").and_then(|t| t.call1((code, PyBytes::new(py, data))))
         };
@@ -405,6 +394,11 @@ impl<'a> Decoder<'a> {
         });
         Ok(ptr::null_mut())
     }
+}
+
+#[inline]
+fn big_endian(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
 }
 
 #[inline]
@@ -445,30 +439,6 @@ fn msgpack_attr<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>>
         .get_or_try_init(py, || py.import("msgpack").map(Bound::unbind))?
         .bind(py)
         .getattr(name)
-}
-
-/// msgpack-python's `unpack_timestamp`, then `msgpack.Timestamp(seconds, nanoseconds)`.
-fn timestamp<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-    let be = |b: &[u8]| b.iter().fold(0u64, |acc, x| (acc << 8) | u64::from(*x));
-    let (sec, nsec): (i64, u64) = match data.len() {
-        4 => (be(data) as i64, 0),
-        8 => {
-            let v = be(data);
-            ((v & 0x0000_0003_ffff_ffff) as i64, v >> 34)
-        }
-        12 => (be(&data[4..]) as i64, be(&data[..4])),
-        n => {
-            return Err(PyValueError::new_err(format!(
-                "invalid timestamp data (length {n})"
-            )))
-        }
-    };
-    if nsec > 999_999_999 {
-        return Err(PyValueError::new_err(
-            "nanoseconds must be a non-negative integer not greater than 999999999.",
-        ));
-    }
-    msgpack_attr(py, "Timestamp")?.call1((sec, nsec))
 }
 
 /// Decode `data` as `unpackb_bounded(data, raw=False, use_list=True, object_hook=hook)` does

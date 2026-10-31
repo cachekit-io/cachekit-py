@@ -77,7 +77,7 @@ if TYPE_CHECKING:
 
     from ..backends.base import BaseBackend, LockableBackend
     from ..serializers.base import SerializerProtocol
-    from ..serializers.standard_serializer import KeptEntry
+    from ..serializers.standard_serializer import VerifiedMsgpack
 
 
 def _resolve_lazy_backend() -> BaseBackend:
@@ -1157,7 +1157,7 @@ def create_cache_wrapper(
     # applies only when this namespace's cache is first created — namespaces share one
     # L1Cache, so give functions with distinct budgets distinct namespaces (issue #163).
     _l1_cache = get_l1_cache(namespace or "default", max_size_mb=l1_max_size_mb) if l1_enabled else None
-    # Whether an L1 hit may swap its entry for one marked as walked (deserialize_l1). Every other handler's
+    # Whether an L1 hit may swap its entry for its verified MessagePack (deserialize_l1). Every other handler's
     # hit decodes exactly as before, at no extra cost.
     _l1_keeps_msgpack = serialization_handler.keeps_msgpack_in_l1
 
@@ -1927,13 +1927,13 @@ def create_cache_wrapper(
             return None
 
     def _decode_shared(
-        entry: bytes | KeptEntry | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        entry: bytes | VerifiedMsgpack | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[bool, Any]:
         """A joined backed-mode caller's own copy of the trip's envelope, or of the L1 entry the re-check
-        found (which may be a KeptEntry), decoded as an L1 hit would be: every caller gets its own
+        found (which may be a VerifiedMsgpack), decoded as an L1 hit would be: every caller gets its own
         object, and the decrypt checks bind to this caller's tenant. It never swaps the L1 entry, so
         bytes go to deserialize_data, which decodes them as deserialize_l1 does without building a
-        KeptEntry for it to discard.
+        VerifiedMsgpack for it to discard.
 
         (False, None) when there is no entry or it does not decode for this caller, who then takes
         its own trip, unshared: its probe slot went back on joining, so it is admitted afresh.
@@ -2260,7 +2260,7 @@ def create_cache_wrapper(
                             l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
                                 l1_bytes, cache_key, args, kwargs
                             )
-                            if l1_kept is not None:  # walked and marked: later hits skip the walk (deserialize_l1)
+                            if l1_kept is not None:  # verified and kept: later hits skip retrieve() (deserialize_l1)
                                 _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
                         else:  # as before; a swapped entry fails: SuspiciousCacheEntryError if encrypted, else a corrupt frame
                             l1_value = operation_handler.serialization_handler.deserialize_data(
@@ -2422,9 +2422,9 @@ def create_cache_wrapper(
         decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
         return value if decoded else _own_trip_sync(cache_key, args, kwargs, twin_key)[0]
 
-    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | KeptEntry | None]]:
+    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | VerifiedMsgpack | None]]:
         """The sync backed flight's re-check (ThreadFlights.run): the L1 entry a trip that settled since
-        the caller's own L1 lookup left (its envelope, or the KeptEntry a hit swapped in), for a joined
+        the caller's own L1 lookup left (its envelope, or the VerifiedMsgpack a hit swapped in), for a joined
         caller to decode. Never an L2 read: it runs under the flight map's lock."""
         assert _l1_cache is not None  # noqa: S101 - passed only with L1 on
         entry = _l1_cache.peek(cache_key)

@@ -21,10 +21,9 @@ trailing-byte paths are reached as well as the happy path.
 from __future__ import annotations
 
 import gc
-import math
 import threading
 from collections.abc import Callable
-from datetime import UTC, date, datetime, time, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import msgpack
@@ -34,7 +33,7 @@ from hypothesis import strategies as st
 
 from cachekit._rust_serializer import unpackb_standard
 from cachekit.serializers.base import MSGPACK_MAX_NESTING, SerializationError, unpackb_bounded
-from cachekit.serializers.standard_serializer import StandardSerializer, _standard_default, _standard_object_hook
+from cachekit.serializers.standard_serializer import _standard_default, _standard_object_hook
 from tests.utils.tracemalloc_isolation import measure_in_subprocess
 
 pytestmark = pytest.mark.unit
@@ -239,12 +238,6 @@ def test_buffer_inputs_decode_like_bytes() -> None:
         assert rust(data) == {"k": [1, 2, b"x"]}
 
 
-def test_a_value_round_trips_through_the_serializer() -> None:
-    value = {"at": datetime(2024, 1, 15, 12, 30, tzinfo=UTC), "on": date(2024, 1, 15), "t": time(9), "n": [math.pi, -1]}
-    serializer = StandardSerializer()
-    assert serializer.deserialize(serializer.serialize(value)[0]) == value
-
-
 # ── the marker rule ───────────────────────────────────────────────────────────────────────────
 
 
@@ -290,11 +283,15 @@ def _measure_amplifier_peaks() -> dict[str, list[int]]:
     for name, data in AMPLIFIERS.items():
         pair = []
         for decode in (reference, rust):
+            # Collection paused: on a free-threaded build a cycle collection that lands mid-decode allocates a
+            # worklist (one pointer per tracked object) inside the traced window, and where it lands differs by decoder.
             gc.collect()
+            gc.disable()
             tracemalloc.start()
             value = decode(data)
             pair.append(tracemalloc.get_traced_memory()[1])
             tracemalloc.stop()
+            gc.enable()
             del value
         peaks[name] = pair
     return peaks
@@ -302,7 +299,7 @@ def _measure_amplifier_peaks() -> dict[str, list[int]]:
 
 def test_an_amplifying_payload_costs_no_more_heap_than_before() -> None:
     for name, (before, now) in measure_in_subprocess(_measure_amplifier_peaks).items():
-        assert now <= before * 1.01, f"{name}: {now} bytes at peak, {before} before"
+        assert now <= before, f"{name}: {now} bytes at peak, {before} before"
 
 
 def _measure_leaks() -> list[int]:

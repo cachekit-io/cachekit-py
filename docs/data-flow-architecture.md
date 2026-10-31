@@ -31,7 +31,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 > **Architecture Principles:**
 > - **L1 + L2 Caching**: In-memory bytes cache (L1) + pluggable backend storage (L2) for optimal performance
 > - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CachekitIO, File, Memcached, custom)
-> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself. After its first hit, a plaintext entry of the default serializer with integrity checking on is held marked as walked, as its verified MessagePack where that is no longer than the envelope, so later hits skip re-checking it (see [Storage Architecture](#storage-architecture)); encrypted caches keep the ciphertext
+> - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself. After its first hit, a plaintext entry of the default serializer with integrity checking on is held as its verified MessagePack where that is no longer than the envelope, so later hits skip the decompress and checksum; every hit still runs the bounded decode (see [Storage Architecture](#storage-architecture)); encrypted caches keep the ciphertext
 > - **Security First**: Decompression bomb protection, checksum validation, size limits, encrypted-at-rest
 > - **Performance Optimized**: Thread affinity, connection pooling, pre-cached serializers
 > - **Flexible Configuration**: L1+L2, L1-only, L2-only, or observability-only modes
@@ -309,8 +309,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  objects. L1-only mode (backend=None) stores the object itself.             │
 │                                                                             │
 │  L1 admits and evicts envelopes. A later L1 hit on a plaintext entry of the │
-│  default serializer (integrity on) marks it in place as walked, shrinking   │
-│  it to its verified MessagePack where that is no longer than the envelope:  │
+│  default serializer (integrity on) shrinks it in place to its verified      │
+│  MessagePack where that is no longer than the envelope:                     │
 │  see Storage Architecture. Encrypted caches keep ciphertext.                │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
@@ -485,7 +485,7 @@ L1-only mode (`backend=None`) skips this layer: it stores the Python object itse
 - **After refactor**: Stores bytes (encrypted or plaintext) → `len(bytes)` for size estimation
 - **Performance improvement**: O(1) size calculation vs recursive traversal
 - **Security improvement**: Encrypted bytes at rest (decrypt-at-read-time only)
-- **Kept entries**: L1 stores, admits and evicts envelopes. The first L1 hit on a plaintext entry of the default serializer with integrity checking on decodes the envelope as every read does: `ByteStorage.retrieve()` verifies the MessagePack, and the Rust decode (`unpackb_standard`) bounds and decodes it in one pass. L1 then holds the entry marked as verified from then on (same expiry and LRU place): the verified MessagePack (`VerifiedMsgpack`) when it is no longer than the envelope, else the envelope itself (`WalkedEnvelope`). Held MessagePack skips the decompress and checksum on later hits; a held envelope skips the frame's header checks. Every hit still runs the bounded decode. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. The swap never grows an entry, so L1 never holds fewer entries than it would hold envelopes, and it never touches an entry stored or removed since the hit read it. Bytes from L2, and bytes still held as bytes, never skip `retrieve()`: L1 marks a kept entry by its type, which no backend returns
+- **Kept entries**: L1 stores, admits and evicts envelopes. The first L1 hit on a plaintext entry of the default serializer with integrity checking on decodes the envelope as every read does: `ByteStorage.retrieve()` verifies the MessagePack, and the Rust decode (`unpackb_standard`) bounds and decodes it in one pass. When the verified MessagePack is no longer than the envelope, L1 then holds it in the envelope's place (`VerifiedMsgpack`, same expiry and LRU place), and later hits skip the decompress and checksum; otherwise L1 keeps the envelope. Every hit still runs the bounded decode. Compressible values are usually longer as MessagePack, so they keep the envelope; small and incompressible ones switch. The swap never grows an entry, so L1 never holds fewer entries than it would hold envelopes, and it never touches an entry stored or removed since the hit read it. Bytes from L2, and bytes still held as bytes, never skip `retrieve()`: L1 marks a kept entry by its type, which no backend returns
 
 **Hierarchical Read Path:**
 1. Check L1 cache (bytes) → if hit, deserialize and return (the first hit on a plaintext entry of the default serializer with integrity checking on marks it as verified, so later hits on held MessagePack skip the decompress and checksum)
@@ -716,7 +716,6 @@ except BackendError as e:
 
 ```python notest
 from typing import Any
-import msgpack
 
 def deserialize(data: bytes, metadata) -> Any:
     # ULTRA-FAST: NumPy arrays

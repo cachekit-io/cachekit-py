@@ -68,30 +68,6 @@ class VerifiedMsgpack:
         return len(self.data)
 
 
-@final  # the read paths test `type(data) is WalkedEnvelope`
-class WalkedEnvelope:
-    """A plaintext envelope frame whose MessagePack a decode in this process verified and accepted, as
-    :class:`VerifiedMsgpack` is, which an L1 entry holds in place of its frame bytes when the MessagePack is
-    longer than the frame. It decodes with retrieve(), skipping the header checks that decide whether an entry
-    may be kept.
-
-    Marked by its type for the reason VerifiedMsgpack is. Its length is the frame's, so swapping it in for the
-    frame leaves L1's accounting unchanged.
-    """
-
-    __slots__ = ("frame",)
-
-    def __init__(self, frame: bytes) -> None:
-        self.frame = frame
-
-    def __len__(self) -> int:
-        return len(self.frame)
-
-
-#: An L1 entry a hit swapped in for the envelope it decoded (``CacheSerializationHandler.deserialize_l1``).
-KeptEntry = VerifiedMsgpack | WalkedEnvelope
-
-
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
     "StandardSerializer does not support NumPy arrays (Python-specific type). "
