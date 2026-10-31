@@ -50,21 +50,50 @@ _CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but th
 
 @final  # the read paths test `type(data) is VerifiedMsgpack`
 class VerifiedMsgpack:
-    """MessagePack a successful ``ByteStorage.retrieve()`` returned, which an L1 entry holds in place of its
-    envelope (``CacheSerializationHandler.deserialize_l1``). It decodes without another retrieve().
+    """MessagePack a successful ``ByteStorage.retrieve()`` returned and the structure walk
+    (``check_msgpack_structure``) passed, which an L1 entry holds in place of its envelope
+    (``CacheSerializationHandler.deserialize_l1``). It decodes without another retrieve() or walk, and
+    without the object hook when ``hook`` is False (:func:`_may_hold_marker`).
 
     The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never take
     the unverified decode, whatever they hold. It holds retrieve()'s own bytes object rather than
     copying it into a bytes subclass, and its length is theirs, which L1 accounts.
     """
 
-    __slots__ = ("data",)
+    __slots__ = ("data", "hook")
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, hook: bool = True) -> None:
         self.data = data
+        self.hook = hook
 
     def __len__(self) -> int:
         return len(self.data)
+
+
+@final  # the read paths test `type(data) is WalkedEnvelope`
+class WalkedEnvelope:
+    """A plaintext envelope frame whose MessagePack a decode in this process verified and walked, as
+    :class:`VerifiedMsgpack` is, which an L1 entry holds in place of its frame bytes when the MessagePack is
+    longer than the frame. It decodes with retrieve() but without the walk, and without the object hook when
+    ``hook`` is False.
+
+    The walk's answer cannot change: the frame is an immutable bytes object and retrieve() is deterministic.
+    Marked by its type for the reason VerifiedMsgpack is. Its length is the frame's, so swapping it in for the
+    frame leaves L1's accounting unchanged.
+    """
+
+    __slots__ = ("frame", "hook")
+
+    def __init__(self, frame: bytes, hook: bool) -> None:
+        self.frame = frame
+        self.hook = hook
+
+    def __len__(self) -> int:
+        return len(self.frame)
+
+
+#: An L1 entry a hit swapped in for the envelope it decoded (``CacheSerializationHandler.deserialize_l1``).
+KeptEntry = VerifiedMsgpack | WalkedEnvelope
 
 
 # Error message constants for unsupported types (Task 2)
@@ -202,6 +231,24 @@ def _standard_object_hook(obj: Any) -> Any:
     return obj
 
 
+def _may_hold_marker(msgpack_data: bytes) -> bool:
+    """Whether a MessagePack document may hold a map :func:`_standard_object_hook` acts on.
+
+    False only when no marker key's UTF-8 (``__datetime__``, ``__date__``, ``__time__``) occurs anywhere
+    in it. A str decodes from its bytes verbatim, so such a document has no marker key at any depth, the
+    hook returns every map it is given unchanged, and the decode without the hook is the same value. Any
+    other document, a value that merely mentions a marker key included, keeps the hook.
+
+    Examples:
+        >>> from datetime import date
+        >>> _may_hold_marker(msgpack.packb({"user": "ada"})), _may_hold_marker(msgpack.packb({"__time__": 1}))
+        (False, True)
+        >>> _may_hold_marker(msgpack.packb(date(2024, 1, 15), default=_standard_default))
+        True
+    """
+    return b"__date" in msgpack_data or b"__time__" in msgpack_data  # "__date" covers "__datetime__" too
+
+
 class StandardSerializer:
     """Language-agnostic MessagePack serializer for multi-language cache interoperability.
 
@@ -302,6 +349,8 @@ class StandardSerializer:
             "raw": False,  # Decode strings properly (not bytes)
             "object_hook": _standard_object_hook,  # Restore datetime/date/time
         }
+        # For MessagePack _may_hold_marker cleared: the hook would return every map unchanged.
+        self._msgpack_unpack_opts_hookless = {"use_list": True, "raw": False}
 
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:
         """Serialize object to pure MessagePack bytes with optional ByteStorage wrapper.
@@ -412,35 +461,53 @@ class StandardSerializer:
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
-    def _deserialize_keeping_msgpack(self, data: bytes | memoryview, limit: int) -> tuple[Any, VerifiedMsgpack | None]:
+    def _deserialize_keeping_msgpack(self, data: bytes | memoryview) -> tuple[Any, VerifiedMsgpack]:
         """What :meth:`deserialize` returns for a ByteStorage envelope when integrity checking is on, plus the
-        MessagePack ``retrieve()`` verified when it is at most ``limit`` bytes, for the caller to keep and decode
-        later without retrieve() (:meth:`_deserialize_verified`). It always unwraps the envelope, so call it
-        only for an integrity-on serializer. Raises SerializationError as deserialize does then.
+        MessagePack ``retrieve()`` verified and this decode walked, with whether it may hold a marker map, for the
+        caller to keep and decode later without the walk (:meth:`_deserialize_verified`,
+        :meth:`_deserialize_walked`). It always unwraps the envelope, so call it only for an integrity-on
+        serializer. Raises SerializationError as deserialize does then.
 
         Examples:
             >>> serializer = StandardSerializer()
             >>> envelope, _ = serializer.serialize({"test": 123})
-            >>> value, kept = serializer._deserialize_keeping_msgpack(envelope, len(envelope))
-            >>> value, serializer._deserialize_verified(kept)
-            ({'test': 123}, {'test': 123})
-            >>> serializer._deserialize_keeping_msgpack(envelope, 4)  # the MessagePack is 7 bytes
-            ({'test': 123}, None)
+            >>> value, kept = serializer._deserialize_keeping_msgpack(envelope)
+            >>> value, kept.hook, serializer._deserialize_verified(kept.data, kept.hook)
+            ({'test': 123}, False, {'test': 123})
         """
         try:
             msgpack_data, _ = self._byte_storage.retrieve(data)
             value = unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
-        return value, VerifiedMsgpack(msgpack_data) if len(msgpack_data) <= limit else None
+        return value, VerifiedMsgpack(msgpack_data, _may_hold_marker(msgpack_data))
 
-    def _deserialize_verified(self, kept: VerifiedMsgpack) -> Any:
-        """Decode MessagePack that :meth:`_deserialize_keeping_msgpack` kept, without another ``retrieve()``.
-        Raises SerializationError as deserialize does."""
+    def _deserialize_verified(self, msgpack_data: bytes, hook: bool) -> Any:
+        """Decode MessagePack that :meth:`_deserialize_keeping_msgpack` kept: no retrieve(), no walk, and no object
+        hook unless ``hook``. The ``max_*_len`` caps stay as :func:`unpackb_bounded` sets them. Raises
+        SerializationError as deserialize does."""
+        n = len(msgpack_data)
         try:
-            return unpackb_bounded(kept.data, **self._msgpack_unpack_opts)
+            return msgpack.unpackb(
+                msgpack_data,
+                max_str_len=n,
+                max_bin_len=n,
+                max_array_len=n,
+                max_map_len=n,
+                max_ext_len=n,
+                **(self._msgpack_unpack_opts if hook else self._msgpack_unpack_opts_hookless),
+            )
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
+
+    def _deserialize_walked(self, data: bytes | memoryview, hook: bool) -> Any:
+        """:meth:`_deserialize_verified` for the envelope whose MessagePack :meth:`_deserialize_keeping_msgpack`
+        walked, with retrieve() run again. Raises SerializationError as deserialize does."""
+        try:
+            msgpack_data, _ = self._byte_storage.retrieve(data)
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
+        return self._deserialize_verified(msgpack_data, hook)
 
     def _is_verified_envelope(self, data: bytes | memoryview, value: Any, markers: frozenset[int]) -> bool:
         """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope whose payload marker
