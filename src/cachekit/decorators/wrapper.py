@@ -1880,7 +1880,7 @@ def create_cache_wrapper(
         delete ended may have read the old entry. One call, so the forgets run after the delete wherever
         the delete runs, even in a worker an async caller stopped waiting for. An invalidation can be an
         erasure, and the memo holds the arguments it was given: deleting an entry drops its memo slots,
-        whatever arguments they were spelled with, and a whole-function invalidation empties the memo.
+        whatever arguments they were spelled with (ObjectCache, "Lock-free hits").
         Returns the current-format key's outcome (see _invalidate_keys); None for all."""
         try:
             if cache_keys is None:
@@ -1889,8 +1889,6 @@ def create_cache_wrapper(
             return _invalidate_keys(cache_keys)
         finally:
             _forget_flights(cache_keys)
-            if cache_keys is None and _object_cache is not None:
-                _object_cache.clear_memo()
 
     def _l1_only_fill(
         cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None

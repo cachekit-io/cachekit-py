@@ -684,14 +684,6 @@ class ObjectCache:
                 return True
             return False
 
-    def clear_memo(self) -> None:
-        """Empty the memo, keeping the entries: the next read of one under the lock memoises it again."""
-        s = self._state
-        if s.memo is None:
-            return
-        with s.lock:
-            s.memo.clear()
-
     def clear(self) -> None:
         """Remove all entries from the cache.
 
