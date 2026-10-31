@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable
 
 import pytest
@@ -460,11 +461,15 @@ def test_fork_waits_for_a_thread_mid_read_and_the_child_does_not_hang():
 
 def test_a_thread_state_freed_once_the_interpreter_is_exiting_retires_nothing(monkeypatch):
     # The atexit hook has emptied _live. The subprocess test below covers the teardown itself, which coverage cannot see.
+    class State(async_metrics._ThreadState):
+        __slots__ = ("__weakref__",)  # so the test can tell the state was freed, which runs its __del__
+
     monkeypatch.setattr(async_metrics, "_live", [])
-    state = async_metrics._ThreadState()
-    ops = state.ops
+    state = State()
+    ops, freed = state.ops, weakref.ref(state)
     del state
     try:
+        assert freed() is None
         assert async_metrics._deferred == [] and async_metrics._thread_ops.get(id(ops)) is ops
     finally:
         with async_metrics._locked():
