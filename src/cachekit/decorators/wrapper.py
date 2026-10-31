@@ -807,7 +807,8 @@ def create_cache_wrapper(
         backpressure_limits = {"queue_size": config.backpressure.queue_size, "timeout": config.backpressure.timeout}
 
         # Monitoring settings
-        collect_stats = config.monitoring.collect_stats
+        # Either flag off stops the cache-operation Prometheus series: no collector is built (cache_info() still counts)
+        collect_stats = config.monitoring.collect_stats and config.monitoring.enable_prometheus_metrics
         enable_structured_logging = config.monitoring.enable_structured_logging
 
         # Encryption settings

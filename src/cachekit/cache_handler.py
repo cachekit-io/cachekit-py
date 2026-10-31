@@ -262,8 +262,13 @@ def supports_locking(backend: object) -> TypeGuard[LockableBackend]:
 class FillLockBackend(Protocol):
     """Backend whose miss-path lock reports contention and releases without blocking.
 
-    Not part of LockableBackend: only the decorator's miss path uses it. Currently only
-    CachekitIOBackend. ``acquire_fill_lock`` yields ``(acquired, uncontended)``.
+    Not part of LockableBackend: only the decorator's miss path uses it. CachekitIOBackend and
+    PerRequestRedisBackend. ``acquire_fill_lock`` yields ``(acquired, uncontended)``.
+
+    Contract: the backend's read (``get_with_freshness`` if it has one, else ``get``) raises on a
+    failed read and returns None only for an absent entry. An uncontended grant after a None read
+    skips the post-lock re-read (see ``L2MissProbe``); a read that hid a failure as None would lose
+    its only retry.
     """
 
     def acquire_fill_lock(
@@ -468,9 +473,10 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
 class L2MissProbe:
     """Whether the async L2 read in a ``probe_l2_miss`` scope found no entry, cleanly.
 
-    ``clean_miss`` is set only where the backend's freshness read itself returned None: the read
-    every backend with ``acquire_fill_lock`` takes. Any other read leaves it False, which costs
-    only a re-read. A read that failed is reported to the caller as a miss too, but leaves it
+    ``clean_miss`` is set only where the backend's own read returned None: its freshness read
+    (CachekitIO), or ``get`` on a backend without one (Redis). Every backend with
+    ``acquire_fill_lock`` raises on a failed read rather than returning None. Any other read leaves
+    it False, which costs only a re-read. A read that failed is reported to the caller as a miss too, but leaves it
     False, so anything other than a confirmed miss reads as "not known to be absent".
     """
 
@@ -2667,6 +2673,8 @@ class StandardCacheHandler:
         try:
             # Run sync backend operation in thread pool
             value = await self._with_backpressure_and_timeout_async(self.backend.get, key)
+            if value is None:
+                _note_clean_l2_miss()  # a real miss on a backend that raises on failure (FillLockBackend's contract)
 
             # Optionally refresh TTL if value exists and refresh_ttl provided
             # Uses graceful degradation (skips if backend doesn't support TTL inspection)

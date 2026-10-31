@@ -139,16 +139,16 @@ class TestAsyncCachingTDD:
         contenders = 5
         lock_requests = 0
         all_contending = asyncio.Event()
-        real_acquire_lock = PerRequestRedisBackend.acquire_lock
+        real_fill_lock = PerRequestRedisBackend.acquire_fill_lock  # the lock the miss path takes
 
-        def counting_acquire_lock(self, key, *args, **kwargs):
+        def counting_fill_lock(self, key, *args, **kwargs):
             nonlocal lock_requests
             lock_requests += 1
             if lock_requests == contenders:
                 all_contending.set()
-            return real_acquire_lock(self, key, *args, **kwargs)
+            return real_fill_lock(self, key, *args, **kwargs)
 
-        monkeypatch.setattr(PerRequestRedisBackend, "acquire_lock", counting_acquire_lock)
+        monkeypatch.setattr(PerRequestRedisBackend, "acquire_fill_lock", counting_fill_lock)
 
         async def slow_async_operation(value: int) -> int:
             nonlocal call_count

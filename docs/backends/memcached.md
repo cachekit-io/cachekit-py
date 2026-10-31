@@ -95,7 +95,7 @@ cache key, so an entry moved under another prefix fails authentication. See
 - TTL support: Yes (max 30 days); `refresh_ttl` yes (via `touch`), `get_ttl` no
 - Cross-process: Yes (shared across pods)
 - Persistence: No (volatile memory only)
-- Consistent hashing: Yes (via pymemcache HashClient)
+- Consistent hashing: Yes, pymemcache's rendezvous hashing. Each key goes to the server pymemcache's `HashClient` would pick, so cachekit and plain pymemcache clients agree on placement; cachekit computes the pick natively (one server needs no hash)
 - Thread-safe: Yes (per-server connection pool; see [Concurrency](#concurrency))
 
 ## Concurrency

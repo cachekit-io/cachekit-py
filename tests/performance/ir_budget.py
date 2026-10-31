@@ -96,6 +96,7 @@ BASELINES = Path(__file__).with_name("ir_baselines.json")
 WORKLOAD = Path(__file__).with_name("ir_workload.py")  # the measured process
 PATHS = (
     "l1_hit",
+    "l1_hit_backed",
     "minimal_l1_hit",
     "l2_hit",
     "miss",
