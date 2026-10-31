@@ -51,6 +51,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 SCHEMA = "cachekit.terrain/v1"
 LO = -7  # log10 seconds of the first bin's lower edge: 100 ns
@@ -192,7 +193,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "redis_version"
         ]
     except redis.RedisError as e:
-        raise SystemExit(f"terrain_canary: cannot reach Redis at {args.redis}: {e}") from e
+        # The URL can carry a password: name the host, never the userinfo.
+        u = urlsplit(args.redis)
+        where = urlunsplit((u.scheme, u.netloc.rpartition("@")[2], u.path, "", ""))
+        raise SystemExit(f"terrain_canary: cannot reach Redis at {where}: {e}") from e
     # Whole slices only: the run lasts a whole number of them, and a call still running when
     # the last one closes is not recorded, so no slice holds a partial window.
     n_slices = max(1, round(args.minutes * 60 / args.slice))
