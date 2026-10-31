@@ -1353,10 +1353,9 @@ class CacheSerializationHandler:
         """:meth:`deserialize_data` for an entry read from L1, plus what L1 should hold in its place, if anything.
 
         When this handler keeps MessagePack (``keeps_msgpack_in_l1``) and the entry is its own plaintext
-        envelope, that is what this decode verified and walked: the MessagePack (:class:`VerifiedMsgpack`) when it
-        is no longer than the entry, else the entry marked as walked (:class:`WalkedEnvelope`). Either records
-        whether the MessagePack may hold a marker map. The caller's swap (``L1Cache.shrink_if_held``) costs no
-        second decode, and later hits skip the structure walk, the object hook when no marker map can be present,
+        envelope, that is what this decode verified: the MessagePack (:class:`VerifiedMsgpack`) when it
+        is no longer than the entry, else the entry marked as verified (:class:`WalkedEnvelope`). The caller's
+        swap (``L1Cache.shrink_if_held``) costs no second decode, and later hits skip the frame's header checks
         and, for VerifiedMsgpack, retrieve(). Everything else gets None: a kept entry decodes that way, and any
         other entry goes to deserialize_data, which refuses another handler's kept entry. Raises as
         deserialize_data.
@@ -1365,9 +1364,9 @@ class CacheSerializationHandler:
             >>> handler = CacheSerializationHandler()
             >>> envelope = handler.serialize_data("hello", cache_key="greeting")
             >>> value, entry = handler.deserialize_l1(envelope, cache_key="greeting")
-            >>> value, type(entry).__name__, len(entry) <= len(envelope), entry.hook
-            ('hello', 'VerifiedMsgpack', True, False)
-            >>> handler.deserialize_l1(entry, cache_key="greeting")  # already walked MessagePack
+            >>> value, type(entry).__name__, len(entry) <= len(envelope)
+            ('hello', 'VerifiedMsgpack', True)
+            >>> handler.deserialize_l1(entry, cache_key="greeting")  # already verified MessagePack
             ('hello', None)
             >>> compressible = handler.serialize_data("ab" * 600, cache_key="k")
             >>> value, entry = handler.deserialize_l1(compressible, cache_key="k")  # its MessagePack is longer
@@ -1380,12 +1379,12 @@ class CacheSerializationHandler:
         # deserialize_data costs.
         if not self.keeps_msgpack_in_l1:
             return self.deserialize_data(data, cache_key, args, kwargs), None
-        # Only L1 holds these types, and only such a handler swapped them in, after a decode that walked them.
+        # Only L1 holds these types, and only such a handler swapped them in, after a decode that accepted them.
         if type(data) is VerifiedMsgpack:
-            return self._base_serializer._deserialize_verified(data.data, data.hook), None  # type: ignore[union-attr]
+            return self._base_serializer._deserialize_verified(data.data), None  # type: ignore[union-attr]
         if type(data) is WalkedEnvelope:
-            payload = SerializationWrapper.unwrap_metadata(data.frame)[0]  # parsed when it was walked: cannot fail
-            return self._base_serializer._deserialize_walked(payload, data.hook), None  # type: ignore[union-attr]
+            payload = SerializationWrapper.unwrap_metadata(data.frame)[0]  # parsed when it was kept: cannot fail
+            return self._base_serializer.deserialize(payload), None
         try:
             payload, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -1396,7 +1395,7 @@ class CacheSerializationHandler:
         if serializer_name != self._serializer_string_name or metadata.encrypted or not metadata.compressed:
             return self.deserialize_data(data, cache_key, args, kwargs), None
         value, kept = self._base_serializer._deserialize_keeping_msgpack(payload)  # type: ignore[union-attr]
-        return value, kept if len(kept) <= len(data) else WalkedEnvelope(data, kept.hook)
+        return value, kept if len(kept) <= len(data) else WalkedEnvelope(data)
 
     def deserialize_data(
         self,

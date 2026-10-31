@@ -18,6 +18,10 @@ pub use cachekit_core::{
 #[cfg(feature = "python")]
 pub mod python_bindings;
 
+// StandardSerializer's one-pass bounded MessagePack decode
+#[cfg(feature = "python")]
+pub mod msgpack_decode;
+
 // The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's
 // own tests run in the pure-Rust test build too.
 pub mod hit_counter;
@@ -63,6 +67,8 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_bindings::check_msgpack_structure_py,
         m
     )?)?;
+    // StandardSerializer's read decode: the walk above and msgpack.unpackb in one pass
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_standard_py, m)?)?;
     // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
     m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 

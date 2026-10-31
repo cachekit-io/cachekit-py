@@ -155,6 +155,21 @@ pub fn check_msgpack_structure_py(
     })
 }
 
+/// Decode one untrusted MessagePack document as StandardSerializer reads it, under the bounds
+/// `check_msgpack_structure` enforces, in one pass (`crate::msgpack_decode`). `object_hook` runs
+/// only on maps holding a `__datetime__`, `__date__` or `__time__` str key.
+#[pyfunction]
+#[pyo3(name = "unpackb_standard")]
+pub fn unpackb_standard_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    max_depth: usize,
+    object_hook: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let view = bytes_view(py, data)?;
+    crate::msgpack_decode::unpackb_standard(py, view.as_slice(), max_depth, object_hook)
+}
+
 /// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
 /// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
 /// touches the Python heap). It covers `retrieve` and `check_msgpack_structure`, and the exact
