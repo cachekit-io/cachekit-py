@@ -191,11 +191,14 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  File: src/cachekit/decorators/wrapper.py                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Concurrent misses on one key in one process share one call                 │
-│  (decorators/single_flight.py). In backed mode, sync or async, that is the  │
-│  whole trip from the L2 read to the write: only the caller that started it  │
-│  reads L2 (and, if async, takes the lock), and the others decode their own  │
-│  copy of its result. A trip with no serialized value to share sends each of │
-│  them on its own trip afterwards (which trips those are, per path:          │
+│  (decorators/single_flight.py); async callers share it only on the event    │
+│  loop running the key's call, and a caller on another thread's loop runs    │
+│  its own (features/distributed-locking.md, In-Process Single-Flight). In    │
+│  backed mode, sync or async, the shared call is the whole trip from the L2  │
+│  read to the write: only the caller that started it reads L2 (and, if       │
+│  async, takes the lock), and the others decode their own copy of its        │
+│  result. A trip with no serialized value to share sends each of them on its │
+│  own trip afterwards (which trips those are, per path:                      │
 │  features/distributed-locking.md, In-Process Single-Flight). In L1-only     │
 │  mode it is the function call.                                              │
 │                                                                             │
