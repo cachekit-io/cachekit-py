@@ -8,9 +8,7 @@ monkeypatch takes it back out when the test ends.
 
 from __future__ import annotations
 
-import types
 from collections.abc import Callable
-from typing import Any
 
 import pytest
 
@@ -36,8 +34,15 @@ class _SharedClock:
 shared_clock = _SharedClock()
 
 
-def fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> Any:
+class FakeClock:
+    """What ``fake_clock`` returns: assign ``monotonic`` a callable to move the shared clock."""
+
+    def __init__(self, start: float) -> None:
+        self.monotonic: Callable[[], float] = lambda: start
+
+
+def fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> FakeClock:
     """Replace the shared clock with one that reads ``start`` until the test sets the returned ``monotonic``."""
-    fake = types.SimpleNamespace(monotonic=lambda: start)
+    fake = FakeClock(start)
     monkeypatch.setattr(shared_clock, "fake", lambda: fake.monotonic())
     return fake
