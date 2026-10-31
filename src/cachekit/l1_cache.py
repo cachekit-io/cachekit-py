@@ -13,7 +13,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from typing import TYPE_CHECKING, Any, Concatenate, Optional, ParamSpec
 
@@ -63,6 +63,9 @@ class CacheEntry:
     value: "bytes | KeptEntry"  # a KeptEntry once a hit swapped it in (shrink_if_held)
     expires_at: float
     size_bytes: int
+    # This entry's tuple in its state's expiry heap. A tuple is live only while it is this very object,
+    # so the tuple of an overwrite with the same deadline is dead, not a second live one.
+    record: "tuple[float, str] | None" = field(default=None, repr=False, compare=False)
 
     def is_expired(self) -> bool:
         """Check if entry has expired."""
@@ -85,8 +88,8 @@ class _L1State:
         self.memory_bytes = 0
         # Min-heap of (expires_at, key), one per put, so the sweep visits only due entries instead of
         # scanning them all under the lock. Deletion is lazy: a removal, eviction or overwrite leaves its
-        # tuple behind. A tuple is live while its key holds an entry with that deadline, and every entry
-        # has one, so a dead tuple is safe to drop. cleanup_expired compacts the heap once dead tuples
+        # tuple behind. A tuple is live while it is its key's entry's record, and every entry has one, so
+        # a dead tuple is safe to drop. cleanup_expired compacts the heap once dead tuples
         # outnumber the entries; push() rebuilds it where no sweep runs.
         self.expiry: list[tuple[float, str]] = []
 
@@ -107,7 +110,7 @@ class _L1State:
         self.memory_bytes = 0
         self.expiry = []
 
-    def push(self, expires_at: float, key: str) -> None:
+    def push(self, key: str, entry: CacheEntry) -> None:
         """Record a stored entry's deadline; call with lock held, after the cache write.
 
         Where no sweep runs (a child forked without at-fork hooks starts no thread), nothing compacts
@@ -116,15 +119,20 @@ class _L1State:
         sweep compacts at two to one, so with it running a put rebuilds only if puts outrun it.
         """
         if len(self.expiry) >= 8 * len(self.cache) + _INVALIDATE_BATCH:
-            self.expiry = [(e.expires_at, k) for k, e in self.cache.items()]
-            heapq.heapify(self.expiry)
+            heap: list[tuple[float, str]] = []
+            for k, e in self.cache.items():
+                e.record = (e.expires_at, k)
+                heap.append(e.record)
+            heapq.heapify(heap)
+            self.expiry = heap
         else:
-            heapq.heappush(self.expiry, (expires_at, key))
+            entry.record = (entry.expires_at, key)
+            heapq.heappush(self.expiry, entry.record)
 
-    def is_live(self, expires_at: float, key: str) -> bool:
-        """Whether an expiry-heap tuple belongs to the key's current entry; call with lock held."""
-        entry = self.cache.get(key)
-        return entry is not None and entry.expires_at == expires_at
+    def is_live(self, record: tuple[float, str]) -> bool:
+        """Whether an expiry-heap tuple is its key's current entry's record; call with lock held."""
+        entry = self.cache.get(record[1])
+        return entry is not None and entry.record is record
 
     def remove_due(self, now: float) -> tuple[int, bool]:
         """Pop at most _SWEEP_BATCH due heap tuples, removing their live entries; call with lock held.
@@ -136,9 +144,9 @@ class _L1State:
         for _ in range(_SWEEP_BATCH):
             if not heap or heap[0][0] > now:
                 return removed, False
-            expires_at, key = heapq.heappop(heap)
-            if self.is_live(expires_at, key):
-                self.remove(key)
+            record = heapq.heappop(heap)
+            if self.is_live(record):
+                self.remove(record[1])
                 removed += 1
         return removed, True
 
@@ -373,7 +381,7 @@ class L1Cache:
             entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size)
             s.cache[key] = entry
             s.memory_bytes += size
-            s.push(expiry, key)
+            s.push(key, entry)
 
             # Move to end (most recently used)
             s.cache.move_to_end(key)
@@ -521,6 +529,10 @@ class L1Cache:
         loses its deadline; one that dies before its tuple is pushed back leaves a dead tuple, dropped
         later like any other. An expired entry found on the way is removed.
 
+        Both lists are consumed a batch at a time from the end, so the dead tuples are freed batch by
+        batch, before each GIL yield. Dropping the detached list whole on return would free them all at
+        once, holding the GIL for about 30 ms per 250,000 tuples.
+
         Returns:
             Number of expired entries removed
         """
@@ -530,22 +542,26 @@ class L1Cache:
             old, s.expiry = s.expiry, []
         removed = 0
         kept: list[tuple[float, str]] = []
-        for start in range(0, len(old), _INVALIDATE_BATCH):
+        while old:
+            batch = old[-_INVALIDATE_BATCH:]
+            del old[-_INVALIDATE_BATCH:]
             with s.lock:
-                for expires_at, key in old[start : start + _INVALIDATE_BATCH]:
-                    if not s.is_live(expires_at, key):
+                for record in batch:
+                    if not s.is_live(record):
                         continue
-                    if expires_at <= now:
-                        s.remove(key)
+                    if record[0] <= now:
+                        s.remove(record[1])
                         removed += 1
                         self._expired_evictions += 1
                     else:
-                        kept.append((expires_at, key))
+                        kept.append(record)
+            del batch  # frees this batch's dead tuples now, not with the next
             time.sleep(0)
-        for start in range(0, len(kept), _INVALIDATE_BATCH):
+        while kept:
             with s.lock:
-                for item in kept[start : start + _INVALIDATE_BATCH]:
-                    heapq.heappush(s.expiry, item)
+                for record in kept[-_INVALIDATE_BATCH:]:
+                    heapq.heappush(s.expiry, record)
+            del kept[-_INVALIDATE_BATCH:]
             time.sleep(0)
         return removed
 

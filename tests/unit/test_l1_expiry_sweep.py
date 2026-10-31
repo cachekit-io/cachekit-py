@@ -164,6 +164,25 @@ class TestSweepBatching:
         clock.now += 90
         assert l1.cleanup_expired() == live
 
+    def test_compaction_drops_overwrites_with_the_same_deadline(self, clock: _Clock) -> None:
+        """An overwrite with an equal deadline leaves a dead tuple: liveness is the entry's own record, not its deadline."""
+        l1 = L1Cache(ttl_buffer_seconds=0)
+        live = _INVALIDATE_BATCH
+        deadline = clock.now + 100
+        for _ in range(4):  # 4 tuples per entry: past compaction's 2:1, short of a put's 8:1 rebuild
+            for i in range(live):
+                l1.put(f"k{i}", b"v", expires_at=deadline)
+        assert len(l1._state.expiry) == 4 * live
+
+        assert l1.cleanup_expired() == 0
+        assert len(l1._state.expiry) == live
+        lock = _CountingLock(l1)
+        l1._state.lock = lock
+        assert l1.cleanup_expired() == 0
+        assert len(lock.spans) == 2  # nothing due, nothing to compact: a later sweep repeats no work
+        clock.now = deadline
+        assert l1.cleanup_expired() == live
+
     def test_writes_during_compaction_keep_their_deadlines(self, clock: _Clock) -> None:
         """Compaction detaches the heap and pushes the live tuples back across many holds; writes land between them."""
         l1 = L1Cache(ttl_buffer_seconds=0)
