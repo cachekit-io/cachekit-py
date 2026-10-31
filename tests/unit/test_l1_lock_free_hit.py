@@ -274,6 +274,38 @@ class TestTheCacheKeepsTheMemoInStep:
         assert len(memo) == 0
         assert first.alive  # the entry that lost its slot stays stored, for the lock to serve
 
+    def test_a_slot_set_on_a_state_the_fork_reset_retired_is_taken_back(self) -> None:
+        """A thread that forks inside its critical section (from a signal handler or a finalizer) returns
+        there in the child on the state the at-fork hook retired. A slot it then sets would point at an
+        entry no removal will ever reach, so the cache ends that entry and drops the slot."""
+        oc, memo = _memo_cache(max_entries=8)
+        oc.put("key:k", _Value("k"), 3600)  # stored without a slot
+        s = oc._state
+        entry = s.store["key:k"]
+        with s.lock:
+            oc._reset_after_fork()  # what the hook does in a child forked inside this section
+            oc._memoise(s, entry, _memo_key(("k",), {}))
+        assert (len(memo), entry.hit.alive, _hit(memo, "k")) == (0, False, _MISS)
+
+    def test_a_refresh_on_a_state_the_fork_reset_retired_leaves_no_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = fake_clock(monkeypatch)
+        oc, memo = _memo_cache(max_entries=8)
+        _put_and_hit_entry(oc, "k", _Value("old"), ttl=100)
+        clock.monotonic = lambda: 1060.0
+        _, _, needs_refresh, version = oc.get_with_swr("key:k", 100, _memo_key(("k",), {}))
+        assert needs_refresh
+        made: list[Any] = []
+        real = object_cache.HitEntry
+
+        def forking_hit_entry(*args: Any) -> Any:  # a finalizer that forks while the refresh allocates
+            oc._reset_after_fork()
+            made.append(real(*args))
+            return made[-1]
+
+        monkeypatch.setattr(object_cache, "HitEntry", forking_hit_entry)
+        oc.complete_refresh("key:k", version, _Value("new"), ttl=100)
+        assert (len(memo), made[0].alive, _hit(memo, "k")) == (0, False, _MISS)
+
     def test_a_slot_left_on_a_removed_entry_still_misses(self) -> None:
         """The cache forgets a removed entry's slots; the hit's liveness check is the second guard, for
         a slot that outlived its entry."""
