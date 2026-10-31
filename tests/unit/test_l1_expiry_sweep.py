@@ -7,8 +7,6 @@ keeps every live deadline, and that each lock hold handles a bounded batch.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from cachekit import l1_cache
@@ -225,13 +223,3 @@ def test_put_rebuilds_the_heap_where_no_sweep_runs(clock: _Clock) -> None:
     clock.now += 100 + 999
     assert l1.cleanup_expired() == 10  # every entry kept its latest deadline through the rebuilds
     assert not l1._state.cache
-
-
-@pytest.mark.unit
-def test_real_clock_sweep() -> None:
-    """No fake clock: put with a deadline just ahead, wait past it, sweep."""
-    l1 = L1Cache(ttl_buffer_seconds=0)
-    l1.put("k", b"v", expires_at=time.time() + 0.05)
-    time.sleep(0.1)
-
-    assert l1.cleanup_expired() == 1

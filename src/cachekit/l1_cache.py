@@ -496,9 +496,9 @@ class L1Cache:
 
         Examples:
             >>> l1 = L1Cache(namespace="docs")
-            >>> l1.put("a", b"1", expires_at=time.time() + 1.1)  # L1 drops it 1 s (ttl_buffer_seconds) early
+            >>> l1.put("a", b"1", expires_at=time.time() + 1.3)  # L1 drops it 1 s (ttl_buffer_seconds) early
             >>> l1.put("b", b"2", redis_ttl=60)
-            >>> time.sleep(0.2)
+            >>> time.sleep(0.6)
             >>> l1.cleanup_expired()
             1
             >>> l1.get("b")
