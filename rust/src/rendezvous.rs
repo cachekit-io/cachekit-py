@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString};
 
 /// `MurmurHash3_x86_32`, as pymemcache's `murmur3_32` computes it over the bytes [`hash_input`] builds.
+#[must_use]
 pub fn murmur3_32(data: &[u8], seed: u32) -> u32 {
     const C1: u32 = 0xCC9E_2D51;
     const C2: u32 = 0x1B87_3593;
@@ -63,6 +64,7 @@ pub fn hash_input(buf: &mut Vec<u8>, node: &str, key: &str) {
 /// The index of the node pymemcache's `RendezvousHash.get_node` returns, or None when `nodes` is
 /// empty: the highest score wins, and a tie goes to the greater string. Rust orders `str` by its
 /// UTF-8 bytes, which is code-point order, as Python orders `str`.
+#[must_use]
 pub fn rendezvous_index<'a>(
     nodes: impl IntoIterator<Item = &'a str>,
     key: &str,
@@ -85,39 +87,26 @@ pub fn rendezvous_index<'a>(
 /// itself, so a concurrent `remove_node` cannot shift it.
 ///
 /// None when the caller must ask pymemcache instead: `nodes` is empty, or `key` or a node is not
-/// exactly a str with a UTF-8 form. pymemcache formats a bytes key as `b'...'`, a non-str node through `str()`, and a
-/// str subclass through its own `__format__`: a `(str, Enum)` member hashes as `Cls.MEMBER`, not as
-/// its value.
+/// exactly a str with a UTF-8 form. pymemcache formats a bytes key as `b'...'`, a non-str node
+/// through `str()`, and a str subclass through its own `__format__`: a `(str, Enum)` member hashes
+/// as `Cls.MEMBER`, not as its value. A str holding a lone surrogate (a surrogateescaped path, say)
+/// has no UTF-8 form, and pymemcache hashes it character by character.
 #[cfg(feature = "python")]
 #[pyfunction]
+#[must_use]
 pub fn rendezvous_node<'py>(
     nodes: &Bound<'py, PyList>,
     key: &Bound<'py, PyAny>,
     seed: u32,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    // A str holding a lone surrogate (a surrogateescaped path, say) has no UTF-8 form: pymemcache
-    // hashes it character by character, so it answers for such a key or node.
-    let Some(key) = key
-        .cast_exact::<PyString>()
-        .ok()
-        .and_then(|k| k.to_str().ok())
-    else {
-        return Ok(None);
-    };
+) -> Option<Bound<'py, PyAny>> {
+    let key = key.cast_exact::<PyString>().ok()?.to_str().ok()?;
     // A snapshot: another thread may add or remove a node meanwhile, as in pymemcache's own loop.
     let nodes: Vec<Bound<'py, PyAny>> = nodes.iter().collect();
     let mut names = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let Some(name) = node
-            .cast_exact::<PyString>()
-            .ok()
-            .and_then(|n| n.to_str().ok())
-        else {
-            return Ok(None);
-        };
-        names.push(name);
+        names.push(node.cast_exact::<PyString>().ok()?.to_str().ok()?);
     }
-    Ok(rendezvous_index(names.iter().copied(), key, seed).map(|i| nodes[i].clone()))
+    rendezvous_index(names.iter().copied(), key, seed).map(|i| nodes[i].clone())
 }
 
 #[cfg(test)]
