@@ -264,6 +264,11 @@ class FillLockBackend(Protocol):
 
     Not part of LockableBackend: only the decorator's miss path uses it. CachekitIOBackend and
     PerRequestRedisBackend. ``acquire_fill_lock`` yields ``(acquired, uncontended)``.
+
+    Contract: the backend's read (``get_with_freshness`` if it has one, else ``get``) raises on a
+    failed read and returns None only for an absent entry. An uncontended grant after a None read
+    skips the post-lock re-read (see ``L2MissProbe``); a read that hid a failure as None would lose
+    its only retry.
     """
 
     def acquire_fill_lock(
@@ -2676,7 +2681,7 @@ class StandardCacheHandler:
             # Run sync backend operation in thread pool
             value = await self._with_backpressure_and_timeout_async(self.backend.get, key)
             if value is None:
-                _note_clean_l2_miss()  # a failed read raised above, so this None is a real miss
+                _note_clean_l2_miss()  # a real miss on a backend that raises on failure (FillLockBackend's contract)
 
             # Optionally refresh TTL if value exists and refresh_ttl provided
             # Uses graceful degradation (skips if backend doesn't support TTL inspection)

@@ -180,6 +180,14 @@ def _encode_tenant(tenant_id: object) -> str:
     return url_encode(tenant_id, safe="")
 
 
+def _log_release_failure(key: str, exc: BaseException) -> None:
+    logger.warning(
+        "Redis lock release for %s failed (%s); the key lives until its TTL",
+        redact_cache_key(key),
+        redact_error_for_log(exc),
+    )
+
+
 class PerRequestRedisBackend:
     """Tenant-scoped Redis backend over a shared client.
 
@@ -641,6 +649,7 @@ class PerRequestRedisBackend:
         # Resolve it here, in the caller's context: run_in_executor does not carry contextvars,
         # so the executor callables below must never read tenant_context themselves.
         scoped_key = f"{self._scoped_key(key)}:lock"
+        operation = "acquire_fill_lock" if background_release else "acquire_lock"
         body_error: Optional[Exception] = None
         with _ClearedOnInterrupt():
             try:
@@ -668,11 +677,7 @@ class PerRequestRedisBackend:
                             "Redis lock already expired or taken over before release: %s", redact_error_for_log(e)
                         )  # nothing to orphan
                     except redis.RedisError as e:
-                        logger.warning(
-                            "Redis lock release for %s failed (%s); the key lives until its TTL",
-                            redact_cache_key(key),
-                            redact_error_for_log(e),
-                        )
+                        _log_release_failure(key, e)
 
                 async def _release() -> None:
                     # Drained: a cancel landing while this still queues for a thread must not drop the release.
@@ -684,11 +689,7 @@ class PerRequestRedisBackend:
                     try:
                         _release_sync()
                     except Exception as e:
-                        logger.warning(
-                            "Redis lock release for %s failed (%s); the key lives until its TTL",
-                            redact_cache_key(key),
-                            redact_error_for_log(e),
-                        )
+                        _log_release_failure(key, e)
 
                 first_attempt = True
                 while True:
@@ -701,9 +702,10 @@ class PerRequestRedisBackend:
                         # have won; log it rather than let it mask the cancellation.
                         if (err := attempt.exception()) is not None:
                             logger.warning(
-                                "Redis lock attempt for %s failed (%s) while acquire_lock was being cancelled",
+                                "Redis lock attempt for %s failed (%s) while %s was being cancelled",
                                 redact_cache_key(key),
                                 redact_error_for_log(err),
+                                operation,
                             )
                         elif attempt.result():
                             await _release()
@@ -721,12 +723,9 @@ class PerRequestRedisBackend:
                     body_error = exc  # raised by the caller's code in the block, not by redis-py
                     raise
                 finally:
-                    # Release lock if acquired (also run in thread pool)
-                    if acquired and not background_release:
-                        await _release()
-                    elif acquired:
+                    if acquired and background_release:
                         try:
-                            loop.run_in_executor(None, _release_detached)
+                            loop.run_in_executor(None, _release_detached)  # not awaited: see acquire_fill_lock
                         except RuntimeError as e:
                             logger.debug(
                                 "Redis lock release for %s sent inline: the default executor refused it (%s)",
@@ -734,6 +733,8 @@ class PerRequestRedisBackend:
                                 redact_error_for_log(e),
                             )
                             _release_detached()
+                    elif acquired:
+                        await _release()
                 return
             except Exception as exc:
                 if body_error is not None and exc is not body_error:
@@ -745,7 +746,7 @@ class PerRequestRedisBackend:
                     )
                 # The block's own exception wins, even over a release that failed after it, and is kept whole.
                 failed = exc if body_error is None else body_error
-                error = classify_redis_error(failed, operation="acquire_lock", key=key, keep_exception=failed is body_error)
+                error = classify_redis_error(failed, operation=operation, key=key, keep_exception=failed is body_error)
             except BaseException:
                 # An interrupt or a cancel, whose frames the ``with`` clears as it leaves. A cancel during the release after
                 # the block raised: the block's exception, on whose traceback this frame is, must not stay in a local here.

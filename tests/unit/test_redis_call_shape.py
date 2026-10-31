@@ -30,7 +30,7 @@ _HOLDER = b"another-process"
 def _label(args: tuple[Any, ...]) -> str:
     """``SET`` for a write, ``SET NX`` for a lock attempt, else the command name."""
     name = str(args[0]).upper()
-    return f"{name} NX" if name == "SET" and any(str(arg).upper() in ("NX", "B'NX'") for arg in args) else name
+    return f"{name} NX" if name == "SET" and "NX" in args[3:] else name  # options follow name and value
 
 
 class _GatedPipeline(Pipeline):
