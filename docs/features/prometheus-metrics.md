@@ -66,9 +66,10 @@ scrape_configs:
 
 ### Which Decorators Record
 
-The three cache-operation series (`cache_operations_total`, `cache_operation_duration_ms` and
-`cache_operation_size_bytes`) record `get` and `set` operations for a decorator that has a
-backend and `MonitoringConfig.collect_stats=True`, the default. That covers `@cache`,
+The three cache-operation series record for a decorator that has a backend and
+`MonitoringConfig.collect_stats=True`, the default: `cache_operations_total` and
+`cache_operation_duration_ms` record `get` and `set` operations, and `cache_operation_size_bytes`
+records `get` hits only. That covers `@cache`,
 `@cache.production`, `@cache.secure`, `@cache.dev` and `@cache.io`. The rest record less:
 
 - An L1-only decorator records only failures in them, such as
@@ -168,7 +169,7 @@ What each `cache_operation_duration_ms` series times, measured with a monotonic 
 
 `cache_operation_size_bytes` records the length of the bytes a `get` hit read; a `set` records no size. For an L1 `get`, that is the L1 entry:
 on a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit swaps its envelope for its
-MessagePack when that is no longer, so later L1 `get`s of it record a smaller size than its L2 `get`. Earlier releases recorded
+MessagePack when the MessagePack is no longer than the envelope, so later L1 `get`s of it record a size no larger than its L2 `get`. Earlier releases recorded
 the envelope's length on every hit.
 
 > **Changed durations.** Earlier releases recorded every L1 hit as a constant 0.001 ms, and timed
