@@ -5,10 +5,13 @@ This conftest overrides the root conftest's autouse fixture to
 skip Redis setup for pure unit tests.
 """
 
+from typing import Any
+
 import pytest
 
 from cachekit.decorators import orchestrator as orchestrator_module
 from cachekit.reliability.circuit_breaker import CircuitBreaker
+from cachekit.serializers import base as serializers_base
 
 
 @pytest.fixture(autouse=True)
@@ -46,3 +49,21 @@ def backend_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     that patches the resolver must say a backend is configured, or its stand-in is never asked.
     """
     monkeypatch.setenv("REDIS_URL", "redis://configured.invalid:6379")
+
+
+@pytest.fixture
+def walks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Each structure walk (check_msgpack_structure) a decode runs: "ok", or "refused" when the walk raised."""
+    seen: list[str] = []
+    real = serializers_base.check_msgpack_structure
+
+    def recording(data: Any, limit: int) -> None:
+        try:
+            real(data, limit)
+        except ValueError:
+            seen.append("refused")
+            raise
+        seen.append("ok")
+
+    monkeypatch.setattr(serializers_base, "check_msgpack_structure", recording)
+    return seen

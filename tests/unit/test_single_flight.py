@@ -44,7 +44,6 @@ from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
 from cachekit.decorators.tenant_context import ContextVarExtractor
 from cachekit.l1_cache import L1Cache, get_l1_cache_manager
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitState
-from cachekit.serializers import base as serializers_base
 from cachekit.serializers.standard_serializer import VerifiedMsgpack
 
 pytestmark = pytest.mark.unit
@@ -1007,16 +1006,11 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
 
 
 def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(
-    waiting: list[int], decoded: list[type], decoded_data: list[type], monkeypatch: pytest.MonkeyPatch
+    waiting: list[int], decoded: list[type], decoded_data: list[type], walks: list[str]
 ) -> None:
     """Each joined caller decodes the trip's envelope once, for its own copy, as before. It goes to
     deserialize_data: a joiner keeps nothing in L1, so it builds no kept entry (deserialize_l1). The envelope
     came from the trip, not from a decode in this process, so each joiner's decode walks it."""
-    walks: list[int] = []
-    real_walk = serializers_base.check_msgpack_structure
-    monkeypatch.setattr(
-        serializers_base, "check_msgpack_structure", lambda data, limit: walks.append(1) or real_walk(data, limit)
-    )
 
     def compute(x: int) -> dict[str, int]:
         _until(lambda: waiting[0] == HERD - 1)
@@ -1030,7 +1024,7 @@ def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(
     assert backend.requests == ["get", "set"]
     assert decoded == []
     assert decoded_data == [bytes] * (HERD - 1)
-    assert len(walks) == HERD - 1
+    assert walks == ["ok"] * (HERD - 1)
 
 
 def test_sync_backed_recheck_hit_hands_its_half_open_probe_slot_back(

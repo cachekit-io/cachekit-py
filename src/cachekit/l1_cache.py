@@ -48,8 +48,9 @@ class CacheEntry:
     """L1 cache entry with value, TTL, and size tracking.
 
     Storage: Stores bytes (encrypted or plaintext msgpack) for unified
-    encrypted-at-rest architecture. Decryption/deserialization happens at
-    read time in CacheHandler, not storage time.
+    encrypted-at-rest architecture, or the KeptEntry a hit swapped in for a
+    plaintext entry. Decryption/deserialization happens at read time in
+    CacheHandler, not storage time.
     """
 
     value: "bytes | KeptEntry"  # a KeptEntry once a hit swapped it in (shrink_if_held)
@@ -103,7 +104,7 @@ class L1Cache:
     - LRU eviction when memory limit reached
     - In-process lookups, with no network round trip
     - Background TTL synchronization
-    - Stores bytes (encrypted or plaintext msgpack), not Python objects
+    - Stores bytes (encrypted or plaintext msgpack), or the KeptEntry a hit swapped in, not Python objects
 
     Storage Architecture:
     - Stores serialized bytes for unified encrypted-at-rest
@@ -154,13 +155,13 @@ class L1Cache:
         )
 
     def _estimate_size(self, value: "bytes | KeptEntry") -> int:
-        """Estimate memory size of bytes value.
+        """Estimate memory size of an entry's value.
 
         Simplified from recursive sys.getsizeof() - faster and more accurate
-        for bytes storage.
+        for bytes storage. A KeptEntry's length is that of the bytes it holds.
 
         Args:
-            value: Bytes to estimate size for
+            value: Bytes, or a KeptEntry, to estimate size for
 
         Returns:
             Size in bytes
@@ -202,7 +203,7 @@ class L1Cache:
             return True, entry.value
 
     def peek(self, key: str) -> "Optional[bytes | KeptEntry]":
-        """The bytes ``get`` would return, without counting a hit or miss or moving the entry in LRU order.
+        """The value ``get`` would return (bytes, or the KeptEntry a hit swapped in), without counting a hit or miss or moving the entry in LRU order.
 
         For a second lookup within one call, such as the single-flight re-check after a miss, which
         the call's first lookup already counted. An expired entry reads as absent and is left for

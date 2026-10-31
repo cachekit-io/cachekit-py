@@ -64,7 +64,7 @@ from cachekit.serializers.encryption_wrapper import (
     KeyringConfigurationError,
     require_cross_sdk_serializer,
 )
-from cachekit.serializers.standard_serializer import StandardSerializer, VerifiedMsgpack, WalkedEnvelope
+from cachekit.serializers.standard_serializer import KeptEntry, StandardSerializer, VerifiedMsgpack, WalkedEnvelope
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
@@ -1379,7 +1379,7 @@ class CacheSerializationHandler:
         # Inline, not helpers: this is every L1 hit's decode, and an envelope it keeps must cost what
         # deserialize_data costs.
         if not self.keeps_msgpack_in_l1:
-            return self.deserialize_data(data, cache_key, args, kwargs), None  # pyright: ignore[reportArgumentType]
+            return self.deserialize_data(data, cache_key, args, kwargs), None
         # Only L1 holds these types, and only such a handler swapped them in, after a decode that walked them.
         if type(data) is VerifiedMsgpack:
             return self._base_serializer._deserialize_verified(data.data, data.hook), None  # type: ignore[union-attr]
@@ -1400,7 +1400,7 @@ class CacheSerializationHandler:
 
     def deserialize_data(
         self,
-        data: str | bytes | memoryview,
+        data: str | bytes | memoryview | KeptEntry,
         cache_key: str = "",
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
@@ -1477,7 +1477,8 @@ class CacheSerializationHandler:
             True
         """
         if self.interop_mode:
-            return self._deserialize_interop(data, cache_key)
+            # A KeptEntry here is another handler's swapped L1 entry: the bytes-only decode refuses it.
+            return self._deserialize_interop(data, cache_key)  # pyright: ignore[reportArgumentType]
 
         try:
             # unwrap/from_dict raise bare ValueError subclasses on frame faults. The
@@ -1488,10 +1489,11 @@ class CacheSerializationHandler:
                 # A custom SerializerProtocol may write to the metadata it is handed, so it gets its own
                 # copy rather than the header memo's shared, read-only instance.
                 serialized_data, metadata, serializer_name = SerializationWrapper.unwrap_metadata(
-                    data, shared=not self._custom_serializer
+                    data,  # pyright: ignore[reportArgumentType]  # a KeptEntry raises here and is refused below
+                    shared=not self._custom_serializer,
                 )
             except (AttributeError, KeyError, TypeError, ValueError) as e:
-                if self.encryption and type(data) in (VerifiedMsgpack, WalkedEnvelope):  # pyright: ignore[reportUnnecessaryComparison]
+                if self.encryption and type(data) in (VerifiedMsgpack, WalkedEnvelope):
                     # A plaintext handler's swapped L1 entry under this key: refused as the plaintext
                     # envelope it replaced would be, and counted the same way (suspicious_envelope).
                     raise SuspiciousCacheEntryError(

@@ -348,24 +348,6 @@ def test_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
 
 
 @pytest.fixture
-def walks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Each structure walk (check_msgpack_structure) a decode runs: "ok", or "refused" when the walk raised."""
-    seen: list[str] = []
-    real = base.check_msgpack_structure
-
-    def recording(data: Any, limit: int) -> None:
-        try:
-            real(data, limit)
-        except ValueError:
-            seen.append("refused")
-            raise
-        seen.append("ok")
-
-    monkeypatch.setattr(base, "check_msgpack_structure", recording)
-    return seen
-
-
-@pytest.fixture
 def hooks(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
     """For each msgpack.unpackb call, whether it ran an object hook."""
     seen: list[bool] = []

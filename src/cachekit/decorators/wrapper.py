@@ -1944,7 +1944,7 @@ def create_cache_wrapper(
                     value = operation_handler.serialization_handler.deserialize_l1(entry, cache_key, args, kwargs)[0]
                 else:
                     value = operation_handler.serialization_handler.deserialize_data(
-                        entry,  # pyright: ignore[reportArgumentType]
+                        entry,
                         cache_key,
                         args,
                         kwargs,
@@ -2264,7 +2264,7 @@ def create_cache_wrapper(
                                 _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
                         else:  # as before; a swapped entry fails: SuspiciousCacheEntryError if encrypted, else a corrupt frame
                             l1_value = operation_handler.serialization_handler.deserialize_data(
-                                l1_bytes,  # pyright: ignore[reportArgumentType]
+                                l1_bytes,
                                 cache_key,
                                 args,
                                 kwargs,
@@ -2774,7 +2774,7 @@ def create_cache_wrapper(
                                 _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
                         else:
                             l1_value = operation_handler.serialization_handler.deserialize_data(
-                                l1_bytes,  # pyright: ignore[reportArgumentType]
+                                l1_bytes,
                                 cache_key,
                                 args,
                                 kwargs,
