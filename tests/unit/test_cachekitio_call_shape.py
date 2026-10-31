@@ -6,38 +6,7 @@ caller waits on, and the set of requests that run in the background after it ret
 a blocking round trip, or a background request that becomes blocking, changes the list and fails here.
 A round-trip fix edits the pinned list in its own PR, and that diff is its proof.
 
-Blocking is decided by state, never by a clock: a request blocks if the caller is still waiting on it.
-The thread a request arrives on cannot tell that for an async caller. The async backend methods send on
-the backend's one client through ``asyncio.to_thread``, so the caller's own requests and its background tasks'
-all arrive on worker threads. The gate goes by what the caller is doing instead, and by whether anything
-waits on the executor job that sent the request.
-
-Async: every request is parked on the gate, its worker thread held until the event loop releases it.
-A request from an executor job whose future nothing waits on (the miss path's lock release) is never released
-while the caller is pending: as on the sync side, it is held until the caller has returned, so it is background
-however long the caller keeps running, unless a timer fires meanwhile (see below).
-Any other parked request is judged by the caller. Once the loop
-has run everything it can, for a whole settle since the latest request parked, and the caller is still
-pending, the caller waits on a parked request: the oldest is released as blocking. With none parked yet,
-the gate waits for one to arrive or for the caller to finish, because a request still on its way through a
-worker thread has not parked. Once the caller has returned, whatever it left running is background. A task
-the caller spawns cannot send before the caller's current step ends, and on every pinned path the caller
-returns within a few turns of that step: the miss runs in a single-flight task the caller awaits.
-A caller that kept awaiting after spawning one would let the task's request read as blocking: the pinned
-list fails, it does not pass by mistake. A wait on a held request that bypasses its job's future (on an
-Event the job sets, say) is one the gate cannot see. Unbounded, it hangs until the guard fails the run.
-Bounded, its timer fires while the request is held, and the gate books the request blocking. Any timer that
-fires then counts, whichever task set it: a helper task can bound the wait for the caller and live on, so neither
-the task nor its fate shows whose wait it was. The gate errs toward blocking instead. A caller that sleeps after
-its background release, or background work whose timer fires before the caller returns, makes the pinned list
-fail rather than pass by mistake. No pinned path has a timer after its background release. A wait bounded
-without a loop timer (by counting turns, say) stays invisible.
-
-Sync: a request blocks if it runs on the caller's thread, where the caller cannot return until it does;
-a request on any other thread is held until the caller has returned, so it can only be background.
-
-Only single-caller paths are pinned exactly. Herd paths (several callers on one key) vary in lock-poll
-count and order from run to run, so they belong to invariant tests, not here.
+The gate that classifies each request is tests/utils/call_shape_gate.py; its docstring says how.
 """
 
 from __future__ import annotations
@@ -48,10 +17,8 @@ import contextvars
 import json
 import threading
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable
-from concurrent.futures import Executor
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
 from urllib.parse import unquote
 
 import pytest
@@ -60,17 +27,12 @@ from urllib3 import HTTPResponse
 from cachekit import cache
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
 from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
+from tests.utils.call_shape_gate import SETTLE_TURNS, CallShapeGate, Shape, settle
 
 pytestmark = pytest.mark.unit
 
 _API_KEY = "ck_test_call_shape"  # pragma: allowlist secret — fake key, test fixture
 _PREFIX = "/v1/cache/"
-# Loop turns a parked request is given to show it is not awaited. The paths below need a few turns per
-# task hop; the bound only has to exceed that, and it counts turns, not time. If it were ever too small,
-# a background request would read as blocking: the pinned list fails, it does not pass by mistake.
-_SETTLE_TURNS = 100
-_GUARD_SECONDS = 10.0  # hang guard only: hitting it fails the test, it never classifies a request
-_WRITER = "cachekit-write-behind"  # the threads write_behind=True sends deferred writes from
 
 
 @dataclass
@@ -133,236 +95,18 @@ def _parse(request: FakeRequest) -> tuple[str, str]:
     return unquote(encoded_key), f"{request.method} /{suffix}" if suffix else request.method
 
 
-@dataclass
-class _Shape:
-    blocking: list[str] = field(default_factory=list)  # in the order the caller waited on them
-    background: list[str] = field(default_factory=list)
-
-
-_running = threading.local()  # .job: the _Job a worker thread is running, for the requests it sends
-
-
-class _Job(asyncio.Future[Any]):
-    """An executor job's future as the gate's ``run_in_executor`` hands it back: a real future that settles as the
-    loop's own future for the job does, and records whether anything waits on it. Every wait registers a done
-    callback (``await``, ``asyncio.wait``, ``gather``, ``shield``), so registering one is what counts."""
-
-    inner: asyncio.Future[Any]  # the loop's own future for the job
-    awaited = False
-
-    def __init__(self, loop: asyncio.AbstractEventLoop, on_awaited: Callable[[], None]) -> None:
-        super().__init__(loop=loop)
-        self._on_awaited = on_awaited
-
-    def add_done_callback(
-        self, fn: Callable[[asyncio.Future[Any]], object], /, *, context: contextvars.Context | None = None
-    ) -> None:
-        if not self.awaited:
-            self.awaited = True
-            self._on_awaited()
-        super().add_done_callback(fn, context=context)
-
-    def run(self, func: Callable[..., Any], *args: Any) -> Any:
-        _running.job = self
-        try:
-            return func(*args)
-        finally:
-            _running.job = None
-
-    def relay(self, inner: asyncio.Future[Any]) -> None:
-        if self.done():
-            return
-        if inner.cancelled():
-            self.cancel()
-        elif (exc := inner.exception()) is not None:
-            self.set_exception(exc)
-        else:
-            self.set_result(inner.result())
-
-
-@dataclass(eq=False)
-class _Parked:
-    op: str
-    job: _Job | None  # None: sent from outside any executor job
-    release: Callable[[], None]
-
-    @property
-    def awaited(self) -> bool:
-        """Whether something may wait on the request. Not when it comes from a job nothing awaits."""
-        return self.job is None or self.job.awaited
-
-
-class _Gate:
-    """The fake pool's handler, classifying each request as blocking or background."""
+class _Gate(CallShapeGate):
+    """The fake pool's handler: each request is classified, then answered by the fake SaaS."""
 
     def __init__(self, saas: _FakeSaaS) -> None:
+        super().__init__()
         self.saas = saas
-        self.shape = _Shape()
-        self.errors: list[str] = []  # a handler's failure would surface as a swallowed BackendError
         self._respond_lock = threading.Lock()
-        # Async run: every request, each on a worker thread, waits here until run_async releases it.
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._waiting: asyncio.Future[Any] | None = None  # the caller, while run_async runs it
-        self._jobs: list[_Job] = []  # every executor job of the run
-        self._parked: list[_Parked] = []
-        self._arrived = asyncio.Event()
-        self.arrivals: list[str] = []  # every request parked this run, in order
-        # Sync run.
-        self._caller: threading.Thread | None = None
-        self._caller_returned = threading.Event()
-
-    def _respond(self, request: FakeRequest) -> HTTPResponse:
-        with self._respond_lock:
-            return self.saas.respond(request)
-
-    def _park(self, parked: _Parked) -> None:
-        self._parked.append(parked)
-        self.arrivals.append(parked.op)
-        self._arrived.set()
-
-    async def arrival(self, op: str) -> None:
-        """Return once ``op`` has parked this run."""
-        while op not in self.arrivals:
-            await asyncio.sleep(0)
-
-    def _run_in_executor(self, executor: Executor | None, func: Callable[..., Any], *args: Any) -> _Job:
-        """The loop's ``run_in_executor`` during an async run (``asyncio.to_thread`` calls it too)."""
-        assert self._loop is not None
-        job = _Job(self._loop, self._arrived.set)  # a new wait may be the one the caller is held on
-        # The class's method: the loop's own attribute is this one while run_async runs.
-        job.inner = type(self._loop).run_in_executor(self._loop, executor, job.run, func, *args)
-        job.inner.add_done_callback(job.relay)
-        self._jobs.append(job)
-        return job
-
-    def _call_at(
-        self, when: float, callback: Callable[..., object], *args: Any, context: contextvars.Context | None = None
-    ) -> asyncio.TimerHandle:
-        """The loop's ``call_at`` during an async run (``call_later``, ``asyncio.sleep`` and ``wait_for`` call it too)."""
-        assert self._loop is not None
-        return type(self._loop).call_at(self._loop, when, self._timer_fired, callback, *args, context=context)
-
-    def _timer_fired(self, callback: Callable[..., object], *args: Any) -> None:
-        # A wait on a held request can bypass its job's future (on an Event the job sets): the gate cannot see that wait,
-        # but a bounded one leaves a trace, its timer firing while the caller still waits. Nor can the gate tell whose
-        # wait a timer bounds (a helper task can bound it for the caller and live on), so any timer counts: an unrelated
-        # one fails the run instead of letting a real wait pass.
-        if self._waiting is not None and not self._waiting.done():
-            for held in [parked for parked in self._parked if not parked.awaited]:
-                self._parked.remove(held)
-                self.shape.blocking.append(held.op)
-                held.release()
-        callback(*args)
 
     def handler(self, request: FakeRequest) -> HTTPResponse:
-        op = _parse(request)[1]
-        if self._loop is not None:
-            # An async run: the request comes from a worker thread (an executor job), never the loop's own.
-            released = threading.Event()
-            self._loop.call_soon_threadsafe(self._park, _Parked(op, getattr(_running, "job", None), released.set))
-            if not released.wait(_GUARD_SECONDS):
-                self.errors.append(f"{op} was never released")
-        elif threading.current_thread() is self._caller:
-            self.shape.blocking.append(op)
-        else:
-            if not self._caller_returned.wait(_GUARD_SECONDS):
-                self.errors.append(f"the caller waited on {op}, sent from another thread")
-            self.shape.background.append(op)
-        return self._respond(request)
-
-    def run_sync(self, call: Callable[[], Any]) -> _Shape:
-        self.shape = _Shape()
-        before = set(threading.enumerate())
-        self._caller = threading.current_thread()
-        self._caller_returned.clear()
-        try:
-            call()
-        finally:
-            self._caller = None
-            self._caller_returned.set()
-        for thread in set(threading.enumerate()) - before:
-            thread.join(_GUARD_SECONDS)
-            assert not thread.is_alive(), f"background thread {thread.name} did not finish"
-        assert not self.errors, self.errors
-        return self.shape
-
-    async def run_async(self, call: Awaitable[Any]) -> _Shape:
-        self.shape = shape = _Shape()
-        self.arrivals, self._jobs = [], []
-        writers_before = _writers()
-        self._loop = loop = asyncio.get_running_loop()
-        loop.run_in_executor = self._run_in_executor  # type: ignore[method-assign]
-        loop.call_at = self._call_at  # type: ignore[method-assign]
-        try:
-            self._waiting = caller = asyncio.ensure_future(call)
-            while True:
-                arrivals = len(self.arrivals)
-                await _settle()
-                if caller.done():
-                    break
-                if len(self.arrivals) > arrivals:
-                    continue  # one arrived mid-settle: it gets a whole settle too before it is judged
-                if waited := next((parked for parked in self._parked if parked.awaited), None):
-                    # Everything runnable has run and the caller still waits: it waits on this request.
-                    self._parked.remove(waited)
-                    shape.blocking.append(waited.op)
-                    waited.release()
-                else:
-                    # None the caller can wait on: it is computing, polling, or its request is still on the way
-                    # through a worker thread. A request nothing awaits stays parked until the caller returns.
-                    await self._next_event({caller})
-            caller.result()
-            # The caller has returned: whatever it left running is background. Drain it to the end.
-            writers: set[threading.Thread] = set()
-            exits: list[asyncio.Future[None]] = []
-            while True:
-                await _settle()
-                if self._parked:
-                    shape.background.extend(parked.op for parked in self._parked)
-                    for parked in self._parked:
-                        parked.release()
-                    self._parked.clear()
-                    continue
-                # Background work is a Task, an executor job (the lock release runs in a thread), or a write-behind thread.
-                # A writer sends outside any task or job, so the drain joins each one the run started, as run_sync does,
-                # including one a background task started during the drain. The join runs off the loop, which must stay
-                # free to release the writer's requests.
-                for writer in _writers() - writers_before - writers:
-                    writers.add(writer)
-                    exits.append(type(loop).run_in_executor(loop, None, writer.join, _GUARD_SECONDS))
-                tasks = asyncio.all_tasks() - {asyncio.current_task()}
-                jobs = {job.inner for job in self._jobs if not job.inner.done()}
-                if not (pending := tasks | jobs | {exited for exited in exits if not exited.done()}):
-                    break
-                await self._next_event(pending)
-        finally:
-            for parked in self._parked:  # left by a caller that raised: never strand a worker thread
-                parked.release()
-            self._parked.clear()
-            del loop.run_in_executor, loop.call_at
-            self._loop = self._waiting = None
-        assert not self.errors, self.errors
-        for writer in writers:
-            assert not writer.is_alive(), f"background thread {writer.name} did not finish"
-        return shape
-
-    async def _next_event(self, tasks: set[Any]) -> None:
-        """Wait until one of ``tasks`` finishes, a request is parked, or a job is first waited on."""
-        self._arrived.clear()
-        arrived = asyncio.ensure_future(self._arrived.wait())
-        done, _ = await asyncio.wait({*tasks, arrived}, timeout=_GUARD_SECONDS, return_when=asyncio.FIRST_COMPLETED)
-        arrived.cancel()
-        await asyncio.gather(arrived, return_exceptions=True)
-        assert done, "nothing finished and no request arrived"
-
-
-def _writers() -> set[threading.Thread]:
-    return {thread for thread in threading.enumerate() if thread.name == _WRITER}
-
-
-async def _settle() -> None:
-    for _ in range(_SETTLE_TURNS):
-        await asyncio.sleep(0)
+        self.observe(_parse(request)[1])
+        with self._respond_lock:
+            return self.saas.respond(request)
 
 
 @pytest.fixture
@@ -382,7 +126,7 @@ def backend(gate: _Gate) -> CachekitIOBackend:
     return backend
 
 
-def _op_counts(shape: _Shape) -> dict[str, int]:
+def _op_counts(shape: Shape) -> dict[str, int]:
     """Requests sent, blocking or not. For several callers at once: a request one caller left in the
     background can park while a sibling still waits, so only the counts are an invariant there."""
     return dict(Counter(shape.blocking + shape.background))
@@ -405,7 +149,7 @@ class TestSyncCallShape:
             return x * 2
 
         shape = gate.run_sync(lambda: fn(1))
-        assert shape == _Shape(blocking=["GET", "PUT"])
+        assert shape == Shape(blocking=["GET", "PUT"])
 
     def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, l1_enabled=False)
@@ -414,7 +158,7 @@ class TestSyncCallShape:
 
         gate.run_sync(lambda: fn(1))
         shape = gate.run_sync(lambda: fn(1))
-        assert shape == _Shape(blocking=["GET"])
+        assert shape == Shape(blocking=["GET"])
 
     def test_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         @cache(backend=backend, ttl=60, stale_ttl=60, l1_enabled=False)
@@ -424,7 +168,7 @@ class TestSyncCallShape:
         gate.run_sync(lambda: fn(1))
         saas.stale = True
         shape = gate.run_sync(lambda: fn(1))
-        assert shape == _Shape(blocking=["GET"], background=["PUT"])
+        assert shape == Shape(blocking=["GET"], background=["PUT"])
 
     def test_refresh_ttl_on_get_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
@@ -433,7 +177,7 @@ class TestSyncCallShape:
 
         gate.run_sync(lambda: fn(1))
         shape = gate.run_sync(lambda: fn(1))
-        assert shape == _Shape(blocking=["GET"])
+        assert shape == Shape(blocking=["GET"])
 
     def test_invalidate(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60)
@@ -442,7 +186,7 @@ class TestSyncCallShape:
 
         gate.run_sync(lambda: fn(1))
         shape = gate.run_sync(lambda: fn.invalidate_cache(1))  # type: ignore[attr-defined]
-        assert shape == _Shape(blocking=["DELETE"])
+        assert shape == Shape(blocking=["DELETE"])
 
     def test_failed_read(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         @cache(backend=backend, ttl=60)
@@ -451,7 +195,7 @@ class TestSyncCallShape:
 
         saas.fail_reads = True  # a failed read is treated as a miss, so the write still goes out
         shape = gate.run_sync(lambda: fn(1))
-        assert shape == _Shape(blocking=["GET", "PUT"])
+        assert shape == Shape(blocking=["GET", "PUT"])
 
     def test_cold_miss_write_behind(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, write_behind=True)
@@ -459,7 +203,7 @@ class TestSyncCallShape:
             return x * 2
 
         shape = gate.run_sync(lambda: fn(1))
-        assert shape == _Shape(blocking=["GET"], background=["PUT"])
+        assert shape == Shape(blocking=["GET"], background=["PUT"])
 
 
 class TestAsyncCallShape:
@@ -472,7 +216,7 @@ class TestAsyncCallShape:
 
         shape = await gate.run_async(fn(1))
         # The first lock POST won after a clean miss: no re-read, and the release is not waited on.
-        assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
     async def test_cold_miss_write_behind_keeps_the_put_inside_the_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, write_behind=True)
@@ -481,7 +225,7 @@ class TestAsyncCallShape:
 
         shape = await gate.run_async(fn(1))
         # Deferred, the PUT would land after the release, and a waiter's re-read would miss and recompute.
-        assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
     async def test_cold_miss_without_distributed_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, distributed_lock=False)
@@ -489,7 +233,7 @@ class TestAsyncCallShape:
             return x * 2
 
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "PUT"])
+        assert shape == Shape(blocking=["GET", "PUT"])
 
     async def test_cold_miss_write_behind_without_distributed_lock(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, write_behind=True, distributed_lock=False)
@@ -498,7 +242,7 @@ class TestAsyncCallShape:
 
         shape = await gate.run_async(fn(1))
         # No lock for a waiter to re-read under, so the PUT leaves the caller's path as on the sync side.
-        assert shape == _Shape(blocking=["GET"], background=["PUT"])
+        assert shape == Shape(blocking=["GET"], background=["PUT"])
 
     async def test_herd_without_distributed_lock_runs_once(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         """An invariant, not a pinned list: 10 concurrent callers on one cold key share one in-process trip."""
@@ -523,7 +267,7 @@ class TestAsyncCallShape:
 
         await gate.run_async(fn(1))
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET"])
+        assert shape == Shape(blocking=["GET"])
 
     @pytest.mark.parametrize("distributed_lock", [True, False])
     async def test_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, distributed_lock: bool) -> None:
@@ -536,7 +280,7 @@ class TestAsyncCallShape:
         await gate.run_async(fn(1))
         saas.stale = True
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET"], background=["POST /lock", "PUT", "DELETE /lock"])
+        assert shape == Shape(blocking=["GET"], background=["POST /lock", "PUT", "DELETE /lock"])
 
     async def test_stale_hit_outlived_by_its_caller(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         """The caller is still running when its revalidation's first request arrives, for most of a settle after:
@@ -552,12 +296,12 @@ class TestAsyncCallShape:
         async def late_caller() -> int:
             value = await fn(1)
             await gate.arrival("POST /lock")
-            for _ in range(_SETTLE_TURNS - 10):  # most of a settle: the gate's own wake-up costs a few turns
+            for _ in range(SETTLE_TURNS - 10):  # most of a settle: the gate's own wake-up costs a few turns
                 await asyncio.sleep(0)
             return value
 
         shape = await gate.run_async(late_caller())
-        assert shape == _Shape(blocking=["GET"], background=["POST /lock", "PUT", "DELETE /lock"])
+        assert shape == Shape(blocking=["GET"], background=["POST /lock", "PUT", "DELETE /lock"])
 
     async def test_locked_miss(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         """The lock is held elsewhere; its holder stores the value, then the caller wins the lock and reads it."""
@@ -571,7 +315,7 @@ class TestAsyncCallShape:
         saas.lock_held_for = 1
         shape = await gate.run_async(fn(1))
         # A waited grant keeps the double-check read: the holder may have filled the key meanwhile.
-        assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET"], background=["DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "POST /lock", "GET"], background=["DELETE /lock"])
 
     # refresh_ttl_on_get decides from the hit's Fresh-For and never blocks the caller.
 
@@ -585,7 +329,7 @@ class TestAsyncCallShape:
         await gate.run_async(fn(1))
         saas.fresh_for = 10
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET"], background=["PATCH /ttl"])
+        assert shape == Shape(blocking=["GET"], background=["PATCH /ttl"])
 
     async def test_refresh_ttl_on_get_hit_not_due(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
@@ -594,7 +338,7 @@ class TestAsyncCallShape:
 
         await gate.run_async(fn(1))
         shape = await gate.run_async(fn(1))  # Fresh-For 60 is above 0.5 x 60
-        assert shape == _Shape(blocking=["GET"])
+        assert shape == Shape(blocking=["GET"])
 
     async def test_refresh_ttl_on_get_hit_in_swr_fresh_window(
         self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS
@@ -609,7 +353,7 @@ class TestAsyncCallShape:
         await gate.run_async(fn(1))
         saas.fresh_for, saas.ttl_left = 25, 85
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET"], background=["PATCH /ttl"])
+        assert shape == Shape(blocking=["GET"], background=["PATCH /ttl"])
 
     async def test_refresh_ttl_on_get_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         """A stale entry can't be renewed (the server answers 409), so no PATCH is sent."""
@@ -621,7 +365,7 @@ class TestAsyncCallShape:
         await gate.run_async(fn(1))
         saas.stale = True
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET"])
+        assert shape == Shape(blocking=["GET"])
 
     @pytest.mark.parametrize("fresh_for", [None, 0], ids=["no-header", "fresh-labelled-zero"])
     async def test_refresh_ttl_on_get_hit_without_fresh_for(
@@ -636,7 +380,7 @@ class TestAsyncCallShape:
         await gate.run_async(fn(1))
         saas.fresh_for = fresh_for
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET"], background=["GET /ttl", "PATCH /ttl"])
+        assert shape == Shape(blocking=["GET"], background=["GET /ttl", "PATCH /ttl"])
 
     async def test_refresh_ttl_on_get_single_flight_is_per_key_prefix(
         self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, monkeypatch: pytest.MonkeyPatch
@@ -672,7 +416,7 @@ class TestAsyncCallShape:
 
         await gate.run_async(fn(1))
         shape = await gate.run_async(fn.ainvalidate_cache(1))  # type: ignore[attr-defined]
-        assert shape == _Shape(blocking=["DELETE"])
+        assert shape == Shape(blocking=["DELETE"])
 
     async def test_failed_read(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         @cache(backend=backend, ttl=60)
@@ -681,7 +425,7 @@ class TestAsyncCallShape:
 
         saas.fail_reads = True  # a failed read is treated as a miss, and is read again once the lock is won
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT"], background=["DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "GET", "PUT"], background=["DELETE /lock"])
 
     async def test_failed_read_of_a_live_entry(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
         """The primary read fails on an entry that is still live, and the first lock POST wins. The post-lock
@@ -696,7 +440,7 @@ class TestAsyncCallShape:
         await gate.run_async(fn(1))
         saas.fail_next_reads = 1
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
         assert calls == [1]
 
     async def test_failed_read_of_a_live_entry_outlived_by_its_caller(
@@ -716,11 +460,11 @@ class TestAsyncCallShape:
             value = await fn(1)
             await gate.arrival("DELETE /lock")
             for _ in range(3):
-                await _settle()  # the gate judges the parked release while this caller still runs
+                await settle()  # the gate judges the parked release while this caller still runs
             return value
 
         shape = await gate.run_async(late_caller())
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
 
     @pytest.mark.parametrize("in_helper", [False, True], ids=["in-the-call", "in-a-helper-that-lives-on"])
     async def test_a_bounded_wait_on_the_release_reads_as_blocking(
@@ -780,7 +524,7 @@ class TestAsyncCallShape:
         monkeypatch.setattr(CachekitIOBackend, "acquire_fill_lock", wait_for_the_release)
         saas.fail_next_reads = 1
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])
 
     async def test_any_timer_while_the_release_is_held_reads_as_blocking(
         self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS
@@ -810,4 +554,4 @@ class TestAsyncCallShape:
             return value
 
         shape = await gate.run_async(caller())
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])
+        assert shape == Shape(blocking=["GET", "POST /lock", "GET", "DELETE /lock"])

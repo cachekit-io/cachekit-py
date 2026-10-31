@@ -599,6 +599,41 @@ class PerRequestRedisBackend:
             always runs to completion, a lock the attempt wins is released, and only then is
             the ``CancelledError`` re-raised.
         """
+        async with self._lock(key, timeout, blocking_timeout, background_release=False) as (acquired, _):
+            yield acquired
+
+    @asynccontextmanager
+    async def acquire_fill_lock(
+        self,
+        key: str,
+        timeout: float,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[tuple[bool, bool]]:
+        """``acquire_lock`` for the decorator's miss path; not part of the LockableBackend protocol.
+
+        Two differences, both so the caller does not wait on a round trip it does not need:
+
+        - It yields ``(acquired, uncontended)``. ``uncontended`` is True when the first ``SET NX``
+          won: this caller never waited behind another holder. A fill that completed between the
+          caller's read and that ``SET NX`` is not seen, so it is recomputed; last write wins.
+        - It releases in the background: the release ``EVALSHA`` is submitted to the default
+          executor and the ``async with`` returns at once. A plain executor future, unlike a Task,
+          is not cancelled by ``asyncio.run`` teardown, which then waits for the executor, so the
+          release lands even when the decorated call is the process's last await. If the executor
+          is already shut down, ``run_in_executor`` refuses the job with ``RuntimeError`` and the
+          release runs inline instead, blocking the loop for one round trip at shutdown only.
+        """
+        async with self._lock(key, timeout, blocking_timeout, background_release=True) as grant:
+            yield grant
+
+    @asynccontextmanager
+    async def _lock(
+        self, key: str, timeout: float, blocking_timeout: Optional[float], *, background_release: bool
+    ) -> AsyncIterator[tuple[bool, bool]]:
+        """The lock both ``acquire_lock`` and ``acquire_fill_lock`` take: ``(acquired, uncontended)``.
+
+        ``background_release`` sends the release without waiting for it (see ``acquire_fill_lock``).
+        """
         # Derive the on-wire Redis lock name from the bare cache key: ``<scoped_key>:lock``.
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
@@ -643,6 +678,19 @@ class PerRequestRedisBackend:
                     # Drained: a cancel landing while this still queues for a thread must not drop the release.
                     await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
 
+                def _release_detached() -> None:
+                    # Nothing reads a background release's future, so it must never hold an exception:
+                    # asyncio would report one only as an unredacted "exception was never retrieved".
+                    try:
+                        _release_sync()
+                    except Exception as e:
+                        logger.warning(
+                            "Redis lock release for %s failed (%s); the key lives until its TTL",
+                            redact_cache_key(key),
+                            redact_error_for_log(e),
+                        )
+
+                first_attempt = True
                 while True:
                     # Drained: a cancel cannot stop the thread's SET NX from winning, only hide that it did.
                     attempt = loop.run_in_executor(None, functools.partial(lock.acquire, blocking=False, token=token))
@@ -665,16 +713,27 @@ class PerRequestRedisBackend:
                     # would land past the deadline. blocking_timeout=None means a single attempt.
                     if acquired or deadline is None or loop.time() + lock.sleep > deadline:
                         break
+                    first_attempt = False
                     await asyncio.sleep(lock.sleep)
                 try:
-                    yield acquired
+                    yield acquired, acquired and first_attempt
                 except Exception as exc:
                     body_error = exc  # raised by the caller's code in the block, not by redis-py
                     raise
                 finally:
                     # Release lock if acquired (also run in thread pool)
-                    if acquired:
+                    if acquired and not background_release:
                         await _release()
+                    elif acquired:
+                        try:
+                            loop.run_in_executor(None, _release_detached)
+                        except RuntimeError as e:
+                            logger.debug(
+                                "Redis lock release for %s sent inline: the default executor refused it (%s)",
+                                redact_cache_key(key),
+                                redact_error_for_log(e),
+                            )
+                            _release_detached()
                 return
             except Exception as exc:
                 if body_error is not None and exc is not body_error:

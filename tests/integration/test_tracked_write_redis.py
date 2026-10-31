@@ -72,7 +72,9 @@ def _tracked(client: redis.Redis) -> set[bytes]:
 
 
 def _cache_keys(client: redis.Redis) -> set[bytes]:
-    return {k[len(b"t:default:") :] for k in client.keys("t:default:*") if b":ck:reg:" not in k}
+    # An async miss's fill lock is released in the background, so its :lock key can outlive the call briefly.
+    keys = client.keys("t:default:*")
+    return {k[len(b"t:default:") :] for k in keys if b":ck:reg:" not in k and not k.endswith(b":lock")}
 
 
 def _drain_writers(created: list[wb.WriteBehind]) -> None:
