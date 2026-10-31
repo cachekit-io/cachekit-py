@@ -7,10 +7,11 @@
 ## TL;DR
 
 cachekit records Prometheus metrics for cache operations, latency, payload size, and
-circuit-breaker state. Collection is on by default — no per-call instrumentation code is
-needed. **Exposition is your responsibility**: cachekit does not start an HTTP server or
-register a `/metrics` route. Wire up `prometheus_client` exposition in your app and the
-metrics show up on your existing scrape endpoint.
+circuit-breaker state. Collection is on by default for every decorator with a backend — no
+per-call instrumentation code is needed. An L1-only decorator records no cache-operation series
+([details](#which-decorators-record)). **Exposition is your responsibility**: cachekit does not
+start an HTTP server or register a `/metrics` route. Wire up `prometheus_client` exposition in
+your app and the metrics show up on your existing scrape endpoint.
 
 ```prometheus
 cache_operations_total{operation="get",namespace="users",success="True",serializer="l1_memory"} 31022
@@ -21,12 +22,12 @@ cache_operations_total{operation="get",namespace="users",success="True",serializ
 
 ## Quick Start
 
-Metrics are recorded automatically once a decorated function runs:
+Metrics are recorded automatically once a decorated function with a backend runs:
 
-```python notest
+```python
 from cachekit import cache
 
-@cache(ttl=300)  # Metrics recorded by default
+@cache(ttl=300)  # Records metrics once it resolves a backend, e.g. with REDIS_URL set
 def get_user(user_id):
     return db.query(User).get(user_id)
 ```
@@ -62,6 +63,21 @@ scrape_configs:
       - targets: ['localhost:8000']  # The host:port your app exposes metrics on
     metrics_path: '/metrics'         # Whatever path you mounted exposition on
 ```
+
+### Which Decorators Record
+
+The three cache-operation series (`cache_operations_total`, `cache_operation_duration_ms` and
+`cache_operation_size_bytes`) are recorded by a decorator that has a backend and
+`MonitoringConfig.collect_stats=True`, the default. That covers `@cache`, `@cache.production`,
+`@cache.secure`, `@cache.dev` and `@cache.io`. These record none of them:
+
+- an L1-only decorator: one with `backend=None`, or one that resolves no backend
+  ([Backend Resolution Priority](../backends/README.md#backend-resolution-priority)), and
+  `@cache.local`;
+- `@cache.minimal` and `@cache.test`, which set `collect_stats=False`
+  ([Configuration](#configuration)).
+
+`cache_info()` counts hits and misses on every decorator, these included.
 
 ---
 
@@ -268,59 +284,39 @@ sum by (namespace) (circuit_breaker_state{state="OPEN"})
 
 ## Configuration
 
-### Enable/Disable Metrics
-
-Metric collection is controlled by `MonitoringConfig.enable_prometheus_metrics` (default:
-`True`). Disabling it stops cachekit from recording series; it has no effect on exposition,
-which your app owns regardless.
-
-```python notest
-from cachekit import cache
-from cachekit.config.nested import MonitoringConfig
-
-@cache(
-    ttl=300,
-    monitoring=MonitoringConfig(enable_prometheus_metrics=True),  # Default: True
-)
-def operation(x):
-    return compute(x)
-```
-
 ### Disable Metrics
 
-```python notest
+`MonitoringConfig.collect_stats` (default: `True`) controls the three cache-operation series.
+Setting it to `False` stops that decorator recording them; `cache_info()` keeps counting. It has
+no effect on exposition, which your app owns regardless.
+
+```python
 from cachekit import cache
 from cachekit.config.nested import MonitoringConfig
 
 @cache(
     ttl=300,
-    monitoring=MonitoringConfig(enable_prometheus_metrics=False),
+    monitoring=MonitoringConfig(collect_stats=False),  # No cache-operation series
 )
 def operation(x):
     return compute(x)
 ```
 
-### Disable All Observability
+> `MonitoringConfig.enable_prometheus_metrics` is not read at runtime: setting it to `False`
+> leaves every series recording. The presets that set it are no exception, so `@cache.dev`
+> records the cache-operation series as `@cache.production` does. Use `collect_stats`.
 
-```python notest
-from cachekit import cache
-from cachekit.config.nested import MonitoringConfig
+### Series That Ignore `MonitoringConfig`
 
-@cache(
-    ttl=300,
-    monitoring=MonitoringConfig(
-        collect_stats=False,
-        enable_structured_logging=False,
-        enable_prometheus_metrics=False,
-    ),
-)
-def operation(x):
-    return compute(x)
-```
+These are recorded whatever `MonitoringConfig` says:
 
-`circuit_breaker_state` is the exception: it is recorded for every function whose circuit
-breaker is enabled, whatever `MonitoringConfig` says. To leave a function out of it, pass
-`circuit_breaker=CircuitBreakerConfig(enabled=False)` (from `cachekit.config.nested`).
+- `circuit_breaker_state`, for every function whose circuit breaker is enabled. To leave a
+  function out of it, pass `circuit_breaker=CircuitBreakerConfig(enabled=False)` (from
+  `cachekit.config.nested`).
+- `redis_cache_operations_total`, on every backpressure rejection. A function with
+  `backpressure=BackpressureConfig(enabled=False)` never rejects, so never adds to it.
+- `cachekit_decrypt_failures_total` and `cachekit_config_drift_reads_total`, the security
+  counters, on every failure they count.
 
 ---
 
@@ -348,7 +344,9 @@ Each thread records a cache operation into cells of its own, and the series add 
 A: cachekit does not expose metrics for you. Confirm your app starts
 `prometheus_client` exposition (`start_http_server` or `make_wsgi_app`/`make_asgi_app`) on
 the **default** registry, and that at least one decorated function has run — series are
-created lazily on first use.
+created lazily on first use. The function must have a backend and `collect_stats=True`: an
+L1-only decorator, `@cache.minimal` and `@cache.test` record no cache-operation series
+([Which Decorators Record](#which-decorators-record)).
 
 **Q: A log says "Metric '…' is already registered outside cachekit; not recording it"**
 A: Your application (or another library) registered a metric with the same name on the

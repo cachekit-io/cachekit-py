@@ -191,12 +191,12 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
 | L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
-| Prometheus Metrics | - | -¹ | - | ✅ | ✅ |
+| Prometheus Metrics¹ | - | ✅ | - | ✅ | ✅ |
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
 | Backend unreachable² | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error | Function runs, no error |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
-> ¹ `@cache.dev` exports no Prometheus metrics except `circuit_breaker_state`, which is recorded for every function whose circuit breaker is enabled.
+> ¹ A preset with a ✅ records the cache-operation series only when it has a backend: in L1-only mode it records none. `circuit_breaker_state` is recorded for every function whose circuit breaker is enabled. See [Which Decorators Record](docs/features/prometheus-metrics.md#which-decorators-record).
 >
 > ² A backend that is down or unreachable never raises to the caller, on any preset (`@cache.io` included): the call logs the failure and runs your function. What gets cached meanwhile is in [Connection Errors](docs/error-codes.md#connection-errors).
 >
@@ -216,7 +216,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 `@cache.dev` and `@cache.test` are Python-only, SDK-local presets. See the comparison table above for the exact feature set of each preset.
 
 ```python
-# Development: verbose logging, integrity checks on, Prometheus off except circuit_breaker_state
+# Development: verbose logging, integrity checks on
 @cache.dev
 def debug_expensive_call():
     return complex_computation()
@@ -406,7 +406,7 @@ See [SECURITY.md][security-url] for vulnerability reporting and detailed documen
 ### Monitoring & Observability
 
 - **Per-function statistics** - `cache_info()` on every decorated function, modelled on `functools.lru_cache`
-- **Prometheus metrics** - Recorded by default (your app owns exposition)
+- **Prometheus metrics** - Recorded by default by every decorator with a backend (your app owns exposition)
 - **Structured logging** - Context-aware, per-operation fields
 - **Health checks** - Comprehensive status endpoints
 

@@ -68,7 +68,7 @@ Are you caching in Python?
 > - TTL support (lru_cache only has maxsize)
 > - **Unhashable arguments**: Cache functions that take lists, dicts, nested structures — lru_cache and cachetools raise `TypeError`
 > - **Async support**: Same `@cache` decorator works on async functions (lru_cache breaks on async)
-> - Prometheus metrics built-in (zero setup)
+> - Hit/miss counters built in: `cache_info()` on every decorated function, no setup
 > - **Zero code changes to upgrade**: Remove `backend=None` → distributed at any time
 >
 > **Type safe**: L1-only mode stores raw Python objects — tuples, sets, frozensets are preserved exactly like `lru_cache`. No serialization overhead.
@@ -106,7 +106,7 @@ def expensive_computation(x: int) -> dict:
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
 > - **Distributed locking**: Prevents cache stampedes across pods
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
-> - **Metrics**: Prometheus counters for hits/misses/errors
+> - **Metrics**: Prometheus operation counts and latency and payload-size histograms, plus `cache_info()` hit/miss counters per function
 
 ```python
 from cachekit import cache
@@ -235,24 +235,25 @@ def expensive_compute(key):
 
 **Why cachekit wins**:
 
-Automatic Prometheus metrics:
+Prometheus metrics, recorded by every decorator with a backend:
 ```prometheus
-cachekit_cache_hits_total{function="fetch_user"} 9847
-cachekit_cache_misses_total{function="fetch_user"} 203
-cachekit_cache_errors_total{function="fetch_user"} 5
-cachekit_cache_hit_latency_seconds{...} histogram
-cachekit_cache_miss_latency_seconds{...} histogram
+cache_operations_total{operation="get",namespace="users",success="True",serializer="l1_memory"} 31022
+cache_operations_total{operation="get",namespace="users",success="True",serializer="rust"} 9847
+cache_operation_duration_ms_bucket{operation="get",namespace="users",serializer="rust",le="1.0"} 9512
+cache_operation_size_bytes_bucket{operation="get",namespace="users",serializer="rust",le="4096.0"} 9847
+circuit_breaker_state{namespace="users",state="OPEN"} 0
 ```
 
 No instrumentation code needed:
 ```python
-@cache(ttl=300)  # Metrics exported automatically
+@cache(ttl=300)  # With a backend, records the series above
 def get_user(id):
     return db.query(User).get(id)
 
-# Prometheus scrape endpoint just works
-# Grafana dashboards available
+info = get_user.cache_info()  # Hits, misses and the L1/L2 split, no scrape needed
 ```
+
+The series carry no hit/miss label; `cache_info()` has those counts. cachekit starts no HTTP server: your app exposes the default `prometheus_client` registry ([how](features/prometheus-metrics.md#quick-start)). An L1-only decorator (`backend=None`) records `cache_info()` counts but none of the three cache-operation series.
 
 **Limitations of alternatives**:
 - `lru_cache`: No metrics at all
