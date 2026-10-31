@@ -132,7 +132,7 @@ assert client_a is not client_c  # Different args, different object
 
 ### Concurrent misses share one call
 
-Calls that miss the same key at the same time (a cold key, or one past its `ttl`) run the function once, and every one of them gets that call's object. This holds across threads for a sync function and across tasks on one event loop for an async one. The same-object guarantee above therefore holds for a concurrent cold herd too, not only for calls made after the first one returns.
+Calls that miss the same key at the same time (a cold key, or one past its `ttl`) run the function once, and every one of them gets that call's object. This holds across threads for a sync function. For an async one it holds only for callers on the event loop running the key's call; a caller on another thread's loop runs its own call ([in-process single-flight](distributed-locking.md#in-process-single-flight-before-the-lock)). The same-object guarantee above therefore holds for a concurrent cold herd too, not only for calls made after the first one returns.
 
 Failure, cancellation, invalidation, `cache_info()` counting and the caveats work as described in [in-process single-flight](distributed-locking.md#in-process-single-flight-before-the-lock).
 

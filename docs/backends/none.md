@@ -54,7 +54,7 @@ With `backend=None`, cachekit skips L2 entirely. The data flow is:
 
 No network calls. No serialization to bytes. No backend initialization.
 
-Concurrent misses on one key, cold or past `ttl`, run the function once: threads for a sync function, tasks on one event loop for an async one. The callers that join that call get its object and count as hits in `cache_info()`; if it raises, they all get the exception and nothing is cached. See [in-process single-flight](../features/distributed-locking.md#in-process-single-flight-before-the-lock).
+Concurrent misses on one key, cold or past `ttl`, run the function once: threads for a sync function; for an async one, only callers on the event loop running the key's call share it, and a caller on another thread's loop runs its own. The callers that join that call get its object and count as hits in `cache_info()`; if it raises, they all get the exception and nothing is cached. See [in-process single-flight](../features/distributed-locking.md#in-process-single-flight-before-the-lock).
 
 ## Callers Share the Cached Object
 
