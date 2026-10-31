@@ -120,6 +120,14 @@ def test_backend_routes_a_str_enum_key_like_a_default_hash_client() -> None:
     assert backend._client._get_client(CacheKey.USER).server == default._get_client(CacheKey.USER).server
 
 
+def test_lone_surrogate_key_or_node_falls_back_to_pymemcache() -> None:
+    # A Unix-socket path decoded with surrogateescape holds a lone surrogate, which has no UTF-8 form.
+    socket_path = b"/run/mc-\xff.sock".decode("utf-8", "surrogateescape")
+    reference, native = both([socket_path, "/run/mc-b.sock"])
+    for key in ("k", "x", "user", "\udcff"):
+        assert native.get_node(key) == reference.get_node(key)
+
+
 def test_last_server_removed_after_the_length_check_picks_no_server() -> None:
     class Emptied(list):
         """A node list another thread emptied between get_node's length check and its index."""

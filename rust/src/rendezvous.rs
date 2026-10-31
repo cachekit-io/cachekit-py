@@ -85,7 +85,7 @@ pub fn rendezvous_index<'a>(
 /// itself, so a concurrent `remove_node` cannot shift it.
 ///
 /// None when the caller must ask pymemcache instead: `nodes` is empty, or `key` or a node is not
-/// exactly a str. pymemcache formats a bytes key as `b'...'`, a non-str node through `str()`, and a
+/// exactly a str with a UTF-8 form. pymemcache formats a bytes key as `b'...'`, a non-str node through `str()`, and a
 /// str subclass through its own `__format__`: a `(str, Enum)` member hashes as `Cls.MEMBER`, not as
 /// its value.
 #[cfg(feature = "python")]
@@ -95,18 +95,27 @@ pub fn rendezvous_node<'py>(
     key: &Bound<'py, PyAny>,
     seed: u32,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let Ok(key) = key.cast_exact::<PyString>() else {
+    // A str holding a lone surrogate (a surrogateescaped path, say) has no UTF-8 form: pymemcache
+    // hashes it character by character, so it answers for such a key or node.
+    let Some(key) = key
+        .cast_exact::<PyString>()
+        .ok()
+        .and_then(|k| k.to_str().ok())
+    else {
         return Ok(None);
     };
-    let key = key.to_str()?;
     // A snapshot: another thread may add or remove a node meanwhile, as in pymemcache's own loop.
     let nodes: Vec<Bound<'py, PyAny>> = nodes.iter().collect();
     let mut names = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let Ok(name) = node.cast_exact::<PyString>() else {
+        let Some(name) = node
+            .cast_exact::<PyString>()
+            .ok()
+            .and_then(|n| n.to_str().ok())
+        else {
             return Ok(None);
         };
-        names.push(name.to_str()?);
+        names.push(name);
     }
     Ok(rendezvous_index(names.iter().copied(), key, seed).map(|i| nodes[i].clone()))
 }
