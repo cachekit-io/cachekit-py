@@ -8,12 +8,14 @@ which the documented PromQL never reads.
 
 from __future__ import annotations
 
+import faulthandler
 import os
 import re
 import signal
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -22,6 +24,7 @@ prometheus_client = pytest.importorskip("prometheus_client")
 
 from cachekit import cache  # noqa: E402
 from cachekit.reliability.async_metrics import AsyncMetricsCollector  # noqa: E402
+from tests.utils.fork_helpers import child_outcome, fork_dumping_stacks, on_new_thread, report  # noqa: E402
 
 REGISTRY = prometheus_client.REGISTRY
 _UUID_SERIES = re.compile(r"^cache_operation(s_total|_duration_ms|_size_bytes)_[0-9a-f]{8}")
@@ -112,17 +115,23 @@ def test_non_collision_registration_error_propagates() -> None:
         AsyncMetricsCollector(sync_mode=True).record_counter(f"reserved_{uuid.uuid4().hex}", {"__k": "v"})
 
 
-def _child_exit_code(child: Any) -> int:
-    """Fork, run ``child()`` in the child on a thread with a deadline, return its exit code."""
-    pid = os.fork()
+def _child_outcome(child: Callable[[], bool]) -> object:
+    """Fork, run ``child()`` in the child on a thread with a deadline, return what the child reported.
+
+    A hung child writes every thread's stack to stderr, so the test fails with the hung frame instead of
+    hanging: a hung ``child()`` at its 5 s deadline, a child hung anywhere else (at-fork hooks included)
+    when child_outcome's deadline kills it.
+    """
+    r, w = os.pipe()
+    pid = fork_dumping_stacks()
     if pid == 0:
-        result: list[bool] = []
-        worker = threading.Thread(target=lambda: result.append(child()), daemon=True)
-        worker.start()
-        worker.join(5)
-        os._exit(0 if result == [True] else 1)
-    _, status = os.waitpid(pid, 0)
-    return os.waitstatus_to_exitcode(status)
+        os.close(r)
+        outcome = on_new_thread(child)
+        if outcome == "hung":
+            faulthandler.dump_traceback(sys.__stderr__)
+        report(w, outcome)
+    os.close(w)
+    return child_outcome(pid, r, dump_stacks=True)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
@@ -144,7 +153,7 @@ def test_fork_while_another_thread_holds_metric_lock_does_not_hang_child() -> No
         AsyncMetricsCollector(sync_mode=True).record_counter(f"after_fork_{uuid.uuid4().hex}", {"k": "v"})
         return True
 
-    assert _child_exit_code(register) == 0
+    assert _child_outcome(register) is True
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
@@ -170,7 +179,7 @@ def test_fork_mid_registration_child_keeps_the_real_metric() -> None:
     def child_sees_real_metric() -> bool:
         return not isinstance(collector._get_metric(name, prometheus_client.Counter, "d", ["k"]), am._NoopMetric)
 
-    assert _child_exit_code(child_sees_real_metric) == 0
+    assert _child_outcome(child_sees_real_metric) is True
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")

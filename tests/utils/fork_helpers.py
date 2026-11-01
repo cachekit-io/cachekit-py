@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ast
+import faulthandler
 import os
 import select
 import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import warnings
 from collections.abc import Callable
@@ -24,13 +26,35 @@ def report(w: int, outcome: object) -> NoReturn:
         os._exit(0)
 
 
-def child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
-    """What the child at pid reported on the pipe r, or why it reported nothing; a hung child is killed."""
+def fork_dumping_stacks() -> int:
+    """os.fork(), with a child that writes every thread's stack to stderr on SIGUSR1; pass dump_stacks=True to child_outcome.
+
+    Armed before the fork, so a child hung in an at-fork hook, before os.fork() returns there, still dumps.
+    """
+    faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # the child inherits it
+    try:
+        pid = os.fork()
+    except BaseException:
+        faulthandler.unregister(signal.SIGUSR1)
+        raise
+    if pid:
+        faulthandler.unregister(signal.SIGUSR1)
+    return pid
+
+
+def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = False) -> object:
+    """What the child at pid reported on the pipe r, or why it reported nothing; a hung child is killed.
+
+    dump_stacks: the child came from fork_dumping_stacks, so a hung one is asked for its stacks before the kill.
+    """
     if pid <= 0:  # not an assert: python -O strips those, and os.kill(0, ...) signals pytest's whole process group
         raise ValueError("no child was forked")
     ready = select.select([r], [], [], timeout)[0]
     data = os.read(r, 65536) if ready else b""
     if not data:  # on EOF the child has exited (it holds the only write end), and a kill leaves its exit status as is
+        if dump_stacks and not ready:
+            os.kill(pid, signal.SIGUSR1)
+            time.sleep(1)  # the handler writes the dump in well under this
         os.kill(pid, signal.SIGKILL)
     _, status = os.waitpid(pid, 0)
     os.close(r)
