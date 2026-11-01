@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,15 +33,18 @@ class Installed:
         return self.text if filename == "direct_url.json" else None
 
 
-def fake_git(status: str = "", fail: bool = False) -> Any:
+def fake_git(status: str = "", fail: bool = False) -> Callable[..., subprocess.CompletedProcess[str]]:
     """A subprocess.run that answers rev-parse with COMMIT[:8] and status with `status`, or fails."""
 
     def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         assert argv[1:3] == ["-C", "/src/cachekit-py"], argv
         if fail:
             raise subprocess.CalledProcessError(128, argv, stderr="fatal: not a git repository")
-        out = COMMIT[:8] + "\n" if argv[3] == "rev-parse" else status
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        if argv[3] == "rev-parse":
+            return subprocess.CompletedProcess(argv, 0, stdout=COMMIT[:8] + "\n", stderr="")
+        # Untracked files count, and only the package's own sources: stray output elsewhere is not dirt.
+        assert argv[3:] == ["status", "--porcelain", "--", "src", "rust"], argv
+        return subprocess.CompletedProcess(argv, 0, stdout=status, stderr="")
 
     return run
 
@@ -83,7 +87,9 @@ def test_refuses_to_run_without_saying_where_the_redis_runs(
             "+1ef1d05e",
         ),
         ({"url": "file:///src/cachekit-py", "dir_info": {"editable": True}}, "", "+1ef1d05e"),
-        ({"url": "file:///src/cachekit-py", "dir_info": {}}, " M src/cachekit/l1_cache.py\n", "+1ef1d05e.dirty"),
+        ({"url": "file:///src/cachekit-py", "dir_info": {"editable": True}}, " M src/cachekit/l1_cache.py\n", "+1ef1d05e.dirty"),
+        # A new module the edited code imports before anyone adds it to git.
+        ({"url": "file:///src/cachekit-py", "dir_info": {"editable": True}}, "?? src/cachekit/hit_path.py\n", "+1ef1d05e.dirty"),
     ],
 )
 def test_names_the_cachekit_it_measured(
@@ -101,8 +107,11 @@ def test_names_the_cachekit_it_measured(
     ("origin", "git", "fail"),
     [
         ({"url": "file:///tmp/cachekit-0.25.1-cp314-cp314-linux_x86_64.whl", "archive_info": {}}, "/usr/bin/git", False),
-        ({"url": "file:///src/cachekit-py", "dir_info": {}}, "/usr/bin/git", True),  # not a git checkout
-        ({"url": "file:///src/cachekit-py", "dir_info": {}}, None, False),  # no git on PATH
+        # A plain directory install copied the tree when it was installed, so the checkout's HEAD
+        # now may not be what runs.
+        ({"url": "file:///src/cachekit-py", "dir_info": {}}, "/usr/bin/git", False),
+        ({"url": "file:///src/cachekit-py", "dir_info": {"editable": True}}, "/usr/bin/git", True),  # not a git checkout
+        ({"url": "file:///src/cachekit-py", "dir_info": {"editable": True}}, None, False),  # no git on PATH
     ],
 )
 def test_refuses_an_install_whose_commit_it_cannot_tell(
@@ -118,8 +127,8 @@ def test_refuses_an_install_whose_commit_it_cannot_tell(
 def test_names_this_checkout_by_its_commit() -> None:
     # The real install, so a change in the direct_url.json an installer writes cannot go unnoticed.
     origin = terrain_canary.importlib.metadata.distribution("cachekit").read_text("direct_url.json")
-    if origin is None or "dir_info" not in json.loads(origin):
-        pytest.skip("cachekit is not installed from a checkout here")
+    if origin is None or not json.loads(origin).get("dir_info", {}).get("editable"):
+        pytest.skip("cachekit is not installed editable from a checkout here")
     assert re.fullmatch(rf"cachekit {re.escape(cachekit.__version__)}\+[0-9a-f]{{8}}(\.dirty)?", terrain_canary.cachekit_label())
 
 

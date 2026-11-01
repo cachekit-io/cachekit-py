@@ -129,7 +129,9 @@ uv run python tests/performance/terrain_canary.py --redis redis://localhost:6379
   --harness https://github.com/cachekit-io/cachekit-py/blob/<sha>/tests/performance/terrain_canary.py
 ```
 
-The recording names the cachekit it ran by version. A checkout reports the last release's version until the next release bumps it, so cachekit installed from anywhere but a package index also gets its commit: `cachekit 0.25.1+1ef1d05e`, or `.dirty` added when the checkout has uncommitted changes. The harness refuses an install whose commit it cannot tell, such as a wheel file. A free-threaded build adds whether the GIL was on when the run ended, and on macOS the host names the chip from `sysctl`. A recording you publish should measure a release. Install it from PyPI into a fresh environment and run the harness from the checkout with that environment's Python:
+The recording names the cachekit it ran by version. A checkout reports the last release's version until the next release bumps it, so an editable install from a git checkout also gets its commit: `cachekit 0.25.1+1ef1d05e`, with `.dirty` added when `src/` or `rust/` has uncommitted or untracked changes. A VCS URL install gets its commit too. The harness refuses an install whose commit it cannot tell: a wheel file, or a non-editable install of a directory, which copies the tree when it is installed. A free-threaded build adds whether the GIL was on when the run ended, and on macOS the host names the chip from `sysctl`.
+
+A checkout run cannot vouch that its compiled extension was rebuilt for its commit, because `uv sync` does not rebuild it when only `rust/` changed. A recording you publish should therefore measure a release. Install it from PyPI into a fresh environment and run the harness from the checkout with that environment's Python:
 
 ```bash
 uv venv --python 3.14 /tmp/terrain-env

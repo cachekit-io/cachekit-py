@@ -53,8 +53,10 @@ file from the checkout with that environment's Python, so ``import cachekit`` fi
 
 The recording names what it ran. It gives cachekit's version, plus the commit when cachekit was not
 installed from a package index (``cachekit_label``), because a checkout reports the last release's
-version until the next release bumps it. It gives the Python and, on a free-threaded build, whether
-the GIL was on (``python_label``). It gives the CPU, which macOS names through ``sysctl``.
+version until the next release bumps it. A checkout run cannot vouch that its compiled extension was
+rebuilt for that commit, which is another reason to publish only a release. It gives the Python and,
+on a free-threaded build, whether the GIL was on (``python_label``). It gives the CPU, which macOS
+names through ``sysctl``.
 
 The summary printed at the end gives each layer's share and its exact p50 and p99 from the raw
 samples; the histograms' own percentiles are only good to a bin (about 15%).
@@ -245,10 +247,13 @@ def cachekit_label() -> str:
 
     A checkout reports the last release's version until the next release bumps it, so a recording made
     from one would pass its figures off as that release's. An install from a package index leaves no
-    ``direct_url.json`` (PEP 610) and is the release its version names. An install from a git checkout or
-    a VCS URL adds the commit, and ``.dirty`` when the checkout has uncommitted changes. Any other direct
-    install, a wheel file for one, cannot say which commit it was built from, so the run is refused
-    before it starts.
+    ``direct_url.json`` (PEP 610) and is the release its version names. An install from a VCS URL adds
+    its commit. An editable install from a git checkout adds the commit its Python follows, and
+    ``.dirty`` when ``src/`` or ``rust/`` has uncommitted or untracked changes. It cannot vouch that
+    its compiled extension was rebuilt for that commit, since ``uv sync`` does not rebuild it when only
+    ``rust/`` changed, so only a release is fit to publish. Any other direct install cannot say which
+    commit it was built from, so the run is refused before it starts. That covers a wheel file, and a
+    non-editable install of a directory, which copies the tree when it is installed.
     """
     import cachekit
 
@@ -260,7 +265,8 @@ def cachekit_label() -> str:
     if "vcs_info" in origin:
         return f"cachekit {version}+{origin['vcs_info']['commit_id'][:8]}"
     git = shutil.which("git")
-    if "dir_info" in origin and git:
+    # Only an editable install follows the checkout: a plain one copied the tree when it was installed.
+    if origin.get("dir_info", {}).get("editable") and git:
         checkout = url2pathname(urlsplit(origin["url"]).path)
 
         def git_out(*cmd: str) -> str:
@@ -270,14 +276,16 @@ def cachekit_label() -> str:
 
         try:
             commit = git_out("rev-parse", "--short=8", "HEAD")
-            changes = git_out("status", "--porcelain", "--untracked-files=no")
+            # Untracked files count: an editable install imports a new module before it is added.
+            changes = git_out("status", "--porcelain", "--", "src", "rust")
         except (OSError, subprocess.SubprocessError):
             pass  # not a git checkout: refused below
         else:
             return f"cachekit {version}+{commit}{'.dirty' if changes else ''}"
     raise SystemExit(
         f"terrain_canary: cachekit {version} was installed from {origin.get('url')}, and which commit it was built "
-        "from is unknown. Install a release from a package index, or run from a git checkout with git on PATH."
+        "from is unknown. Install a release from a package index, or install the checkout editable (uv sync) "
+        "with git on PATH."
     )
 
 
