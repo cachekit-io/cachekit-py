@@ -243,13 +243,16 @@ def cpu_model() -> str:
 
 
 def editable_sources(installed: importlib.metadata.Distribution) -> set[Path]:
-    """The directories an editable install's ``.pth`` files name, by the line grammar ``site`` uses.
+    """The directories an editable install's ``.pth`` files name, counting only lines every ``site`` reads alike.
 
-    ``site.addpackage`` skips a line that starts with ``#`` or is blank, runs one that starts with
-    ``import`` and a space or tab, and joins any other to the ``.pth`` file's directory after
-    stripping only its trailing whitespace. Leading whitespace stays, so ``"  /src"`` names a path
-    under site-packages, not ``/src``. A file that cannot be read or decoded names nothing, so the
-    check fails closed.
+    ``site`` skips a blank line and one starting with ``#``, treats one starting with ``import`` and a
+    space or tab as code, and joins any other to the ``.pth`` file's directory. Versions disagree on
+    leading whitespace: up to 3.14 ``site`` keeps it, so ``"  /src"`` names a path under
+    site-packages, while 3.15 (PEP 829) strips it first, so the same line names ``/src`` and an
+    indented ``#`` or ``import`` line is a comment or code. Only an unindented line counts here, taken
+    with its trailing whitespace stripped, which every version reads alike; uv and maturin write one
+    unindented absolute path. An indented line names nothing, so it can cause a refusal but never a
+    false label, and so does a file that cannot be read or decoded.
 
     >>> editable_sources(importlib.metadata.PathDistribution(Path("/nowhere")))
     set()
@@ -266,7 +269,7 @@ def editable_sources(installed: importlib.metadata.Distribution) -> set[Path]:
         sources |= {
             (pth.parent / line.rstrip()).resolve()
             for line in lines
-            if line.strip() and not line.startswith(("#", "import ", "import\t"))
+            if line and not line[0].isspace() and not line.startswith(("#", "import ", "import\t"))
         }
     return sources
 
