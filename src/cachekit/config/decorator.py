@@ -662,8 +662,9 @@ class DecoratorConfig:
             **kwargs: Overrides (ttl, namespace, integrity_checking, swr_by_default, l1, circuit_breaker,
                 backpressure, monitoring, etc.). ``backend`` is not one — io always
                 caches through its own CachekitIOBackend and rejects ``backend=``.
-                Default ttl=3600 (protocol/spec/intent-presets.md); ttl=None = never expire
-                (and disables the stale_ttl SWR window, which needs a positive ttl).
+                Default ttl=3600 (protocol/spec/intent-presets.md); ttl=None sends no TTL, so the
+                server stores the entry for the plan's maximum TTL (never expiring only on a plan
+                without one), and disables the stale_ttl SWR window, which needs a positive ttl.
 
         Returns:
             DecoratorConfig with CachekitIOBackend

@@ -471,3 +471,18 @@ class TestL1DeclinedPutDropsOlderEntry:
         assert l1.get("k") == (True, b"old")
         l1.put("k", b"new", redis_ttl=0)
         assert l1.get("k") == (False, None)
+
+    def test_declined_put_runs_the_fork_take_over_first(self, clock: _Clock) -> None:
+        """The removal touches L1's state, so a child forked without hooks must take it over first: the
+        lock it would otherwise wait on can be one the fork orphaned."""
+        order: list[str] = []
+        l1 = l1_module.L1Cache(namespace=_namespace(), before_store=lambda: order.append("take-over"))
+        original = l1._on_current_state
+
+        def recording(*args: Any, **kwargs: Any) -> None:
+            order.append("state")
+            original(*args, **kwargs)
+
+        l1._on_current_state = recording  # type: ignore[method-assign]
+        l1.put("k", b"new", redis_ttl=0)
+        assert order == ["take-over", "state"]

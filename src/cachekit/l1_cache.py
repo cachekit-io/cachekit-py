@@ -328,6 +328,11 @@ class L1Cache:
                 "the mapped file for the entry's TTL. Materialize to bytes before caching."
             )
 
+        # Before the first _state use, the declined put's removal below included: the take-over
+        # replaces a state whose lock fork orphaned.
+        if self._before_store is not None:
+            self._before_store()
+
         # Calculate expiry time
         current_time = time.time()
         if expires_at is not None:
@@ -349,10 +354,6 @@ class L1Cache:
                 expiry,
             )
             return
-
-        # Before the first _state use: the take-over replaces a state whose lock fork orphaned.
-        if self._before_store is not None:
-            self._before_store()
 
         # Estimate size
         size = self._estimate_size(value)
