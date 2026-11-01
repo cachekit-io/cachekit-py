@@ -60,6 +60,9 @@ def _parse_telemetry_env(raw: str | None) -> bool | None:
 def resolve_telemetry(setting: bool | None, environ: Mapping[str, str]) -> bool:
     """Whether a CachekitIO backend sends the optional metrics headers: off from either control wins, both unset is on.
 
+    The variable's name matches case-insensitively, as every other ``CACHEKIT_*`` variable loads
+    (``case_sensitive=False``). Where several casings are set, off from any of them wins.
+
     Examples:
         >>> resolve_telemetry(None, {})
         True
@@ -67,8 +70,15 @@ def resolve_telemetry(setting: bool | None, environ: Mapping[str, str]) -> bool:
         False
         >>> resolve_telemetry(False, {"CACHEKIT_TELEMETRY": "on"})
         False
+        >>> resolve_telemetry(None, {"cachekit_telemetry": "false"})
+        False
+        >>> resolve_telemetry(None, {"CACHEKIT_TELEMETRY": "on", "Cachekit_Telemetry": "off"})
+        False
     """
-    return setting is not False and _parse_telemetry_env(environ.get(TELEMETRY_ENV)) is not False
+    if setting is False:
+        return False
+    found = [_parse_telemetry_env(v) for k, v in environ.items() if k.upper() == TELEMETRY_ENV]
+    return False not in found
 
 
 # Loopback, private, link-local (cloud metadata), "this network" and unspecified addresses. An IPv4-mapped IPv6
@@ -158,12 +168,6 @@ class _WithoutTelemetry(PydanticBaseSettingsSource):
     def __init__(self, source: PydanticBaseSettingsSource) -> None:
         super().__init__(source.settings_cls)
         self._source = source
-
-    def _set_current_state(self, state: dict[str, Any]) -> None:
-        self._source._set_current_state(state)  # pyright: ignore[reportPrivateUsage]
-
-    def _set_settings_sources_data(self, states: dict[str, dict[str, Any]]) -> None:
-        self._source._set_settings_sources_data(states)  # pyright: ignore[reportPrivateUsage]
 
     def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
         return self._source.get_field_value(field, field_name)

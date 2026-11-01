@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import weakref
 from collections.abc import Callable
 
 # Bucket i (0-based) holds the durations up to 2**(i + 7) ns, the last up to the 60 s ceiling (spec table).
@@ -17,8 +18,10 @@ BUCKETS = 16
 MAX_DURATION_NS = 60_000_000_000
 # Every integer on the wire is at most 2**53 - 1, the largest a JavaScript number holds exactly.
 _MAX_WIRE_INT = 2**53 - 1
-# Each call is timed with probability 1/N, the same N for every backend. A power of two, so the draw is k random bits.
-ONE_IN = 64
+# Each call is timed with probability 1/N, the same N for every backend: the wrapper's draw is SAMPLE_BITS random
+# bits all zero, so N is derived from it and is always the probability the draw has.
+SAMPLE_BITS = 6
+ONE_IN = 1 << SAMPLE_BITS
 _ONE_IN_VALUE = str(ONE_IN)
 # perf_counter qualifies only at 100 ns or finer (spec: Clock).
 _MAX_CLOCK_RESOLUTION_S = 1e-7
@@ -26,7 +29,6 @@ _MAX_CLOCK_RESOLUTION_S = 1e-7
 BUCKETS_HEADER = "X-CacheKit-L1-Latency-Buckets"
 SUM_HEADER = "X-CacheKit-L1-Latency-Sum-Ns"
 ONE_IN_HEADER = "X-CacheKit-L1-Latency-One-In"
-HEADERS = (BUCKETS_HEADER, SUM_HEADER, ONE_IN_HEADER)
 
 
 def clock_qualifies() -> bool:
@@ -56,16 +58,31 @@ class _State:
         self.sum = 0
 
 
+# A forked child empties every report before any thread of its own runs, where the fork runs Python's at-fork
+# hooks. The per-call PID check below covers a fork that does not (uWSGI).
+_REPORTS: weakref.WeakSet[L1LatencyReport] = weakref.WeakSet()
+
+
+def _empty_reports_in_child() -> None:
+    for report in list(_REPORTS):
+        report._empty_in_child()  # pyright: ignore[reportPrivateUsage]
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_empty_reports_in_child)
+
+
 class L1LatencyReport:
     """One CachekitIO backend's accumulator of timed L1 hits since its last report.
 
     ``add``, ``record`` and ``take`` hold one lock, so a report's buckets and sum always describe the same hits and
-    no two requests carry the same hit (API-85). A forked child starts empty (API-83): checked against the PID
-    rather than by an at-fork hook, because uWSGI forks without running Python's hooks. The child never touches
-    the parent's state, whose lock a parent thread may have held at the fork: it builds a complete new state and
-    publishes it with one assignment, so a thread sees either the inherited state, whose PID sends it to build its
-    own, or a new empty one. Two child threads racing their first use may each build one; the hits counted into the
-    one overwritten are lost, never the parent's sent.
+    no two requests carry the same hit (API-85). A forked child starts empty (API-83): an at-fork hook gives every
+    report a new state before the child's own threads run. A fork that skips Python's hooks (uWSGI) is caught by
+    the PID check on each use instead. The child never touches the parent's state, whose lock a parent thread may
+    have held at the fork: it builds a complete new state and publishes it with one assignment, so a thread sees
+    either the inherited state, whose PID sends it to build its own, or a new empty one. Without the hook, two child
+    threads racing their first use may each build one; the hits counted into the one overwritten are lost, never the
+    parent's sent, and each state's buckets and sum change only under its own lock.
 
     Examples:
         >>> report = L1LatencyReport()
@@ -77,9 +94,13 @@ class L1LatencyReport:
         True
     """
 
-    __slots__ = ("_state",)
+    __slots__ = ("__weakref__", "_state")
 
     def __init__(self) -> None:
+        self._state = _State()
+        _REPORTS.add(self)
+
+    def _empty_in_child(self) -> None:
         self._state = _State()
 
     def _current(self) -> _State:
@@ -135,4 +156,4 @@ class L1LatencyReport:
         }
 
 
-__all__ = ["HEADERS", "ONE_IN", "L1LatencyReport", "bucket_index", "clock_qualifies"]
+__all__ = ["ONE_IN", "SAMPLE_BITS", "L1LatencyReport", "bucket_index", "clock_qualifies"]

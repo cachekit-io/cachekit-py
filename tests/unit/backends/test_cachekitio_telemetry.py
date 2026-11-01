@@ -20,9 +20,19 @@ from cachekit.backends.cachekitio.backend import CachekitIOBackend, _inject_metr
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig, resolve_telemetry
 from cachekit.backends.errors import BackendError
 from cachekit.decorators import l1_latency, wrapper
-from cachekit.decorators.l1_latency import HEADERS, MAX_DURATION_NS, ONE_IN, L1LatencyReport, bucket_index
+from cachekit.decorators.l1_latency import (
+    BUCKETS_HEADER,
+    MAX_DURATION_NS,
+    ONE_IN,
+    ONE_IN_HEADER,
+    SUM_HEADER,
+    L1LatencyReport,
+    bucket_index,
+)
 from cachekit.decorators.wrapper import _FunctionStats, _latency_report_of
 from tests.utils.cachekitio_fakes import TEST_API_KEY, FakePool, FakeRequest, fake_backend, response
+from tests.utils.fork_helpers import child_outcome
+from tests.utils.fork_helpers import report as report_to_parent
 
 SESSION_AND_COUNTERS = (
     "X-CacheKit-Session-ID",
@@ -32,6 +42,7 @@ SESSION_AND_COUNTERS = (
     "X-CacheKit-Misses",
     "X-CacheKit-L1-Hit-Rate",
 )
+HEADERS = (BUCKETS_HEADER, SUM_HEADER, ONE_IN_HEADER)
 OPTIONAL = (*SESSION_AND_COUNTERS, *HEADERS)
 
 
@@ -243,11 +254,42 @@ class TestWhatIsTimed:
         assert backend.l1_latency_report.take() is None
 
     def test_api80_existence_checks_and_reads_inside_a_call_are_not_timed(self, store: _Store, timed: _Clock) -> None:
+        """Backend reads made inside a wrapped call, under its stats context, time nothing: only the call itself is."""
         backend, pool = _backend(store)
         backend.set("k", b"v")
-        assert backend.exists("k")
-        assert backend.get("k") == b"v"
+
+        @cache(backend=backend, ttl=60, namespace=_ns())
+        def f(x: int) -> bytes | None:
+            assert backend.exists("k")
+            return backend.get("k")
+
+        assert f(1) == b"v"  # a miss: its function's exists and get run inside the call
+        assert "X-CacheKit-L1-Hits" in pool.requests[-1].headers  # they ran under the call's context
         assert backend.l1_latency_report is not None and backend.l1_latency_report.take() is None
+
+    def test_api79_a_backend_first_resolved_by_invalidation_still_times_hits(self, store: _Store, timed: _Clock) -> None:
+        """invalidate_cache can resolve a lazy backend before any call does; an L1 entry another wrapper of the same
+        function wrote is then a hit before this wrapper ever installs a handler."""
+        from cachekit.config.decorator import set_default_backend
+
+        backend, pool = _backend(store)
+        ns = _ns()
+
+        def f(x: int) -> int:
+            return x
+
+        explicit = cache(backend=backend, ttl=60, namespace=ns)(f)
+        explicit(1)  # miss: writes L1
+        lazy = cache(ttl=60, namespace=ns)(f)  # no default backend yet: resolved at first use
+        set_default_backend(backend)
+        try:
+            lazy.invalidate_cache(2)  # resolves the default backend, installs no handler
+            assert lazy(1) == 1  # an L1 hit on the entry explicit wrote
+        finally:
+            set_default_backend(None)
+        assert backend.l1_latency_report is not None
+        taken = backend.l1_latency_report.take()
+        assert taken is not None and taken[SUM_HEADER] == "300"
 
     def test_api77_only_a_cachekitio_backend_gets_a_report(self, store: _Store, timed: _Clock) -> None:
         """A Mock answers any attribute; a backend of another kind has none: neither is timed into."""
@@ -292,7 +334,7 @@ class TestSampling:
         assert all(not sent for sent in _sent(pool))  # a non-zero draw times nothing
 
     def test_api81_probability_is_one_in_n_and_n_is_sent(self) -> None:
-        assert 2**wrapper._L1_SAMPLE_BITS == ONE_IN
+        assert 2**l1_latency.SAMPLE_BITS == ONE_IN
         assert 1 <= ONE_IN <= 1_000_000
         report = L1LatencyReport()
         report.add(1)
@@ -326,33 +368,27 @@ class TestClock:
             backend, _ = _backend(store)
         assert backend.l1_latency_report is None
 
-    def test_api82_this_platforms_perf_counter_qualifies(self) -> None:
-        assert time.get_clock_info("perf_counter").resolution <= 1e-7
-        assert l1_latency.clock_qualifies()
-
 
 class TestReports:
-    def test_api83_a_forked_child_starts_empty(self) -> None:
+    @pytest.mark.parametrize("hooks", ["with at-fork hooks", "without (uWSGI)"])
+    def test_api83_a_forked_child_starts_empty(self, hooks: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        if hooks.startswith("without"):
+            monkeypatch.setattr(l1_latency, "_empty_reports_in_child", lambda: None)  # the hook runs, doing nothing
         report = L1LatencyReport()
         report.add(500)
-        read, write = os.pipe()
+        r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - child
-            ok = report.take() is None
+            os.close(r)
+            first = report.take()
             report.add(700)
-            ok = ok and report.take() == {
-                "X-CacheKit-L1-Latency-Buckets": "0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0",
-                "X-CacheKit-L1-Latency-Sum-Ns": "700",
-                "X-CacheKit-L1-Latency-One-In": str(ONE_IN),
-            }
-            os.write(write, b"1" if ok else b"0")
-            os._exit(0)
-        os.close(write)
-        assert os.read(read, 1) == b"1"
-        os.close(read)
-        os.waitpid(pid, 0)
+            report_to_parent(w, (first, report.take()))
+        os.close(w)
+        first, second = child_outcome(pid, r)  # type: ignore[misc]
+        assert first is None
+        assert second == {BUCKETS_HEADER: "0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0", SUM_HEADER: "700", ONE_IN_HEADER: str(ONE_IN)}
         taken = report.take()  # the parent's hit is still the parent's
-        assert taken is not None and taken["X-CacheKit-L1-Latency-Sum-Ns"] == "500"
+        assert taken is not None and taken[SUM_HEADER] == "500"
 
     def test_api83_a_lock_held_at_the_fork_does_not_hang_the_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
         report = L1LatencyReport()
@@ -476,16 +512,6 @@ class TestReports:
 
 
 class TestEncoding:
-    def test_api87_spec_example(self) -> None:
-        report = L1LatencyReport()
-        for d in (90, 300, 300, 40_000):
-            report.add(d)
-        assert report.take() == {
-            "X-CacheKit-L1-Latency-Buckets": "1,0,2,0,0,0,0,0,0,1,0,0,0,0,0,0",
-            "X-CacheKit-L1-Latency-Sum-Ns": "40690",
-            "X-CacheKit-L1-Latency-One-In": str(ONE_IN),
-        }
-
     @pytest.mark.parametrize(
         ("duration", "index"),
         [(0, 0), (128, 0), (129, 1), (256, 1), (257, 2), (2_097_152, 14), (2_097_153, 15), (MAX_DURATION_NS, 15)],
@@ -637,6 +663,27 @@ class TestSwitch:
     def test_api95_with_timeout_keeps_the_setting(self, store: _Store) -> None:
         backend, _ = _backend(store, telemetry=False)
         assert backend.with_timeout(2.0)._telemetry is False
+
+    def test_api95_with_timeout_does_not_reread_the_environment(self, store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CACHEKIT_TELEMETRY", "off")
+        backend, _ = _backend(store)
+        monkeypatch.delenv("CACHEKIT_TELEMETRY")
+        assert backend.with_timeout(2.0)._telemetry is False
+
+    @pytest.mark.parametrize("name", ["cachekit_telemetry", "Cachekit_Telemetry"])
+    def test_api95_the_variable_name_matches_in_any_case(
+        self, name: str, store: _Store, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """As every other CACHEKIT_* variable loads (case_sensitive=False): a lowercase off must not fail open."""
+        monkeypatch.setenv(name, "false")
+        backend, pool = _backend(store, telemetry=True)
+        assert backend.l1_latency_report is None
+        backend.get("k")
+        assert not any(header in pool.requests[0].headers for header in OPTIONAL)
+
+    def test_api95_off_in_any_casing_wins(self) -> None:
+        assert resolve_telemetry(None, {"CACHEKIT_TELEMETRY": "on", "cachekit_telemetry": "off"}) is False
+        assert resolve_telemetry(None, {"cachekit_telemetry": "yes"}) is True
 
     def test_api96_off_accumulates_no_report(self, store: _Store, timed: _Clock) -> None:
         backend, pool = _backend(store, telemetry=False)

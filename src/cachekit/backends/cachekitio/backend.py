@@ -1221,5 +1221,5 @@ class CachekitIOBackend:
             api_url=self._config.api_url,
             api_key=self._config.api_key,
             timeout=timeout,
-            telemetry=self._config.telemetry,
+            telemetry=self._telemetry,  # resolved: the clone does not re-read the environment's choice
         )

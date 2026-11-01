@@ -307,7 +307,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 2,596 | 2,482 |
-| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CachekitIO backend with telemetry on does, so each call pays the 1-in-64 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 89,226 | 90,146 |
+| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CachekitIO backend with telemetry on does, so each call pays the 1-in-64 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 86,553 | 87,480 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,596 | 2,488 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 172,539 | 167,686 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |

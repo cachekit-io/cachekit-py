@@ -67,7 +67,7 @@ from ..serializers.encryption_wrapper import (
 )
 
 # Config import removed - using direct DecoratorConfig integration
-from .l1_latency import ONE_IN, L1LatencyReport
+from .l1_latency import SAMPLE_BITS, L1LatencyReport
 from .orchestrator import FeatureOrchestrator
 from .single_flight import AsyncFlights, ThreadFlights
 from .stats_context import reset_current_function_stats, set_current_function_stats
@@ -639,7 +639,6 @@ _MEMO_MAX_ENTRIES = 1024
 # getrandbits(k) == 0 holds with probability 2**-k: one draw, and a cached small int rather than a new float.
 _getrandbits = random.getrandbits
 _perf_counter_ns = time.perf_counter_ns
-_L1_SAMPLE_BITS = ONE_IN.bit_length() - 1
 
 
 def _latency_report_of(backend: object) -> L1LatencyReport | None:
@@ -982,8 +981,8 @@ def create_cache_wrapper(
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
     _handler_backend = None  # the backend operation_handler's StandardCacheHandler was built for
-    # The report this wrapper times its backed-mode L1 hits into: a lazily resolved backend sets it once
-    # _install_cache_handler sees it, before any L1 hit can happen (the hit waits for the backend).
+    # The report this wrapper times its backed-mode L1 hits into, set wherever _backend is: here for an explicit
+    # backend, in _install_cache_handler for one a call resolves, and in invalidate_cache/ainvalidate_cache.
     _l1_latency = None if backend is None else _latency_report_of(backend)
 
     def _install_cache_handler(resolved: BaseBackend) -> None:
@@ -2627,7 +2626,7 @@ def create_cache_wrapper(
         # The L1 hit-latency draw, before the call's outcome is known (spec API-81). Only a backed-mode L1 hit whose
         # backend keeps a report adds its duration; any other outcome discards it. A memoised hit, above, is L1-only
         # mode, which has no backend to report to.
-        return _sync_call(args, kwargs, None) if _getrandbits(_L1_SAMPLE_BITS) else _timed_call(_sync_call, args, kwargs)
+        return _sync_call(args, kwargs, None) if _getrandbits(SAMPLE_BITS) else _timed_call(_sync_call, args, kwargs)
 
     async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any], served: list[L1LatencyReport | None] | None) -> Any:
         """async_wrapper's call past its lock-free hit; ``served`` as in ``_sync_call``."""
@@ -2874,7 +2873,7 @@ def create_cache_wrapper(
             del kwargs["_bypass_cache"]
             return await func(*args, **kwargs)
         # As in sync_wrapper. The timed coroutine reads its clock at its first step, not at its creation.
-        if _getrandbits(_L1_SAMPLE_BITS):
+        if _getrandbits(SAMPLE_BITS):
             return await _async_call(args, kwargs, None)
         return await _timed_call_async(_async_call, args, kwargs)
 
@@ -3474,7 +3473,7 @@ def create_cache_wrapper(
 
         Returns the call's InvalidationOutcome for one entry, and None for every entry.
         """
-        nonlocal _backend
+        nonlocal _backend, _l1_latency
 
         if _zero_config_pending:
             _settle_zero_config()
@@ -3485,6 +3484,7 @@ def create_cache_wrapper(
         if not _l1_only_mode and _backend is None:
             try:
                 _backend = _resolve_lazy_backend()
+                _l1_latency = _latency_report_of(_backend)  # no handler is installed here (see _install_cache_handler)
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
@@ -3510,7 +3510,7 @@ def create_cache_wrapper(
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
         """Async invalidate_cache: the same deletes, run off the event loop, and the same return value."""
-        nonlocal _backend
+        nonlocal _backend, _l1_latency
 
         if _zero_config_pending:
             _settle_zero_config()
@@ -3521,6 +3521,7 @@ def create_cache_wrapper(
         if not _l1_only_mode and _backend is None:
             try:
                 _backend = _resolve_lazy_backend()
+                _l1_latency = _latency_report_of(_backend)  # as in invalidate_cache
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
