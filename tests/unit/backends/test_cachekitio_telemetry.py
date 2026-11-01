@@ -693,10 +693,16 @@ class TestReports:
 class TestEncoding:
     @pytest.mark.parametrize(
         ("duration", "index"),
-        [(0, 0), (128, 0), (129, 1), (256, 1), (257, 2), (2_097_152, 14), (2_097_153, 15), (MAX_DURATION_NS, 15)],
+        [(0, 0), (1, 0), (128, 0), (129, 1), (256, 1), (257, 2), (2_097_152, 14), (2_097_153, 15), (MAX_DURATION_NS, 15)]
+        # Every bound up to the ceiling: 2**k ns is the last duration of bucket k - 7, and 2**k + 1 the first of the next.
+        + [(d, min(k - 7 + (d > 2**k), 15)) for k in range(7, 36) for d in (2**k, 2**k + 1) if d <= MAX_DURATION_NS],
     )
     def test_api87_bucket_bounds(self, duration: int, index: int) -> None:
+        """Checked twice: bucket_index states the rule, and a report counts by its own inlined copy of it."""
         assert l1_latency.bucket_index(duration) == index
+        report = L1LatencyReport()
+        report.add(duration)
+        assert report._state.buckets == [int(i == index) for i in range(l1_latency.BUCKETS)]
 
     def test_api87_a_duration_above_60s_is_discarded(self) -> None:
         report = L1LatencyReport()
