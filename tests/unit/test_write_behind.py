@@ -20,6 +20,7 @@ import textwrap
 import threading
 import time
 import types
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -956,7 +957,7 @@ def _starts(monkeypatch: pytest.MonkeyPatch) -> list[threading.Thread]:
     return started
 
 
-def _until(holds: Any) -> None:
+def _until(holds: Callable[[], bool]) -> None:
     """Wait for state the test cannot be signalled about (a thread reaching its wait). Guard only."""
     deadline = _deadline()
     while not holds():
