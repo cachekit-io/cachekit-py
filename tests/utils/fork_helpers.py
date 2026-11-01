@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
@@ -40,6 +41,17 @@ def child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
     if os.WIFSIGNALED(status):
         return f"no outcome: killed by signal {os.WTERMSIG(status)} ({signal.Signals(os.WTERMSIG(status)).name})"
     return f"no outcome: exited {os.WEXITSTATUS(status)}"
+
+
+def fork_warns() -> bool:
+    """Whether os.fork() here warns that the process is multi-threaded (it does from Python 3.12). The child exits at once."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        child = os.fork()
+        if child == 0:
+            os._exit(0)
+    os.waitpid(child, 0)
+    return any("multi-threaded" in str(w.message) for w in caught)
 
 
 def on_new_thread(fn: Callable[[], object], timeout: float = 5.0) -> object:
