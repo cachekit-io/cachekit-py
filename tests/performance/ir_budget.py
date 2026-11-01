@@ -22,9 +22,8 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   cache is warmed first, and the heap layout is sampled (``ir_workload.run_workload``, ``measure``
   and ``LAYOUTS``).
 
-Repeated runs agree within 0.04% per op (20 runs of serializer_orjson within 0.004%), against a 1% fail
-threshold. The Arrow round trips and file_set keep noise from outside the measured process's control, up
-to 0.25% in one layout (docs/performance.md).
+Repeated runs agree within 0.04% per op, against a 1% fail threshold; the Arrow round trips and file_set
+keep up to 0.25% in one layout (docs/performance.md).
 
 The measured process is ``ir_workload.py``. Its text is compiled into every measured run, so
 editing it moves the heap layout the budgets were recorded at; this gate is kept out of that
@@ -72,8 +71,8 @@ from pathlib import Path
 N_LO, N_HI = 1000, 3000
 WARMUP = 50
 # The real-data paths cost about 60M main-thread Ir per op, 300 times a small path, so a run of
-# 3000 would take hours under callgrind. Fewer ops still cancel startup: it is a few hundred
-# thousand Ir of run-to-run spread against a difference of over a billion.
+# 3000 would take hours under callgrind. Fewer ops still resolve them: pyarrow's thread pool moves a
+# run by up to about 2M Ir, against a difference of over a billion.
 LOOPS = dict.fromkeys(("serializer_arrow_usgs", "serializer_auto_usgs"), (5, 10, 30))  # path: (warmup, n_lo, n_hi)
 # Heap layout moves per-op counts: the allocators take shorter or longer paths in some heap
 # states. Any code change shifts the layout, even an edit to ir_workload.py's comments, so a single

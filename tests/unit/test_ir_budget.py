@@ -51,9 +51,8 @@ def test_main_thread_ir_without_totals_raises(tmp_path) -> None:
         (99_000, "LOWER", True),
     ],
 )
-@pytest.mark.parametrize("path", ["l1_hit", "serializer_orjson"])  # orjson had a 2% exception until its noise was fixed
-def test_compare_thresholds(path: str, measured: int, verdict: str, ok: bool) -> None:
-    lines, passed = compare({path: 100_000}, {path: measured})
+def test_compare_thresholds(measured: int, verdict: str, ok: bool) -> None:
+    lines, passed = compare({"l1_hit": 100_000}, {"l1_hit": measured})
     assert lines[0].split()[0] == verdict
     assert passed is ok
 
@@ -504,6 +503,7 @@ def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> Non
 
 def test_pinned_os_entropy_starts_numpy_in_the_same_state_in_every_run() -> None:
     """numpy.random seeds its global generator from OS entropy at import, which moved every path's count."""
+    pytest.importorskip("numpy")  # the free-threaded CI lanes install no numpy
     probe = (
         "import sys; sys.path.insert(0, sys.argv[1]); import ir_workload\n"
         "if sys.argv[2] == 'pin': ir_workload.pin_os_entropy()\n"
