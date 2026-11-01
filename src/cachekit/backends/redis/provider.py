@@ -180,6 +180,14 @@ def _encode_tenant(tenant_id: object) -> str:
     return url_encode(tenant_id, safe="")
 
 
+def _log_release_failure(key: str, exc: BaseException) -> None:
+    logger.warning(
+        "Redis lock release for %s failed (%s); the key lives until its TTL",
+        redact_cache_key(key),
+        redact_error_for_log(exc),
+    )
+
+
 class PerRequestRedisBackend:
     """Tenant-scoped Redis backend over a shared client.
 
@@ -599,6 +607,41 @@ class PerRequestRedisBackend:
             always runs to completion, a lock the attempt wins is released, and only then is
             the ``CancelledError`` re-raised.
         """
+        async with self._lock(key, timeout, blocking_timeout, background_release=False) as (acquired, _):
+            yield acquired
+
+    @asynccontextmanager
+    async def acquire_fill_lock(
+        self,
+        key: str,
+        timeout: float,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[tuple[bool, bool]]:
+        """``acquire_lock`` for the decorator's miss path; not part of the LockableBackend protocol.
+
+        Two differences, both so the caller does not wait on a round trip it does not need:
+
+        - It yields ``(acquired, uncontended)``. ``uncontended`` is True when the first ``SET NX``
+          won: this caller never waited behind another holder. A fill that completed between the
+          caller's read and that ``SET NX`` is not seen, so it is recomputed; last write wins.
+        - It releases in the background: the release ``EVALSHA`` is submitted to the default
+          executor and the ``async with`` returns at once. A plain executor future, unlike a Task,
+          is not cancelled by ``asyncio.run`` teardown, which then waits for the executor, so the
+          release lands even when the decorated call is the process's last await. If the executor
+          is already shut down, ``run_in_executor`` refuses the job with ``RuntimeError`` and the
+          release runs inline instead, blocking the loop for one round trip at shutdown only.
+        """
+        async with self._lock(key, timeout, blocking_timeout, background_release=True) as grant:
+            yield grant
+
+    @asynccontextmanager
+    async def _lock(
+        self, key: str, timeout: float, blocking_timeout: Optional[float], *, background_release: bool
+    ) -> AsyncIterator[tuple[bool, bool]]:
+        """The lock both ``acquire_lock`` and ``acquire_fill_lock`` take: ``(acquired, uncontended)``.
+
+        ``background_release`` sends the release without waiting for it (see ``acquire_fill_lock``).
+        """
         # Derive the on-wire Redis lock name from the bare cache key: ``<scoped_key>:lock``.
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
@@ -606,6 +649,7 @@ class PerRequestRedisBackend:
         # Resolve it here, in the caller's context: run_in_executor does not carry contextvars,
         # so the executor callables below must never read tenant_context themselves.
         scoped_key = f"{self._scoped_key(key)}:lock"
+        operation = "acquire_fill_lock" if background_release else "acquire_lock"
         body_error: Optional[Exception] = None
         with _ClearedOnInterrupt():
             try:
@@ -633,16 +677,24 @@ class PerRequestRedisBackend:
                             "Redis lock already expired or taken over before release: %s", redact_error_for_log(e)
                         )  # nothing to orphan
                     except redis.RedisError as e:
-                        logger.warning(
-                            "Redis lock release for %s failed (%s); the key lives until its TTL",
-                            redact_cache_key(key),
-                            redact_error_for_log(e),
-                        )
+                        _log_release_failure(key, e)
 
                 async def _release() -> None:
                     # Drained: a cancel landing while this still queues for a thread must not drop the release.
                     await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
 
+                def _release_detached() -> None:
+                    # On an executor thread nothing awaits, so every outcome ends here: anything left on the future
+                    # would reach asyncio's "exception was never retrieved" report with its traceback whole, and an
+                    # interrupt raised in the worker (a gevent.Timeout) mid-reconnect carries redis-py's auth_args.
+                    # Its frames are cleared first; it reaches no caller either way, so it is logged and dropped.
+                    try:
+                        with _ClearedOnInterrupt():
+                            _release_sync()
+                    except BaseException as e:
+                        _log_release_failure(key, e)
+
+                first_attempt = True
                 while True:
                     # Drained: a cancel cannot stop the thread's SET NX from winning, only hide that it did.
                     attempt = loop.run_in_executor(None, functools.partial(lock.acquire, blocking=False, token=token))
@@ -653,9 +705,10 @@ class PerRequestRedisBackend:
                         # have won; log it rather than let it mask the cancellation.
                         if (err := attempt.exception()) is not None:
                             logger.warning(
-                                "Redis lock attempt for %s failed (%s) while acquire_lock was being cancelled",
+                                "Redis lock attempt for %s failed (%s) while %s was being cancelled",
                                 redact_cache_key(key),
                                 redact_error_for_log(err),
+                                operation,
                             )
                         elif attempt.result():
                             await _release()
@@ -665,15 +718,29 @@ class PerRequestRedisBackend:
                     # would land past the deadline. blocking_timeout=None means a single attempt.
                     if acquired or deadline is None or loop.time() + lock.sleep > deadline:
                         break
+                    first_attempt = False
                     await asyncio.sleep(lock.sleep)
                 try:
-                    yield acquired
+                    yield acquired, acquired and first_attempt
                 except Exception as exc:
                     body_error = exc  # raised by the caller's code in the block, not by redis-py
                     raise
                 finally:
-                    # Release lock if acquired (also run in thread pool)
-                    if acquired:
+                    if acquired and background_release:
+                        try:
+                            loop.run_in_executor(None, _release_detached)  # not awaited: see acquire_fill_lock
+                        except RuntimeError as e:
+                            logger.debug(
+                                "Redis lock release for %s sent inline: the default executor refused it (%s)",
+                                redact_cache_key(key),
+                                redact_error_for_log(e),
+                            )
+                            # On the loop's thread: an interrupt propagates, its frames cleared by the enclosing guard.
+                            try:
+                                _release_sync()
+                            except Exception as exc:
+                                _log_release_failure(key, exc)
+                    elif acquired:
                         await _release()
                 return
             except Exception as exc:
@@ -686,7 +753,7 @@ class PerRequestRedisBackend:
                     )
                 # The block's own exception wins, even over a release that failed after it, and is kept whole.
                 failed = exc if body_error is None else body_error
-                error = classify_redis_error(failed, operation="acquire_lock", key=key, keep_exception=failed is body_error)
+                error = classify_redis_error(failed, operation=operation, key=key, keep_exception=failed is body_error)
             except BaseException:
                 # An interrupt or a cancel, whose frames the ``with`` clears as it leaves. A cancel during the release after
                 # the block raised: the block's exception, on whose traceback this frame is, must not stay in a local here.

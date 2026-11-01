@@ -80,8 +80,12 @@ async def _call(fn: Any, x: int) -> Any:
 
 
 def _redis_entry(client: Any, tenant: str) -> str:
-    """The one cache entry under ``tenant``'s prefix (the key registry also lives there)."""
-    [key] = [k.decode() if isinstance(k, bytes) else k for k in client.keys(f"t:{tenant}:ns:*")]
+    """The one cache entry under ``tenant``'s prefix (the key registry also lives there).
+
+    An async miss's fill lock is released in the background, so its ``:lock`` key can outlive the call briefly.
+    """
+    keys = (k.decode() if isinstance(k, bytes) else k for k in client.keys(f"t:{tenant}:ns:*"))
+    [key] = [k for k in keys if not k.endswith(":lock")]
     return key
 
 

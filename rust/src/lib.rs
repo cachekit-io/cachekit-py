@@ -18,6 +18,10 @@ pub use cachekit_core::{
 #[cfg(feature = "python")]
 pub mod python_bindings;
 
+// StandardSerializer's one-pass bounded MessagePack decode
+#[cfg(feature = "python")]
+pub mod msgpack_decode;
+
 // The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's
 // own tests run in the pure-Rust test build too.
 pub mod hit_counter;
@@ -25,6 +29,9 @@ pub mod hit_counter;
 // The decorator's memoised L1-only hit, answered without a lock (decorators/wrapper.py).
 #[cfg(feature = "python")]
 pub mod l1_hit;
+
+// The Memcached backend's node choice, byte-identical to pymemcache's (backends/memcached/hasher.py).
+pub mod rendezvous;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -60,6 +67,9 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(l1_hit::monotonic, m)?)?;
     m.add_function(wrap_pyfunction!(l1_hit::set_clock, m)?)?;
 
+    // The Memcached backend's rendezvous node choice (backends/memcached/hasher.py)
+    m.add_function(wrap_pyfunction!(rendezvous::rendezvous_node, m)?)?;
+
     // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the
     // bare "_rust_serializer", which breaks pickling back to a parent process otherwise.
@@ -78,6 +88,8 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_bindings::check_msgpack_structure_py,
         m
     )?)?;
+    // StandardSerializer's read decode: the walk above and msgpack.unpackb in one pass
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_standard_py, m)?)?;
     // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
     m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 

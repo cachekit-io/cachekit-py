@@ -25,15 +25,15 @@ from typing import Any, ClassVar, final
 
 import msgpack
 
-from cachekit._rust_serializer import ByteStorage
+from cachekit._rust_serializer import ByteStorage, unpackb_standard
 
 from .base import (
+    MSGPACK_MAX_NESTING,
     PAYLOAD_DECODE_ERRORS,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
     immutable_buffer,
-    unpackb_bounded,
 )
 
 # Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
@@ -50,50 +50,22 @@ _CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but th
 
 @final  # the read paths test `type(data) is VerifiedMsgpack`
 class VerifiedMsgpack:
-    """MessagePack a successful ``ByteStorage.retrieve()`` returned and the structure walk
-    (``check_msgpack_structure``) passed, which an L1 entry holds in place of its envelope
-    (``CacheSerializationHandler.deserialize_l1``). It decodes without another retrieve() or walk, and
-    without the object hook when ``hook`` is False (:func:`_may_hold_marker`).
+    """MessagePack a successful ``ByteStorage.retrieve()`` returned and a decode in this process accepted,
+    which an L1 entry holds in place of its envelope (``CacheSerializationHandler.deserialize_l1``). It decodes
+    without another retrieve().
 
-    The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never take
-    the unverified decode, whatever they hold. It holds retrieve()'s own bytes object rather than
+    The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never skip
+    retrieve(), whatever they hold. It holds retrieve()'s own bytes object rather than
     copying it into a bytes subclass, and its length is theirs, which L1 accounts.
     """
 
-    __slots__ = ("data", "hook")
+    __slots__ = ("data",)
 
-    def __init__(self, data: bytes, hook: bool) -> None:
+    def __init__(self, data: bytes) -> None:
         self.data = data
-        self.hook = hook
 
     def __len__(self) -> int:
         return len(self.data)
-
-
-@final  # the read paths test `type(data) is WalkedEnvelope`
-class WalkedEnvelope:
-    """A plaintext envelope frame whose MessagePack a decode in this process verified and walked, as
-    :class:`VerifiedMsgpack` is, which an L1 entry holds in place of its frame bytes when the MessagePack is
-    longer than the frame. It decodes with retrieve() but without the walk, and without the object hook when
-    ``hook`` is False.
-
-    The walk's answer cannot change: the frame is an immutable bytes object and retrieve() is deterministic.
-    Marked by its type for the reason VerifiedMsgpack is. Its length is the frame's, so swapping it in for the
-    frame leaves L1's accounting unchanged.
-    """
-
-    __slots__ = ("frame", "hook")
-
-    def __init__(self, frame: bytes, hook: bool) -> None:
-        self.frame = frame
-        self.hook = hook
-
-    def __len__(self) -> int:
-        return len(self.frame)
-
-
-#: An L1 entry a hit swapped in for the envelope it decoded (``CacheSerializationHandler.deserialize_l1``).
-KeptEntry = VerifiedMsgpack | WalkedEnvelope
 
 
 # Error message constants for unsupported types (Task 2)
@@ -207,10 +179,10 @@ def _standard_object_hook(obj: Any) -> Any:
     Returns:
         Restored Python object or original obj if not a datetime marker
     """
-    # msgpack calls this once per decoded map. Every marker has exactly two keys (sentinel and
-    # value, as _standard_default writes them), so the length check returns any other map without
-    # the .get() calls. Keep it inline: a wrapper call costs more than it saves on text-heavy values.
-    # AutoSerializer's hook must not copy it: its set and ndarray markers have 3 and 4 keys.
+    # The Rust decode (unpackb_standard) calls this only for a map holding a marker key: any other map
+    # it would return unchanged, as each marker test reads its key with .get(). Every marker has exactly
+    # two keys (sentinel and value, as _standard_default writes them), so a look-alike map with more
+    # comes back unchanged. AutoSerializer's hook must not copy it: its set and ndarray markers have 3 and 4 keys.
     if isinstance(obj, dict) and len(obj) == 2:
         if obj.get("__datetime__"):
             value = obj.get("value")
@@ -229,24 +201,6 @@ def _standard_object_hook(obj: Any) -> Any:
             return time.fromisoformat(value)
 
     return obj
-
-
-def _may_hold_marker(msgpack_data: bytes) -> bool:
-    """Whether a MessagePack document may hold a map :func:`_standard_object_hook` acts on.
-
-    False only when no marker key's UTF-8 (``__datetime__``, ``__date__``, ``__time__``) occurs anywhere
-    in it. A str decodes from its bytes verbatim, so such a document has no marker key at any depth, the
-    hook returns every map it is given unchanged, and the decode without the hook is the same value. Any
-    other document, a value that merely mentions a marker key included, keeps the hook.
-
-    Examples:
-        >>> from datetime import date
-        >>> _may_hold_marker(msgpack.packb({"user": "ada"})), _may_hold_marker(msgpack.packb({"__time__": 1}))
-        (False, True)
-        >>> _may_hold_marker(msgpack.packb(date(2024, 1, 15), default=_standard_default))
-        True
-    """
-    return b"__date" in msgpack_data or b"__time__" in msgpack_data  # "__date" covers "__datetime__" too
 
 
 class StandardSerializer:
@@ -344,13 +298,6 @@ class StandardSerializer:
             "strict_types": False,  # Allow mixed types (more flexible)
             "default": _standard_default,  # Handle datetime/date/time
         }
-        self._msgpack_unpack_opts = {
-            "use_list": True,  # Decode arrays as lists (not tuples)
-            "raw": False,  # Decode strings properly (not bytes)
-            "object_hook": _standard_object_hook,  # Restore datetime/date/time
-        }
-        # For MessagePack _may_hold_marker cleared: the hook would return every map unchanged.
-        self._msgpack_unpack_opts_hookless = {k: v for k, v in self._msgpack_unpack_opts.items() if k != "object_hook"}
 
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:
         """Serialize object to pure MessagePack bytes with optional ByteStorage wrapper.
@@ -442,12 +389,12 @@ class StandardSerializer:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
                 msgpack_data, _ = self._byte_storage.retrieve(data)
-                return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+                return unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
             # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
             if metadata is not None and metadata.compressed:
                 raise SerializationError(_CROSS_CONFIG_ERROR)
             data = immutable_buffer(data)  # the decode and the envelope probe must judge one snapshot
-            value = unpackb_bounded(data, **self._msgpack_unpack_opts)
+            value = unpackb_standard(data, MSGPACK_MAX_NESTING, _standard_object_hook)
             # A decrypted read probes only the legacy layout. The AAD binds compressed, and the one writer
             # that sealed an envelope under compressed=False (AutoSerializer before 0.12.0) predates bin.
             decrypted = metadata is not None and metadata.encrypted
@@ -463,47 +410,31 @@ class StandardSerializer:
 
     def _deserialize_keeping_msgpack(self, data: bytes | memoryview) -> tuple[Any, VerifiedMsgpack]:
         """What :meth:`deserialize` returns for a ByteStorage envelope when integrity checking is on, plus the
-        MessagePack ``retrieve()`` verified and this decode walked, with whether it may hold a marker map, for the
-        caller to keep and decode later without the walk (:meth:`_deserialize_verified`,
-        :meth:`_deserialize_walked`). It always unwraps the envelope, so call it only for an integrity-on
-        serializer. Raises SerializationError as deserialize does then.
+        MessagePack ``retrieve()`` verified and this decode accepted, for the caller to keep and decode later
+        without retrieve() (:meth:`_deserialize_verified`). It always unwraps the envelope, so call it only for
+        an integrity-on serializer. Raises SerializationError as deserialize does then.
 
         Examples:
             >>> serializer = StandardSerializer()
             >>> envelope, _ = serializer.serialize({"test": 123})
             >>> value, kept = serializer._deserialize_keeping_msgpack(envelope)
-            >>> value, kept.hook, serializer._deserialize_verified(kept.data, kept.hook)
-            ({'test': 123}, False, {'test': 123})
+            >>> value, serializer._deserialize_verified(kept.data)
+            ({'test': 123}, {'test': 123})
         """
         try:
             msgpack_data, _ = self._byte_storage.retrieve(data)
-            value = unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+            value = unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
-        return value, VerifiedMsgpack(msgpack_data, _may_hold_marker(msgpack_data))
+        return value, VerifiedMsgpack(msgpack_data)
 
-    def _deserialize_verified(self, msgpack_data: bytes, hook: bool) -> Any:
-        """Decode MessagePack a decode in this process already verified and walked (:meth:`_deserialize_keeping_msgpack`):
-        no retrieve(), no walk, and no object hook unless ``hook``. Raises SerializationError as deserialize does."""
-        # unpackb_bounded's caps, inline rather than through a shared helper: the extra call cost every walked
-        # decode about 2,000 instructions. test_kept_decodes_use_unpackb_bounded_caps pins the two together.
-        n = len(msgpack_data)
-        opts = self._msgpack_unpack_opts if hook else self._msgpack_unpack_opts_hookless
+    def _deserialize_verified(self, msgpack_data: bytes) -> Any:
+        """Decode MessagePack a decode in this process already verified (:meth:`_deserialize_keeping_msgpack`),
+        without retrieve(). Raises SerializationError as deserialize does."""
         try:
-            return msgpack.unpackb(
-                msgpack_data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **opts
-            )
+            return unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
-
-    def _deserialize_walked(self, data: bytes | memoryview, hook: bool) -> Any:
-        """:meth:`_deserialize_verified` for the envelope whose MessagePack :meth:`_deserialize_keeping_msgpack`
-        walked, with retrieve() run again. Raises SerializationError as deserialize does."""
-        try:
-            msgpack_data, _ = self._byte_storage.retrieve(data)
-        except PAYLOAD_DECODE_ERRORS as e:
-            raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
-        return self._deserialize_verified(msgpack_data, hook)
 
     def _is_verified_envelope(self, data: bytes | memoryview, value: Any, markers: frozenset[int]) -> bool:
         """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope whose payload marker

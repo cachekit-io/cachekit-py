@@ -67,6 +67,7 @@ from ..serializers.encryption_wrapper import (
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
+from .orchestrator import logger as _operation_logger
 from .single_flight import AsyncFlights, ThreadFlights
 from .stats_context import reset_current_function_stats, set_current_function_stats
 from .tenant_context import TenantContextExtractor
@@ -78,7 +79,7 @@ if TYPE_CHECKING:
 
     from ..backends.base import BaseBackend, LockableBackend
     from ..serializers.base import SerializerProtocol
-    from ..serializers.standard_serializer import KeptEntry
+    from ..serializers.standard_serializer import VerifiedMsgpack
 
 
 def _resolve_lazy_backend() -> BaseBackend:
@@ -807,7 +808,8 @@ def create_cache_wrapper(
         backpressure_limits = {"queue_size": config.backpressure.queue_size, "timeout": config.backpressure.timeout}
 
         # Monitoring settings
-        collect_stats = config.monitoring.collect_stats
+        # Either flag off stops the cache-operation Prometheus series: no collector is built (cache_info() still counts)
+        collect_stats = config.monitoring.collect_stats and config.monitoring.enable_prometheus_metrics
         enable_structured_logging = config.monitoring.enable_structured_logging
 
         # Encryption settings
@@ -1085,7 +1087,7 @@ def create_cache_wrapper(
     # applies only when this namespace's cache is first created — namespaces share one
     # L1Cache, so give functions with distinct budgets distinct namespaces (issue #163).
     _l1_cache = get_l1_cache(namespace or "default", max_size_mb=l1_max_size_mb) if l1_enabled else None
-    # Whether an L1 hit may swap its entry for one marked as walked (deserialize_l1). Every other handler's
+    # Whether an L1 hit may swap its entry for its verified MessagePack (deserialize_l1). Every other handler's
     # hit decodes exactly as before, at no extra cost.
     _l1_keeps_msgpack = serialization_handler.keeps_msgpack_in_l1
 
@@ -1836,13 +1838,13 @@ def create_cache_wrapper(
             return None
 
     def _decode_shared(
-        entry: bytes | KeptEntry | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        entry: bytes | VerifiedMsgpack | None, cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[bool, Any]:
         """A joined backed-mode caller's own copy of the trip's envelope, or of the L1 entry the re-check
-        found (which may be a KeptEntry), decoded as an L1 hit would be: every caller gets its own
+        found (which may be a VerifiedMsgpack), decoded as an L1 hit would be: every caller gets its own
         object, and the decrypt checks bind to this caller's tenant. It never swaps the L1 entry, so
         bytes go to deserialize_data, which decodes them as deserialize_l1 does without building a
-        KeptEntry for it to discard.
+        VerifiedMsgpack for it to discard.
 
         (False, None) when there is no entry or it does not decode for this caller, who then takes
         its own trip, unshared: its probe slot went back on joining, so it is admitted afresh.
@@ -2066,8 +2068,9 @@ def create_cache_wrapper(
 
     def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:  # noqa: PLR0912
         """sync_wrapper's call past its lock-free hit."""
-        # SET stats context before any backend operations
-        token = set_current_function_stats(_stats)
+        # The stats context is set below the backed L1 hit: its only reader is the CachekitIO request, and
+        # nothing above it reaches the backend. None until then, so a call that ends earlier resets nothing.
+        token = None
 
         try:
             # Key generation - needed for both L1-only and L1+L2 modes
@@ -2181,7 +2184,7 @@ def create_cache_wrapper(
                             l1_value, l1_kept = operation_handler.serialization_handler.deserialize_l1(
                                 l1_bytes, cache_key, args, kwargs
                             )
-                            if l1_kept is not None:  # walked and marked: later hits skip the walk (deserialize_l1)
+                            if l1_kept is not None:  # verified and kept: later hits skip retrieve() (deserialize_l1)
                                 _l1_cache.shrink_if_held(cache_key, l1_bytes, l1_kept)
                         else:  # as before; a swapped entry fails: SuspiciousCacheEntryError if encrypted, else a corrupt frame
                             l1_value = operation_handler.serialization_handler.deserialize_data(
@@ -2203,15 +2206,18 @@ def create_cache_wrapper(
                                 size_bytes=len(l1_bytes),
                             )
 
-                        features.log_cache_operation(
-                            operation="l1_get",
-                            key=cache_key,
-                            namespace=namespace or "default",
-                            serializer="l1_memory",
-                            duration_ms=l1_duration_ms,
-                            hit=True,
-                            ttl=ttl,
-                        )
+                        # The callee's own guard, checked here first: at the default WARNING level the hit
+                        # skips building seven kwargs for a record nobody writes.
+                        if _operation_logger.isEnabledFor(logging.INFO):
+                            features.log_cache_operation(
+                                operation="l1_get",
+                                key=cache_key,
+                                namespace=namespace or "default",
+                                serializer="l1_memory",
+                                duration_ms=l1_duration_ms,
+                                hit=True,
+                                ttl=ttl,
+                            )
 
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
@@ -2259,6 +2265,8 @@ def create_cache_wrapper(
             # outside the try below on purpose: that except records a failure, and a
             # rejection is not one. Recorded, every rejected call would push the OPEN
             # window forward and reopen HALF_OPEN, so the breaker never recovers.
+            # The stats context first: every backend request from here on carries this function's stats.
+            token = set_current_function_stats(_stats)
             probe_cycle = features.admit()  # None when rejected; 0 is an admission too
             if probe_cycle is None:
                 _log_breaker_rejection(cache_key)
@@ -2299,10 +2307,11 @@ def create_cache_wrapper(
             return _sync_shared_miss(cache_key, args, kwargs, probe_cycle, twin_key)
 
         finally:
-            # The one reset, as in async_wrapper: every exit restores the caller's context here,
-            # an interrupt included, which no `except Exception` above sees. A token resets once:
+            # The one reset, as in async_wrapper: every exit past the set restores the caller's context
+            # here, an interrupt included, which no `except Exception` above sees. A token resets once:
             # a second reset raises RuntimeError, so no path may also reset by hand.
-            reset_current_function_stats(token)
+            if token is not None:
+                reset_current_function_stats(token)
 
     def _sync_shared_miss(
         cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any], probe_cycle: int, twin_key: str | None
@@ -2343,9 +2352,9 @@ def create_cache_wrapper(
         decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
         return value if decoded else _own_trip_sync(cache_key, args, kwargs, twin_key)[0]
 
-    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | KeptEntry | None]]:
+    def _peek_l1(cache_key: str) -> tuple[bool, tuple[None, bytes | VerifiedMsgpack | None]]:
         """The sync backed flight's re-check (ThreadFlights.run): the L1 entry a trip that settled since
-        the caller's own L1 lookup left (its envelope, or the KeptEntry a hit swapped in), for a joined
+        the caller's own L1 lookup left (its envelope, or the VerifiedMsgpack a hit swapped in), for a joined
         caller to decode. Never an L2 read: it runs under the flight map's lock."""
         assert _l1_cache is not None  # noqa: S101 - passed only with L1 on
         entry = _l1_cache.peek(cache_key)
@@ -2577,8 +2586,7 @@ def create_cache_wrapper(
 
     async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         """async_wrapper's call past its lock-free hit."""
-        # SET stats context before any backend operations
-        token = set_current_function_stats(_stats)
+        token = None  # the stats context is set below the backed L1 hit, as in _sync_call
 
         try:
             # Get cache key early for consistent usage - note this may fail for complex types
@@ -2735,7 +2743,8 @@ def create_cache_wrapper(
             # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
-            # The outer finally resets the stats context.
+            # The stats context first, as in _sync_call; the outer finally resets it.
+            token = set_current_function_stats(_stats)
             probe_cycle = features.admit()  # None when rejected; 0 is an admission too
             if probe_cycle is None:
                 _log_breaker_rejection(cache_key)
@@ -2803,8 +2812,9 @@ def create_cache_wrapper(
             decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
             return value if decoded else (await _own_trip(cache_key, args, kwargs, twin_key))[0]
         finally:
-            # ALWAYS reset stats context, even on exception
-            reset_current_function_stats(token)
+            # ALWAYS reset a set stats context, even on exception
+            if token is not None:
+                reset_current_function_stats(token)
 
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:

@@ -76,6 +76,8 @@ class MemcachedBackend:
         """
         from pymemcache.client.hash import HashClient
 
+        from cachekit.backends.memcached.hasher import NativeRendezvousHash
+
         self._config = config or MemcachedBackendConfig.from_env()
         servers = [_parse_server(s) for s in self._config.servers]
 
@@ -89,6 +91,8 @@ class MemcachedBackend:
             use_pooling=True,
             max_pool_size=self._config.max_pool_size,
             retry_attempts=self._config.retry_attempts,
+            # pymemcache's own server choice, without its pure-Python murmur3 on every command.
+            hasher=NativeRendezvousHash,
         )
         self._key_prefix = self._config.key_prefix
 

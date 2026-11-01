@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import threading
 import time
+from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 
-from cachekit.l1_cache import L1Cache
+from cachekit import l1_cache
+from cachekit.l1_cache import _INVALIDATE_BATCH, L1Cache
 
 from .stats_utils import report
 
@@ -216,3 +219,94 @@ def test_l1_cache_mixed_workload_hit_counts(record_property) -> None:
 
     # Every key in the 19-of-20 slots is stored, every other key never was.
     assert (len(hit_latencies), len(miss_latencies)) == (total_iterations * 19 // 20, total_iterations // 20)
+
+
+@pytest.mark.performance
+@pytest.mark.parametrize(
+    ("live", "dead", "expired"),
+    [
+        pytest.param(0, 0, 100_000, id="100k-expired"),
+        pytest.param(100_000, 150_000, 0, id="100k-live-150k-dead"),
+        pytest.param(100_000, 600_000, 0, id="100k-live-600k-dead"),
+    ],
+)
+def test_l1_expiry_sweep_lock_holds(record_property, live: int, dead: int, expired: int) -> None:
+    """Time each lock hold of a sweep, and how long a reader thread waits between its gets meanwhile.
+
+    The expired entries share one deadline, the costliest heap order: ties compare keys. The dead
+    cases leave invalidated keys' tuples in the heap, so the sweep compacts it. Holds are timed in
+    thread CPU time, so a loaded host's descheduling does not count as lock work. The reader's gap is
+    wall time from one get's start to the next: it includes waiting for the GIL, not only the lock,
+    so freeing a large list in one go shows up there.
+    """
+    cache = L1Cache(max_memory_mb=1024, ttl_buffer_seconds=0)
+    deadline = time.time() + 0.5
+    # put drops an entry already due, so a fill slower than 0.5 s would store fewer than `expired`.
+    # Hold L1's clock before the deadline for the fill, so every put stores whatever the host's speed.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(l1_cache, "time", SimpleNamespace(time=lambda: deadline - 0.5, sleep=time.sleep))
+        for i in range(expired):
+            cache.put(f"sweep:due:{i}", b"x", expires_at=deadline)
+    assert cache.get_stats()["entries"] == expired, "the fill stored fewer due entries than it put"
+    for i in range(live):
+        cache.put(f"sweep:live:{i}", b"x", redis_ttl=3600)
+    for i in range(dead):
+        cache.put(f"sweep:gone:{i}", b"x", redis_ttl=3600)
+    cache.invalidate_many(f"sweep:gone:{i}" for i in range(dead))
+    cache.put("sweep:hot", b"h", redis_ttl=3600)
+    time.sleep(max(0.0, deadline - time.time()))
+
+    state = cache._state
+    inner, holds, sweeper = state.lock, [], threading.get_ident()
+
+    class TimedLock:
+        depth = 0
+
+        def __enter__(self):
+            inner.acquire()
+            if threading.get_ident() == sweeper:
+                self.depth += 1
+                if self.depth == 1:
+                    self.start = time.thread_time_ns()
+            return self
+
+        def __exit__(self, *exc):
+            if threading.get_ident() == sweeper:
+                self.depth -= 1
+                if self.depth == 0:
+                    holds.append(time.thread_time_ns() - self.start)
+            inner.release()
+
+    state.lock = TimedLock()
+    starts: list[int] = []
+    done = threading.Event()
+
+    def reader() -> None:
+        while not done.is_set():
+            starts.append(time.perf_counter_ns())
+            assert cache.get("sweep:hot") == (True, b"h")
+            time.sleep(0)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        begin = time.perf_counter_ns()
+        removed = cache.cleanup_expired()
+        end = time.perf_counter_ns()
+        time.sleep(0.05)
+    finally:
+        done.set()
+        thread.join()
+
+    gaps = [b - a for a, b in pairwise(starts) if b >= begin and a <= end]
+    label = f"{live:,} live, {dead:,} dead, {expired:,} expired"
+    report(record_property, f"L1 sweep lock hold ({label})", holds, "hold_")
+    report(record_property, "L1 reader gap during the sweep", gaps, "gap_")
+    print(f"max hold {max(holds) / 1e6:.3f} ms over {len(holds)} holds; max reader gap {max(gaps) / 1e6:.3f} ms")
+    record_property("hold_max_ns", max(holds))
+    record_property("gap_max_ns", max(gaps))
+
+    assert removed == expired
+    assert len(cache._state.expiry) == live + 1  # compacted to one tuple per entry, or never needed it
+    assert len(holds) >= (expired + live + dead) // _INVALIDATE_BATCH  # batched: no hold covers the cache

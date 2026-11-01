@@ -93,14 +93,18 @@ class _FailingEIOEntry(_FailingStatEntry):
         raise OSError(errno.EIO, "I/O error")
 
 
-def _scandir_failing_stat_on(monkeypatch: pytest.MonkeyPatch, nth: int) -> None:
-    """Make the nth entry of every os.scandir listing fail its stat()."""
+def _scandir_failing_stat_on(monkeypatch: pytest.MonkeyPatch, failing: str) -> None:
+    """Make the stat() of the entry at path `failing` fail in every os.scandir listing.
+
+    Named by path, not listing position: listing order varies by filesystem, so a position can land
+    on a different file from one host to the next.
+    """
     real_scandir = os.scandir
 
     class _Listing:
         def __init__(self, path: Any) -> None:
             with real_scandir(path) as it:
-                self._entries = [_FailingStatEntry(e) if i == nth else e for i, e in enumerate(it, 1)]
+                self._entries = [_FailingStatEntry(e) if Path(e.path) == Path(failing) else e for e in it]
 
         def __enter__(self) -> list[Any]:
             return self._entries
@@ -1306,8 +1310,9 @@ class TestEvictionErrorPaths:
             # tie would let eviction pick the trigger entry itself.
             os.utime(backend._key_to_path(f"key_{i}"), (base + i, base + i))
 
-        # Fail the stat of the second file during eviction collection (concurrent deletion)
-        _scandir_failing_stat_on(monkeypatch, 2)
+        # Fail the stat of one pre-filled file during eviction collection (concurrent deletion). Never the
+        # trigger file: with it unseen the visible total stays under the 90% trigger and nothing evicts.
+        _scandir_failing_stat_on(monkeypatch, backend._key_to_path("key_1"))
 
         # Trigger eviction (should handle ENOENT gracefully)
         backend.set("trigger_eviction", b"y" * 500_000)  # Should trigger eviction
@@ -1870,8 +1875,8 @@ class TestCalculateCacheSizeEdgeCases:
         backend.set("key1", b"value1")
         backend.set("key2", b"value2")
 
-        # Fail the stat of the second file
-        _scandir_failing_stat_on(monkeypatch, 2)
+        # Fail the stat of key2's file
+        _scandir_failing_stat_on(monkeypatch, backend._key_to_path("key2"))
 
         size_mb, count = backend._calculate_cache_size()
         # Should count only the file that didn't fail
