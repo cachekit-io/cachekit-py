@@ -276,8 +276,9 @@ def cachekit_label() -> str:
 
         try:
             commit = git_out("rev-parse", "--short=8", "HEAD")
-            # Untracked files count: an editable install imports a new module before it is added.
-            changes = git_out("status", "--porcelain", "--", "src", "rust")
+            # Untracked files count, whatever status.showUntrackedFiles says: an editable install
+            # imports a new module before it is added.
+            changes = git_out("status", "--porcelain", "--untracked-files=normal", "--", "src", "rust")
         except (OSError, subprocess.SubprocessError):
             pass  # not a git checkout: refused below
         else:

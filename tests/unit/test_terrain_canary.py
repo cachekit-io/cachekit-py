@@ -43,7 +43,7 @@ def fake_git(status: str = "", fail: bool = False) -> Callable[..., subprocess.C
         if argv[3] == "rev-parse":
             return subprocess.CompletedProcess(argv, 0, stdout=COMMIT[:8] + "\n", stderr="")
         # Untracked files count, and only the package's own sources: stray output elsewhere is not dirt.
-        assert argv[3:] == ["status", "--porcelain", "--", "src", "rust"], argv
+        assert argv[3:] == ["status", "--porcelain", "--untracked-files=normal", "--", "src", "rust"], argv
         return subprocess.CompletedProcess(argv, 0, stdout=status, stderr="")
 
     return run
