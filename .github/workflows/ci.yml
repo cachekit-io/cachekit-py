@@ -552,9 +552,17 @@ jobs:
       with:
         key: perf-ir
 
+    # A stalled mirror once held `apt-get update` for the job's whole 30 minutes, and apt's own timeouts never
+    # fired. A healthy update takes under 30 s, so each attempt gets 60 s and one retry. The install has only the
+    # step timeout: on a slow mirror it has spent up to 4 minutes downloading valgrind and still succeeded.
     - name: Install valgrind
+      timeout-minutes: 5
       run: |
-        sudo apt-get update -q
+        for attempt in 1 2; do
+          sudo timeout -k 10 60 apt-get update -q && break
+          echo "::warning::apt-get update attempt $attempt exited $? (124 or 137: stopped at the 60 s bound)"
+          [ "$attempt" -lt 2 ] || exit 1
+        done
         sudo apt-get install -y -q --no-install-recommends valgrind
         valgrind --version
 
