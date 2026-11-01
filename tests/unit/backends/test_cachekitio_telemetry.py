@@ -27,7 +27,6 @@ from cachekit.decorators.l1_latency import (
     ONE_IN_HEADER,
     SUM_HEADER,
     L1LatencyReport,
-    bucket_index,
 )
 from cachekit.decorators.wrapper import _FunctionStats, _latency_report_of
 from tests.utils.cachekitio_fakes import TEST_API_KEY, FakePool, FakeRequest, fake_backend, response
@@ -371,20 +370,23 @@ class TestClock:
 
 class TestReports:
     @pytest.mark.parametrize("hooks", ["with at-fork hooks", "without (uWSGI)"])
-    def test_api83_a_forked_child_starts_empty(self, hooks: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        if hooks.startswith("without"):
-            monkeypatch.setattr(l1_latency, "_empty_reports_in_child", lambda: None)  # the hook runs, doing nothing
+    def test_api83_a_forked_child_starts_empty(self, hooks: str) -> None:
         report = L1LatencyReport()
+        if hooks.startswith("without"):
+            # The registered hook walks _REPORTS: a report not in it is never emptied by the hook, as under uWSGI.
+            l1_latency._REPORTS.discard(report)
         report.add(500)
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - child
             os.close(r)
+            hook_ran = report._state.pid == os.getpid()
             first = report.take()
             report.add(700)
-            report_to_parent(w, (first, report.take()))
+            report_to_parent(w, (hook_ran, first, report.take()))
         os.close(w)
-        first, second = child_outcome(pid, r)  # type: ignore[misc]
+        hook_ran, first, second = child_outcome(pid, r)  # type: ignore[misc]
+        assert hook_ran is hooks.startswith("with ")  # the bypass is real: the PID check did the emptying
         assert first is None
         assert second == {BUCKETS_HEADER: "0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0", SUM_HEADER: "700", ONE_IN_HEADER: str(ONE_IN)}
         taken = report.take()  # the parent's hit is still the parent's
@@ -397,30 +399,46 @@ class TestReports:
         report.add(200)
         assert report.take() is not None
 
-    def test_api83_racing_first_uses_in_a_child_never_take_the_parents_hits(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Child threads that all reach the inherited state at once each see its PID and build their own; none
-        reads or empties the parent's state, which keeps its hit untouched."""
+    def test_api83_racing_first_uses_in_a_hookless_child_keep_every_hit(self) -> None:
+        """Child threads that reach the inherited state at once agree on one new state: the parent's hit is never
+        sent, and no child hit is lost to another thread's replacement. _State construction is slowed so that every
+        thread is inside the replacement at once, the schedule that lost hits when each built its own."""
         report = L1LatencyReport()
+        l1_latency._REPORTS.discard(report)  # the hook never empties it: a fork that skips Python's hooks
         report.add(12_345)
-        inherited = report._state
-        monkeypatch.setattr(l1_latency.os, "getpid", lambda: -1)
-        barrier = threading.Barrier(8)
-        taken: list[dict[str, str] | None] = []
+        threads_n, hit_ns = 8, 700
+        real_init = l1_latency._State.__init__
 
-        def first_use() -> None:
-            barrier.wait()
-            report.add(700)
-            taken.append(report.take())
+        def slow_init(state: object) -> None:
+            real_init(state)  # type: ignore[arg-type]
+            time.sleep(0.02)
 
-        threads = [threading.Thread(target=first_use) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        assert all(t is None or t["X-CacheKit-L1-Latency-Sum-Ns"] != "12345" for t in taken)
-        sums = [int(t["X-CacheKit-L1-Latency-Sum-Ns"]) for t in taken if t is not None]
-        assert all(s % 700 == 0 for s in sums)  # only child hits, never the parent's 12,345 ns
-        assert inherited.sum == 12_345 and inherited.buckets[bucket_index(12_345)] == 1
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - child
+            os.close(r)
+            l1_latency._State.__init__ = slow_init  # type: ignore[method-assign]
+            barrier = threading.Barrier(threads_n)
+
+            def first_use() -> None:
+                barrier.wait()
+                report.add(hit_ns)
+
+            workers = [threading.Thread(target=first_use) for _ in range(threads_n)]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join()
+            report_to_parent(w, report.take())
+        os.close(w)
+        taken = child_outcome(pid, r)
+        assert taken == {
+            BUCKETS_HEADER: f"0,0,0,{threads_n},0,0,0,0,0,0,0,0,0,0,0,0",
+            SUM_HEADER: str(threads_n * hit_ns),
+            ONE_IN_HEADER: str(ONE_IN),
+        }
+        parent = report.take()
+        assert parent is not None and parent[SUM_HEADER] == "12345"
 
     def test_a_zero_sum_report_is_not_attached_and_stays(self) -> None:
         report = L1LatencyReport()

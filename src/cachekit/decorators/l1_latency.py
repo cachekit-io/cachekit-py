@@ -68,6 +68,15 @@ def _empty_reports_in_child() -> None:
         report._empty_in_child()  # pyright: ignore[reportPrivateUsage]
 
 
+# One lock per process, for replacing an inherited state. dict.setdefault is atomic, so every thread of a process
+# gets the same lock, and a child never uses one its parent's threads could hold.
+_REPLACEMENT_LOCKS: dict[int, threading.Lock] = {}
+
+
+def _replacement_lock(pid: int) -> threading.Lock:
+    return _REPLACEMENT_LOCKS.setdefault(pid, threading.Lock())
+
+
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_empty_reports_in_child)
 
@@ -80,9 +89,8 @@ class L1LatencyReport:
     report a new state before the child's own threads run. A fork that skips Python's hooks (uWSGI) is caught by
     the PID check on each use instead. The child never touches the parent's state, whose lock a parent thread may
     have held at the fork: it builds a complete new state and publishes it with one assignment, so a thread sees
-    either the inherited state, whose PID sends it to build its own, or a new empty one. Without the hook, two child
-    threads racing their first use may each build one; the hits counted into the one overwritten are lost, never the
-    parent's sent, and each state's buckets and sum change only under its own lock.
+    either the inherited state, whose PID sends it to build its own, or a new empty one. Without the hook, child
+    threads racing their first use build that state once, under a lock of the child's own.
 
     Examples:
         >>> report = L1LatencyReport()
@@ -105,9 +113,16 @@ class L1LatencyReport:
 
     def _current(self) -> _State:
         state = self._state
-        if state.pid != os.getpid():
-            state = _State()
-            self._state = state
+        pid = os.getpid()
+        if state.pid != pid:
+            # A fork that skipped the hook: threads racing their first use agree on one new state, so none
+            # discards hits another already counted into its own. The lock is this process's own, never one
+            # inherited from the parent, which a parent thread may have held at the fork.
+            with _replacement_lock(pid):
+                state = self._state
+                if state.pid != pid:
+                    state = _State()
+                    self._state = state
         return state
 
     @staticmethod
