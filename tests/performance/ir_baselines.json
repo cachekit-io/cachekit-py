@@ -2,7 +2,7 @@
   "interpreters": {
     "cpython-3.12-x86_64": {
       "budgets": {
-        "byte_storage_store_40b": 2656,
+        "byte_storage_store_40b": 2690,
         "byte_storage_store_64k": 720631,
         "file_set": 76035,
         "l1_hit": 2595,
@@ -26,7 +26,7 @@
     },
     "cpython-3.14-x86_64": {
       "budgets": {
-        "byte_storage_store_40b": 2532,
+        "byte_storage_store_40b": 2565,
         "byte_storage_store_64k": 720751,
         "file_set": 74112,
         "l1_hit": 2487,

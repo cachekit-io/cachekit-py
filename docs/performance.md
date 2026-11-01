@@ -334,7 +334,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,781,406 | 61,324,948 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,793,577 | 61,344,459 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 89,289 | 90,918 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,656 | 2,532 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,690 | 2,565 |
 | `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,631 | 720,751 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 76,035 | 74,112 |
 | `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,014 | 160,608 |
