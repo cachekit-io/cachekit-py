@@ -58,8 +58,8 @@ _logger = logging.getLogger(__name__)
 
 MAX_WORKERS = 4
 # How long a thread with nothing to send waits for the next write. A miss that finds one waiting starts no
-# thread, which saves it ~55 µs; misses further apart than this pay that once each, noise next to the gap.
-# Longer only keeps idle threads around.
+# thread; misses further apart than this pay one thread start each, which is noise next to the gap between
+# them. Longer only keeps idle threads around.
 IDLE_S = 1.0
 # Waiting threads per process, across every writer: two writers' full set of MAX_WORKERS, or eight hot
 # functions with one each. Past it a thread ends as soon as its queue is empty, which costs the next miss a
