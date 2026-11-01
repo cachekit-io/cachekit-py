@@ -12,7 +12,7 @@ import os
 import random
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
@@ -663,7 +663,7 @@ def _timed_call(call: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str
     return value
 
 
-async def _timed_call_async(call: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+async def _timed_call_async(call: Callable[..., Awaitable[_T]], args: tuple[Any, ...], kwargs: dict[str, Any]) -> _T:
     """``_timed_call`` for ``_async_call``. An L1 hit awaits nothing, so the record runs in the step that produced
     the value."""
     start = _perf_counter_ns()
