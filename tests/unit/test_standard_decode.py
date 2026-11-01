@@ -317,8 +317,8 @@ def _measure_leaks() -> list[int]:
     gc.collect()
     tracemalloc.start()
     sizes = []
-    for _ in range(4):
-        for _ in range(300):
+    for _ in range(LEAK_ROUNDS + 1):
+        for _ in range(LEAK_CALLS_PER_ROUND):
             every_path()
         gc.collect()
         sizes.append(tracemalloc.get_traced_memory()[0])
@@ -326,10 +326,20 @@ def _measure_leaks() -> list[int]:
     return sizes
 
 
+# A leak on any path keeps at least one object per call, and the smallest object (an int) is 28 bytes, so it adds at
+# least 500 * 28 = 13.7 KiB to EVERY round. The interpreter's own growth (caches, free lists, a dict resizing) comes
+# in a few one-off steps, and one such step can exceed any fixed budget on the total. So the gate bounds the quietest
+# of five rounds, which grows by under 1 KiB when nothing leaks.
+LEAK_ROUNDS = 5
+LEAK_CALLS_PER_ROUND = 500
+LEAK_ROUND_BUDGET = 8 * 1024
+
+
 def test_no_path_leaks_a_reference() -> None:
-    """A leaked reference keeps its object alive, so traced memory would climb with every round."""
+    """A leaked reference keeps its object alive, so traced memory would climb in every round."""
     sizes = measure_in_subprocess(_measure_leaks)
-    assert sizes[-1] - sizes[0] < 16 * 1024, sizes
+    rounds = [after - before for before, after in zip(sizes, sizes[1:], strict=False)]
+    assert min(rounds) < LEAK_ROUND_BUDGET, sizes
 
 
 def test_threads_decode_one_document_concurrently() -> None:
