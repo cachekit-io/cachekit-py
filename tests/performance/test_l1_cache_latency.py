@@ -10,9 +10,11 @@ from __future__ import annotations
 import threading
 import time
 from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 
+from cachekit import l1_cache
 from cachekit.l1_cache import _INVALIDATE_BATCH, L1Cache
 
 from .stats_utils import report
@@ -239,8 +241,13 @@ def test_l1_expiry_sweep_lock_holds(record_property, live: int, dead: int, expir
     """
     cache = L1Cache(max_memory_mb=1024, ttl_buffer_seconds=0)
     deadline = time.time() + 0.5
-    for i in range(expired):
-        cache.put(f"sweep:due:{i}", b"x", expires_at=deadline)
+    # put drops an entry already due, so a fill slower than 0.5 s would store fewer than `expired`.
+    # Hold L1's clock before the deadline for the fill, so every put stores whatever the host's speed.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(l1_cache, "time", SimpleNamespace(time=lambda: deadline - 0.5, sleep=time.sleep))
+        for i in range(expired):
+            cache.put(f"sweep:due:{i}", b"x", expires_at=deadline)
+    assert cache.get_stats()["entries"] == expired, "the fill stored fewer due entries than it put"
     for i in range(live):
         cache.put(f"sweep:live:{i}", b"x", redis_ttl=3600)
     for i in range(dead):

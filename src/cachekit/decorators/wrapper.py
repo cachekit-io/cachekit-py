@@ -68,6 +68,7 @@ from ..serializers.encryption_wrapper import (
 # Config import removed - using direct DecoratorConfig integration
 from .l1_latency import SAMPLE_BITS, L1LatencyReport, sampling_rng
 from .orchestrator import FeatureOrchestrator
+from .orchestrator import logger as _operation_logger
 from .single_flight import AsyncFlights, ThreadFlights
 from .stats_context import reset_current_function_stats, set_current_function_stats
 from .tenant_context import TenantContextExtractor
@@ -2114,8 +2115,9 @@ def create_cache_wrapper(
     def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any], served: list[L1LatencyReport | None] | None) -> Any:  # noqa: PLR0912
         """sync_wrapper's call past its lock-free hit. ``served`` is given when the call is timed (_timed_call):
         a backed-mode L1 hit appends the report its duration goes to."""
-        # SET stats context before any backend operations
-        token = set_current_function_stats(_stats)
+        # The stats context is set below the backed L1 hit: its only reader is the CachekitIO request, and
+        # nothing above it reaches the backend. None until then, so a call that ends earlier resets nothing.
+        token = None
 
         try:
             # Key generation - needed for both L1-only and L1+L2 modes
@@ -2251,15 +2253,18 @@ def create_cache_wrapper(
                                 size_bytes=len(l1_bytes),
                             )
 
-                        features.log_cache_operation(
-                            operation="l1_get",
-                            key=cache_key,
-                            namespace=namespace or "default",
-                            serializer="l1_memory",
-                            duration_ms=l1_duration_ms,
-                            hit=True,
-                            ttl=ttl,
-                        )
+                        # The callee's own guard, checked here first: at the default WARNING level the hit
+                        # skips building seven kwargs for a record nobody writes.
+                        if _operation_logger.isEnabledFor(logging.INFO):
+                            features.log_cache_operation(
+                                operation="l1_get",
+                                key=cache_key,
+                                namespace=namespace or "default",
+                                serializer="l1_memory",
+                                duration_ms=l1_duration_ms,
+                                hit=True,
+                                ttl=ttl,
+                            )
 
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
@@ -2309,6 +2314,8 @@ def create_cache_wrapper(
             # outside the try below on purpose: that except records a failure, and a
             # rejection is not one. Recorded, every rejected call would push the OPEN
             # window forward and reopen HALF_OPEN, so the breaker never recovers.
+            # The stats context first: every backend request from here on carries this function's stats.
+            token = set_current_function_stats(_stats)
             probe_cycle = features.admit()  # None when rejected; 0 is an admission too
             if probe_cycle is None:
                 _log_breaker_rejection(cache_key)
@@ -2349,10 +2356,11 @@ def create_cache_wrapper(
             return _sync_shared_miss(cache_key, args, kwargs, probe_cycle, twin_key)
 
         finally:
-            # The one reset, as in async_wrapper: every exit restores the caller's context here,
-            # an interrupt included, which no `except Exception` above sees. A token resets once:
+            # The one reset, as in async_wrapper: every exit past the set restores the caller's context
+            # here, an interrupt included, which no `except Exception` above sees. A token resets once:
             # a second reset raises RuntimeError, so no path may also reset by hand.
-            reset_current_function_stats(token)
+            if token is not None:
+                reset_current_function_stats(token)
 
     def _sync_shared_miss(
         cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any], probe_cycle: int, twin_key: str | None
@@ -2630,8 +2638,7 @@ def create_cache_wrapper(
 
     async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any], served: list[L1LatencyReport | None] | None) -> Any:
         """async_wrapper's call past its lock-free hit; ``served`` as in ``_sync_call``."""
-        # SET stats context before any backend operations
-        token = set_current_function_stats(_stats)
+        token = None  # the stats context is set below the backed L1 hit, as in _sync_call
 
         try:
             # Get cache key early for consistent usage - note this may fail for complex types
@@ -2790,7 +2797,8 @@ def create_cache_wrapper(
             # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
-            # The outer finally resets the stats context.
+            # The stats context first, as in _sync_call; the outer finally resets it.
+            token = set_current_function_stats(_stats)
             probe_cycle = features.admit()  # None when rejected; 0 is an admission too
             if probe_cycle is None:
                 _log_breaker_rejection(cache_key)
@@ -2858,8 +2866,9 @@ def create_cache_wrapper(
             decoded, value = _decode_shared(envelope, cache_key, args, kwargs)
             return value if decoded else (await _own_trip(cache_key, args, kwargs, twin_key))[0]
         finally:
-            # ALWAYS reset stats context, even on exception
-            reset_current_function_stats(token)
+            # ALWAYS reset a set stats context, even on exception
+            if token is not None:
+                reset_current_function_stats(token)
 
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:

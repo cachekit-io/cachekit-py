@@ -44,6 +44,20 @@ Run (from a checkout, after ``uv sync``, against a Redis you can write to)::
 The harness cannot tell from the URL (a tunnel or port-forward on localhost reaches a remote Redis),
 so it always asks.
 
+A recording you publish should measure a release. Install it into a fresh environment and run this
+file from the checkout with that environment's Python, so ``import cachekit`` finds the release::
+
+  uv venv --python 3.14 /tmp/terrain-env
+  uv pip install --python /tmp/terrain-env 'cachekit==<version>'
+  /tmp/terrain-env/bin/python tests/performance/terrain_canary.py --redis ...  # the flags above
+
+The recording names what it ran. It gives cachekit's version, plus the commit when cachekit was not
+installed from a package index (``cachekit_label``), because a checkout reports the last release's
+version until the next release bumps it. A checkout run cannot vouch that its compiled extension was
+rebuilt for that commit, which is another reason to publish only a release. It gives the Python and,
+on a free-threaded build, whether the GIL was on (``python_label``). It gives the CPU, which macOS
+names through ``sysctl``.
+
 The summary printed at the end gives each layer's share and its exact p50 and p99 from the raw
 samples; the histograms' own percentiles are only good to a bin (about 15%).
 """
@@ -52,18 +66,23 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.metadata
 import itertools
 import json
 import math
 import platform
 import random
+import shutil
+import subprocess
 import sys
+import sysconfig
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import url2pathname
 
 import msgpack
 
@@ -210,17 +229,137 @@ def cpu_model() -> str:
                 return line.split(":", 1)[1].strip()
     except OSError:
         pass  # no /proc (macOS, Windows) or unreadable: fall back to what platform reports
+    if platform.system() == "Darwin":
+        # platform.processor() says only "arm" on Apple silicon; sysctl names the chip ("Apple M5 Pro").
+        try:
+            name = subprocess.run(  # noqa: S603 (trusted: literal argv)
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, check=True, timeout=30
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            name = ""  # no sysctl, or no such key: fall back to what platform reports
+        if name:
+            return name
     return platform.processor() or platform.machine()
+
+
+def editable_sources(installed: importlib.metadata.Distribution) -> set[Path]:
+    """The directories an editable install's ``.pth`` files name, counting only lines every ``site`` reads alike.
+
+    ``site`` skips a blank line and one starting with ``#``, treats one starting with ``import`` and a
+    space or tab as code, and joins any other to the ``.pth`` file's directory. Versions disagree on
+    leading whitespace: up to 3.14 ``site`` keeps it, so ``"  /src"`` names a path under
+    site-packages, while 3.15 (PEP 829) strips it first, so the same line names ``/src`` and an
+    indented ``#`` or ``import`` line is a comment or code. Only an unindented line counts here, taken
+    with its trailing whitespace stripped, which every version reads alike; uv and maturin write one
+    unindented absolute path. An indented line names nothing, so it can cause a refusal but never a
+    false label, and so does a file that cannot be read or decoded.
+
+    >>> editable_sources(importlib.metadata.PathDistribution(Path("/nowhere")))
+    set()
+    """
+    sources: set[Path] = set()
+    for recorded in installed.files or ():
+        if recorded.suffix != ".pth":
+            continue
+        pth = Path(installed.locate_file(recorded))
+        try:
+            lines = pth.read_text().splitlines()
+        except (OSError, ValueError):
+            continue  # unreadable or undecodable: it names nothing here
+        sources |= {
+            (pth.parent / line.rstrip()).resolve()
+            for line in lines
+            if line and not line[0].isspace() and not line.startswith(("#", "import ", "import\t"))
+        }
+    return sources
+
+
+def cachekit_label() -> str:
+    """Name the cachekit this run measures: its version, and its commit when it is not a release.
+
+    A checkout reports the last release's version until the next release bumps it, so a recording made
+    from one would pass its figures off as that release's. An install from a package index leaves no
+    ``direct_url.json`` (PEP 610) and is the release its version names. An install from a VCS URL adds
+    its commit. Either counts only when the imported package is one of that install's own files:
+    otherwise something earlier on ``sys.path``, a checkout on ``PYTHONPATH`` say, shadows it.
+
+    An editable install from a git checkout adds the commit its Python follows. That holds only when
+    the imported package is the one in the source directory its ``.pth`` file puts on ``sys.path``,
+    inside that checkout; a copy installed elsewhere under the checkout, in its ``.venv`` say, is not
+    it. It adds ``.dirty`` when the sources the extension builds from (``src/``, ``rust/``,
+    ``Cargo.toml``, ``Cargo.lock``) have uncommitted or untracked changes. It cannot vouch that its
+    compiled extension was rebuilt for that commit, since ``uv sync`` does not rebuild it when only
+    ``rust/`` changed, so only a release is fit to publish.
+
+    Any other install cannot say which commit ran, so the run is refused before it starts. That covers
+    a shadowed import, a wheel file, and a non-editable install of a directory, which copies the tree
+    when it is installed.
+    """
+    import cachekit
+
+    version = cachekit.__version__
+    imported = Path(cachekit.__file__).resolve()
+    installed = importlib.metadata.distribution("cachekit")
+    direct_url = installed.read_text("direct_url.json")
+    origin: dict[str, Any] = json.loads(direct_url) if direct_url else {}
+    git = shutil.which("git")
+    # Only an editable install follows the checkout: a plain one copied the tree when it was installed.
+    if origin.get("dir_info", {}).get("editable") and git:
+        checkout = Path(url2pathname(urlsplit(origin["url"]).path)).resolve()
+
+        def git_out(*cmd: str) -> str:
+            return subprocess.run(  # noqa: S603 (trusted: git on PATH, run in the install's own checkout)
+                [git, "-C", str(checkout), *cmd], capture_output=True, text=True, check=True, timeout=30
+            ).stdout.strip()
+
+        # Only the package in the editable source directory is the checkout's: anything else, even under the
+        # checkout, is a copy or something earlier on sys.path shadowing it.
+        source = imported.parent.parent
+        if source in editable_sources(installed) and source.is_relative_to(checkout):
+            try:
+                commit = git_out("rev-parse", "--short=8", "HEAD")
+                # Untracked files count, whatever status.showUntrackedFiles says: an editable install
+                # imports a new module before it is added.
+                changes = git_out(
+                    "status", "--porcelain", "--untracked-files=normal", "--", "src", "rust", "Cargo.toml", "Cargo.lock"
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass  # not a git checkout: refused below
+            else:
+                return f"cachekit {version}+{commit}{'.dirty' if changes else ''}"
+    elif "dir_info" not in origin and any(installed.locate_file(f).resolve() == imported for f in installed.files or ()):
+        if direct_url is None:
+            return f"cachekit {version}"
+        if "vcs_info" in origin:
+            return f"cachekit {version}+{origin['vcs_info']['commit_id'][:8]}"
+    raise SystemExit(
+        f"terrain_canary: cachekit {version} was imported from {imported.parent} and installed from "
+        f"{origin.get('url', 'a package index')}, and which commit it was built from is unknown. Install a release "
+        "from a package index, with nothing on PYTHONPATH shadowing it, or install the checkout editable (uv sync) "
+        "with git on PATH."
+    )
+
+
+def python_label() -> str:
+    """Name the Python this run measures; a free-threaded build also says whether the GIL was on.
+
+    Read after the run: importing an extension that does not declare free-threaded support turns the
+    GIL back on for the whole process.
+    """
+    label = f"Python {platform.python_version()}"
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        label += f", free-threaded, GIL {'on' if sys._is_gil_enabled() else 'off'}"  # type: ignore[attr-defined]
+    return label
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import redis
 
-    import cachekit
     from cachekit import cache
     from cachekit.backends.redis import RedisBackend
     from cachekit.config.nested import L1CacheConfig
 
+    sdk = cachekit_label()  # before the run: an install it cannot place is refused, not recorded for minutes
     namespace = f"terrain-canary-{uuid.uuid4().hex[:12]}"
     executed = [False]
     value_p50, value_p95 = value_size_quantiles(args.keys)
@@ -305,7 +444,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source": {
             "kind": "recorded",
             "recordedAt": datetime.fromtimestamp(start_wall, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "sdk": f"cachekit {cachekit.__version__} (Python {platform.python_version()})",
+            "sdk": f"{sdk} ({python_label()})",
             "l2": f"Redis {redis_version}, {args.l2_where}",
             "cache": (
                 f"L1 budget {args.l1_mb} MB, ttl {args.ttl} s, values {value_p50 / 1000:.1f} KB median as MessagePack "
@@ -363,8 +502,10 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--origin-ms must not be negative")
     if not args.out.parent.is_dir():
         p.error(f"--out: {args.out.parent} is not a directory")
-    if not args.l2_where.strip():
-        # The recording's L2 label is copy on a public page: a blank one would print as "Redis 8.x, ".
+    # The recording's L2 label is copy on a public page: padding would print as is, and a blank one
+    # as "Redis 8.x, ".
+    args.l2_where = args.l2_where.strip()
+    if not args.l2_where:
         p.error("--l2-where must say where the Redis runs")
     doc = run(args)
     text = json.dumps(doc, separators=(",", ":"), allow_nan=False)

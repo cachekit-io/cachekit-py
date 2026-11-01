@@ -151,28 +151,26 @@ class TestWhatIsTimed:
         assert [sent for sent in _sent(pool) if sent] == [ONE_HIT_300]
         assert _sent(pool)[before] == ONE_HIT_300
 
-    def test_api79_the_clock_spans_key_building_and_context_cleanup(
-        self, store: _Store, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The first clock read comes before the call's first step past the wrapper (its stats context, then its key);
-        the last after the context is restored, the call's last step before its value is handed back."""
+    def test_api79_the_clock_spans_key_building(self, store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The first clock read comes before the call builds its key, the last after the hit is served: the whole
+        call as the caller sees it, not only the L1 lookup."""
         events: list[str] = []
         monkeypatch.setattr(wrapper, "_getrandbits", lambda k: 0)
         monkeypatch.setattr(wrapper, "_perf_counter_ns", lambda: events.append("clock") or 1_000 * len(events))
-        real = wrapper.set_current_function_stats
-        monkeypatch.setattr(wrapper, "set_current_function_stats", lambda stats: events.append("call") or real(stats))
-        real_reset = wrapper.reset_current_function_stats
-        monkeypatch.setattr(wrapper, "reset_current_function_stats", lambda token: events.append("reset") or real_reset(token))
         backend, _ = _backend(store)
 
-        @cache(backend=backend, ttl=60, namespace=_ns())
+        def key(x: int) -> str:
+            events.append("key")
+            return f"telemetry-clock-{x}"
+
+        @cache(backend=backend, ttl=60, namespace=_ns(), key=key)
         def f(x: int) -> int:
             return x
 
         f(1)
         events.clear()
-        f(1)  # hit
-        assert events == ["clock", "call", "reset", "clock"]
+        assert f(1) == 1  # hit
+        assert events == ["clock", "key", "clock"]
 
     @pytest.mark.parametrize("mode", ["sync", "async"])
     def test_api79_the_wait_for_the_reports_lock_is_in_the_duration(
