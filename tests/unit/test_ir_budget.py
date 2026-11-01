@@ -511,6 +511,23 @@ def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> Non
     assert seen[0] > 1.7e9 + 1e6  # the real clock: 2023-11 + 11 days at the very least
 
 
+def test_pinned_os_entropy_starts_numpy_in_the_same_state_in_every_run() -> None:
+    """numpy.random seeds its global generator from OS entropy at import, which moved every path's count."""
+    probe = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import ir_workload\n"
+        "if sys.argv[2] == 'pin': ir_workload.pin_os_entropy()\n"
+        "import numpy.random; print(numpy.random.get_state()[1][:8].tolist())"
+    )
+    perf = str(Path(ir_workload.__file__).parent)
+
+    def first_words(mode: str) -> str:
+        run = [sys.executable, "-c", probe, perf, mode]
+        return subprocess.run(run, capture_output=True, text=True, check=True).stdout  # noqa: S603 (trusted: this test's probe)
+
+    assert first_words("pin") == first_words("pin")
+    assert first_words("os") != first_words("os")  # unpinned, numpy's start does come from OS entropy
+
+
 @pytest.mark.parametrize("n", [1, 4, len(PATHS) + 1])
 def test_shards_split_the_paths_exactly_once(n: int) -> None:
     """N machines running --shard 1/N .. N/N measure every path that is not skipped, and none twice."""

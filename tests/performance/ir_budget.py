@@ -269,6 +269,14 @@ def measure(
         "PYTHONNOUSERSITE": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
+        # pyarrow's two allocators run on real time. Its bundled jemalloc starts a background thread at
+        # import, and how that thread is scheduled against the main thread puts startup in one of two
+        # states, up to 1.2M Ir apart. With the thread off, jemalloc would check its real-time purge
+        # deadlines on the allocating thread instead, so it never purges. pyarrow's default pool, mimalloc,
+        # purges freed memory after a real-time delay that the freeing thread checks (10 clock reads per
+        # real-data round trip), so it never purges either.
+        "JE_ARROW_MALLOC_CONF": "background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1",
+        "MIMALLOC_PURGE_DELAY": "-1",
         # cachekit's L1 sweeper wakes every 30 s of real time. A woken thread takes the GIL at a
         # load-dependent moment, and the sweeper compares expiry times stamped by the pinned
         # main-thread clock against the real one, so it evicts live entries mid-run. A day-long

@@ -215,6 +215,21 @@ def pin_main_thread_clocks() -> None:
         setattr(time, f"{name}_ns", pinned(getattr(time, f"{name}_ns"), int(origin * 1e9), 1000))
 
 
+def pin_os_entropy() -> None:
+    """Give Python code the same OS entropy in every run.
+
+    Importing pandas imports ``numpy.random``, which seeds its global generator from 128 bits of
+    ``secrets.randbits``. The cost of that seeding and the sizes of what it allocates depend on the
+    bits drawn, and the heap layout everything after it runs in moves with them: on CPython 3.14,
+    16 runs of one path spread over 57,000 instructions, and over 557 with this. ``secrets`` reads
+    ``random._urandom``, which is ``os.urandom`` bound at import, so both are replaced. Must run
+    before ``import pandas``. C code that reads OS entropy itself is not covered.
+    """
+    import random
+
+    random._urandom = os.urandom = random.Random(0).randbytes  # pyright: ignore[reportAttributeAccessIssue]
+
+
 def run_workload(path: str, n: int, warmup: int) -> None:
     import gc
 
@@ -228,6 +243,7 @@ def run_workload(path: str, n: int, warmup: int) -> None:
     # main thread gives up the GIL only where the code releases it itself.
     sys.setswitchinterval(1e6)
     pin_main_thread_clocks()
+    pin_os_entropy()
     _shift = [object() for _ in range(int(os.environ.get("IR_BUDGET_LAYOUT", "0")))]  # noqa: F841 (held: see LAYOUTS in ir_budget.py)
     op = build_workload(path)
     for _ in range(warmup):  # identical warmup at both N: first-call costs (L1 fill, lazy imports) cancel
