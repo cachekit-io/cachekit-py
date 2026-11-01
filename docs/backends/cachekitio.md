@@ -163,7 +163,7 @@ copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied
 lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
 as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
 backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread, provided the wrapper
-holds that backend when it is passed to `@cache`: as an attribute, or in a list or tuple attribute,
+holds that backend when it is passed to `@cache`: as an attribute (`__slots__` included), or in a list or tuple attribute,
 at most three wrappers down. A wrapper that builds its backend on first use is not found, and its
 L1 copies keep `ttl`. A wrapper that delegates on another thread (a timeout wrapper with its own
 executor) must run the call under `contextvars.copy_context().run`; otherwise its L1 copies keep

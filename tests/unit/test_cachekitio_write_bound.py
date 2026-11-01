@@ -16,6 +16,7 @@ L1 put and L1 expiry all read one clock.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import math
 import threading
 import time
@@ -301,6 +302,40 @@ class TestWriteBound:
         assert _write(handler) == (True, False, None)
         assert handler._write_deadlines_reachable is False
 
+    def test_reachability_reads_slots(self, backend: CachekitIOBackend) -> None:
+        """A slotted wrapper (``__slots__``, ``@dataclass(slots=True)``) has no ``__dict__``: its slots are read."""
+
+        @dataclasses.dataclass(slots=True)
+        class _SlottedDataclass:
+            inner: CachekitIOBackend
+
+        class _Private:
+            __slots__ = ("__inner",)
+
+            def __init__(self, inner: CachekitIOBackend) -> None:
+                self.__inner = inner
+
+        class _Unset:
+            __slots__ = ("inner",)
+
+        assert _reaches_write_deadlines(_SlottedDataclass(backend))
+        assert _reaches_write_deadlines(_Private(backend))  # name-mangled slot
+        assert not _reaches_write_deadlines(_Unset())
+
+    def test_reachability_is_not_starved_by_a_large_sibling(self, backend: CachekitIOBackend) -> None:
+        """A direct ``inner`` is found however many objects a sibling attribute holds, before or after it."""
+
+        class _Wrapper:
+            def __init__(self, inner: CachekitIOBackend, first: bool) -> None:
+                if first:
+                    self.inner = inner
+                self.locks = [threading.Lock() for _ in range(5000)]
+                if not first:
+                    self.inner = inner
+
+        assert _reaches_write_deadlines(_Wrapper(backend, first=True))
+        assert _reaches_write_deadlines(_Wrapper(backend, first=False))
+
     def test_lazily_built_backend_keeps_the_stated_ttl(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         """A wrapper that builds its CachekitIOBackend on first use is out of reach when the handler first
         asks, so its writes keep the stated ttl, as before API-103 (documented)."""
@@ -506,6 +541,33 @@ class TestWriterCopyBound:
         assert compute() == 1
         assert calls
         assert "PUT" not in saas.ops
+
+    def test_slotted_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
+        """A ``@dataclass(slots=True)`` wrapper over CachekitIO: a 0 Fresh-For keeps no copy."""
+
+        @dataclasses.dataclass(slots=True)
+        class _Slotted:
+            inner: CachekitIOBackend
+
+            def get(self, key: str) -> bytes | None:
+                return self.inner.get(key)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.inner.set(key, value, ttl)
+
+            def delete(self, key: str) -> bool:
+                return self.inner.delete(key)
+
+            def exists(self, key: str) -> bool:
+                return self.inner.exists(key)
+
+        saas.put_fresh_for = "0"
+        compute, calls = _decorated(_Slotted(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
+        assert compute() == 1
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+        assert len(calls) == 1
 
     def test_composing_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
         """A composing wrapper (no attribute forwarding) over CachekitIO: a 0 Fresh-For keeps no copy."""

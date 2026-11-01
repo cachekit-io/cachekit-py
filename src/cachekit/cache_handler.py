@@ -401,37 +401,63 @@ def _fuses_tracked_write(backend: object) -> bool:
 
 _unreported_write_classes: set[type] = set()
 _REACH_DEPTH = 3  # wrapper levels searched for a reporting backend
-_REACH_NODES = 256  # objects searched at most, so a backend holding a large object graph stays cheap
+_REACH_CHECKS = 4096  # objects checked at most, so a backend holding a large object graph stays cheap
 _REACH_LEAVES = (str, bytes, int, float, bool, type(None), type)
+
+
+def _attribute_values(obj: object) -> tuple[list[object], list[object]]:
+    """``obj``'s attribute values, from its ``__dict__`` and the ``__slots__`` across its MRO (a slotted
+    dataclass has no ``__dict__``): (direct values, items of list and tuple values)."""
+    values: list[object] = list(getattr(obj, "__dict__", {}).values())
+    for klass in type(obj).__mro__:
+        slots = vars(klass).get("__slots__", ())
+        for name in (slots,) if isinstance(slots, str) else slots:
+            if name in ("__dict__", "__weakref__"):
+                continue
+            if name.startswith("__") and not name.endswith("__"):  # name-mangled private slot
+                name = f"_{klass.__name__.lstrip('_')}{name}"
+            with contextlib.suppress(AttributeError):  # an unset slot
+                values.append(getattr(obj, name))
+    direct = [v for v in values if not isinstance(v, (list, tuple, *_REACH_LEAVES))]
+    items = [i for v in values if isinstance(v, (list, tuple)) for i in v if not isinstance(i, _REACH_LEAVES)]
+    return direct, items
 
 
 def _reaches_write_deadlines(backend: object) -> bool:
     """Whether a write through ``backend`` can report a write deadline (API-103): the backend says it reports,
-    attribute-forwarding proxies included, or it holds such a backend in an attribute, a list or a tuple, up
-    to ``_REACH_DEPTH`` wrappers down (a metrics or timeout wrapper that composes a CachekitIOBackend).
+    attribute-forwarding proxies included, or it holds such a backend in an attribute (``__dict__`` or
+    ``__slots__``), a list or a tuple, up to ``_REACH_DEPTH`` wrappers down (a metrics or timeout wrapper
+    that composes a CachekitIOBackend).
 
-    Asked once per handler (``write_deadlines_reachable``): a backend that cannot report never pays for the
-    deadline list on its writes, which costs the instruction-gated miss path about 2%. A wrapper that builds
-    its CachekitIOBackend on first use, or holds it out of reach, keeps L1 copies at the stated ttl.
+    Breadth first, and each object is checked as it is found, direct attributes before list items: a
+    shallow ``inner`` is never starved by a large sibling list or a deep branch. At most ``_REACH_CHECKS``
+    objects are checked. Asked once per handler (``write_deadlines_reachable``): a backend that cannot
+    report never pays for the deadline list on its writes, which costs the instruction-gated miss path
+    about 2%. A wrapper that builds its CachekitIOBackend on first use, or holds it out of reach, keeps L1
+    copies at the stated ttl.
     """
-    stack = [(backend, 0)]
-    visited: set[int] = set()
-    while stack and len(visited) < _REACH_NODES:
-        obj, depth = stack.pop()
-        if id(obj) in visited:
-            continue
-        visited.add(id(obj))
-        try:
-            if getattr(obj, "_reports_write_deadline", False) is True:
-                return True
-            attrs = vars(obj) if depth < _REACH_DEPTH else {}
-        except Exception as exc:  # noqa: BLE001 - an object that cannot be inspected holds no reachable backend
-            get_logger().debug(f"write-deadline search skipped a {type(obj).__name__}: {type(exc).__name__}")
-            continue
-        for value in attrs.values():
-            for item in value if isinstance(value, (list, tuple)) else (value,):
-                if not isinstance(item, _REACH_LEAVES):
-                    stack.append((item, depth + 1))
+    level = [backend]
+    seen: set[int] = set()
+    for depth in range(_REACH_DEPTH + 1):
+        next_direct: list[object] = []
+        next_items: list[object] = []
+        for obj in level:
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            try:
+                if getattr(obj, "_reports_write_deadline", False) is True:
+                    return True
+                if len(seen) >= _REACH_CHECKS:
+                    return False
+                if depth < _REACH_DEPTH:
+                    direct, items = _attribute_values(obj)
+                    next_direct += direct
+                    next_items += items
+            except Exception as exc:  # noqa: BLE001 - an object that cannot be inspected holds no reachable backend
+                get_logger().debug(f"write-deadline search skipped a {type(obj).__name__}: {type(exc).__name__}")
+        # Direct attributes of the whole level before any list item, so a big list cannot hide an inner.
+        level = next_direct + next_items
     return False
 
 
