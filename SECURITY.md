@@ -310,7 +310,7 @@ On the tenant-scoped Redis backend, every successful invalidation is announced o
 | Tier | Timing | Trigger | Checks |
 |:-----|:------:|:--------|:-------|
 | **Fast** | < 3 min | Every PR | cargo-audit, cargo-deny, clippy, machete, pip-audit. cachekit-rs declares `#![deny(unsafe_code)]`, so a build of a PR that adds unsafe code to it fails; `msgpack_decode`, which calls the CPython C API directly, is the one module exempt |
-| **Medium** | < 15 min | Post-merge | cargo-geiger (zero unsafe functions in cachekit-rs). The Miri job runs no tests: this crate has none, and byte_storage and encryption are re-exports from cachekit-core |
+| **Medium** | < 15 min | Post-merge | cargo-geiger. It fails if cachekit-rs holds any unsafe function, so `msgpack_decode`'s unsafe functions fail it. The Miri job runs no tests: this crate has none, and byte_storage and encryption are re-exports from cachekit-core |
 | **Deep** | < 2 hr | Nightly | Sanitizers (ASan, TSan, MSan), security report |
 
 <details>

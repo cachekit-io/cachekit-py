@@ -6,7 +6,7 @@
 //!
 //! Unsafe code belongs in cachekit-core, whose CI verifies it, so the crate denies it: a build
 //! rejects any here rather than leaving it to the post-merge cargo-geiger count (SECURITY.md).
-//! `msgpack_decode` is the one module exempt; it calls the CPython C API directly.
+//! `msgpack_decode` is the one module exempt; it calls the `CPython` C API directly.
 #![deny(unsafe_code)]
 
 // Re-export core types for use in Python bindings
