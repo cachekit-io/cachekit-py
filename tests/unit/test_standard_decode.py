@@ -50,8 +50,16 @@ def reference(data: bytes) -> Any:
     return unpackb_bounded(data, raw=False, use_list=True, object_hook=_standard_object_hook)
 
 
-def rust(data: bytes) -> Any:
+def rust(data: bytes | bytearray | memoryview) -> Any:
     return unpackb_standard(data, MSGPACK_MAX_NESTING, _standard_object_hook)
+
+
+def _decode_or_refuse(data: bytes | bytearray | memoryview) -> None:
+    """Decode ``data``, swallowing only the refusals CASES pins; any other error fails the caller."""
+    try:
+        rust(data)
+    except (ValueError, SerializationError, TypeError):  # noqa: S110 - the refusal is the expected outcome
+        pass
 
 
 def outcome(decode: Callable[[bytes], Any], data: bytes) -> tuple[Any, ...]:
@@ -320,8 +328,10 @@ except MemoryError:
     sys.exit(0)
 sys.exit(3)
 """
-# Every allocation the input sizes (n is 128 MiB), as the `data` expression the script decodes.
+# Each single allocation the input sizes (n is 128 MiB), as the `data` expression the script decodes. Many small
+# objects (dicts, short lists, floats, ints past the small-int cache) still abort: see msgpack_decode.rs's module doc.
 _OUT_OF_MEMORY_SHAPES = {
+    "str": 'b"\\xdb" + n.to_bytes(4, "big") + b"a" * n',
     "bin": 'b"\\xc6" + n.to_bytes(4, "big") + bytes(n)',
     "ext": 'b"\\xc9" + n.to_bytes(4, "big") + b"\\x05" + bytes(n)',
     "trailing bytes": 'b"\\xc0" + bytes(n)',
@@ -347,10 +357,7 @@ def _measure_leaks() -> list[int]:
 
     def every_path() -> None:
         for data in (*CASES.values(), _pack({"k": ["v" * 40, datetime(2024, 1, 15), b"b"] * 3}, True)):
-            try:
-                rust(data)
-            except (ValueError, SerializationError, TypeError):  # noqa: S110 - every refusal CASES pins; any other error fails
-                pass
+            _decode_or_refuse(data)
 
     for _ in range(50):  # warm caches and lazily imported msgpack classes
         every_path()
@@ -384,7 +391,7 @@ def test_no_path_leaks_an_object() -> None:
     assert min(rounds) < LEAK_ROUND_BUDGET, sizes
 
 
-# Empty and one-byte bytes are immortal singletons, whose count never moves.
+# Empty and one-byte bytes are shared cached singletons (immortal from 3.12), so their counts are not the decode's alone.
 _MULTI_BYTE = {name: data for name, data in CASES.items() if len(data) > 1}
 
 
@@ -398,10 +405,7 @@ def test_no_decode_keeps_a_reference_to_its_input(data: bytes) -> None:
     before = [sys.getrefcount(o) for o in watched]
     for source in (owned, view, buffer):
         for _ in range(100):
-            try:
-                rust(source)
-            except (ValueError, SerializationError, TypeError):  # noqa: S110 - every refusal CASES pins; any other error fails
-                pass
+            _decode_or_refuse(source)
     del source  # still bound to the last input
     assert [sys.getrefcount(o) for o in watched] == before
     buffer.append(0)  # a buffer export never released refuses the resize with BufferError

@@ -15,11 +15,14 @@
 //!
 //! Safe Rust only (`SECURITY.md`): every object is a PyO3 `Bound`, so each reference is released
 //! by its owner on any exit. PyO3's plain constructors abort the process when CPython is out of
-//! memory (the release profile sets `panic = "abort"`), so every allocation the input sizes, a
-//! long array's list and the bytes of a bin, an ext or `ExtraData`, goes through a constructor
-//! that raises MemoryError instead (`nones`, `bytes_of`).
+//! memory (the release profile sets `panic = "abort"`). A single allocation the input sizes, a
+//! long array's list or the bytes of a str, bin, ext or `ExtraData`, goes through a constructor
+//! that raises MemoryError instead (`nones`, `bytes_of`, `PyString::from_bytes`). A dict, a list
+//! of at most `SHORT_LIST` items, a float or an int outside -5..=256 does not: running out of
+//! memory while building one aborts the process, where msgpack-python raises MemoryError.
 
-// cargo-geiger checks the crate only after a merge; this fails any build, a PR's included.
+// cargo-geiger checks the crate only after a merge; this fails any build with the `python`
+// feature (a default one), which every PR's clippy job and wheel builds compile.
 #![forbid(unsafe_code)]
 
 use std::convert::Infallible;
@@ -204,9 +207,9 @@ impl<'a, 'py> Decoder<'a, 'py> {
                         list.set_item(*index, value).map_err(|e| restore(py, e))?;
                         *index += 1;
                     }
-                    Open::Map(dict, pending) => match pending.take() {
+                    Open::Map(dict, awaiting_key) => match awaiting_key.take() {
                         None => {
-                            *pending = Some(value);
+                            *awaiting_key = Some(value);
                             break;
                         }
                         Some(key) => {
