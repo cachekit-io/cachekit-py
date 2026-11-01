@@ -210,8 +210,8 @@ first request or timed hit on one it inherited. Each call is still timed with pr
 time the same call positions. The flag removes the window. Hits timed after the last request are not sent.
 
 **Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` (name and value in any case) to `false`, `0`, `off` or `no`.
-Off from either wins over on from the other; both unset is on. Any other value of the variable also turns telemetry
-off and logs one warning. Both are read once, when the backend is constructed: set the variable before creating it.
+Off from either wins over on from the other; both unset is on. An empty or blank value counts as unset, so it leaves
+telemetry on. Any other value of the variable also turns telemetry off and logs one warning. Both are read once, when the backend is constructed: set the variable before creating it.
 `@cache.io()` builds its own backend, so use the variable there.
 
 ```python notest
