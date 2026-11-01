@@ -304,15 +304,15 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 211,434 | 203,521 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 139,943 | 140,926 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,370 | 167,447 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 58,661 | 59,595 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 57,670 | 58,612 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,422,079 | 1,422,120 |
-| `serializer_auto` | `AutoSerializer` round trip | 65,971 | 66,624 |
+| `serializer_auto` | `AutoSerializer` round trip | 64,882 | 65,642 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 22,085 | 22,677 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,972,713 | 1,982,226 |
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,750,733 | 61,321,806 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,806,031 | 61,327,994 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,164 | 101,927 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,658 | 2,530 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 98,999 | 101,927 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,690 | 2,566 |
 | `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,667 | 720,663 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,887 | 74,132 |
 | `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 164,514 | 160,511 |
