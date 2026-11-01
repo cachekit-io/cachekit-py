@@ -403,7 +403,7 @@ def _fuses_tracked_write(backend: object) -> bool:
 _unreported_write_classes: set[type] = set()
 # Three wrapper levels covers a metrics wrapper around a router around a backend; deeper nesting is rare.
 _REACH_DEPTH = 3
-# Values read at most (attribute values, container items and the type entries scanned to find them) before
+# Values read at most (attribute values, slot reads, container items and the type entries scanned to find them) before
 # the search gives up and answers True. The answer is cached per handler, so a large object graph costs the
 # deadline list, never a missed bound.
 _REACH_READS = 4096
@@ -474,7 +474,8 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
                 flag = held["_reports_write_deadline"]
             if want_values:
                 values += dict.values(held)
-    return flag is True, values, spent + len(values)
+    # Every slot read counts, an unset one too; the caller charges each value it walks, so values are not charged here.
+    return flag is True, values, spent + (len(members) if want_values else 0)
 
 
 def _reaches_write_deadlines(backend: object) -> bool:

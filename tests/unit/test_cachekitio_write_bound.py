@@ -599,6 +599,30 @@ class TestWriteBound:
 
         assert _reaches_write_deadlines(_Striped(object()))  # nothing to find, but too wide to be sure
 
+    def test_each_attribute_value_is_charged_once(self) -> None:
+        """A backend whose attributes fit the budget when each value is charged once answers a clean False:
+        charging a value both when read and when walked spends the budget and opens the list on every write."""
+
+        class _Wide:
+            def __init__(self) -> None:
+                for i in range(_REACH_READS * 3 // 4):
+                    setattr(self, f"a{i}", i)
+
+        assert _reaches_write_deadlines(_Wide()) is False
+
+    def test_unset_slots_spend_the_budget(self) -> None:
+        """Reading an unset slot is still a read: many instances with many unset slots spend the budget and
+        fail open, instead of a descriptor call per slot per instance going uncharged."""
+
+        class _Sparse:
+            __slots__ = tuple(f"s{i}" for i in range(100))
+
+        class _Holder:
+            def __init__(self) -> None:
+                self.items = [_Sparse() for _ in range(1000)]
+
+        assert _reaches_write_deadlines(_Holder())
+
     def test_composing_wrapper_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         """A wrapper that composes a CachekitIO backend without forwarding its attributes (a metrics class)
         still reaches the base ``set`` on the same thread: the list is open around every write."""
