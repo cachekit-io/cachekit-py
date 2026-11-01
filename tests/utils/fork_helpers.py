@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import ctypes
 import faulthandler
 import os
 import select
@@ -26,11 +27,23 @@ def report(w: int, outcome: object) -> NoReturn:
         os._exit(0)
 
 
+def _sigusr1_has_handler() -> bool:
+    """Whether a handler is installed for SIGUSR1; signal.getsignal cannot see one faulthandler.register installed."""
+    action = ctypes.create_string_buffer(256)  # holds struct sigaction on Linux and macOS, whose handler comes first
+    if ctypes.CDLL(None, use_errno=True).sigaction(signal.SIGUSR1, None, action):
+        raise OSError(ctypes.get_errno(), "sigaction(SIGUSR1) failed")
+    return ctypes.c_void_p.from_buffer(action).value not in (None, 1)  # SIG_DFL is 0, SIG_IGN is 1
+
+
 def fork_dumping_stacks() -> int:
     """os.fork(), with a child that writes every thread's stack to stderr on SIGUSR1; pass dump_stacks=True to child_outcome.
 
     Armed before the fork, so a child hung in an at-fork hook, before os.fork() returns there, still dumps.
+    A SIGUSR1 handler the parent already has is left alone, and its child does not dump.
     """
+    if _sigusr1_has_handler():  # faulthandler.unregister would restore SIG_DFL over it, not the handler
+        warnings.warn("SIGUSR1 already has a handler: a hung child is killed without dumping its stacks", stacklevel=2)
+        return os.fork()
     faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # the child inherits it
     try:
         pid = os.fork()
