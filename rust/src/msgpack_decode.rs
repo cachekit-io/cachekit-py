@@ -12,16 +12,16 @@
 //!
 //! The hook runs only on a map holding a `str` key equal to a marker key. Any other map it would
 //! return unchanged, because each marker test reads its key with `dict.get`.
-
-use std::os::raw::{c_char, c_long};
-use std::ptr;
+//!
+//! Safe Rust only (`SECURITY.md`): every object is a PyO3 `Bound`, so each reference is released
+//! by its owner on any exit, and an array's items wait on a stack until it closes, so no
+//! partly-filled list is ever built.
 
 use cachekit_core::check_msgpack_structure;
 use pyo3::exceptions::PyValueError;
-use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString};
 
 /// The keys `_standard_object_hook` tests (`standard_serializer.py`).
 const MARKER_KEYS: [&[u8]; 3] = [b"__datetime__", b"__date__", b"__time__"];
@@ -33,62 +33,50 @@ const VALUE_CACHE_MAX_LEN: usize = 32;
 const CACHE_BITS: u32 = 8;
 const CACHE_SLOTS: usize = 1 << CACHE_BITS;
 
-/// A Python error is already set (`PyErr::fetch` takes it), or the input broke a bound.
+/// A Python error is set (`restore` put it there, `PyErr::fetch` takes it), or the input broke a
+/// bound. A unit enum, so a decode step's result stays two words.
 enum Fail {
     Py,
     Bound,
 }
 
-/// An open array or map, holding a strong reference to its container.
-struct Frame {
-    obj: *mut ffi::PyObject,
+/// An open array or map.
+struct Frame<'py> {
+    /// Map: the dict, filled as each value arrives. Array: None.
+    dict: Option<Bound<'py, PyDict>>,
+    /// Map: the key read, awaiting its value.
+    key: Option<Bound<'py, PyAny>>,
+    /// Array: where its items start on the decoder's `items` stack.
+    base: usize,
     /// Elements still to read: items for an array, keys plus values for a map.
     owed: u64,
-    /// Array: next index. Map: unused.
-    index: ffi::Py_ssize_t,
-    /// Map: the key read, awaiting its value (strong reference), or null.
-    key: *mut ffi::PyObject,
-    is_map: bool,
     /// Map: a `str` key equal to a marker key was read.
     marker: bool,
 }
 
-/// One cached string: its bytes' position in the input, and the `str` (a strong reference).
-#[derive(Clone, Copy)]
-struct StrSlot {
+/// One cached string: its bytes' position in the input, and the `str`.
+struct StrSlot<'py> {
     start: usize,
     len: usize,
-    obj: *mut ffi::PyObject,
+    obj: Bound<'py, PyAny>,
 }
 
-struct Decoder<'a> {
+struct Decoder<'a, 'py> {
+    py: Python<'py>,
     data: &'a [u8],
     pos: usize,
     max_depth: usize,
     /// Elements owed across every open container, the root included (the walk's `pending`).
     pending: u64,
-    stack: Vec<Frame>,
+    stack: Vec<Frame<'py>>,
+    /// The items of every open array, innermost last; an array's become its list when it closes.
+    /// Only decoded elements land here, so it never outgrows the input.
+    items: Vec<Bound<'py, PyAny>>,
     /// Cached strings; a table slot holds an index into it plus one, or 0 when empty. A slot holds
     /// one string at a time, a colliding one replacing it, so this never exceeds `2 * CACHE_SLOTS`.
-    cached: Vec<StrSlot>,
+    cached: Vec<StrSlot<'py>>,
     keys: [u16; CACHE_SLOTS],
     values: [u16; CACHE_SLOTS],
-}
-
-impl Drop for Decoder<'_> {
-    fn drop(&mut self) {
-        // SAFETY: every pointer here is a strong reference this decoder owns, or null; the
-        // thread is attached (the decoder never outlives the pyfunction call).
-        unsafe {
-            for f in self.stack.drain(..) {
-                ffi::Py_XDECREF(f.key);
-                ffi::Py_DECREF(f.obj);
-            }
-            for slot in &self.cached {
-                ffi::Py_DECREF(slot.obj);
-            }
-        }
-    }
 }
 
 /// The cache slot for `bytes`: its first and last eight bytes, multiplied and shifted.
@@ -106,23 +94,16 @@ fn slot_of(bytes: &[u8]) -> usize {
     (h >> (64 - CACHE_BITS)) as usize
 }
 
-#[inline]
-unsafe fn decode_utf8(bytes: &[u8]) -> *mut ffi::PyObject {
-    ffi::PyUnicode_DecodeUTF8(
-        bytes.as_ptr().cast::<c_char>(),
-        bytes.len() as ffi::Py_ssize_t,
-        ptr::null(),
-    )
-}
-
-impl<'a> Decoder<'a> {
-    fn new(data: &'a [u8], max_depth: usize) -> Self {
+impl<'a, 'py> Decoder<'a, 'py> {
+    fn new(py: Python<'py>, data: &'a [u8], max_depth: usize) -> Self {
         Self {
+            py,
             data,
             pos: 0,
             max_depth,
             pending: 1,
             stack: Vec::new(),
+            items: Vec::new(),
             cached: Vec::new(),
             keys: [0; CACHE_SLOTS],
             values: [0; CACHE_SLOTS],
@@ -156,14 +137,11 @@ impl<'a> Decoder<'a> {
     /// Whether the next element read is a map key.
     #[inline]
     fn at_key(&self) -> bool {
-        matches!(self.stack.last(), Some(f) if f.is_map && f.key.is_null())
+        matches!(self.stack.last(), Some(f) if f.dict.is_some() && f.key.is_none())
     }
 
-    fn decode(
-        &mut self,
-        py: Python<'_>,
-        hook: &Bound<'_, PyAny>,
-    ) -> Result<*mut ffi::PyObject, Fail> {
+    fn decode(&mut self, hook: &Bound<'py, PyAny>) -> Result<Bound<'py, PyAny>, Fail> {
+        let py = self.py;
         loop {
             let marker = *self.data.get(self.pos).ok_or(Fail::Bound)?;
             self.pos += 1;
@@ -171,82 +149,71 @@ impl<'a> Decoder<'a> {
             if let Some(f) = self.stack.last_mut() {
                 f.owed -= 1;
             }
-            // SAFETY: the thread is attached; every constructor returns a new reference or null
-            // with an exception set, which `check` turns into Fail::Py.
-            let mut value = unsafe {
-                match marker {
-                    0x00..=0x7f => self.scalar(ffi::PyLong_FromLong(c_long::from(marker)))?,
-                    0xe0..=0xff => self.scalar(ffi::PyLong_FromLong(c_long::from(marker as i8)))?,
-                    0xc0 => self.scalar(ffi::Py_NewRef(ffi::Py_None()))?,
-                    0xc2 => self.scalar(ffi::Py_NewRef(ffi::Py_False()))?,
-                    0xc3 => self.scalar(ffi::Py_NewRef(ffi::Py_True()))?,
-                    0xa0..=0xbf => self.string(u64::from(marker & 0x1f))?,
-                    0xd9 => self.prefixed(1).and_then(|n| self.string(n))?,
-                    0xda => self.prefixed(2).and_then(|n| self.string(n))?,
-                    0xdb => self.prefixed(4).and_then(|n| self.string(n))?,
-                    0xc4 => self.prefixed(1).and_then(|n| self.binary(n))?,
-                    0xc5 => self.prefixed(2).and_then(|n| self.binary(n))?,
-                    0xc6 => self.prefixed(4).and_then(|n| self.binary(n))?,
-                    0xc7 => self.prefixed(1).and_then(|n| self.ext(py, n))?,
-                    0xc8 => self.prefixed(2).and_then(|n| self.ext(py, n))?,
-                    0xc9 => self.prefixed(4).and_then(|n| self.ext(py, n))?,
-                    0xd4..=0xd8 => self.ext(py, 1u64 << (marker - 0xd4))?,
-                    0xca..=0xd3 => self.number(marker)?,
-                    0x90..=0x9f => self.open(false, u64::from(marker & 0x0f))?,
-                    0xdc => self.prefixed(2).and_then(|n| self.open(false, n))?,
-                    0xdd => self.prefixed(4).and_then(|n| self.open(false, n))?,
-                    0x80..=0x8f => self.open(true, u64::from(marker & 0x0f))?,
-                    0xde => self.prefixed(2).and_then(|n| self.open(true, n))?,
-                    0xdf => self.prefixed(4).and_then(|n| self.open(true, n))?,
-                    0xc1 => return Err(Fail::Bound),
-                }
+            let value = match marker {
+                0x00..=0x7f => self.scalar(int(py, i64::from(marker)))?,
+                0xe0..=0xff => self.scalar(int(py, i64::from(marker as i8)))?,
+                0xc0 => self.scalar(py.None().into_bound(py))?,
+                0xc2 => self.scalar(PyBool::new(py, false).to_owned().into_any())?,
+                0xc3 => self.scalar(PyBool::new(py, true).to_owned().into_any())?,
+                0xa0..=0xbf => self.string(u64::from(marker & 0x1f))?,
+                0xd9 => self.prefixed(1).and_then(|n| self.string(n))?,
+                0xda => self.prefixed(2).and_then(|n| self.string(n))?,
+                0xdb => self.prefixed(4).and_then(|n| self.string(n))?,
+                0xc4 => self.prefixed(1).and_then(|n| self.binary(n))?,
+                0xc5 => self.prefixed(2).and_then(|n| self.binary(n))?,
+                0xc6 => self.prefixed(4).and_then(|n| self.binary(n))?,
+                0xc7 => self.prefixed(1).and_then(|n| self.ext(n))?,
+                0xc8 => self.prefixed(2).and_then(|n| self.ext(n))?,
+                0xc9 => self.prefixed(4).and_then(|n| self.ext(n))?,
+                0xd4..=0xd8 => self.ext(1u64 << (marker - 0xd4))?,
+                0xca..=0xd3 => self.number(marker)?,
+                0x90..=0x9f => self.open(false, u64::from(marker & 0x0f))?,
+                0xdc => self.prefixed(2).and_then(|n| self.open(false, n))?,
+                0xdd => self.prefixed(4).and_then(|n| self.open(false, n))?,
+                0x80..=0x8f => self.open(true, u64::from(marker & 0x0f))?,
+                0xde => self.prefixed(2).and_then(|n| self.open(true, n))?,
+                0xdf => self.prefixed(4).and_then(|n| self.open(true, n))?,
+                0xc1 => return Err(Fail::Bound),
             };
-            // A non-empty container was pushed: read its first element.
-            if value.is_null() {
+            // None: a non-empty container was pushed, so read its first element.
+            let Some(mut value) = value else {
                 continue;
-            }
+            };
             // Hand the value to its container, closing every container it completes.
             loop {
                 let Some(f) = self.stack.last_mut() else {
                     return Ok(value);
                 };
-                // SAFETY: `f.obj` is a strong reference to a list or dict this decoder built;
-                // `value` and `f.key` are strong references the set calls consume.
-                unsafe {
-                    if !f.is_map {
-                        if ffi::PyList_SetItem(f.obj, f.index, value) != 0 {
-                            return Err(Fail::Py);
+                match &f.dict {
+                    None => self.items.push(value),
+                    Some(dict) => match f.key.take() {
+                        None => {
+                            f.key = Some(value);
+                            break;
                         }
-                        f.index += 1;
-                    } else if f.key.is_null() {
-                        f.key = value;
-                        break;
-                    } else {
-                        let key = std::mem::replace(&mut f.key, ptr::null_mut());
-                        let ok = key_admitted(key);
-                        let rc = if ok {
-                            ffi::PyDict_SetItem(f.obj, key, value)
-                        } else {
-                            0
-                        };
-                        if !ok {
-                            set_key_error(py, key);
+                        Some(key) => {
+                            // strict_map_key=True: a map key must be exactly `str` or `bytes`.
+                            if !(key.is_exact_instance_of::<PyString>()
+                                || key.is_exact_instance_of::<PyBytes>())
+                            {
+                                return Err(restore(py, key_error(&key)));
+                            }
+                            dict.set_item(key, value).map_err(|e| restore(py, e))?;
                         }
-                        ffi::Py_DECREF(key);
-                        ffi::Py_DECREF(value);
-                        if !ok || rc != 0 {
-                            return Err(Fail::Py);
-                        }
-                    }
-                    if f.owed > 0 {
-                        break;
-                    }
-                    let done = self.stack.pop().expect("a frame was just read");
-                    value = done.obj;
-                    if done.marker {
-                        let obj = Bound::from_owned_ptr(py, value);
-                        value = hook.call1((obj,)).map_err(|e| restore(py, e))?.into_ptr();
-                    }
+                    },
+                }
+                if f.owed > 0 {
+                    break;
+                }
+                let done = self.stack.pop().expect("a frame was just read");
+                value = match done.dict {
+                    Some(dict) => dict.into_any(),
+                    None => PyList::new(py, self.items.drain(done.base..))
+                        .map_err(|e| restore(py, e))?
+                        .into_any(),
+                };
+                if done.marker {
+                    value = hook.call1((value,)).map_err(|e| restore(py, e))?;
                 }
             }
         }
@@ -265,19 +232,14 @@ impl<'a> Decoder<'a> {
         Ok(n)
     }
 
-    /// A one-byte element, already built as `obj`.
+    /// A one-byte element, already built as `obj` (dropped on a bound failure).
     #[inline]
-    fn scalar(&mut self, obj: *mut ffi::PyObject) -> Result<*mut ffi::PyObject, Fail> {
-        // Accounting first: on a bound failure the object is dropped, not leaked.
-        if let Err(e) = self.account(0, 0) {
-            // SAFETY: obj is a new reference or null.
-            unsafe { ffi::Py_XDECREF(obj) };
-            return Err(e);
-        }
-        check(obj)
+    fn scalar(&mut self, obj: Bound<'py, PyAny>) -> Result<Option<Bound<'py, PyAny>>, Fail> {
+        self.account(0, 0)?;
+        Ok(Some(obj))
     }
 
-    unsafe fn string(&mut self, len: u64) -> Result<*mut ffi::PyObject, Fail> {
+    fn string(&mut self, len: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
         self.account(len, 0)?;
         let at_key = self.at_key();
         let start = self.pos;
@@ -293,22 +255,22 @@ impl<'a> Decoder<'a> {
             VALUE_CACHE_MAX_LEN
         };
         if bytes.len() > max {
-            return check(decode_utf8(bytes));
+            return self.decode_utf8(bytes).map(Some);
         }
         let i = slot_of(bytes);
         let held = if at_key { self.keys[i] } else { self.values[i] };
-        if let Some(s) = (held as usize).checked_sub(1).map(|j| self.cached[j]) {
+        if let Some(s) = (held as usize).checked_sub(1).map(|j| &self.cached[j]) {
             if s.len == bytes.len() && &self.data[s.start..s.start + s.len] == bytes {
-                return Ok(ffi::Py_NewRef(s.obj));
+                return Ok(Some(s.obj.clone()));
             }
         }
         // Not interned, unlike msgpack-python's keys: equal either way, and interning a distinct key
         // costs more than every later lookup of it saves.
-        let obj = check(decode_utf8(bytes))?;
+        let obj = self.decode_utf8(bytes)?;
         let slot = StrSlot {
             start,
             len: bytes.len(),
-            obj: ffi::Py_NewRef(obj),
+            obj: obj.clone(),
         };
         if held == 0 {
             self.cached.push(slot);
@@ -319,41 +281,50 @@ impl<'a> Decoder<'a> {
                 &mut self.values[i]
             }) = self.cached.len() as u16;
         } else {
-            let old = std::mem::replace(&mut self.cached[held as usize - 1], slot);
-            ffi::Py_DECREF(old.obj);
+            self.cached[held as usize - 1] = slot;
         }
-        Ok(obj)
+        Ok(Some(obj))
     }
 
-    unsafe fn binary(&mut self, len: u64) -> Result<*mut ffi::PyObject, Fail> {
+    /// `bytes` as a `str`, or the UnicodeDecodeError of the strict UTF-8 decode msgpack-python runs.
+    #[inline]
+    fn decode_utf8(&self, bytes: &[u8]) -> Result<Bound<'py, PyAny>, Fail> {
+        PyString::from_bytes(self.py, bytes)
+            .map(Bound::into_any)
+            .map_err(|e| restore(self.py, e))
+    }
+
+    fn binary(&mut self, len: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
         self.account(len, 0)?;
         let bytes = self.take(len);
-        check(ffi::PyBytes_FromStringAndSize(
-            bytes.as_ptr().cast::<c_char>(),
-            bytes.len() as ffi::Py_ssize_t,
-        ))
+        Ok(Some(PyBytes::new(self.py, bytes).into_any()))
     }
 
-    unsafe fn number(&mut self, marker: u8) -> Result<*mut ffi::PyObject, Fail> {
+    fn number(&mut self, marker: u8) -> Result<Option<Bound<'py, PyAny>>, Fail> {
+        let py = self.py;
         let width = 1u64 << (marker & 0x03);
         self.account(width, 0)?;
         let raw = big_endian(self.take(width));
-        check(match marker {
-            0xca => ffi::PyFloat_FromDouble(f64::from(f32::from_bits(raw as u32))),
-            0xcb => ffi::PyFloat_FromDouble(f64::from_bits(raw)),
-            0xcc..=0xce => ffi::PyLong_FromLongLong(raw as i64),
-            0xcf => ffi::PyLong_FromUnsignedLongLong(raw),
-            0xd0 => ffi::PyLong_FromLong(c_long::from(raw as u8 as i8)),
-            0xd1 => ffi::PyLong_FromLong(c_long::from(raw as u16 as i16)),
-            0xd2 => ffi::PyLong_FromLong(c_long::from(raw as u32 as i32)),
-            _ => ffi::PyLong_FromLongLong(raw as i64),
-        })
+        Ok(Some(match marker {
+            0xca => PyFloat::new(py, f64::from(f32::from_bits(raw as u32))).into_any(),
+            0xcb => PyFloat::new(py, f64::from_bits(raw)).into_any(),
+            0xcf => match raw.into_pyobject(py) {
+                Ok(n) => n.into_any(),
+                Err(never) => match never {},
+            },
+            0xd0 => int(py, i64::from(raw as u8 as i8)),
+            0xd1 => int(py, i64::from(raw as u16 as i16)),
+            0xd2 => int(py, i64::from(raw as u32 as i32)),
+            // 0xcc..=0xce (unsigned, at most 32 bits) and 0xd3 (signed 64 bits).
+            _ => int(py, raw as i64),
+        }))
     }
 
     /// An ext of `len` data bytes after its type byte, decoded as msgpack-python's defaults do:
     /// type -1 to `msgpack.Timestamp` (through its own `from_bytes`), any other to
     /// `msgpack.ExtType(code, data)`. cachekit never writes an ext, so this path is not hot.
-    unsafe fn ext(&mut self, py: Python<'_>, len: u64) -> Result<*mut ffi::PyObject, Fail> {
+    fn ext(&mut self, len: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
+        let py = self.py;
         self.account(len + 1, 0)?;
         let code = self.take(1)[0] as i8;
         let data = self.take(len);
@@ -363,36 +334,42 @@ impl<'a> Decoder<'a> {
         } else {
             msgpack_attr(py, "ExtType").and_then(|t| t.call1((code, PyBytes::new(py, data))))
         };
-        made.map(Bound::into_ptr).map_err(|e| restore(py, e))
+        made.map(Some).map_err(|e| restore(py, e))
     }
 
-    /// Open a container of `n` elements (`2n` slots for a map). Returns null after pushing a
+    /// Open a container of `n` elements (`2n` slots for a map). Returns None after pushing a
     /// non-empty one, or the empty container.
-    unsafe fn open(&mut self, is_map: bool, n: u64) -> Result<*mut ffi::PyObject, Fail> {
+    fn open(&mut self, is_map: bool, n: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
         // An empty container is still a level, so depth is checked before the n > 0 push.
         if self.stack.len() >= self.max_depth {
             return Err(Fail::Bound);
         }
         let owed = if is_map { 2 * n } else { n };
         self.account(0, owed)?;
-        // n <= the input length now, so it fits Py_ssize_t.
-        let obj = check(if is_map {
-            ffi::PyDict_New()
-        } else {
-            ffi::PyList_New(n as ffi::Py_ssize_t)
-        })?;
         if n == 0 {
-            return Ok(obj);
+            return Ok(Some(if is_map {
+                PyDict::new(self.py).into_any()
+            } else {
+                PyList::empty(self.py).into_any()
+            }));
         }
         self.stack.push(Frame {
-            obj,
+            dict: is_map.then(|| PyDict::new(self.py)),
+            key: None,
+            base: self.items.len(),
             owed,
-            index: 0,
-            key: ptr::null_mut(),
-            is_map,
             marker: false,
         });
-        Ok(ptr::null_mut())
+        Ok(None)
+    }
+}
+
+/// A Python `int`.
+#[inline]
+fn int(py: Python<'_>, n: i64) -> Bound<'_, PyAny> {
+    match n.into_pyobject(py) {
+        Ok(n) => n.into_any(),
+        Err(never) => match never {},
     }
 }
 
@@ -401,28 +378,15 @@ fn big_endian(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
 }
 
-#[inline]
-fn check(obj: *mut ffi::PyObject) -> Result<*mut ffi::PyObject, Fail> {
-    if obj.is_null() {
-        Err(Fail::Py)
-    } else {
-        Ok(obj)
-    }
-}
-
-/// Put a fetched error back so the `Fail::Py` path finds it.
+/// Set `e` as the current Python error, for the `Fail::Py` path to fetch.
 fn restore(py: Python<'_>, e: PyErr) -> Fail {
     e.restore(py);
     Fail::Py
 }
 
-/// `strict_map_key=True`: a map key must be exactly `str` or `bytes`.
-unsafe fn key_admitted(key: *mut ffi::PyObject) -> bool {
-    ffi::PyUnicode_CheckExact(key) != 0 || ffi::PyBytes_CheckExact(key) != 0
-}
-
-unsafe fn set_key_error(py: Python<'_>, key: *mut ffi::PyObject) {
-    let name = Bound::from_borrowed_ptr(py, key)
+/// msgpack-python's `strict_map_key=True` refusal of `key`.
+fn key_error(key: &Bound<'_, PyAny>) -> PyErr {
+    let name = key
         .get_type()
         .name()
         .map(|n| n.to_string())
@@ -430,7 +394,6 @@ unsafe fn set_key_error(py: Python<'_>, key: *mut ffi::PyObject) {
     PyValueError::new_err(format!(
         "{name:.100} is not allowed for map key when strict_map_key=True"
     ))
-    .restore(py);
 }
 
 fn msgpack_attr<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -449,14 +412,12 @@ pub fn unpackb_standard(
     max_depth: usize,
     hook: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let mut decoder = Decoder::new(data, max_depth);
-    let outcome = decoder.decode(py, hook);
+    let mut decoder = Decoder::new(py, data, max_depth);
+    let outcome = decoder.decode(hook);
     let consumed = decoder.pos;
     drop(decoder);
     let failure = match outcome {
         Ok(value) => {
-            // SAFETY: a strong reference the decode returned.
-            let value = unsafe { Bound::from_owned_ptr(py, value) };
             if consumed == data.len() {
                 return Ok(value.unbind());
             }

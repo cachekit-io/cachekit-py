@@ -11,7 +11,8 @@ extension now does both in one pass. These tests hold it to that reference, inpu
   read paths' error handling see what they saw before;
 - the hook runs only on maps holding a marker key (the rule the speed rests on), and a heap
   amplification payload costs no more than it did;
-- no path leaks a reference, and the decode is safe to run from many threads.
+- no path leaks an object it allocates, nor a reference to its input, the input's buffer or the hook,
+  and the decode is safe to run from many threads.
 
 The inputs are values packed as the serializer packs them, the same with ``bytes`` packed as str
 (invalid UTF-8), and both after random byte edits, so the bounds, truncation, reserved-marker and
@@ -21,6 +22,7 @@ trailing-byte paths are reached as well as the happy path.
 from __future__ import annotations
 
 import gc
+import sys
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -326,8 +328,10 @@ def _measure_leaks() -> list[int]:
     return sizes
 
 
-# A leak on any path keeps at least one object per call, and the smallest object (an int) is 28 bytes, so it adds at
-# least 500 * 28 = 13.7 KiB to EVERY round. The interpreter's own growth (caches, free lists, a dict resizing) comes
+# This gate catches per-call allocations only: a path that keeps an object it allocated keeps at least one per call,
+# and the smallest object (an int) is 28 bytes, so it adds at least 500 * 28 = 13.7 KiB to EVERY round. A leaked
+# reference to an object that already exists (the input, its buffer, the hook) allocates nothing, so tracemalloc
+# cannot see it: test_no_decode_keeps_a_reference_to_its_input counts those. The interpreter's own growth (caches, free lists, a dict resizing) comes
 # in a few one-off steps, and one such step can exceed any fixed budget on the total. So the gate bounds the quietest
 # of five rounds, which grows by under 1 KiB when nothing leaks.
 LEAK_ROUNDS = 5
@@ -336,10 +340,32 @@ LEAK_ROUND_BUDGET = 8 * 1024
 
 
 def test_no_path_leaks_a_reference() -> None:
-    """A leaked reference keeps its object alive, so traced memory would climb in every round."""
+    """An object a decode allocates and never frees climbs traced memory every round (per-call allocations only)."""
     sizes = measure_in_subprocess(_measure_leaks)
     rounds = [after - before for before, after in zip(sizes, sizes[1:], strict=False)]
     assert min(rounds) < LEAK_ROUND_BUDGET, sizes
+
+
+_MULTI_BYTE = {name: data for name, data in CASES.items() if len(data) > 1}
+
+
+@pytest.mark.parametrize("data", _MULTI_BYTE.values(), ids=_MULTI_BYTE.keys())
+def test_no_decode_keeps_a_reference_to_its_input(data: bytes) -> None:
+    """Every path, from every buffer type, gives back each reference it took to the input, its buffer and the hook."""
+    owned = bytes(bytearray(data))  # a fresh object: a code constant may be immortal, and its count never moves
+    view, buffer = memoryview(owned), bytearray(data)
+    assert view.obj is owned
+    watched = (owned, view, buffer, _standard_object_hook)
+    before = [sys.getrefcount(o) for o in watched]
+    for source in (owned, view, buffer):
+        for _ in range(100):
+            try:
+                rust(source)
+            except (ValueError, SerializationError, TypeError):  # noqa: S110 - every refusal CASES pins; any other error fails
+                pass
+    del source  # still bound to the last input
+    assert [sys.getrefcount(o) for o in watched] == before
+    buffer.append(0)  # a buffer export never released refuses the resize with BufferError
 
 
 def test_threads_decode_one_document_concurrently() -> None:
