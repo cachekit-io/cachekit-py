@@ -248,44 +248,57 @@ def cachekit_label() -> str:
     A checkout reports the last release's version until the next release bumps it, so a recording made
     from one would pass its figures off as that release's. An install from a package index leaves no
     ``direct_url.json`` (PEP 610) and is the release its version names. An install from a VCS URL adds
-    its commit. An editable install from a git checkout adds the commit its Python follows, and
-    ``.dirty`` when ``src/`` or ``rust/`` has uncommitted or untracked changes. It cannot vouch that
-    its compiled extension was rebuilt for that commit, since ``uv sync`` does not rebuild it when only
-    ``rust/`` changed, so only a release is fit to publish. Any other direct install cannot say which
-    commit it was built from, so the run is refused before it starts. That covers a wheel file, and a
-    non-editable install of a directory, which copies the tree when it is installed.
+    its commit. Either counts only when the imported package is one of that install's own files:
+    otherwise something earlier on ``sys.path``, a checkout on ``PYTHONPATH`` say, shadows it.
+
+    An editable install from a git checkout adds the commit its Python follows, when the imported
+    package lies in that checkout. It adds ``.dirty`` when the sources the extension builds from
+    (``src/``, ``rust/``, ``Cargo.toml``, ``Cargo.lock``) have uncommitted or untracked changes. It
+    cannot vouch that its compiled extension was rebuilt for that commit, since ``uv sync`` does not
+    rebuild it when only ``rust/`` changed, so only a release is fit to publish.
+
+    Any other install cannot say which commit ran, so the run is refused before it starts. That covers
+    a shadowed import, a wheel file, and a non-editable install of a directory, which copies the tree
+    when it is installed.
     """
     import cachekit
 
     version = cachekit.__version__
-    direct_url = importlib.metadata.distribution("cachekit").read_text("direct_url.json")
-    if direct_url is None:
-        return f"cachekit {version}"
-    origin = json.loads(direct_url)
-    if "vcs_info" in origin:
-        return f"cachekit {version}+{origin['vcs_info']['commit_id'][:8]}"
+    imported = Path(cachekit.__file__).resolve()
+    installed = importlib.metadata.distribution("cachekit")
+    direct_url = installed.read_text("direct_url.json")
+    origin: dict[str, Any] = json.loads(direct_url) if direct_url else {}
     git = shutil.which("git")
     # Only an editable install follows the checkout: a plain one copied the tree when it was installed.
     if origin.get("dir_info", {}).get("editable") and git:
-        checkout = url2pathname(urlsplit(origin["url"]).path)
+        checkout = Path(url2pathname(urlsplit(origin["url"]).path)).resolve()
 
         def git_out(*cmd: str) -> str:
             return subprocess.run(  # noqa: S603 (trusted: git on PATH, run in the install's own checkout)
-                [git, "-C", checkout, *cmd], capture_output=True, text=True, check=True, timeout=30
+                [git, "-C", str(checkout), *cmd], capture_output=True, text=True, check=True, timeout=30
             ).stdout.strip()
 
-        try:
-            commit = git_out("rev-parse", "--short=8", "HEAD")
-            # Untracked files count, whatever status.showUntrackedFiles says: an editable install
-            # imports a new module before it is added.
-            changes = git_out("status", "--porcelain", "--untracked-files=normal", "--", "src", "rust")
-        except (OSError, subprocess.SubprocessError):
-            pass  # not a git checkout: refused below
-        else:
-            return f"cachekit {version}+{commit}{'.dirty' if changes else ''}"
+        if imported.is_relative_to(checkout):  # else something earlier on sys.path shadows the checkout
+            try:
+                commit = git_out("rev-parse", "--short=8", "HEAD")
+                # Untracked files count, whatever status.showUntrackedFiles says: an editable install
+                # imports a new module before it is added.
+                changes = git_out(
+                    "status", "--porcelain", "--untracked-files=normal", "--", "src", "rust", "Cargo.toml", "Cargo.lock"
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass  # not a git checkout: refused below
+            else:
+                return f"cachekit {version}+{commit}{'.dirty' if changes else ''}"
+    elif "dir_info" not in origin and any(installed.locate_file(f).resolve() == imported for f in installed.files or ()):
+        if direct_url is None:
+            return f"cachekit {version}"
+        if "vcs_info" in origin:
+            return f"cachekit {version}+{origin['vcs_info']['commit_id'][:8]}"
     raise SystemExit(
-        f"terrain_canary: cachekit {version} was installed from {origin.get('url')}, and which commit it was built "
-        "from is unknown. Install a release from a package index, or install the checkout editable (uv sync) "
+        f"terrain_canary: cachekit {version} was imported from {imported.parent} and installed from "
+        f"{origin.get('url', 'a package index')}, and which commit it was built from is unknown. Install a release "
+        "from a package index, with nothing on PYTHONPATH shadowing it, or install the checkout editable (uv sync) "
         "with git on PATH."
     )
 
