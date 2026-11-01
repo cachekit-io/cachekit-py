@@ -644,7 +644,7 @@ class CachekitIOBackend:
         if seen is not None:
             seen.append(self._write_freshness(response))
 
-    # set reports its write's freshness through _WRITE_DEADLINES; see cache_handler._l1_write_until.
+    # set reports its write's freshness through _WRITE_DEADLINES; see cache_handler._written_copy_expiry.
     _reports_write_deadline = True
 
     @staticmethod

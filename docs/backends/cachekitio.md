@@ -162,7 +162,9 @@ plan maximum. A malformed or `0` value keeps no L1 copy; a server that sends no 
 copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied TTL, so it never
 lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
 as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
-backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread. A subclass that writes
+backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread. A wrapper that
+delegates on another thread (a timeout wrapper with its own executor) must run the call under
+`contextvars.copy_context().run`; otherwise its L1 copies keep `ttl` and ignore Fresh-For. A subclass that writes
 any other way gives the decorator no response to read, so it keeps no L1 copy of that write.
 
 ## TTL Inspection (async only)

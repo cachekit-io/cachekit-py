@@ -399,23 +399,35 @@ def _fuses_tracked_write(backend: object) -> bool:
     return True
 
 
-def _l1_write_until(handler: Any, seen: list[tuple[float, float]], stored: bool, ttl: Optional[float]) -> Optional[float]:
-    """The instant the writer's L1 copy of a value must stop serving by (API-103), from what the write's
-    backend reported into ``seen`` (``_WRITE_DEADLINES``); None keeps the stated ttl from the put.
+_unreported_write_classes: set[type] = set()
+
+
+def _written_copy_expiry(
+    backend: object, seen: list[tuple[float, float]], stored: bool, ttl: Optional[float]
+) -> Optional[float]:
+    """When the writer's L1 copy of a value it wrote expires (API-103), from what the write reported into
+    ``seen`` (``_WRITE_DEADLINES``); None keeps the stated ttl from the put.
 
     ``min(local_ttl, effective_ttl, fresh_for)``, every term timed from the 2xx's receipt: ttl stands for
     local_ttl and effective_ttl (the L1 default for ttl=None), Fresh-For for the last, unbounded when
     absent. A report wins even when the write then failed (an override that raised after its 2xx). With
     none: None for a failed write (API-36/37 bound the copy) or a backend that never reports, and 0.0, no
-    copy, when the handler's backend says it reports but the write never reached its own ``set`` (an
-    override that does not delegate, or delegates on another thread), so the bound is unknown. A nested
-    write that reports into the same list can only shorten the bound.
+    copy, when the backend says it reports but the write never reached its own ``set`` (an override that
+    does not delegate, or delegates on another thread without the context), so the bound is unknown: that
+    turns L1 off for the backend's writes, logged once per class. A nested write that reports into the
+    same list can only shorten the bound.
     """
     if seen:
         local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
         return min(min(received + local_ttl, fresh_until) for received, fresh_until in seen)
-    if not stored or getattr(getattr(handler, "backend", None), "_reports_write_deadline", False) is not True:
+    if not stored or getattr(backend, "_reports_write_deadline", False) is not True:
         return None
+    if type(backend) not in _unreported_write_classes:
+        _unreported_write_classes.add(type(backend))
+        get_logger().warning(
+            f"{type(backend).__name__}.set reported no write deadline: its writes keep no L1 copy. "
+            "Delegate to the base set on the same thread, or under contextvars.copy_context().run."
+        )
     return 0.0
 
 
@@ -433,7 +445,7 @@ def _set_l2(
     With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
     (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
     False and the caller tracks a stored key itself. l1_until bounds the writer's L1 copy
-    (``_l1_write_until``), None where the backend reports no freshness. getattr: custom CacheHandlerStrategy
+    (``_written_copy_expiry``), None where the backend reports no freshness. getattr: custom CacheHandlerStrategy
     impls predate set_tracked, as they predate set_streaming.
     """
     set_tracked = None if registry_id is None else getattr(handler, "set_tracked", None)
@@ -455,7 +467,12 @@ def _set_l2(
             stored = bool(handler.set(key, value, ttl))
     finally:
         _WRITE_DEADLINES.reset(token)
-    return stored, False, _l1_write_until(handler, seen, stored, ttl)
+    # Nothing reported, the case for every backend but CachekitIO: answered inline, so the gated miss
+    # path pays no extra call (_written_copy_expiry gives None here too).
+    backend = getattr(handler, "backend", None)
+    if not seen and (not stored or getattr(backend, "_reports_write_deadline", False) is not True):
+        return stored, False, None
+    return stored, False, _written_copy_expiry(backend, seen, stored, ttl)
 
 
 class _MultiDeleteBackend(Protocol):
@@ -1724,7 +1741,7 @@ class StoreOutcome(NamedTuple):
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
     already reported: the caller must not track the key again. l1_until is the instant the
-    caller's L1 copy must stop serving by (``_l1_write_until``; None keeps the stated ttl).
+    caller's L1 copy must stop serving by (``_written_copy_expiry``; None keeps the stated ttl).
     """
 
     envelope: Optional[bytes]

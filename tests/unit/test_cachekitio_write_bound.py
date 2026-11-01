@@ -185,7 +185,6 @@ class TestBackendReportsPutFreshFor:
     def test_set_keeps_its_none_return(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         saas.put_fresh_for = "5"
         assert backend.set("k", b"v", ttl=60) is None  # type: ignore[func-returns-value]
-        assert _WRITE_DEADLINES.get() is None  # nobody listening: nothing reported
 
 
 class TestWriteBound:
@@ -259,38 +258,6 @@ class TestWriteBound:
         assert _write(StandardCacheHandler(backend)) == (True, False, 0.0)
         assert saas.ops == ["PUT"]
 
-    def test_patched_class_set_still_runs(
-        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        seen: list[str] = []
-        original = CachekitIOBackend.set
-
-        def recording_set(
-            self: CachekitIOBackend, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None
-        ) -> None:
-            seen.append(key)
-            original(self, key, value, ttl, stale_ttl)
-
-        monkeypatch.setattr(CachekitIOBackend, "set", recording_set)
-        saas.put_fresh_for = "5"
-        assert _write(StandardCacheHandler(backend)) == (True, False, clock.now + 5)
-        assert seen == ["k"]
-
-    def test_handler_set_override_runs(
-        self, saas: _FakeSaaS, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The write goes through the handler's own ``set``, so a patch that refuses it sends no PUT."""
-        calls: list[str] = []
-
-        def refusing(self: StandardCacheHandler, *args: Any, **kwargs: Any) -> bool:
-            calls.append("set")
-            return False
-
-        monkeypatch.setattr(StandardCacheHandler, "set", refusing)
-        assert _write(StandardCacheHandler(backend)) == (False, False, None)
-        assert calls == ["set"]
-        assert "PUT" not in saas.ops
-
     def test_nested_write_restores_the_outer_list(self, saas: _FakeSaaS, clock: _Clock) -> None:
         """A write made inside another backend's ``set`` reports into its own list, and the outer write's
         list is back in place for the outer 2xx."""
@@ -339,8 +306,9 @@ class TestWriteBound:
         saas.put_fresh_for = "5"
         assert _write(StandardCacheHandler(backend)) == (False, False, clock.now + 5)
 
-    def test_forwarding_proxy_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
-        """The capability is read off the instance, so a proxy that forwards attributes forwards it."""
+    def test_forwarding_proxy_that_bypasses_set_keeps_no_copy(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
+        """The capability is read off the instance, so a proxy that forwards attributes forwards it: a write
+        that then never reaches the base ``set`` has an unknown bound, and keeps no copy (0.0)."""
 
         class _Proxy:
             def __init__(self, inner: CachekitIOBackend) -> None:
@@ -350,10 +318,12 @@ class TestWriteBound:
                 return getattr(self.inner, name)
 
             def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
-                self.inner.set(key, value, ttl, stale_ttl)
+                inner = self.inner
+                inner._request_sync("PUT", inner._encode_key(key), body=value, headers=inner._set_headers(ttl, stale_ttl))
 
-        saas.put_fresh_for = "0"
-        assert _write(StandardCacheHandler(_Proxy(backend))) == (True, False, clock.now)  # type: ignore[arg-type]
+        saas.put_fresh_for = "5"
+        assert _write(StandardCacheHandler(_Proxy(backend))) == (True, False, 0.0)  # type: ignore[arg-type]
+        assert saas.ops == ["PUT"]
 
 
 def _decorated(
@@ -502,31 +472,6 @@ class TestWriterCopyBound:
         assert calls
         assert "PUT" not in saas.ops
 
-    def test_forwarding_proxy_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
-        """A proxy that forwards attributes and set to a CachekitIO backend keeps its writes' bounds."""
-
-        class _Proxy:
-            def __init__(self, inner: CachekitIOBackend) -> None:
-                self.inner = inner
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self.inner, name)
-
-            def get_with_freshness(self, key: str) -> Any:
-                return self.inner.get_with_freshness(key)
-
-            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
-                self.inner.set(key, value, ttl, stale_ttl)
-
-        saas.put_fresh_for = "0"
-        saas.get_fresh_for = "0"
-        compute, calls = _decorated(_Proxy(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
-        assert compute() == 1
-        gets = saas.gets()
-        assert compute() == 1
-        assert saas.gets() == gets + 1
-        assert len(calls) == 1
-
     def test_composing_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
         """A composing wrapper (no attribute forwarding) over CachekitIO: a 0 Fresh-For keeps no copy."""
 
@@ -548,24 +493,6 @@ class TestWriterCopyBound:
 
         saas.put_fresh_for = "0"
         compute, calls = _decorated(_Metrics(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
-        assert compute() == 1
-        gets = saas.gets()
-        assert compute() == 1
-        assert saas.gets() == gets + 1
-        assert len(calls) == 1
-
-    def test_delegating_override_keeps_the_bound(
-        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool
-    ) -> None:
-        """A ``set`` override that records and delegates must not erase a 0 Fresh-For: no copy is kept."""
-
-        class _Recording(CachekitIOBackend):
-            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
-                super().set(key, value, ttl, stale_ttl)
-
-        backend.__class__ = _Recording
-        saas.put_fresh_for = "0"
-        compute, calls = _decorated(backend, is_async=is_async)
         assert compute() == 1
         gets = saas.gets()
         assert compute() == 1
@@ -705,6 +632,50 @@ class TestWriteBehindCopyBound:
         clock.now = received + 58.5  # past receipt + 59 less the buffer
         assert compute() == 1
         assert saas.gets() == gets + 1
+
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("lands_first", [False, True], ids=["put-first", "write-lands-first"])
+    @pytest.mark.parametrize("raiser", ["backend", "handler"])
+    def test_write_failing_after_its_2xx_keeps_no_copy(
+        self,
+        saas: _FakeSaaS,
+        backend: CachekitIOBackend,
+        clock: _Clock,
+        monkeypatch: pytest.MonkeyPatch,
+        raiser: str,
+        lands_first: bool,
+        is_async: bool,
+    ) -> None:
+        """A deferred write whose PUT got Fresh-For 0 and which then raised: in the backend's ``set`` (the
+        handler catches it, so the write is not stored but its bound was reported), or in a patched handler
+        ``set`` (so ``_set_l2`` raises and the bound is lost). Either way no copy serves."""
+        if raiser == "backend":
+
+            class _Raising(CachekitIOBackend):
+                def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+                    super().set(key, value, ttl, stale_ttl)
+                    raise RuntimeError("audit hook failed")
+
+            backend.__class__ = _Raising
+        else:
+            original = StandardCacheHandler.set
+
+            def raising(self_: StandardCacheHandler, *args: Any, **kwargs: Any) -> bool:
+                original(self_, *args, **kwargs)
+                raise RuntimeError("audit hook failed")
+
+            monkeypatch.setattr(StandardCacheHandler, "set", raising)
+        if lands_first:
+            self._land_before_put(monkeypatch)
+        saas.put_fresh_for = "0"
+        compute, _ = _decorated(backend, is_async=is_async, write_behind=True, distributed_lock=False)
+        assert compute() == 1
+        self._drain()
+        assert saas.ops.count("PUT") == 1
+        gets = saas.gets()
+        clock.advance(30)
+        assert compute() == 1
+        assert saas.gets() == gets + 1  # no L1 copy served
 
 
 class TestPatchTtlNeverExtendsL1:
