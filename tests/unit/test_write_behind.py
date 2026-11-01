@@ -941,3 +941,173 @@ class TestWriterEdges:
         release.set()
         assert writer.close(_deadline()) == []
         assert sent == ["newer"] and [type(e) for e in errors] == [_Escape]
+
+
+def _starts(monkeypatch: pytest.MonkeyPatch) -> list[threading.Thread]:
+    """Every thread started from now on, in order."""
+    started: list[threading.Thread] = []
+    start = threading.Thread.start
+
+    def recording_start(self: threading.Thread) -> None:
+        started.append(self)
+        start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", recording_start)
+    return started
+
+
+def _until(holds: Any) -> None:
+    """Wait for state the test cannot be signalled about (a thread reaching its wait). Guard only."""
+    deadline = _deadline()
+    while not holds():
+        if time.monotonic() > deadline:
+            raise AssertionError("never held")
+        time.sleep(0.001)
+
+
+@pytest.fixture
+def no_park_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Other tests' threads may still be waiting out IDLE_S; the cap is TestParking's own subject only."""
+    monkeypatch.setattr(wb, "MAX_PARKED", 10_000)
+
+
+def _three_writers_under_a_cap_of_two() -> object:
+    """Run fresh: what three writers' threads do once their one write is sent, with MAX_PARKED 2."""
+    wb.MAX_PARKED, wb.IDLE_S = 2, 3600.0
+    writers = [wb.WriteBehind(lambda *_: None) for _ in range(3)]
+    for writer in writers:
+        writer.submit(("", "k"), 1, lambda: None)
+    states = [w._state for w in writers]
+    _until(lambda: all(not s.pending and not s.sending and s.workers == s.idle for s in states))
+    waiting = sorted((s.workers, s.idle) for s in states)
+    parked = wb._parked[os.getpid()]
+    for writer in writers:
+        writer.close(_deadline())
+    _until(lambda: not any(t.name == _WRITER for t in threading.enumerate()))
+    return {"waiting": waiting, "parked": parked, "parked_after_close": wb._parked[os.getpid()]}
+
+
+def _forked_child_parks_from_zero() -> object:
+    """Run fresh: a parent with a waiting thread forks; what the child's writer and count start from."""
+    wb.IDLE_S = 3600.0
+    writer = wb.WriteBehind(lambda *_: None)
+    writer.submit(("", "k"), 1, lambda: None)
+    _until(lambda: writer._state.idle == 1)
+    r, w = os.pipe()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(r)
+            state = writer._current()
+            before = {"parked": wb._parked.get(os.getpid(), 0), "workers": state.workers, "idle": state.idle}
+            writer.submit(("", "child"), 1, lambda: None)
+            _until(lambda: state.idle == 1)
+            outcome: object = {"before": before, "parked_after": wb._parked[os.getpid()]}
+        except BaseException as e:
+            outcome = {"error": repr(e)}
+        try:
+            report(w, outcome)
+        finally:
+            os._exit(1)
+    os.close(w)
+    return {"child": child_outcome(child, r), "parent_parked": wb._parked[os.getpid()]}
+
+
+def _fork_warns_without_write_behind() -> object:
+    """Run fresh: does os.fork() already warn after a default @cache.minimal miss, write-behind off?"""
+    import warnings
+
+    backend = _GatedBackend()
+
+    @cache.minimal(backend=backend, write_behind=False)
+    def fn(x: int) -> int:
+        return x
+
+    fn(1)
+    threads = sorted(t.name for t in threading.enumerate())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        child = os.fork()
+        if child == 0:
+            os._exit(0)
+    os.waitpid(child, 0)
+    return {"threads": threads, "warned": any("multi-threaded" in str(w.message) for w in caught)}
+
+
+@pytest.mark.usefixtures("no_park_cap")
+class TestParking:
+    def test_a_write_that_finds_a_waiting_thread_starts_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wb, "IDLE_S", 3600.0)
+        writer = wb.WriteBehind(lambda *_: None)
+        started = _starts(monkeypatch)
+        sent: list[str] = []
+        assert writer.submit(("", "a"), 1, lambda: sent.append("a"))
+        _until(lambda: writer._state.idle == 1)
+        assert writer.submit(("", "b"), 1, lambda: sent.append("b"))
+        _until(lambda: sent == ["a", "b"])
+        assert [t.name for t in started] == [_WRITER]
+        assert writer.close(_deadline()) == []
+
+    def test_a_waiting_thread_ends_after_idle_s(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wb, "IDLE_S", 0.05)
+        writer = wb.WriteBehind(lambda *_: None)
+        started = _starts(monkeypatch)
+        sent_at: list[float] = []
+        assert writer.submit(("", "a"), 1, lambda: sent_at.append(time.monotonic()))
+        (thread,) = started
+        thread.join(_GUARD_SECONDS)
+        assert not thread.is_alive()
+        assert time.monotonic() - sent_at[0] >= wb.IDLE_S  # waited, rather than ending with the queue
+        s = writer._state
+        assert (s.workers, s.idle) == (0, 0)
+        assert writer.submit(("", "b"), 1, lambda: None)  # nothing waiting: a thread starts again
+        assert len(started) == 2
+        assert writer.close(_deadline()) == []
+
+    def test_closing_ends_waiting_threads_at_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wb, "IDLE_S", 3600.0)
+        writer = wb.WriteBehind(lambda *_: None)
+        started = _starts(monkeypatch)
+        assert writer.submit(("", "a"), 1, lambda: None)
+        _until(lambda: writer._state.idle == 1)
+        assert writer.close(_deadline()) == []
+        (thread,) = started
+        thread.join(_GUARD_SECONDS)  # an hour short of IDLE_S: alive here means close never woke it
+        assert not thread.is_alive()
+        assert (writer._state.workers, writer._state.idle) == (0, 0)
+
+    def test_a_waiting_thread_sends_a_write_queued_before_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """close() wakes waiting threads to end them, but a write already queued is still sent first."""
+        monkeypatch.setattr(wb, "IDLE_S", 3600.0)
+        writer = wb.WriteBehind(lambda *_: None)
+        sent: list[str] = []
+        assert writer.submit(("", "a"), 1, lambda: sent.append("a"))
+        _until(lambda: writer._state.idle == 1)
+        with writer._state.cond:  # queued with no notify: only close() wakes the thread
+            writer._state.pending[("", "b")] = wb._Job(lambda: sent.append("b"), contextvars.copy_context(), 1)
+            writer._state.bytes += 1
+        assert writer.close(_deadline()) == []
+        assert sent == ["a", "b"]
+
+    def test_at_most_max_parked_threads_wait_per_process(self) -> None:
+        run = run_fresh(_three_writers_under_a_cap_of_two)
+        assert run.returncode == 0, run.stderr
+        outcome = ast.literal_eval(run.stdout)
+        assert outcome == {"waiting": [(0, 0), (1, 1), (1, 1)], "parked": 2, "parked_after_close": 0}
+
+    def test_a_forked_child_starts_with_no_waiting_threads(self) -> None:
+        run = run_fresh(_forked_child_parks_from_zero)
+        assert run.returncode == 0, run.stderr
+        outcome = ast.literal_eval(run.stdout)
+        assert outcome["child"] == {"before": {"parked": 0, "workers": 0, "idle": 0}, "parked_after": 1}, outcome
+        assert outcome["parent_parked"] == 1
+
+    @pytest.mark.skipif(sys.version_info < (3, 12), reason="os.fork() warns about threads from 3.12")
+    def test_minimal_already_forks_multi_threaded_without_write_behind(self) -> None:
+        """Why a waiting thread needs no before-fork hook: a @cache.minimal process already runs the L1
+        sweeper for good, so os.fork() warns with write-behind off too, and a waiting thread changes nothing."""
+        run = run_fresh(_fork_warns_without_write_behind)
+        assert run.returncode == 0, run.stderr
+        outcome = ast.literal_eval(run.stdout)
+        assert outcome["warned"] is True, outcome
+        assert _WRITER not in outcome["threads"], outcome
