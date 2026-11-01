@@ -302,11 +302,12 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 ## Instruction Budgets
 
-`make perf-ir` counts the instructions each hot path executes per call and fails when a path costs **1% or more** above its committed budget. It warns from 0.2%. The orjson round trip fails at 2% and warns from 1% (see Limits). Instruction counts are deterministic where wall clock is not: two full runs agree within 0.08% per path (0.01% on CPython 3.12).
+`make perf-ir` counts the instructions each hot path executes per call and fails when a path costs **1% or more** above its committed budget. It warns from 0.2%. The orjson round trip fails at 2% and warns from 1% (see Limits). Instruction counts are deterministic where wall clock is not: two full runs agree within 0.08% per path (0.01% on CPython 3.12), and `byte_storage_store_40b` within 0.22% (see Method).
 
 **Method** (`tests/performance/ir_budget.py`; the measured process is `ir_workload.py`):
 - Each path runs under `valgrind --tool=callgrind --separate-threads=yes`, and only the main thread is counted. cachekit's background threads (L1 cleanup) vary by tens of percent between identical runs.
-- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped. The two real-data paths cost about 60 million instructions per call, so they run 10 and 30 calls after 5 warmup calls; startup still cancels, and two runs agreed within 0.03%.
+- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped. The two real-data paths cost about 60 million instructions per call, so they run 10 and 30 calls after 5 warmup calls; startup still cancels, and two runs agreed within 0.03%. The three paths that cost about 2,600 instructions per call (`l1_hit`, `minimal_l1_hit`, `byte_storage_store_40b`) run 1,000 and 300,000 calls, because startup cancels only to within about a million instructions (next item).
+- Startup lands in one of two states. Every measured process imports pandas, which loads pyarrow, and pyarrow's bundled jemalloc starts a background thread. How that thread is scheduled against the main thread decides which state a run starts in, and the two states' totals differ by 0.1 to 1.2 million instructions, by a different amount at each layout and loop size. Each run is a coin flip, on an idle machine as on a loaded one. With the thread turned off (`JE_ARROW_MALLOC_CONF=background_thread:false`) there is one state: 16 runs agreed within 4,800 instructions. A layout whose two runs start in different states is off by up to 350 instructions per call over 2,000 calls. The median of five layouts hides that on most paths, but one layout of a 2,600-instruction path reads up to 13% off, and in 8 of 80 gate runs at 1,000 and 3,000 calls such layouts moved `byte_storage_store_40b`'s figure by 4.2% to 8.4% (2,434 to 2,912 overall). Over 299,000 calls the shift is a few instructions per call: in 20 gate runs each on a loaded machine, its figure stayed within 2,656 to 2,658 (0.08%) on a build with cachekit-core 0.7.2 and 2,690 to 2,696 (0.22%) with 0.7.4, and `l1_hit` and `minimal_l1_hit` did not move in 6 runs each.
 - The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day L1 cleanup interval, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
 - Nothing that runs on real time lands in the measured loop: no background thread wakes, cyclic GC is off, and the GIL switch interval is long enough that the main thread gives up the GIL only where the code releases it.
 - Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the median. Any code change moves the layout, and the allocators take shorter or longer paths in some heap states: single layouts of the orjson round trip and the minimal L1 hit sat up to 2.4% from the rest. The median ignores one or two such layouts. The cheapest layout is not used, because a lucky one can sit 1% below the rest, and a budget recorded there makes every later run look like a regression.
@@ -318,9 +319,9 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 2,596 | 2,482 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 2,595 | 2,487 |
 | `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit) | 83,015 | 83,882 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,596 | 2,488 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,595 | 2,487 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 172,539 | 167,686 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 134,323 | 134,972 |
@@ -333,7 +334,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,781,406 | 61,324,948 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,793,577 | 61,344,459 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,097 | 101,938 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,658 | 2,540 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,656 | 2,532 |
 | `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,631 | 720,751 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 76,035 | 74,112 |
 | `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,014 | 160,608 |
