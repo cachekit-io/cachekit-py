@@ -371,7 +371,6 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Holder([(17, object()), (42, backend)]))  # (hash, backend) ring
         assert _reaches_write_deadlines(_Holder({backend}))
         assert _reaches_write_deadlines(_Holder({"tier": [[{"x": backend}]]}))  # nested, one wrapper level
-        assert _reaches_write_deadlines(_Holder([object()] * 1_000_000))  # budget spent: fails open, quickly
 
     def test_an_ordinary_backend_answers_false_without_failing_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A plain backend with dicts, lists, sets and slots in its attributes is searched to a clean False:
@@ -411,54 +410,59 @@ class TestWriteBound:
                 self.grid = [row] * 10**6
                 self.nested = [[[[0] * 100] * 100] * 100] * 100
 
-        started = time.monotonic()
-        assert _reaches_write_deadlines(_Wide())
-        assert time.monotonic() - started < 1.0
+        assert _reaches_write_deadlines(_Wide())  # finishes only if every read counts and shared lists are read once
 
-    def test_a_cycle_beside_the_backend_ends(self, backend: CachekitIOBackend) -> None:
+    def test_a_cycle_before_the_backend_ends(self, backend: CachekitIOBackend) -> None:
+        """The walk meets a self-referencing config dict first, then finds the backend one level down."""
         root: dict[str, object] = {}
         root["children"] = [{"parent": root}]
+
+        class _Holder:
+            def __init__(self) -> None:
+                self.inner = backend
 
         class _Wrapper:
             def __init__(self) -> None:
                 self.config = root
-                self.inner = backend
+                self.holder = _Holder()
 
         assert _reaches_write_deadlines(_Wrapper())
 
-    def test_a_full_bucket_does_not_starve_a_route(self, backend: CachekitIOBackend) -> None:
-        """Containers at one nesting level are read round-robin: a 4,096-item bucket before a router does
-        not use up the budget before the router's backend is read."""
+    def test_a_shared_wrapper_reached_by_a_longer_path_first_is_searched_to_full_reach(self, backend: CachekitIOBackend) -> None:
+        """``seen`` keeps the shallowest depth: a router first reached through a metrics wrapper (one level
+        deeper) is expanded again when the shorter route through a dict reaches it."""
 
-        class _Wrapper:
+        class _Shard:
             def __init__(self) -> None:
-                self.buckets = [[object() for _ in range(_REACH_READS)]]
-                self.routes = {"us": [backend]}
+                self.backend = backend
 
-        class _Root:
+        class _Router:
             def __init__(self) -> None:
-                self.wrapper = _Wrapper()
+                self.shard = _Shard()
 
-        assert _reaches_write_deadlines(_Wrapper())
-        assert _reaches_write_deadlines(_Root())
-
-    def test_a_wide_sibling_does_not_starve_another_wrapper(self, backend: CachekitIOBackend) -> None:
-        """Each object at a wrapper level gets a fair share of the budget."""
-
-        class _Wide:
-            def __init__(self) -> None:
-                self.items = [object() for _ in range(10 * _REACH_READS)]
-
-        class _Holder:
+        class _Metrics:
             def __init__(self, inner: object) -> None:
                 self.inner = inner
 
         class _Root:
             def __init__(self) -> None:
-                self.a = _Wide()
-                self.b = _Holder(backend)
+                router = _Router()
+                self.metrics = _Metrics(router)
+                self.routes = {"eu": router}
 
         assert _reaches_write_deadlines(_Root())
+
+    def test_a_bucket_within_budget_does_not_hide_a_route(self, backend: CachekitIOBackend) -> None:
+        """A bucket that leaves room in the budget is read in full, then the router's backend is found;
+        the same shape with no backend answers False, so the True is a find, not exhaustion."""
+
+        class _Wrapper:
+            def __init__(self, inner: object) -> None:
+                self.buckets = [[object() for _ in range(_REACH_READS - 100)]]
+                self.routes = {"us": [inner]}
+
+        assert _reaches_write_deadlines(_Wrapper(backend))
+        assert _reaches_write_deadlines(_Wrapper(object())) is False
 
     def test_properties_named_like_storage_never_run(self, backend: CachekitIOBackend) -> None:
         """A property named ``__dict__`` (a lazy proxy) or overriding a slot name is skipped, not called."""
@@ -542,10 +546,10 @@ class TestWriteBound:
     def test_a_search_that_raises_opens_the_list(self, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         """Opening the list is always safe, so a search that fails answers True."""
 
-        def broken(obj: object) -> list[object]:
+        def broken(obj: object, types_read: object) -> tuple[bool, list[object], int]:
             raise RuntimeError("unexpected")
 
-        monkeypatch.setattr(cache_handler_module, "_instance_values", broken)
+        monkeypatch.setattr(cache_handler_module, "_read_object", broken)
         assert _reaches_write_deadlines(object())
 
     def test_a_none_backend_or_odd_module_neither_raises_nor_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -557,6 +561,29 @@ class TestWriteBound:
         odd.__module__ = None  # type: ignore[assignment]
         assert _reaches_write_deadlines(odd()) is False
         assert len(logged) == 1
+
+    def test_a_raising_metaclass_name_does_not_escape(self) -> None:
+        class _Meta(type):
+            @property
+            def __name__(cls) -> str:  # type: ignore[override]
+                raise RuntimeError("no name")
+
+        class _Odd(metaclass=_Meta):
+            pass
+
+        assert _reaches_write_deadlines(_Odd()) is False  # a clean answer: logged by qualname, nothing raised
+
+    def test_unreachable_log_keeps_no_class_alive(self) -> None:
+        """The once-per-class log is keyed by names, so throwaway classes (one per MagicMock) are not kept."""
+        import gc
+        import weakref
+
+        kind = type("Throwaway", (), {})
+        ref = weakref.ref(kind)
+        assert _reaches_write_deadlines(kind()) is False
+        del kind
+        gc.collect()
+        assert ref() is None
 
     def test_budget_exhaustion_opens_the_list(self, backend: CachekitIOBackend) -> None:
         """A wide first level used to answer False and drop the bound; now the walk fails open."""

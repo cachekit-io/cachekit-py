@@ -403,8 +403,9 @@ def _fuses_tracked_write(backend: object) -> bool:
 _unreported_write_classes: set[type] = set()
 # Three wrapper levels covers a metrics wrapper around a router around a backend; deeper nesting is rare.
 _REACH_DEPTH = 3
-# Values read at most before the search gives up and answers True. Search time is bounded (a few ms), and the
-# answer is cached per handler, so a large object graph costs the deadline list, never a missed bound.
+# Values read at most (attribute values, container items and the type entries scanned to find them) before
+# the search gives up and answers True. The answer is cached per handler, so a large object graph costs the
+# deadline list, never a missed bound.
 _REACH_READS = 4096
 _REACH_LEAVES = (str, bytes, bytearray, memoryview, int, float, complex, bool, type(None), type)
 # Containers are walked with the base type's own iterator, so a subclass's __iter__ never runs.
@@ -415,48 +416,60 @@ _REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
     (set, set.__iter__),
     (frozenset, frozenset.__iter__),
 )
-_unreachable_wrapper_classes: set[type] = set()
+# Type internals read through type's own descriptors, so a metaclass property or __getattribute__ never runs.
+_TYPE_MRO: Any = vars(type)["__mro__"]
+_TYPE_DICT: Any = vars(type)["__dict__"]
+_TYPE_MODULE: Any = vars(type)["__module__"]
+_TYPE_QUALNAME: Any = vars(type)["__qualname__"]
+_unreachable_wrapper_classes: set[tuple[str, str]] = set()  # names, not classes: a class per mock is not kept
 
 
-def _instance_storage(obj: object) -> tuple[Optional[dict[str, Any]], list[object]]:
-    """``obj``'s instance ``__dict__`` and its set ``__slots__`` values, read only through the C descriptors
-    Python makes for them (a getset ``__dict__``, member slots). Type attributes are read with
-    ``type.__getattribute__``, so no metaclass hook runs; a property named ``__dict__`` or shadowing a slot is
-    skipped, never called."""
-    kind = type(obj)
-    slots: list[object] = []
+def _scan_type(kind: type) -> tuple[list[Any], object, object, int]:
+    """What reading an instance of ``kind`` needs, from one scan of its MRO: its member descriptors, its getset
+    ``__dict__`` descriptor, its class-level ``_reports_write_deadline`` value, and the entries scanned."""
+    members: list[Any] = []
+    scanned = 0
     instance_dict: object = None
-    for klass in type.__getattribute__(kind, "__mro__"):
-        namespace = type.__getattribute__(klass, "__dict__")
-        for descriptor in namespace.values():
-            if type(descriptor) is types.MemberDescriptorType:
-                with contextlib.suppress(AttributeError):  # an unset slot
-                    slots.append(descriptor.__get__(obj, kind))
+    flag: object = None
+    for klass in _TYPE_MRO.__get__(kind):
+        namespace = _TYPE_DICT.__get__(klass)
+        scanned += 1 + len(namespace)
+        members += [d for d in namespace.values() if type(d) is types.MemberDescriptorType]
         if instance_dict is None and "__dict__" in namespace:
             instance_dict = namespace["__dict__"]
-    held = None
+        if flag is None and "_reports_write_deadline" in namespace:
+            flag = namespace["_reports_write_deadline"]
+    return members, instance_dict, flag, scanned
+
+
+def _read_object(obj: object, types_read: dict[type, Any]) -> tuple[bool, list[object], int]:
+    """One read of ``obj``: (it says it reports a write deadline, its attribute values, reads spent). A type is
+    scanned once per search (``types_read``), and charged then.
+
+    Storage is read only through the C descriptors Python makes for it: the getset ``__dict__`` and every
+    member descriptor along the MRO, so a property named ``__dict__`` or shadowing a slot is skipped, never
+    called. Member descriptors are deliberately every C member field, not only ``__slots__``: that is how a
+    bound method's ``__self__`` is found (``self.write = backend.set``), and a function's ``__globals__``
+    only spends the budget, which fails open. Do not make functions leaves: that turns a True into a False.
+    """
+    kind = type(obj)
+    spent = 0
+    scan = types_read.get(kind)
+    if scan is None:
+        scan = types_read[kind] = _scan_type(kind)
+        spent = scan[3]
+    members, instance_dict, flag, _ = scan
+    values: list[object] = []
+    for descriptor in members:
+        with contextlib.suppress(AttributeError):  # an unset slot
+            values.append(descriptor.__get__(obj, kind))
     if type(instance_dict) is types.GetSetDescriptorType:
         held = instance_dict.__get__(obj, kind)  # type: ignore[attr-defined]
-    return (held if type(held) is dict else None), slots
-
-
-def _instance_values(obj: object) -> list[object]:
-    """The values ``_instance_storage`` reads: instance ``__dict__`` values, then set slots."""
-    held, slots = _instance_storage(obj)
-    return (list(dict.values(held)) if held is not None else []) + slots
-
-
-def _says_it_reports(obj: object) -> bool:
-    """``obj._reports_write_deadline is True``, looked up with no user code: the instance ``__dict__`` (through
-    its C descriptor), then the type namespaces along the MRO (through ``type.__getattribute__``)."""
-    held, _ = _instance_storage(obj)
-    if held is not None and "_reports_write_deadline" in held:
-        return held["_reports_write_deadline"] is True
-    for klass in type.__getattribute__(type(obj), "__mro__"):
-        namespace = type.__getattribute__(klass, "__dict__")
-        if "_reports_write_deadline" in namespace:
-            return namespace["_reports_write_deadline"] is True
-    return False
+        if type(held) is dict:
+            if "_reports_write_deadline" in held:  # an instance value shadows the class's
+                flag = held["_reports_write_deadline"]
+            values += dict.values(held)
+    return flag is True, values, spent + len(members)
 
 
 def _reaches_write_deadlines(backend: object) -> bool:
@@ -465,14 +478,15 @@ def _reaches_write_deadlines(backend: object) -> bool:
     up to ``_REACH_DEPTH`` wrappers down, in an attribute (``__dict__`` or ``__slots__``) or in a dict, list,
     tuple or set there (a metrics, timeout, router or shard-ring wrapper over a CachekitIOBackend).
 
-    One breadth-first walk with one counter: every value read counts, container items included, and each
-    object or container is read once, so a cycle ends. Below the root the flag and storage are read only
-    through Python's own descriptors (``_says_it_reports``, ``_instance_values``), so a lazy object is not
-    evaluated and no property, ``__getattr__``, ``__iter__`` override or metaclass hook runs. If the walk
-    raises, or reads ``_REACH_READS`` values without an answer, the answer is True: opening the deadline list
-    is always safe, skipping it is not. A wrapper holding its backend only in a closure, or creating it on
-    first use (even into an attribute: the search runs before the first write), is out of reach: logged once
-    per class, and its L1 copies keep the stated ttl.
+    One breadth-first walk with one counter: every value read counts, container items and the type entries
+    scanned included. An object is expanded again only when reached by a shorter path (``seen`` keeps the
+    shallowest depth), so a cycle ends and a wrapper shared by a long and a short path is searched to its
+    full reach. Below the root everything is read through Python's own descriptors (``_read_object``), so a
+    lazy object is not evaluated and no property, ``__getattr__``, ``__iter__`` override or metaclass hook
+    runs. If the walk raises, or spends ``_REACH_READS`` reads without an answer, the answer is True: opening
+    the deadline list is always safe, skipping it is not. A wrapper holding its backend only in a closure, or
+    creating it on first use (even into an attribute: the search runs before the first write), is out of
+    reach: logged once per class, and its L1 copies keep the stated ttl.
     """
     if backend is None:
         return False
@@ -480,39 +494,43 @@ def _reaches_write_deadlines(backend: object) -> bool:
         if getattr(backend, "_reports_write_deadline", False) is True:
             return True
         queue: collections.deque[tuple[object, int]] = collections.deque([(backend, 0)])
-        seen = {id(backend)}
+        seen = {id(backend): 0}  # id -> the shallowest depth it was reached at
+        types_read: dict[type, Any] = {}  # each type's MRO is scanned once per search
         reads = 0
         while queue:
             obj, depth = queue.popleft()
-            kind = type(obj)
-            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(kind, base)), None)
+            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(type(obj), base)), None)
             if walk is not None:
                 children: Any = walk(obj)  # a container: its items stay at the holder's depth
-            elif depth < _REACH_DEPTH:
-                children = _instance_values(obj)
-                depth += 1
             else:
-                continue
+                reports, children, scanned = _read_object(obj, types_read)
+                if reports and depth:  # the root's own flag was read with getattr above
+                    return True
+                reads += scanned
+                if reads > _REACH_READS:
+                    return True
+                if depth == _REACH_DEPTH:  # its flag is read; its own attributes are past the reach
+                    continue
+                depth += 1
             for child in children:
                 reads += 1
                 if reads > _REACH_READS:
                     return True
-                if issubclass(type(child), _REACH_LEAVES) or id(child) in seen:
+                if issubclass(type(child), _REACH_LEAVES) or seen.get(id(child), _REACH_DEPTH + 1) <= depth:
                     continue
-                seen.add(id(child))
-                if _says_it_reports(child):
-                    return True
+                seen[id(child)] = depth
                 queue.append((child, depth))
         kind = type(backend)
-        module = getattr(kind, "__module__", None)
-        if kind not in _unreachable_wrapper_classes and not (isinstance(module, str) and module.startswith("cachekit.")):
-            _unreachable_wrapper_classes.add(kind)
+        module = _TYPE_MODULE.__get__(kind)
+        name = (module if isinstance(module, str) else "", _TYPE_QUALNAME.__get__(kind))
+        if name not in _unreachable_wrapper_classes and not name[0].startswith("cachekit."):
+            _unreachable_wrapper_classes.add(name)
             get_logger().info(
-                f"{kind.__name__} holds no CachekitIOBackend in its attributes: its writes keep L1 copies for "
-                "their ttl. If it wraps one, hold it in an attribute before the first write."
+                f"{name[1]} holds no CachekitIOBackend in its attributes: its writes keep L1 copies for their "
+                "ttl. If it wraps one, hold it in an attribute before the first write."
             )
     except Exception as exc:  # noqa: BLE001 - the safe answer: open the list
-        get_logger().debug(f"write-deadline search failed on a {type(backend).__name__}: {type(exc).__name__}")
+        get_logger().debug(f"write-deadline search failed: {type(exc).__name__}")
         return True
     return False
 
@@ -520,7 +538,7 @@ def _reaches_write_deadlines(backend: object) -> bool:
 def write_deadlines_reachable(handler: Any) -> bool:
     """``_reaches_write_deadlines`` for the handler's backend, cached on the handler. The decorator always
     installs a ``StandardCacheHandler``; a custom ``CacheHandlerStrategy`` (a public extension point) that
-    cannot take the attribute (``__slots__``) is searched again on each write, which costs well under 1 ms."""
+    cannot take the attribute (``__slots__``) is searched again on each write, bounded by ``_REACH_READS``."""
     reachable = _reaches_write_deadlines(getattr(handler, "backend", None))
     with contextlib.suppress(AttributeError):
         handler._write_deadlines_reachable = reachable
