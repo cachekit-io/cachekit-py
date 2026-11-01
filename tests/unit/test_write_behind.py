@@ -1035,7 +1035,8 @@ def _l1_off_fork_warns_only_while_a_thread_waits() -> object:
     while_waiting = fork_warns()
     wb.IDLE_S = 0.05
     fn(2)  # the waiting thread sends it, then waits the new IDLE_S out and ends
-    # The OS thread, not the Thread object: fork's warning counts /proc/self/task, which outlives join() briefly.
+    # OS threads, not Thread objects: fork's warning reads the count in /proc/self/stat, where a thread can stay
+    # briefly after join() returns. /proc/self/task lists the same threads.
     _until(lambda: s.workers == 0 and len(os.listdir("/proc/self/task")) == 1)
     return {"threads": threads, "while_waiting": while_waiting, "after": fork_warns(), "sent": len(backend.store)}
 
