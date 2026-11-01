@@ -28,7 +28,7 @@ CACHEKIT_REDIS_URL=redis://prod.example.com:6379  # Primary
 REDIS_URL=redis://localhost:6379                  # Fallback
 ```
 
-`CACHEKIT_REDIS_URL` takes precedence over `REDIS_URL`. If neither is set and nothing else is configured, a plaintext decorator does not use Redis: it caches L1-only, in process ([Nothing Configured](README.md#4-nothing-configured-l1-only)). An explicit `RedisBackend()` with no URL, and an encrypted or interop decorator with nothing configured, still connect to `redis://localhost:6379`.
+`CACHEKIT_REDIS_URL` takes precedence over `REDIS_URL`. If neither is set and nothing else is configured, a plaintext decorator does not use Redis: it caches L1-only, in process ([Nothing Configured](README.md#4-nothing-configured-l1-only)). An explicit `RedisBackend()` with no URL, and an encrypted decorator with nothing configured, still connect to `redis://localhost:6379`. An interop decorator needs an explicit `backend=RedisBackend()`: the Redis it would resolve on its own, from these variables or that default URL, is tenant-scoped (keys prefixed `t:{tenant}:`), and interop refuses it with `ConfigurationError` at the first call ([Interop Mode](../features/interop-mode.md)).
 
 ## Configuration via Python
 

@@ -102,6 +102,12 @@ def pytest_markdown_docs_globals():
         """Stub for expensive computation examples."""
         return {"computed": True}
 
+    class _Db:
+        """Stub for examples that read through a database client (db.fetch)."""
+
+        def fetch(self, user_id):
+            return {"id": user_id, "name": "alice"}
+
     # Create a logger for examples
     logger = logging.getLogger("cachekit.examples")
     logger.setLevel(logging.INFO)
@@ -138,6 +144,7 @@ def pytest_markdown_docs_globals():
         "process_tenant_request": process_tenant_request,
         "trained_ml_model": trained_ml_model,
         "expensive_computation": expensive_computation,
+        "db": _Db(),
         "secret_key": secret_key,
     }
 

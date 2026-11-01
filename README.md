@@ -103,9 +103,11 @@ def expensive_api_call(user_id: int):
 
 > [!WARNING]
 > Earlier releases connected to `redis://localhost:6379` when nothing was configured. To keep
-> that Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`). `@cache.secure`,
-> `encryption=True` and `interop=` still need a backend and still fall back to localhost Redis;
-> see [Backend Resolution Priority](docs/backends/README.md#backend-resolution-priority).
+> that Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`). `@cache.secure`
+> and `encryption=True` still need a backend and still fall back to localhost Redis; see
+> [Backend Resolution Priority](docs/backends/README.md#backend-resolution-priority). `interop=`
+> refuses that Redis, and any Redis resolved without `backend=`, because it prefixes keys with the
+> tenant: pass `backend=RedisBackend()` ([Interop Mode](docs/features/interop-mode.md)).
 
 ### More Backends
 
@@ -516,7 +518,8 @@ info = expensive_func.cache_info()
 # CACHEKIT_MEMCACHED_SERVERS, CACHEKIT_FILE_CACHE_DIR. Two or more is a ConfigurationError at
 # first call, and decorators relying on env auto-detection run uncached (docs/backends/README.md).
 # REDIS_URL is only a fallback and never conflicts. With none of them set, decorators cache
-# L1-only, in process (encrypted and interop decorators still use localhost Redis).
+# L1-only, in process (encrypted decorators still use localhost Redis; interop decorators refuse
+# any Redis resolved here, which is tenant-prefixed, and need backend=RedisBackend()).
 
 # Redis Connection (priority: CACHEKIT_REDIS_URL > REDIS_URL)
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)

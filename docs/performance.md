@@ -87,7 +87,7 @@ An L1-only hit takes 0.311μs for the 100-user dict and 0.31μs for the DataFram
 - **The function's names.** The memo answers only while the function's `__module__` and `__qualname__` are the objects it was built with, as its cache keys embed them: renaming the function re-keys its calls.
 - **The use time** for the cache's LRU order, and **the hit count** for `cache_info()`, both atomic.
 
-A memoised L1-only hit runs nothing that reads the stats context backend calls use, so it does not set one, and it records no Prometheus metric. A miss takes more Python frames than it did before the memo, so a recursive `@cache(backend=None)` function reaches the recursion limit sooner: on CPython 3.14 at the default limit of 1,000, it recurses 197 levels deep instead of 247.
+A memoised L1-only hit records no Prometheus metric. Only a CachekitIO request reads the per-function stats context, so a call sets it only once it is past its L1 lookup and may reach the backend: no L1-only call and no backed L1 hit sets it. A miss takes more Python frames than it did before the memo, so a recursive `@cache(backend=None)` function reaches the recursion limit sooner: on CPython 3.14 at the default limit of 1,000, it recurses 197 levels deep instead of 247.
 
 The object cache keeps the memo in step under its lock. A store, or a read under the lock, points the call's slot at its entry, and every removal (expiry, eviction, `invalidate_cache()`, `cache_clear()`, the reset in a forked child) ends the entry's hits and drops its slots before it returns. So a hit never serves a value once its removal has returned, and the memo keeps no removed value. It keeps a call's arguments only while their slot lasts, and at most 1,024 slots per function: a full memo empties before it takes a new key. Full, it holds about 110 to 140KiB when each call passes one `int`, and under 4.5MiB when every call fills its 256 characters with 4-byte ones, the most a call can make it keep (3.5 to 3.8MiB measured on CPython 3.12, 3.14 and free-threaded 3.14 and 3.15).
 
@@ -307,11 +307,11 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 2,596 | 2,482 |
-| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit) | 89,226 | 90,146 |
+| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit) | 83,015 | 83,882 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,596 | 2,488 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 172,539 | 167,686 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 140,428 | 141,391 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 134,323 | 134,972 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,976 | 167,728 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 47,895 | 48,623 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,420,388 | 1,424,292 |

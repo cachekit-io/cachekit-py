@@ -114,7 +114,7 @@ def get_user(user_id: int) -> dict:
 
 **Issue**: Redis connection timeout or refused
 
-`@cache` does not raise these: it logs the failure and runs the function. They only occur with a backend configured (or for `@cache.secure`, `encryption=True` and `interop=`, which fall back to localhost Redis); with nothing configured, a plaintext `@cache` is L1-only and connects to nothing. If Redis was unreachable when the backend was first built (the `Connection refused` line below comes from that first ping), nothing is cached, the failure counts toward the circuit breaker, and the next call tries again. If Redis went away later, the result is still stored in L1. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
+`@cache` does not raise these: it logs the failure and runs the function. They only occur with a backend configured (or for `@cache.secure`, `encryption=True` and `interop=`, which fall back to localhost Redis; an `interop=` decorator that reaches it raises `ConfigurationError` instead, see [Interop Mode](features/interop-mode.md)); with nothing configured, a plaintext `@cache` is L1-only and connects to nothing. If Redis was unreachable when the backend was first built (the `Connection refused` line below comes from that first ping), nothing is cached, the failure counts toward the circuit breaker, and the next call tries again. If Redis went away later, the result is still stored in L1. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
 ```
 Error 111 connecting to localhost:6379. Connection refused.
 Timeout connecting to server

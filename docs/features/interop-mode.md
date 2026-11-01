@@ -11,13 +11,19 @@
 
 Interop mode is the opt-in path that lets cachekit-py share cache entries **byte-identically** with cachekit-rs and cachekit-ts. Keys become `{namespace}:{operation}:{args_hash}` and values become one plain MessagePack document — no Python-internal framing, readable by any language with a MessagePack library.
 
-```python notest
+```python
 from cachekit import cache
+from cachekit.backends import RedisBackend
 
-@cache(interop="get_user", namespace="users", ttl=300)
+@cache(interop="get_user", namespace="users", ttl=300, backend=RedisBackend())
 def get_user(user_id: int, include_profile: bool = False):
-    return db.fetch(user_id)  # illustrative - db not defined
+    return db.fetch(user_id)
+
+assert get_user(42) == {"id": 42, "name": "alice"}
 ```
+
+> [!WARNING]
+> **Pass the backend explicitly.** Without `backend=`, a decorator resolves Redis from `CACHEKIT_REDIS_URL` or `REDIS_URL`, or from `redis://localhost:6379` when nothing is configured, through the default provider. That path is a tenant-scoped wrapper that prefixes every key with `t:default:`, a prefix no other SDK writes, so interop refuses it: decoration succeeds and the first call raises `ConfigurationError` (see [Guardrails](#guardrails-all-loud-none-silent)). `RedisBackend()` reads the same two variables and writes the bare key. Two things it does not do that the default path does: it takes no cross-process stampede lock ([Distributed Locking](distributed-locking.md)), and a no-argument `invalidate_cache()` deletes only the entries this process wrote or read, not every process's ([Whole-Function Invalidation](l1-invalidation.md#whole-function-invalidation)).
 
 A Rust service using `#[cachekit(interop = "get_user", namespace = "users")]` or a TypeScript service using `wrap(fetchUser, { interop: "get_user", namespace: "users" })` reads and writes the **same entries**.
 
@@ -49,12 +55,15 @@ Default behavior is completely unchanged: functions that don't pass `interop=` k
 
 **Recommended form** — spec-identical bytes plus the production reliability profile:
 
-```python notest
+```python
 from cachekit import cache
+from cachekit.backends import RedisBackend
 
-@cache.production(interop="get_user", namespace="users", ttl=300)
+@cache.production(interop="get_user", namespace="users", ttl=300, backend=RedisBackend())
 def get_user(user_id: int):
-    return db.fetch(user_id)  # illustrative
+    return db.fetch(user_id)
+
+assert get_user(42) == {"id": 42, "name": "alice"}
 ```
 
 All three configuration styles accept it — bare `@cache(interop=..., ...)` (see the TL;DR), an intent preset (above), or RORO:
@@ -92,16 +101,22 @@ The contract for one operation is the operation name **plus** the effective argu
 
 Encryption works unchanged — and cross-SDK. The AES-256-GCM plaintext is the plain MessagePack bytes (no ByteStorage step), the AAD is always exactly four components (`tenant_id`, `cache_key`, `"msgpack"`, `"False"`), and the ciphertext layout is `nonce(12) ‖ ciphertext ‖ tag(16)`.
 
-```python notest
+```python
+from cachekit.backends import RedisBackend
+
+# Its own operation: every binder of one (namespace, operation) must agree on encryption.
 @cache(
-    interop="get_user",
+    interop="get_user_private",
     namespace="users",
     encryption=True,
     master_key=secret_key,
     single_tenant_mode=True,  # tenant_id "default" — the same literal every SDK derives from
+    backend=RedisBackend(),
 )
-def get_user(user_id: int):
-    return db.fetch(user_id)  # illustrative
+def get_user_private(user_id: int):
+    return db.fetch(user_id)
+
+assert get_user_private(42) == {"id": 42, "name": "alice"}
 ```
 
 Three constraints, all fail-closed:
@@ -121,7 +136,7 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 | Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` and a segment containing `..` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
-| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` and `ainvalidate_cache()`, with or without arguments (a prefixed key is invisible to other SDKs, and the encryption AAD would bind the prefix, which no other SDK includes) |
+| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`), including the default provider's tenant-prefixed Redis path that a decorator with no `backend=` resolves from `CACHEKIT_REDIS_URL`, `REDIS_URL` or `redis://localhost:6379` | `ConfigurationError` — checked at decoration when the backend is known (an explicit `backend=`), at the first call when it is resolved then (no `backend=`), **and re-checked per call**, including `invalidate_cache()` and `ainvalidate_cache()`, with or without arguments (a prefixed key is invisible to other SDKs, and the encryption AAD would bind the prefix, which no other SDK includes) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` after the function runs (never "computed but silently never cached"), also when the call runs uncached because the circuit breaker rejected it, the backend could not be created, or the cache read failed |
 | CK v3 frame found at an interop key | Diagnostic error, treated as a miss, entry overwritten (self-healing) |
