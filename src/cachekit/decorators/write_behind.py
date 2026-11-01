@@ -185,10 +185,8 @@ class WriteBehind:
                     entry = _runnable(s)
                     if entry is None and _park(s):
                         try:
-                            deadline = time.monotonic() + IDLE_S
-                            while entry is None and not s.closed and (left := deadline - time.monotonic()) > 0:
-                                s.wake.wait(left)
-                                entry = _runnable(s)
+                            s.wake.wait_for(lambda: s.closed or _runnable(s) is not None, timeout=IDLE_S)
+                            entry = _runnable(s)
                         finally:
                             _unpark(s)
                     if entry is None:
@@ -265,7 +263,8 @@ def _unpark(s: _State) -> None:
 
 _writers: weakref.WeakSet[WriteBehind] = weakref.WeakSet()
 # Guards _writers and _parked: a decoration can add while an invalidation walks it. Per PID, so a child never waits on
-# a lock a parent thread held at fork.
+# a lock a parent thread held at fork. Lock order: a state's cond first, then this lock (as _park and _unpark take
+# them), never the reverse.
 _writers_locks: dict[int, threading.Lock] = {}
 
 
