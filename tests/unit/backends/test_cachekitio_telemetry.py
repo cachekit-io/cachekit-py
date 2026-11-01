@@ -494,6 +494,27 @@ class TestReports:
         taken = report.take()  # the parent's hit is still the parent's
         assert taken is not None and taken[SUM_HEADER] == "500"
 
+    def test_api83_a_hit_counted_by_reentry_during_takeover_is_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A finalizer that runs while the takeover builds its new state, and records a hit on this thread, publishes
+        a state of its own. The outer takeover must keep that state, and the hit in it, rather than overwrite it."""
+        report = L1LatencyReport()
+        child_pid = os.getpid() + 1_000_000  # the parent's state carries the real PID: a fork as far as it can tell
+        monkeypatch.setattr(l1_latency.os, "getpid", lambda: child_pid)
+        real_init = l1_latency._State.__init__
+        reentered = False
+
+        def init_with_reentry(state: object) -> None:
+            nonlocal reentered
+            real_init(state)  # type: ignore[arg-type]
+            if not reentered:  # as a finalizer would, mid-allocation, on this thread
+                reentered = True
+                report.add(700)
+
+        monkeypatch.setattr(l1_latency._State, "__init__", init_with_reentry)
+        report.add(900)
+        taken = report.take()
+        assert taken is not None and taken[SUM_HEADER] == "1600"
+
     def test_api83_a_lock_held_at_the_fork_does_not_hang_the_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
         report = L1LatencyReport()
         report._state.lock.acquire()  # a parent thread mid-add when the process forked

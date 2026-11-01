@@ -135,12 +135,15 @@ class L1LatencyReport:
         if state.pid != pid:
             # A forked child's first use: threads racing their first use agree on one new state, so none
             # discards hits another already counted into its own. The lock is this process's own, never one
-            # inherited from the parent, which a parent thread may have held at the fork.
+            # inherited from the parent, which a parent thread may have held at the fork. The new state is built
+            # before the lock: building it allocates, and a garbage-collection finalizer that calls a cached
+            # function on this thread may re-enter here meanwhile, publish its own state and count a hit into it.
+            # Only a state still stale under the lock is replaced, so that hit is kept.
+            fresh = _State()
             with _replacement_lock(pid):
                 state = self._state
                 if state.pid != pid:
-                    state = _State()
-                    self._state = state
+                    state = self._state = fresh
         return state
 
     @staticmethod
