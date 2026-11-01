@@ -170,9 +170,11 @@ What each `cache_operation_duration_ms` series times, measured with a monotonic 
 | `operation="set"`, a write `write_behind=True` deferred | The backend write alone, recorded when it lands. A write-behind miss that writes on the caller's thread instead is timed as the row above: an async miss under the distributed lock, a sync streaming write ([What stays on the caller's path](write-behind.md#what-stays-on-the-callers-path)), or a value the full writer queue refused ([The writer](write-behind.md#the-writer)) |
 
 `cache_operation_size_bytes` records the length of the bytes a `get` hit read; a `set` records no size. For an L1 `get`, that is the L1 entry:
-on a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit swaps its envelope for its
-MessagePack when the MessagePack is no longer than the envelope, so later L1 `get`s of it record a size no larger than its L2 `get`. Earlier releases recorded
-the envelope's length on every hit.
+on a plaintext cache with integrity checking on, an entry's first L1 hit can swap its envelope for the payload it verified, so later
+L1 `get`s of it record a size no larger than its L2 `get`. With the default serializer, and with the auto serializer for a plain
+MessagePack entry, the swap happens when the MessagePack is no longer than the envelope; the auto serializer's NumPy, Arrow,
+DataFrame and Series entries keep the envelope and record its length on every hit. With the orjson serializer every entry swaps,
+so later L1 `get`s record its JSON length. Earlier releases recorded the envelope's length on every hit.
 
 > **Changed durations.** Earlier releases recorded every L1 hit as a constant 0.001 ms, and timed
 > `set` from before the L2 read, so each `set` sample also held the miss round trip and the

@@ -22,7 +22,7 @@ except ImportError as e:  # pragma: no cover - only reachable without the [json]
 
 import xxhash
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata
+from .base import SerializationError, SerializationFormat, SerializationMetadata, VerifiedPayload, immutable_buffer
 
 
 class OrjsonSerializer:
@@ -182,32 +182,60 @@ class OrjsonSerializer:
             >>> result == {"test": 123}
             True
         """
-        data = bytes(data)  # coerce unwrap's zero-copy memoryview; no-op when already bytes
+        # No bytes() copy of unwrap's zero-copy memoryview, and no slice copy of the JSON in it: orjson and xxhash
+        # read buffers. A mutable one is snapshotted, so the checksum and the decode judge the same bytes. bytes
+        # skips the call, which costs more than the copy it saves on a small value.
+        if type(data) is not bytes:
+            data = immutable_buffer(data)
         try:
             if self.enable_integrity_checking:
-                # Guard clause: Minimum size check (8 bytes checksum + at least 2 bytes JSON: {})
-                if len(data) < 10:
-                    raise SerializationError(
-                        f"Invalid data: Expected at least 10 bytes (8-byte checksum + 2-byte JSON), got {len(data)} bytes"
-                    )
-
-                # Extract checksum and JSON data
-                expected_checksum = data[:8]
-                json_data = data[8:]
-
-                # Validate checksum
-                computed_checksum = xxhash.xxh3_64_digest(json_data)
-                if computed_checksum != expected_checksum:
-                    raise SerializationError("Checksum validation failed - data corruption detected")
-
-                # Deserialize JSON
-                return orjson.loads(json_data)
-            else:
-                # No integrity checking - deserialize directly
-                # This handles both: data written with integrity=False AND backward compatible reads
-                # If data has checksum but we're not validating, just try to parse as JSON
-                return orjson.loads(data)
-        except orjson.JSONDecodeError as e:
+                return orjson.loads(self._verified_json(data))
+            # No integrity checking - deserialize directly
+            # This handles both: data written with integrity=False AND backward compatible reads
+            # If data has checksum but we're not validating, just try to parse as JSON
+            return orjson.loads(data)
+        except ValueError as e:  # orjson.JSONDecodeError is one
             raise SerializationError(f"Failed to deserialize JSON data: {e}") from e
-        except ValueError as e:
+
+    @staticmethod
+    def _verified_json(data: bytes | memoryview) -> bytes | memoryview:
+        """The JSON of a ``[8-byte xxHash3-64][JSON]`` envelope, as a view, once its checksum matches.
+
+        Raises:
+            SerializationError: The envelope is too short to hold a checksum and JSON, or the checksum does not
+                match (corruption).
+        """
+        # Guard clause: Minimum size check (8 bytes checksum + at least 2 bytes JSON: {})
+        if len(data) < 10:
+            raise SerializationError(
+                f"Invalid data: Expected at least 10 bytes (8-byte checksum + 2-byte JSON), got {len(data)} bytes"
+            )
+        json_data = data[8:]  # a view of a view; bytes, which only direct callers pass, copies as it always did
+        if xxhash.xxh3_64_digest(json_data) != data[:8]:
+            raise SerializationError("Checksum validation failed - data corruption detected")
+        return json_data
+
+    def _deserialize_keeping(self, data: bytes | memoryview, metadata: SerializationMetadata) -> tuple[Any, VerifiedPayload]:
+        """What :meth:`deserialize` returns when integrity checking is on, plus the JSON its checksum verified, for
+        the caller to keep and decode later without the checksum (:meth:`_deserialize_verified`). Every entry this
+        serializer writes is that envelope, whatever its header (orjson reads none), so it never returns None. The
+        kept JSON is the one copy of the payload a hit makes. Call it only for an integrity-on serializer. Raises
+        SerializationError as deserialize does then.
+
+        Examples:
+            >>> serializer = OrjsonSerializer()
+            >>> envelope, metadata = serializer.serialize({"test": 123})
+            >>> value, kept = serializer._deserialize_keeping(envelope, metadata)
+            >>> value, serializer._deserialize_verified(kept.data), len(kept) == len(envelope) - 8
+            ({'test': 123}, {'test': 123}, True)
+        """
+        json_data = bytes(self._verified_json(immutable_buffer(data)))
+        return self._deserialize_verified(json_data), VerifiedPayload(json_data, OrjsonSerializer)
+
+    def _deserialize_verified(self, json_data: bytes) -> Any:
+        """Decode JSON a decode in this process already verified (:meth:`_deserialize_keeping`), without the
+        checksum. Raises SerializationError as deserialize does."""
+        try:
+            return orjson.loads(json_data)
+        except ValueError as e:  # orjson.JSONDecodeError is one
             raise SerializationError(f"Failed to deserialize JSON data: {e}") from e

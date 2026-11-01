@@ -52,7 +52,9 @@ from .base import (
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
+    VerifiedPayload,
     bounded_error,
+    immutable_buffer,
     unpackb_bounded,
 )
 
@@ -810,8 +812,10 @@ class AutoSerializer:
                 whose header lost ``original_type`` still decodes on an integrity-off reader
                 rather than failing closed.
         """
-        # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
-        data = bytes(data)
+        # No bytes() copy of unwrap's zero-copy memoryview: every route below reads a buffer. A mutable one is
+        # snapshotted, so the routing tests and the decode judge the same bytes. bytes skips the call.
+        if type(data) is not bytes:
+            data = immutable_buffer(data)
         # The header's claim about the stored format. Read once: binding it twice under two names
         # is how a header-sourced value reached a variable holding the envelope's format before.
         # Typed once too, here rather than at each of the three sites that compare or echo it —
@@ -829,7 +833,7 @@ class AutoSerializer:
         # digest, failed it, and raised on every read — a permanent miss on a healthy key.
         # Both structural routes hand the delegate the gate-verified body, so it is hashed once.
         numpy_body = None
-        if data.startswith(b"NUMPY_RAW"):
+        if data[:9] == b"NUMPY_RAW":
             numpy_body = memoryview(data)
         elif self._checksummed_prefix(data, b"NUMPY_RAW"):
             numpy_body = memoryview(data)[8:]
@@ -910,27 +914,7 @@ class AutoSerializer:
                     f"Rust envelope parsing failed, falling back to Python-only deserialization: {redact_error_for_log(e)}"
                 )
             else:
-                # The envelope verified (checksum matched), so its payload is exactly what was
-                # stored; a payload that then fails to decode is corruption or a forged entry
-                # (e.g. a decode bomb) and MUST fail closed. Falling through here used to
-                # re-decode the ENVELOPE bytes as plain MessagePack and return its positional
-                # fields as the cached value — wrong data, silently.
-                # Format by agreement, never by a winner — see Raises:.
-                if format_id not in _ENVELOPE_FORMATS:
-                    raise self._envelope_failure(f"unknown envelope format {format_id!r:.40}")
-                if header_format is not None and header_format != format_id:
-                    raise self._envelope_failure(
-                        f"envelope format {format_id!r:.40} disagrees with header format {header_format!r:.40}"
-                    )
-                try:
-                    if format_id in ("dataframe", "series"):
-                        return self._decode_columnar(original_data, format_id)
-                    return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
-                except PAYLOAD_DECODE_ERRORS as e:
-                    raise SerializationError(
-                        f"Cache entry payload failed to decode inside a verified envelope (format={format_id!r:.40}): "
-                        f"{bounded_error(e)}"
-                    ) from e
+                return self._decode_verified_envelope(original_data, format_id, header_format)
 
         # Reached with integrity on when retrieve() raised the "not an envelope" ValueError
         # (envelope_error is set), or with integrity off (envelope_error is None; a
@@ -974,6 +958,66 @@ class AutoSerializer:
             )
         return value
 
+    def _decode_verified_envelope(self, original_data: bytes, format_id: str, header_format: str | None) -> Any:
+        """Decode the payload of an envelope ``retrieve()`` verified, whose format is ``format_id``.
+
+        The envelope verified (checksum matched), so its payload is exactly what was stored; a payload that then
+        fails to decode is corruption or a forged entry (e.g. a decode bomb) and MUST fail closed. Falling through
+        used to re-decode the ENVELOPE bytes as plain MessagePack and return its positional fields as the cached
+        value — wrong data, silently. Format by agreement, never by a winner — see :meth:`deserialize`'s Raises:.
+        """
+        if format_id not in _ENVELOPE_FORMATS:
+            raise self._envelope_failure(f"unknown envelope format {format_id!r:.40}")
+        if header_format is not None and header_format != format_id:
+            raise self._envelope_failure(f"envelope format {format_id!r:.40} disagrees with header format {header_format!r:.40}")
+        try:
+            if format_id in ("dataframe", "series"):
+                return self._decode_columnar(original_data, format_id)
+            return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(
+                f"Cache entry payload failed to decode inside a verified envelope (format={format_id!r:.40}): {bounded_error(e)}"
+            ) from e
+
+    def _deserialize_keeping(
+        self, data: bytes | memoryview, metadata: SerializationMetadata
+    ) -> tuple[Any, VerifiedPayload] | None:
+        """What :meth:`deserialize` returns for a plain MessagePack envelope when integrity checking is on, plus
+        the MessagePack ``retrieve()`` verified and this decode accepted, for the caller to keep and decode later
+        without retrieve() (:meth:`_deserialize_verified`). Call it only for an integrity-on serializer.
+
+        None, decoding nothing, for every other entry: a header that claims another format (NumPy, Arrow,
+        DataFrame, Series), and any bytes with the ``NUMPY_RAW`` magic at offset 0 or 8. That magic test is
+        deliberately broader than :meth:`deserialize`'s checksum-gated NumPy route, which refuses such bytes
+        under a ``"msgpack"`` header: a broader test only declines to keep. The caller decodes those as any other entry, so only the route
+        :meth:`deserialize` takes for this header to ``retrieve()`` runs here, and it fails as that route does.
+
+        Examples:
+            >>> serializer = AutoSerializer()
+            >>> envelope, metadata = serializer.serialize({"when": (1, 2)})
+            >>> value, kept = serializer._deserialize_keeping(envelope, metadata)
+            >>> value, serializer._deserialize_verified(kept.data)
+            ({'when': (1, 2)}, {'when': (1, 2)})
+        """
+        if metadata.original_type != "msgpack" or data[:9] == b"NUMPY_RAW" or data[8:17] == b"NUMPY_RAW":
+            return None
+        try:
+            msgpack_data, format_id = self._byte_storage.retrieve(data)
+        except Exception as e:  # as deserialize does with a header present: fail closed, never re-parse
+            raise self._envelope_failure(e) from e
+        value = self._decode_verified_envelope(msgpack_data, format_id, "msgpack")
+        return value, VerifiedPayload(msgpack_data, AutoSerializer)
+
+    def _deserialize_verified(self, msgpack_data: bytes) -> Any:
+        """Decode MessagePack a decode in this process already verified (:meth:`_deserialize_keeping`), without
+        retrieve(). Still the bounded decode. Raises SerializationError as deserialize does."""
+        try:
+            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(
+                f"Cache entry payload failed to decode inside a verified envelope (format='msgpack'): {bounded_error(e)}"
+            ) from e
+
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
         """Serialize a NumPy array into the ``NUMPY_RAW`` binary format.
 
@@ -1015,7 +1059,7 @@ class AutoSerializer:
             return xxhash.xxh3_64_digest(raw) + raw
         return raw
 
-    def _deserialize_numpy(self, data: bytes) -> np.ndarray:
+    def _deserialize_numpy(self, data: bytes | memoryview) -> np.ndarray:
         """Deserialize NumPy array from NUMPY_RAW binary format.
 
         Raises:
@@ -1026,7 +1070,7 @@ class AutoSerializer:
         # serialization. Detect by structure (like ArrowSerializer): a checksummed entry is
         # [8-byte checksum][NUMPY_RAW...]; a raw entry (integrity-off / legacy) is [NUMPY_RAW...].
         # A mismatch fails closed (#155) — never reconstructs the corrupted array.
-        if not data.startswith(b"NUMPY_RAW") and len(data) >= 17 and data[8:17] == b"NUMPY_RAW":
+        if data[:9] != b"NUMPY_RAW" and len(data) >= 17 and data[8:17] == b"NUMPY_RAW":
             body = memoryview(data)[8:]
             if xxhash.xxh3_64_digest(body) != data[:8]:
                 raise SerializationError("NumPy integrity check failed: xxHash3-64 checksum mismatch (corrupted cache entry)")
@@ -1199,7 +1243,7 @@ class AutoSerializer:
         return series
 
     @staticmethod
-    def _checksummed_prefix(data: bytes, magic: bytes) -> bool:
+    def _checksummed_prefix(data: bytes | memoryview, magic: bytes) -> bool:
         """True iff ``data`` is ``[8-byte xxHash3-64][magic...]`` and the digest matches the body.
 
         One gate for both self-checksummed formats (Arrow, NumPy). It disambiguates a real
