@@ -371,6 +371,35 @@ class TestSampling:
         assert first[0] == second[0] == parent  # before the first report use: replayed, as documented
         assert first[1] != second[1]  # after it: each child draws its own sequence
 
+    @pytest.mark.parametrize(("seed", "counted"), [(0, False), (31, True)])
+    def test_api81_the_hit_that_reseeds_a_c_forked_child_is_drawn_again(self, seed: int, counted: bool) -> None:
+        """The first timed hit in a child forked from C was chosen by a draw replayed from the parent, which every
+        sibling worker shares. It counts only if a draw from the child's own, reseeded sequence chooses it too.
+        The reseed is pinned to a known seed so the redraw's outcome is known: 0 draws non-zero, 31 draws zero."""
+        import ctypes
+        import random
+
+        libc_fork = ctypes.PyDLL(None).fork
+        report = L1LatencyReport()  # inherited: built in the parent
+        r, w = os.pipe()
+        pid = libc_fork()
+        if pid == 0:  # pragma: no cover - child
+            os.close(r)
+            try:
+                rng = l1_latency.sampling_rng
+                rng.seed = lambda *_: random.Random.seed(rng, seed)  # type: ignore[method-assign]
+                report.record(0, lambda: 300)  # the child's first report use: a timed hit
+                outcome: object = report.take()
+            except BaseException as exc:  # never return into pytest from the child
+                outcome = f"child raised {exc!r}"
+            report_to_parent(w, outcome)
+        os.close(w)
+        taken = child_outcome(pid, r)
+        if counted:
+            assert isinstance(taken, dict) and taken[SUM_HEADER] == "300"
+        else:
+            assert taken is None
+
     def test_api81_a_report_built_in_a_child_forked_from_c_reseeds(self) -> None:
         """A worker that builds its backend after a fork made from C never takes over an inherited state, so its
         report's construction must reseed the draw itself. Two such children of one parent state diverge at once."""
