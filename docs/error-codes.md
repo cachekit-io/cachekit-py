@@ -620,7 +620,7 @@ def my_function():
 
 ### Redis URL not set
 
-**Exception**: none. With no backend configured at all (no `CACHEKIT_*` selector, no `REDIS_URL`, no `set_default_backend()`, no backend provider of your own), a plaintext, non-interop decorator caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). `@cache.secure`, `encryption=True` and `interop=` decorators cannot run L1-only: they connect to `redis://localhost:6379`, and if nothing listens there, see *Redis unreachable*.
+**Exception**: none. With no backend configured at all (no `CACHEKIT_*` selector, no `REDIS_URL`, no `set_default_backend()`, no backend provider of your own), a plaintext, non-interop decorator caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). `@cache.secure`, `encryption=True` and `interop=` decorators cannot run L1-only: they connect to `redis://localhost:6379`, and if nothing listens there, see *Redis unreachable*. If Redis does answer there, an `interop=` decorator raises `ConfigurationError` at its first call, because that Redis is tenant-prefixed; pass `backend=RedisBackend()` ([Interop Mode](features/interop-mode.md)).
 
 **Cause**: No backend selected. Earlier releases connected every decorator to `redis://localhost:6379` here; set `REDIS_URL` to keep that Redis
 
