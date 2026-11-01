@@ -6,13 +6,14 @@ CI runs no doctests under tests/performance, so its doctests and its argument ch
 from __future__ import annotations
 
 import doctest
+import importlib.metadata
 import json
 import re
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -29,28 +30,31 @@ EDITABLE = {"url": f"file://{CHECKOUT}", "dir_info": {"editable": True}}
 FROM_SITE = f"{SITE}/cachekit/__init__.py"
 FROM_CHECKOUT = f"{CHECKOUT}/src/cachekit/__init__.py"
 SHADOW = "/work/other-checkout/src/cachekit/__init__.py"  # a checkout earlier on sys.path, PYTHONPATH say
+VENV_COPY = f"{CHECKOUT}/.venv/lib/python3.14/site-packages/cachekit/__init__.py"  # under the checkout, not its source
 
 
 class Installed:
     """An installed cachekit distribution: its PEP 610 direct_url.json holds `origin` (None: from an index),
-    and its RECORD lists `files` under SITE (None: no RECORD)."""
+    and its RECORD lists `files` under `root` (None: no RECORD)."""
 
-    def __init__(self, origin: dict[str, Any] | None, files: tuple[str, ...] | None) -> None:
+    def __init__(self, origin: dict[str, Any] | None, files: tuple[str, ...] | None, root: Path | str = SITE) -> None:
         self.text = None if origin is None else json.dumps(origin)
         self.files = None if files is None else [PurePosixPath(f) for f in files]
+        self.root = Path(root)
 
     def read_text(self, filename: str) -> str | None:
         return self.text if filename == "direct_url.json" else None
 
     def locate_file(self, path: PurePosixPath) -> Path:
-        return Path(SITE) / path
+        return self.root / path
 
 
 def fake_git(status: str = "", fail: bool = False) -> Callable[..., subprocess.CompletedProcess[str]]:
     """A subprocess.run that answers rev-parse with COMMIT[:8] and status with `status`, or fails."""
 
     def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
-        assert argv[1:3] == ["-C", CHECKOUT], argv
+        # The harness runs git in the resolved, native checkout path: C:\src\cachekit-py on Windows.
+        assert argv[1:3] == ["-C", str(Path(CHECKOUT).resolve())], argv
         if fail:
             raise subprocess.CalledProcessError(128, argv, stderr="fatal: not a git repository")
         if argv[3] == "rev-parse":
@@ -65,15 +69,25 @@ def fake_git(status: str = "", fail: bool = False) -> Callable[..., subprocess.C
 
 def install(
     monkeypatch: pytest.MonkeyPatch,
+    site: Path,
     origin: dict[str, Any] | None,
     imported: str,
     *,
     git: str | None = GIT,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     files: tuple[str, ...] | None = ("cachekit/__init__.py",),
+    pth: str = f"{CHECKOUT}/src",
 ) -> None:
-    """Make cachekit look installed from `origin` and imported from the file `imported`."""
-    monkeypatch.setattr(terrain_canary.importlib.metadata, "distribution", lambda name: Installed(origin, files))
+    """Make cachekit look installed from `origin` and imported from the file `imported`.
+
+    An editable install records only a real cachekit.pth in `site`, which puts the directory `pth`
+    on sys.path, as uv's editable install does.
+    """
+    installed = Installed(origin, files)
+    if origin is not None and origin.get("dir_info", {}).get("editable"):
+        (site / "cachekit.pth").write_text(pth + "\n")
+        installed = Installed(origin, ("cachekit.pth",), site)
+    monkeypatch.setattr(terrain_canary.importlib.metadata, "distribution", lambda name: installed)
     monkeypatch.setattr(cachekit, "__file__", imported)
     monkeypatch.setattr(terrain_canary.shutil, "which", lambda name: git)
     monkeypatch.setattr(terrain_canary.subprocess, "run", run or fake_git())
@@ -120,11 +134,11 @@ def test_refuses_to_run_without_saying_where_the_redis_runs(
     ],
 )
 def test_names_the_cachekit_it_measured(
-    monkeypatch: pytest.MonkeyPatch, origin: dict[str, Any] | None, imported: str, status: str, suffix: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: dict[str, Any] | None, imported: str, status: str, suffix: str
 ) -> None:
     # A checkout reports the last release's version until the next release bumps it, so a recording
     # made from one names its commit; only an index install is the release its version names.
-    install(monkeypatch, origin, imported, run=fake_git(status))
+    install(monkeypatch, tmp_path, origin, imported, run=fake_git(status))
     assert terrain_canary.cachekit_label() == f"cachekit {cachekit.__version__}{suffix}"
 
 
@@ -141,21 +155,40 @@ def test_names_the_cachekit_it_measured(
         (None, SHADOW, GIT, False),
         (VCS, SHADOW, GIT, False),
         (EDITABLE, SHADOW, GIT, False),
+        # A full copy installed under the checkout is still not the checkout's source.
+        (EDITABLE, VENV_COPY, GIT, False),
     ],
 )
 def test_refuses_an_install_whose_commit_it_cannot_tell(
-    monkeypatch: pytest.MonkeyPatch, origin: dict[str, Any] | None, imported: str, git: str | None, fail: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: dict[str, Any] | None, imported: str, git: str | None, fail: bool
 ) -> None:
-    install(monkeypatch, origin, imported, git=git, run=fake_git(fail=fail))
+    install(monkeypatch, tmp_path, origin, imported, git=git, run=fake_git(fail=fail))
     with pytest.raises(SystemExit, match="which commit it was built from is unknown"):
         terrain_canary.cachekit_label()
 
 
-def test_refuses_an_installed_copy_without_a_record(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_refuses_an_installed_copy_without_a_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Without its RECORD, an install cannot show that the imported package is one of its files.
-    install(monkeypatch, None, FROM_SITE, files=None)
+    install(monkeypatch, tmp_path, None, FROM_SITE, files=None)
     with pytest.raises(SystemExit, match="which commit it was built from is unknown"):
         terrain_canary.cachekit_label()
+
+
+def test_refuses_an_editable_source_outside_its_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # The checkout's commit says nothing about a source directory that lies outside it.
+    install(monkeypatch, tmp_path, EDITABLE, "/elsewhere/src/cachekit/__init__.py", pth="/elsewhere/src")
+    with pytest.raises(SystemExit, match="which commit it was built from is unknown"):
+        terrain_canary.cachekit_label()
+
+
+def test_reads_an_editable_installs_source_directories_as_site_does(tmp_path: Path) -> None:
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    (site / "cachekit.pth").write_text("# a comment\nimport sys\n\n  /src/cachekit-py/src  \n../relative\n")
+    installed = Installed(EDITABLE, ("cachekit.pth", "cachekit-0.25.1.dist-info/RECORD"), site)
+    # Comments, blank lines and `import` lines name no directory; a relative line names one beside the .pth.
+    expected = {Path("/src/cachekit-py/src").resolve(), (tmp_path / "relative").resolve()}
+    assert terrain_canary.editable_sources(cast("importlib.metadata.Distribution", installed)) == expected
 
 
 def test_refuses_a_package_that_shadows_the_install(tmp_path: Path) -> None:

@@ -242,6 +242,28 @@ def cpu_model() -> str:
     return platform.processor() or platform.machine()
 
 
+def editable_sources(installed: importlib.metadata.Distribution) -> set[Path]:
+    """The directories an editable install's ``.pth`` files put on ``sys.path``, read as ``site`` reads them.
+
+    >>> editable_sources(importlib.metadata.PathDistribution(Path("/nowhere")))
+    set()
+    """
+    sources: set[Path] = set()
+    for recorded in installed.files or ():
+        if recorded.suffix != ".pth":
+            continue
+        pth = Path(installed.locate_file(recorded))
+        try:
+            lines = pth.read_text().splitlines()
+        except OSError:
+            continue  # listed but unreadable: it puts nothing on sys.path
+        # Blank lines and comments do nothing, and a line starting with `import` runs instead of naming a
+        # directory; any other line names one, relative to the .pth file's own directory.
+        names = (line.strip() for line in lines)
+        sources |= {(pth.parent / n).resolve() for n in names if n and not n.startswith(("#", "import ", "import\t"))}
+    return sources
+
+
 def cachekit_label() -> str:
     """Name the cachekit this run measures: its version, and its commit when it is not a release.
 
@@ -251,11 +273,13 @@ def cachekit_label() -> str:
     its commit. Either counts only when the imported package is one of that install's own files:
     otherwise something earlier on ``sys.path``, a checkout on ``PYTHONPATH`` say, shadows it.
 
-    An editable install from a git checkout adds the commit its Python follows, when the imported
-    package lies in that checkout. It adds ``.dirty`` when the sources the extension builds from
-    (``src/``, ``rust/``, ``Cargo.toml``, ``Cargo.lock``) have uncommitted or untracked changes. It
-    cannot vouch that its compiled extension was rebuilt for that commit, since ``uv sync`` does not
-    rebuild it when only ``rust/`` changed, so only a release is fit to publish.
+    An editable install from a git checkout adds the commit its Python follows. That holds only when
+    the imported package is the one in the source directory its ``.pth`` file puts on ``sys.path``,
+    inside that checkout; a copy installed elsewhere under the checkout, in its ``.venv`` say, is not
+    it. It adds ``.dirty`` when the sources the extension builds from (``src/``, ``rust/``,
+    ``Cargo.toml``, ``Cargo.lock``) have uncommitted or untracked changes. It cannot vouch that its
+    compiled extension was rebuilt for that commit, since ``uv sync`` does not rebuild it when only
+    ``rust/`` changed, so only a release is fit to publish.
 
     Any other install cannot say which commit ran, so the run is refused before it starts. That covers
     a shadowed import, a wheel file, and a non-editable install of a directory, which copies the tree
@@ -278,7 +302,10 @@ def cachekit_label() -> str:
                 [git, "-C", str(checkout), *cmd], capture_output=True, text=True, check=True, timeout=30
             ).stdout.strip()
 
-        if imported.is_relative_to(checkout):  # else something earlier on sys.path shadows the checkout
+        # Only the package in the editable source directory is the checkout's: anything else, even under the
+        # checkout, is a copy or something earlier on sys.path shadowing it.
+        source = imported.parent.parent
+        if source in editable_sources(installed) and source.is_relative_to(checkout):
             try:
                 commit = git_out("rev-parse", "--short=8", "HEAD")
                 # Untracked files count, whatever status.showUntrackedFiles says: an editable install
