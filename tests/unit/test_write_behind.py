@@ -37,7 +37,7 @@ from cachekit.decorators import write_behind as wb
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.interop import InteropError
 from cachekit.serializers.encryption_wrapper import KeyringConfigurationError
-from tests.utils.fork_helpers import child_outcome, report, run_fresh
+from tests.utils.fork_helpers import child_outcome, fork_warns, report, run_fresh
 
 pytestmark = pytest.mark.unit
 
@@ -969,7 +969,8 @@ def _until(holds: Callable[[], bool]) -> None:
 @pytest.fixture
 def no_park_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     """Other tests' threads may still be waiting out IDLE_S; the cap is TestParking's own subject only."""
-    monkeypatch.setattr(wb, "MAX_PARKED", 10_000)
+    # raising=False: a mutation run against a writer without the cap fails these tests, rather than their setup.
+    monkeypatch.setattr(wb, "MAX_PARKED", 10_000, raising=False)
 
 
 def _three_writers_under_a_cap_of_two() -> object:
@@ -989,8 +990,9 @@ def _three_writers_under_a_cap_of_two() -> object:
 
 
 def _forked_child_parks_from_zero() -> object:
-    """Run fresh: a parent with a waiting thread forks; what the child's writer and count start from."""
-    wb.IDLE_S = 3600.0
+    """Run fresh: a parent with a waiting thread forks; what the child's writer and count start from. The cap is
+    the parent's one thread, so a child that inherited the parent's count could not park its own."""
+    wb.MAX_PARKED, wb.IDLE_S = 1, 3600.0
     writer = wb.WriteBehind(lambda *_: None)
     writer.submit(("", "k"), 1, lambda: None)
     _until(lambda: writer._state.idle == 1)
@@ -1014,25 +1016,29 @@ def _forked_child_parks_from_zero() -> object:
     return {"child": child_outcome(child, r), "parent_parked": wb._parked[os.getpid()]}
 
 
-def _fork_warns_without_write_behind() -> object:
-    """Run fresh: does os.fork() already warn after a default @cache.minimal miss, write-behind off?"""
-    import warnings
-
+def _l1_off_fork_warns_only_while_a_thread_waits() -> object:
+    """Run fresh: with L1 off no sweeper runs, so the writer's waiting thread is the process's only other thread.
+    Does os.fork() warn while it waits, and not once it has waited out IDLE_S and ended?"""
+    wb.IDLE_S = 3600.0
     backend = _GatedBackend()
+    backend.gate.set()
 
-    @cache.minimal(backend=backend, write_behind=False)
+    @cache(backend=backend, ttl=60, write_behind=True, l1_enabled=False)
     def fn(x: int) -> int:
         return x
 
     fn(1)
+    (writer,) = wb._all_writers()
+    s = writer._state
+    _until(lambda: s.idle == 1)  # sent, and waiting for the next write
     threads = sorted(t.name for t in threading.enumerate())
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        child = os.fork()
-        if child == 0:
-            os._exit(0)
-    os.waitpid(child, 0)
-    return {"threads": threads, "warned": any("multi-threaded" in str(w.message) for w in caught)}
+    while_waiting = fork_warns()
+    wb.IDLE_S = 0.05
+    fn(2)  # the waiting thread sends it, then waits the new IDLE_S out and ends
+    # OS threads, not Thread objects: fork's warning reads the count in /proc/self/stat, where a thread can stay
+    # briefly after join() returns. /proc/self/task lists the same threads.
+    _until(lambda: s.workers == 0 and len(os.listdir("/proc/self/task")) == 1)
+    return {"threads": threads, "while_waiting": while_waiting, "after": fork_warns(), "sent": len(backend.store)}
 
 
 @pytest.mark.usefixtures("no_park_cap")
@@ -1104,11 +1110,11 @@ class TestParking:
         assert outcome["parent_parked"] == 1
 
     @pytest.mark.skipif(sys.version_info < (3, 12), reason="os.fork() warns about threads from 3.12")
-    def test_minimal_already_forks_multi_threaded_without_write_behind(self) -> None:
-        """Why a waiting thread needs no before-fork hook: a @cache.minimal process already runs the L1
-        sweeper for good, so os.fork() warns with write-behind off too, and a waiting thread changes nothing."""
-        run = run_fresh(_fork_warns_without_write_behind)
+    @pytest.mark.skipif(sys.platform != "linux", reason="counts the process's threads in /proc/self/task")
+    def test_with_l1_off_fork_warns_only_while_a_thread_waits(self) -> None:
+        """L1's sweeper makes any process with an L1 cache multi-threaded for good (test_l1_expiry_sweep pins it).
+        With L1 off, a waiting writer thread opens a window of up to IDLE_S after a write in which os.fork() warns."""
+        run = run_fresh(_l1_off_fork_warns_only_while_a_thread_waits)
         assert run.returncode == 0, run.stderr
         outcome = ast.literal_eval(run.stdout)
-        assert outcome["warned"] is True, outcome
-        assert _WRITER not in outcome["threads"], outcome
+        assert outcome == {"threads": ["MainThread", _WRITER], "while_waiting": True, "after": False, "sent": 2}
