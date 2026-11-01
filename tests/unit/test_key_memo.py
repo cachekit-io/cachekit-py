@@ -370,8 +370,8 @@ class TestKeyBytesUnchanged:
         assert ":elsewhere.renamed:" in moved
 
     def test_a_rename_rekeys_a_callable_that_is_not_a_plain_function(self) -> None:
-        """A plain function's names are read through the descriptors on its type; any other callable,
-        here a bound method reporting its function's names, through its own attribute access."""
+        """The memo reads every callable's names by attribute access, so a rename re-keys any callable,
+        here a bound method reporting its function's names, as it re-keys a plain function."""
 
         class Service:
             def lookup(self, x: int) -> int:
