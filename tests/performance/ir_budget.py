@@ -97,6 +97,7 @@ WORKLOAD = Path(__file__).with_name("ir_workload.py")  # the measured process
 PATHS = (
     "l1_hit",
     "l1_hit_backed",
+    "l1_hit_backed_auto",
     "minimal_l1_hit",
     "l2_hit",
     "miss",

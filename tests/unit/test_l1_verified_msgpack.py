@@ -1,5 +1,7 @@
-"""A non-encrypted backed cache's L1 hit swaps its envelope for the verified MessagePack (``VerifiedMsgpack``) when
-that is no longer; otherwise L1 keeps the envelope.
+"""A non-encrypted backed cache's L1 hit swaps its envelope for the verified MessagePack (``VerifiedPayload``) when
+that is no longer; otherwise L1 keeps the envelope. The auto serializer's MessagePack envelopes and the orjson
+serializer's checksummed JSON are kept the same way (the last section); everything else here is the default
+serializer's.
 
 The first L1 hit on an entry decodes the envelope as before, and its retrieve() yields the MessagePack; when that is
 no longer than the envelope, L1 then holds it in place of the envelope (``CacheSerializationHandler.deserialize_l1``,
@@ -27,7 +29,7 @@ import os
 import random
 import uuid
 from collections.abc import Callable, Iterator
-from datetime import UTC, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import msgpack
@@ -42,9 +44,9 @@ from cachekit.config import reset_settings
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache, get_l1_cache
 from cachekit.serializers import base
-from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError, unpackb_bounded
+from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError, VerifiedPayload, unpackb_bounded
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
-from cachekit.serializers.standard_serializer import VerifiedMsgpack, _standard_object_hook
+from cachekit.serializers.standard_serializer import StandardSerializer, _standard_object_hook
 from cachekit.serializers.wrapper import SerializationWrapper
 from tests.fixtures.zero_config import clear_cachekit_env
 
@@ -123,7 +125,7 @@ def test_the_first_hit_swaps_an_envelope_for_its_msgpack_when_no_longer(value: A
     before = compute.cache_info().l1_hits  # type: ignore[attr-defined]  # stats are per function name
     assert compute(1) == value  # first hit: decodes the envelope, keeps its MessagePack
     _, entry = _stored(backend, namespace)
-    assert type(entry) is VerifiedMsgpack
+    assert type(entry) is VerifiedPayload
     assert entry.data == msgpack.packb(value, use_bin_type=True)
     assert len(entry) <= len(envelope)
 
@@ -184,7 +186,7 @@ def test_an_l2_hit_backfills_the_envelope_and_the_next_hit_swaps_it() -> None:
     assert type(entry) is bytes and entry == envelope
     assert compute(1) == {"x": 1}
     _, entry = _stored(backend, namespace)
-    assert type(entry) is VerifiedMsgpack
+    assert type(entry) is VerifiedPayload
     assert backend.gets == 2
 
 
@@ -225,7 +227,7 @@ _VALUES = st.recursive(
 
 @settings(max_examples=300, deadline=None)
 @given(value=_VALUES | st.binary(min_size=1000, max_size=20_000) | st.text(min_size=1000, max_size=20_000))
-def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_same(value: Any) -> None:
+def test_deserialize_l1_keeps_verified_only_when_no_longer_and_it_decodes_the_same(value: Any) -> None:
     handler = CacheSerializationHandler()
     envelope = handler.serialize_data(value, cache_key="k")
     decoded, entry = handler.deserialize_l1(envelope, cache_key="k")
@@ -235,7 +237,7 @@ def test_deserialize_l1_keeps_msgpack_only_when_no_longer_and_it_decodes_the_sam
         assert entry is None
         assert handler.deserialize_l1(envelope, cache_key="k") == (expected, None)  # every hit on it: the same again
     else:
-        assert type(entry) is VerifiedMsgpack and len(entry) <= len(envelope)
+        assert type(entry) is VerifiedPayload and len(entry) <= len(envelope)
         assert handler.deserialize_l1(entry, cache_key="k") == (expected, None)
 
 
@@ -243,7 +245,7 @@ def test_msgpack_exactly_as_long_as_the_envelope_is_kept_and_one_byte_longer_is_
     """Random bytes followed by k zero bytes: each zero lengthens the MessagePack by one byte, and LZ4 folds the run,
     so the MessagePack overtakes the envelope, passing through both lengths."""
     handler, head = CacheSerializationHandler(), random.Random(0).randbytes(300)
-    for extra, kept in ((0, VerifiedMsgpack), (1, type(None))):
+    for extra, kept in ((0, VerifiedPayload), (1, type(None))):
         for k in range(2000):
             value = head + bytes(k)
             envelope = handler.serialize_data(value, cache_key="k")
@@ -256,7 +258,14 @@ def test_msgpack_exactly_as_long_as_the_envelope_is_kept_and_one_byte_longer_is_
 
 _CORRUPT = (SerializationError, "Corrupt cache envelope")
 _OTHER_HANDLERS: dict[str, tuple[Callable[[], CacheSerializationHandler], tuple[type[Exception], str]]] = {
-    "auto": (lambda: CacheSerializationHandler(serializer_name="auto"), _CORRUPT),
+    "auto-integrity-off": (
+        lambda: CacheSerializationHandler(serializer_name="auto", enable_integrity_checking=False),
+        _CORRUPT,
+    ),
+    "orjson-integrity-off": (
+        lambda: CacheSerializationHandler(serializer_name="orjson", enable_integrity_checking=False),
+        _CORRUPT,
+    ),
     "integrity-off": (lambda: CacheSerializationHandler(enable_integrity_checking=False), _CORRUPT),
     "encrypted": (
         lambda: CacheSerializationHandler(encryption=True, master_key=MASTER_KEY, single_tenant_mode=True),
@@ -265,9 +274,9 @@ _OTHER_HANDLERS: dict[str, tuple[Callable[[], CacheSerializationHandler], tuple[
 }
 
 
-def _planted() -> VerifiedMsgpack:
+def _planted() -> VerifiedPayload:
     """The kept entry a plaintext default-serializer handler leaves in L1."""
-    return VerifiedMsgpack(msgpack.packb({"x": 2}))
+    return VerifiedPayload(msgpack.packb({"x": 2}), StandardSerializer)
 
 
 @pytest.mark.parametrize(("make", "refusal"), list(_OTHER_HANDLERS.values()), ids=list(_OTHER_HANDLERS))
@@ -278,7 +287,7 @@ def test_other_handlers_keep_their_envelope_and_refuse_a_kept_entry(
     handler left under the same key: under encryption as the plaintext envelope it replaced would be."""
     handler = make()
     envelope = handler.serialize_data({"x": 1}, cache_key="k")
-    assert not handler.keeps_msgpack_in_l1
+    assert not handler.keeps_verified_in_l1
     assert handler.deserialize_l1(envelope, cache_key="k") == ({"x": 1}, None)
     error, message = refusal
     for decode in (handler.deserialize_l1, handler.deserialize_data):
@@ -365,7 +374,7 @@ def retrieves(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     return seen
 
 
-_PLAIN = {"id": 7, "tags": ["a"]}  # its MessagePack is no longer than its envelope: kept as VerifiedMsgpack
+_PLAIN = {"id": 7, "tags": ["a"]}  # its MessagePack is no longer than its envelope: kept as VerifiedPayload
 _COMPRESSIBLE = {"users": [{"name": f"user {i}", "theme": "dark"} for i in range(50)]}  # L1 keeps its envelope
 
 
@@ -392,7 +401,7 @@ def _decorated(backend: _Backend, namespace: str, value: Any, mode: str) -> Call
 @pytest.mark.parametrize("mode", ["sync", "async"])
 @pytest.mark.parametrize(
     ("value", "kept"),
-    [(_PLAIN, VerifiedMsgpack), (_COMPRESSIBLE, bytes)],
+    [(_PLAIN, VerifiedPayload), (_COMPRESSIBLE, bytes)],
     ids=["msgpack", "envelope"],
 )
 def test_every_hit_runs_the_bounded_decode_and_only_kept_msgpack_skips_retrieve(
@@ -412,7 +421,7 @@ def test_every_hit_runs_the_bounded_decode_and_only_kept_msgpack_skips_retrieve(
     retrieves.clear()
     for _ in range(2):
         assert _call(fn, mode) == value
-    assert (decodes, len(retrieves), backend.gets) == (["ok", "ok"], 0 if kept is VerifiedMsgpack else 2, 1)
+    assert (decodes, len(retrieves), backend.gets) == (["ok", "ok"], 0 if kept is VerifiedPayload else 2, 1)
 
 
 def test_a_nesting_bomb_put_in_l1_as_bytes_is_refused_by_the_bounded_decode(decodes: list[str]) -> None:
@@ -518,9 +527,9 @@ def _outcome(decode: Callable[[], Any]) -> Any:
         return type(e)
 
 
-def _verified(envelope: bytes) -> VerifiedMsgpack:
+def _verified(envelope: bytes) -> VerifiedPayload:
     """``envelope``'s MessagePack as retrieve() verifies it, held as L1 holds a kept entry, whatever its length."""
-    return VerifiedMsgpack(ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])[0])
+    return VerifiedPayload(ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])[0], StandardSerializer)
 
 
 def _walked_hooked(envelope: bytes) -> Any:
@@ -594,7 +603,7 @@ def test_shrink_if_held_swaps_the_entry_in_place(size: int) -> None:
     l1.put("b", b"b" * 10, redis_ttl=60)
     expires_at = l1._state.cache["a"].expires_at
 
-    new = VerifiedMsgpack(b"m" * size)
+    new = VerifiedPayload(b"m" * size, StandardSerializer)
     assert l1.shrink_if_held("a", old, new)
 
     assert l1.peek("a") is new
@@ -610,13 +619,13 @@ def test_shrink_if_held_leaves_an_entry_it_did_not_read_or_would_grow(change: st
     l1 = L1Cache(max_memory_mb=1, namespace=_namespace())
     old = b"e" * 100
     l1.put("a", old, redis_ttl=60)
-    new = VerifiedMsgpack(b"m" * 40)
+    new = VerifiedPayload(b"m" * 40, StandardSerializer)
     if change == "removed":
         l1.invalidate("a")
     elif change == "stored-again":
         l1.put("a", bytes(bytearray(old)), redis_ttl=60)  # equal bytes, another object: a newer write
     else:
-        new = VerifiedMsgpack(b"m" * 101)
+        new = VerifiedPayload(b"m" * 101, StandardSerializer)
     held = l1.peek("a")
 
     assert not l1.shrink_if_held("a", old, new)
@@ -704,7 +713,7 @@ def test_an_encrypted_reader_refuses_a_kept_entry_in_its_l1() -> None:
     held = l1.peek(key)
     assert held is not None and len(planted) <= len(held)
     assert l1.shrink_if_held(key, held, planted)
-    assert type(l1.peek(key)) is VerifiedMsgpack
+    assert type(l1.peek(key)) is VerifiedPayload
     assert compute(1) == {"x": 1}  # read from L2 instead
     assert type(l1.peek(key)) is bytes
 
@@ -845,3 +854,205 @@ def test_an_entry_shrunk_under_the_admission_cap_stays_out_so_the_hot_set_keeps_
     assert len(_replay(trace, 1, _envelope_rule)) == 20
     assert len(_replay(trace, 1, _envelope_rule, promote=True)) == 20
     assert _replay(trace, 1, _admit_on_raw_rule) == []  # 20 hits fell to 0
+
+
+# ── auto and orjson: the same rules, their own payloads ───────────────────────────────────────
+
+
+def _auto_value() -> dict[str, Any]:
+    """Python types only the auto serializer's object hook restores, so a kept decode must run that hook."""
+    return {
+        "pair": (1, "a"),
+        "set": {1, 2},
+        "frozen": frozenset({"x"}),
+        "when": datetime(2026, 11, 1, 12, 30, tzinfo=UTC),
+        "id": uuid.UUID(int=7),
+    }
+
+
+_KEEPING = {"auto": _auto_value, "orjson": lambda: {"id": 7, "tags": ["a"], "score": 97.5}}
+
+
+def _verified_payload(serializer_name: str, envelope: bytes) -> bytes:
+    """What a verified hit on ``envelope`` keeps: the MessagePack retrieve() returns, or the JSON under the checksum."""
+    payload = bytes(SerializationWrapper.unwrap(envelope)[0])
+    return ByteStorage("msgpack").retrieve(payload)[0] if serializer_name == "auto" else payload[8:]
+
+
+@pytest.fixture
+def checks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """One entry per integrity check either serializer runs: ByteStorage.retrieve(), or orjson's xxHash3-64."""
+    import xxhash
+
+    from cachekit.serializers import orjson_serializer
+
+    seen: list[str] = []
+    real_retrieve, real_digest = ByteStorage.retrieve, xxhash.xxh3_64_digest
+
+    def retrieve(self: ByteStorage, data: Any) -> Any:
+        seen.append("retrieve")
+        return real_retrieve(self, data)
+
+    def digest(data: Any) -> bytes:
+        seen.append("xxh3")
+        return real_digest(data)
+
+    monkeypatch.setattr(ByteStorage, "retrieve", retrieve)
+    monkeypatch.setattr(orjson_serializer.xxhash, "xxh3_64_digest", digest)
+    return seen
+
+
+@pytest.mark.parametrize("serializer_name", list(_KEEPING))
+def test_auto_and_orjson_hits_keep_their_verified_payload_and_skip_the_check(serializer_name: str, checks: list[str]) -> None:
+    """The first hit verifies the envelope and keeps what it verified, owned by its serializer; later hits decode
+    the kept payload with no integrity check, through the same decoder, so they return equal fresh objects."""
+    value, backend, namespace = _KEEPING[serializer_name](), _Backend(), _namespace()
+
+    @cache(backend=backend, ttl=60, namespace=namespace, serializer=serializer_name)
+    def compute(x: int) -> Any:
+        return value
+
+    assert compute(1) == value  # miss: L1 holds the envelope
+    envelope, entry = _stored(backend, namespace)
+    assert type(entry) is bytes
+    checks.clear()
+    first = compute(1)  # first hit: verifies, decodes, keeps
+    assert first == value and len(checks) == 1
+    _, entry = _stored(backend, namespace)
+    assert type(entry) is VerifiedPayload
+    assert entry.owner is type(CacheSerializationHandler(serializer_name=serializer_name)._base_serializer)
+    assert entry.data == _verified_payload(serializer_name, envelope)
+    assert len(entry) <= len(envelope)
+
+    checks.clear()
+    second = compute(1)
+    assert second == value and second is not first
+    assert (checks, backend.gets) == ([], 1)
+
+
+@pytest.mark.parametrize("serializer_name", list(_KEEPING))
+def test_a_corrupt_auto_or_orjson_entry_in_l1_is_never_kept(serializer_name: str) -> None:
+    """A payload enters L1 only from a check that verified it: a corrupt envelope in L1 is refused, never kept."""
+    handler = CacheSerializationHandler(serializer_name=serializer_name)
+    envelope = handler.serialize_data(_KEEPING[serializer_name](), cache_key="k")
+    with pytest.raises(SerializationError):
+        handler.deserialize_l1(_corrupt(envelope), cache_key="k")
+
+
+@pytest.mark.parametrize(
+    ("reader", "minter"),
+    [("auto", StandardSerializer), ("orjson", StandardSerializer), ("default", "auto"), ("auto", "orjson")],
+)
+def test_a_keeping_handler_refuses_another_serializers_kept_entry(reader: str, minter: Any) -> None:
+    """The owner is the mark of which decoder may read a kept payload: a kept entry under a key another serializer's
+    handler reads is refused as the corrupt frame it is to that handler, never decoded by the wrong decoder."""
+    if isinstance(minter, str):
+        other = CacheSerializationHandler(serializer_name=minter)
+        minter = type(other._base_serializer)
+    planted = VerifiedPayload(msgpack.packb({"x": 2}), minter)
+    handler = CacheSerializationHandler(serializer_name=reader)
+    assert handler.keeps_verified_in_l1
+    for decode in (handler.deserialize_l1, handler.deserialize_data):
+        with pytest.raises(_CORRUPT[0], match=_CORRUPT[1]):
+            decode(planted, cache_key="k")  # type: ignore[arg-type]
+
+
+def _keeping_frames(serializer_name: str) -> dict[str, bytes]:
+    """Entries an auto or orjson handler must decode exactly as deserialize_data does; only "own-envelope" is kept."""
+    k = "k"
+    handler = CacheSerializationHandler(serializer_name=serializer_name)
+    own = handler.serialize_data(_KEEPING[serializer_name](), cache_key=k)
+    frames = {
+        "own-envelope": own,
+        "other-serializer": CacheSerializationHandler().serialize_data({"x": 1}, cache_key=k),
+        "integrity-off": CacheSerializationHandler(
+            serializer_name=serializer_name, enable_integrity_checking=False
+        ).serialize_data({"x": 1}, cache_key=k),
+        "corrupt-payload": _corrupt(own),
+        "truncated": own[:-30],
+        "not-a-frame": msgpack.packb({"x": 1}),
+    }
+    if serializer_name == "orjson":
+        frames["encrypted-drift"] = CacheSerializationHandler(
+            serializer_name="orjson", encryption=True, master_key=MASTER_KEY, single_tenant_mode=True
+        ).serialize_data({"x": 1}, cache_key=k)
+        return frames
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    payload, metadata, name = SerializationWrapper.unwrap(own)
+    frames |= {
+        "numpy": handler.serialize_data(np.arange(12.0).reshape(3, 4), cache_key=k),
+        "dataframe-arrow": handler.serialize_data(pd.DataFrame({"a": [1, 2]}), cache_key=k),
+        "series": handler.serialize_data(pd.Series([1.5, 2.5], name="s"), cache_key=k),
+        "header-claims-series": SerializationWrapper.wrap(bytes(payload), metadata | {"original_type": "series"}, name),
+        "header-claims-none": SerializationWrapper.wrap(
+            bytes(payload), {key: v for key, v in metadata.items() if key != "original_type"}, name
+        ),
+    }
+    return frames
+
+
+_KEEPING_FRAME_NAMES = {
+    "auto": (
+        "own-envelope",
+        "other-serializer",
+        "integrity-off",
+        "corrupt-payload",
+        "truncated",
+        "not-a-frame",
+        "numpy",
+        "dataframe-arrow",
+        "series",
+        "header-claims-series",
+        "header-claims-none",
+    ),
+    "orjson": (
+        "own-envelope",
+        "other-serializer",
+        "integrity-off",
+        "corrupt-payload",
+        "truncated",
+        "not-a-frame",
+        "encrypted-drift",
+    ),
+}
+
+
+@pytest.mark.parametrize("serializer_name", list(_KEEPING))
+def test_keeping_frame_names_list_every_frame(serializer_name: str) -> None:
+    assert set(_keeping_frames(serializer_name)) == set(_KEEPING_FRAME_NAMES[serializer_name])
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Equality that also compares NumPy arrays and pandas objects (whose == is elementwise)."""
+    if hasattr(a, "equals"):
+        return type(a) is type(b) and a.equals(b)
+    if hasattr(a, "shape") and hasattr(a, "dtype"):
+        return type(a) is type(b) and a.dtype == b.dtype and a.shape == b.shape and bool((a == b).all())
+    return a == b
+
+
+@pytest.mark.parametrize(
+    ("serializer_name", "name"),
+    [(s, n) for s, names in _KEEPING_FRAME_NAMES.items() for n in names],
+)
+def test_auto_and_orjson_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
+    serializer_name: str, name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The keeping path runs only the route deserialize takes for its own plain envelope: NumPy, Arrow, columnar
+    and every other entry go to deserialize_data, so the two agree on every entry and only that envelope is kept."""
+    data = _keeping_frames(serializer_name)[name]
+    monkeypatch.setenv("CACHEKIT_MASTER_KEY", MASTER_KEY)  # lets the encrypted-drift entry decrypt, as it would
+    reset_settings()
+    handler = CacheSerializationHandler(serializer_name=serializer_name, encryption=False)
+
+    def outcome(decode: Callable[[], Any]) -> Any:
+        try:
+            return decode()
+        except Exception as e:  # noqa: BLE001 - the outcome under comparison
+            return type(e)
+
+    expected = outcome(lambda: handler.deserialize_data(data, cache_key="k"))
+    got = outcome(lambda: handler.deserialize_l1(data, cache_key="k"))
+    assert _same(got[0] if isinstance(got, tuple) else got, expected)
+    assert (isinstance(got, tuple) and got[1] is not None) == (name == "own-envelope")

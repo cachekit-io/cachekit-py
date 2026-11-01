@@ -21,7 +21,7 @@ Security: Uses strict isinstance() checks (no hasattr()) to prevent arbitrary co
 from __future__ import annotations
 
 from datetime import date, datetime, time
-from typing import Any, ClassVar, final
+from typing import Any, ClassVar
 
 import msgpack
 
@@ -33,6 +33,7 @@ from .base import (
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
+    VerifiedPayload,
     immutable_buffer,
 )
 
@@ -46,26 +47,6 @@ _ENVELOPE_PROBE_MAX_SIZE = 256 * 1024
 # lz4_flex's get_maximum_output_size for that budget: the most compressed bytes any envelope within it carries.
 _ENVELOPE_PROBE_MAX_COMPRESSED = 20 + _ENVELOPE_PROBE_MAX_SIZE * 110 // 100
 _CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
-
-
-@final  # the read paths test `type(data) is VerifiedMsgpack`
-class VerifiedMsgpack:
-    """MessagePack a successful ``ByteStorage.retrieve()`` returned and a decode in this process accepted,
-    which an L1 entry holds in place of its envelope (``CacheSerializationHandler.deserialize_l1``). It decodes
-    without another retrieve().
-
-    The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never skip
-    retrieve(), whatever they hold. It holds retrieve()'s own bytes object rather than
-    copying it into a bytes subclass, and its length is theirs, which L1 accounts.
-    """
-
-    __slots__ = ("data",)
-
-    def __init__(self, data: bytes) -> None:
-        self.data = data
-
-    def __len__(self) -> int:
-        return len(self.data)
 
 
 # Error message constants for unsupported types (Task 2)
@@ -408,28 +389,34 @@ class StandardSerializer:
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
-    def _deserialize_keeping_msgpack(self, data: bytes | memoryview) -> tuple[Any, VerifiedMsgpack]:
+    def _deserialize_keeping(
+        self, data: bytes | memoryview, metadata: SerializationMetadata
+    ) -> tuple[Any, VerifiedPayload] | None:
         """What :meth:`deserialize` returns for a ByteStorage envelope when integrity checking is on, plus the
         MessagePack ``retrieve()`` verified and this decode accepted, for the caller to keep and decode later
-        without retrieve() (:meth:`_deserialize_verified`). It always unwraps the envelope, so call it only for
-        an integrity-on serializer. Raises SerializationError as deserialize does then.
+        without retrieve() (:meth:`_deserialize_verified`). None, decoding nothing, when the header does not say
+        what an integrity-on writer wrote (``compressed``): the caller decodes such an entry as any other. It
+        always unwraps the envelope, so call it only for an integrity-on serializer. Raises SerializationError as
+        deserialize does then.
 
         Examples:
             >>> serializer = StandardSerializer()
-            >>> envelope, _ = serializer.serialize({"test": 123})
-            >>> value, kept = serializer._deserialize_keeping_msgpack(envelope)
+            >>> envelope, metadata = serializer.serialize({"test": 123})
+            >>> value, kept = serializer._deserialize_keeping(envelope, metadata)
             >>> value, serializer._deserialize_verified(kept.data)
             ({'test': 123}, {'test': 123})
         """
+        if not metadata.compressed:
+            return None
         try:
             msgpack_data, _ = self._byte_storage.retrieve(data)
             value = unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
-        return value, VerifiedMsgpack(msgpack_data)
+        return value, VerifiedPayload(msgpack_data, StandardSerializer)
 
     def _deserialize_verified(self, msgpack_data: bytes) -> Any:
-        """Decode MessagePack a decode in this process already verified (:meth:`_deserialize_keeping_msgpack`),
+        """Decode MessagePack a decode in this process already verified (:meth:`_deserialize_keeping`),
         without retrieve(). Raises SerializationError as deserialize does."""
         try:
             return unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
