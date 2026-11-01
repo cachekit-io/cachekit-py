@@ -158,7 +158,9 @@ bounds its in-process (L1) copy of the value it wrote by it: the copy lives at m
 `min(ttl, fresh_for)` from the response, so a clamped write is never served from L1 past the
 plan maximum. A malformed or `0` value keeps no L1 copy; a server that sends no header leaves the
 copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied TTL, so it never
-lengthens an L1 copy.
+lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
+as its override calls `super().set(...)` on the same thread. If it writes any other way, the
+decorator cannot see the response, so it keeps no L1 copy of that write.
 
 ## TTL Inspection (async only)
 

@@ -223,18 +223,18 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
 
 
 class _DeferredCopy:
-    """Who drops a write-behind miss's L1 copy when its write lands with a shorter bound (API-103).
+    """Who drops a write-behind miss's L1 copy when it would outlive its write's bound (API-103).
 
-    The writer can land before or after the miss's L1 put. Each side sets its flag under ``lock`` and
-    reads the other's, so whichever comes second sees both and drops the copy.
+    The writer can land before or after the miss's L1 put. Each side records its instant under ``lock``
+    and reads the other's, so whichever comes second sees both and drops the copy.
     """
 
-    __slots__ = ("drop", "lock", "put_done")
+    __slots__ = ("fresh_until", "lock", "put_until")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.put_done = False  # the miss has put its copy in L1
-        self.drop = False  # the write landed with a bound the copy would outlive
+        self.put_until: float | None = None  # when the miss's L1 copy expires, at the latest, once put
+        self.fresh_until: float | None = None  # the write's bound, once it landed with one
 
 
 class _LockPhase:
@@ -1211,7 +1211,9 @@ def create_cache_wrapper(
 
         task.add_done_callback(_done)
 
-    def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None, *, twin: str | None) -> None:
+    def _put_l1(
+        cache_key: str, serialized_data: Any, l1_ttl: int | None, *, twin: str | None, expires_at: float | None = None
+    ) -> None:
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
         then record the key, and its pre-0.20.0 twin if it has one (_twin_key), in _cached_keys.
 
@@ -1225,8 +1227,22 @@ def create_cache_wrapper(
         """
         if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-            _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
+            _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl, expires_at=expires_at)
         _record(cache_key, twin)
+
+    def _put_l1_written(cache_key: str, serialized_data: Any, fresh_until: float | None, *, twin: str | None) -> None:
+        """The writer's own L1 copy of a value it stored (API-103): served until the earlier of ttl from now
+        and fresh_until, the instant the write's 2xx bounds it to (``set_with_freshness``).
+
+        fresh_until is timed from the 2xx's receipt, not from this put, so a stall between the two (the
+        hop back to the event loop) shortens the copy instead of restarting its bound. None (no bound
+        reported, or a failed write) keeps the stated ttl.
+        """
+        if fresh_until is None:
+            _put_l1(cache_key, serialized_data, ttl, twin=twin)
+            return
+        local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
+        _put_l1(cache_key, serialized_data, None, twin=twin, expires_at=min(time.time() + local_ttl, fresh_until))
 
     def _record(cache_key: str, twin: str | None) -> None:
         """Record ``cache_key`` and its ``twin`` (if any) in _cached_keys under the current L2 scope,
@@ -1287,11 +1303,11 @@ def create_cache_wrapper(
         if _is_trackable():
             await asyncio.to_thread(_track_and_record, cache_key)
 
-    async def _set_l2_async(cache_key: str, serialized_data: bytes) -> tuple[bool, bool, int | None]:
-        """An async L2 write: (stored, tracked, fresh_for). Where the handler can (set_tracked_async), the
+    async def _set_l2_async(cache_key: str, serialized_data: bytes) -> tuple[bool, bool, float | None]:
+        """An async L2 write: (stored, tracked, fresh_until). Where the handler can (set_tracked_async), the
         key-registry write rides in the same round trip and thread hop, and tracked is True; otherwise the
-        caller tracks a stored key itself (_track_and_record_async). fresh_for is the write's
-        X-CacheKit-Fresh-For (set_with_freshness_async), None where the handler reports none."""
+        caller tracks a stored key itself (_track_and_record_async). fresh_until bounds the writer's L1
+        copy (set_with_freshness_async), None where the handler reports no bound."""
         handler = operation_handler.cache_handler
         # Asked first: a backend without a registry never pays for the probe. Custom strategies predate set_tracked_async.
         set_tracked_async = getattr(handler, "set_tracked_async", None) if _is_trackable() else None
@@ -1301,22 +1317,18 @@ def create_cache_wrapper(
                 return stored, True, None
         set_with_freshness_async = getattr(handler, "set_with_freshness_async", None)
         if set_with_freshness_async is not None:
-            stored, fresh_for = await set_with_freshness_async(cache_key, serialized_data, ttl, _stale_ttl)
-            return stored, False, fresh_for
+            stored, fresh_until = await set_with_freshness_async(cache_key, serialized_data, ttl, _stale_ttl)
+            return stored, False, fresh_until
         return await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl), False, None  # type: ignore[union-attr]
 
-    def _l1_bounded_ttl(fresh_for: int | None) -> Any:
-        """L1 TTL for a copy of an L2 value, bounded by the server's remaining
-        freshness (spec/saas-api.md#remaining-freshness): a backfill from an L2 read
-        (API-29), or the writer's own copy of a value it stored (API-103), whose
-        fresh_for comes from the PUT's 2xx and is measured from its receipt.
+    def _l1_backfill_ttl(fresh_for: int | None) -> Any:
+        """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
+        freshness (spec/saas-api.md#remaining-freshness).
 
         Unbounded, a read near the end of the server's freshness window restarts
-        the clock and serves from L1 as fresh past the server's fresh_until; a write
-        whose TTL the server clamped to the plan maximum would serve from L1 past it.
-        fresh_for=None (pre-signal server / no expiry / non-SWR backend / failed
-        write) keeps legacy behavior: min(local_ttl, effective_ttl), both the
-        decorator's ttl here; fresh_for=0 makes L1Cache.put skip the entry entirely
+        the clock and serves from L1 as fresh past the server's fresh_until.
+        fresh_for=None (pre-signal server / no expiry / non-SWR backend) keeps
+        legacy behavior; fresh_for=0 makes L1Cache.put skip the entry entirely
         (effective expiry <= now — nothing fresh remains to record).
 
         The signal may only ever SHORTEN the L1 lifetime: with ttl=None the
@@ -1373,7 +1385,7 @@ def create_cache_wrapper(
             _record(cache_key, twin)
             return
         try:
-            _put_l1(cache_key, cached_data, _l1_bounded_ttl(fresh_for), twin=twin)
+            _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for), twin=twin)
         except TypeError as exc:
             _record(cache_key, twin)
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
@@ -1470,9 +1482,9 @@ def create_cache_wrapper(
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
         )
-        stored, tracked, fresh_for = await _set_l2_async(cache_key, serialized_data)
+        stored, tracked, fresh_until = await _set_l2_async(cache_key, serialized_data)
         # Refresh L1 with the new fresh bytes (mirrors the miss-path store), bounded by the write (API-103).
-        _put_l1(cache_key, serialized_data, _l1_bounded_ttl(fresh_for), twin=_twin_key(call_args, call_kwargs))
+        _put_l1_written(cache_key, serialized_data, fresh_until, twin=_twin_key(call_args, call_kwargs))
         if stored and not tracked:
             await _track_and_record_async(cache_key)
 
@@ -1511,8 +1523,8 @@ def create_cache_wrapper(
             )
             # No registry_id: the key is tracked below, as before.
             handler = operation_handler.cache_handler
-            stored, _, fresh_for = _set_l2(handler, cache_key, serialized_data, ttl, _stale_ttl, None, _warn_track_failure)
-            _put_l1(cache_key, serialized_data, _l1_bounded_ttl(fresh_for), twin=_twin_key(call_args, call_kwargs))
+            stored, _, fresh_until = _set_l2(handler, cache_key, serialized_data, ttl, _stale_ttl, None, _warn_track_failure)
+            _put_l1_written(cache_key, serialized_data, fresh_until, twin=_twin_key(call_args, call_kwargs))
             if stored:
                 _track_and_record(cache_key)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
@@ -1798,11 +1810,11 @@ def create_cache_wrapper(
         start = time.perf_counter()
         # Trackable first: a backend without a registry never pays for set_tracked's probe.
         registry_id = _registry_id if _is_trackable() else None
-        stored, tracked, fresh_for = _set_l2(handler, cache_key, envelope, ttl, _stale_ttl, registry_id, _warn_track_failure)
+        stored, tracked, fresh_until = _set_l2(handler, cache_key, envelope, ttl, _stale_ttl, registry_id, _warn_track_failure)
         duration_ms = (time.perf_counter() - start) * 1000
         if stored:
             get_logger().cache_stored(cache_key, ttl)
-            _bound_deferred_copy(cache_key, fresh_for, copy)
+            _bound_deferred_copy(cache_key, fresh_until, copy)
             _record(cache_key, twin)
             if not tracked:
                 _track_and_record(cache_key)
@@ -1817,35 +1829,40 @@ def create_cache_wrapper(
                 serializer="rust",
             )
 
-    def _bound_deferred_copy(cache_key: str, fresh_for: int | None, copy: _DeferredCopy) -> None:
+    def _bound_deferred_copy(cache_key: str, fresh_until: float | None, copy: _DeferredCopy) -> None:
         """Hold a write-behind copy to the bound of its write's 2xx (API-103), once that write lands.
 
-        The miss puts the copy in L1 for ttl (less L1's buffer) no later than the write's receipt, so the
-        copy ends by receipt + fresh_for whenever fresh_for >= ttl - buffer. Otherwise (the server clamped
-        the TTL to the plan maximum, or sent 0 or a malformed value) the copy is dropped, not re-put: a
-        re-put could replace a newer value, and the next read backfills under its own bound. The writer
-        can land before the miss's put, so whichever of the two comes second drops it (_DeferredCopy).
+        The miss put the copy in L1 for ttl, before the write's bound was known. A copy that would serve
+        past fresh_until (the server clamped the TTL to the plan maximum, sent 0 or a malformed value, or
+        the put came well after the 2xx) is dropped, not re-put: a re-put could replace a newer value, and
+        the next read backfills under its own bound. The writer can land before the miss's put, so
+        whichever of the two comes second compares them (_DeferredCopy).
         """
-        if fresh_for is None or _l1_cache is None:
-            return
-        local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
-        if fresh_for >= local_ttl - _l1_cache.ttl_buffer_seconds:
+        if fresh_until is None or _l1_cache is None:
             return
         with copy.lock:
-            copy.drop = True
-            put_done = copy.put_done
-        if put_done:
+            copy.fresh_until = fresh_until
+            put_until = copy.put_until
+        if put_until is not None and _outlives(put_until, fresh_until):
             _l1_cache.invalidate(cache_key)
 
     def _put_deferred_copy(cache_key: str, serialized_data: Any, twin: str | None, copy: _DeferredCopy) -> None:
         """A deferred miss's L1 put: no bound from a 2xx yet, and dropped at once if its write already
-        landed with a shorter one (_bound_deferred_copy)."""
+        landed with a bound the copy would outlive (_bound_deferred_copy)."""
         _put_l1(cache_key, serialized_data, ttl, twin=twin)
+        # Read after the put, so it is no earlier than the expiry L1 computed: the comparison errs to dropping.
+        put_until = time.time() + (DEFAULT_L1_TTL_SECONDS if ttl is None else ttl)
         with copy.lock:
-            copy.put_done = True
-            drop = copy.drop
-        if drop and _l1_cache is not None:
+            copy.put_until = put_until
+            fresh_until = copy.fresh_until
+        if fresh_until is not None and _l1_cache is not None and _outlives(put_until, fresh_until):
             _l1_cache.invalidate(cache_key)
+
+    def _outlives(put_until: float, fresh_until: float) -> bool:
+        """Whether an L1 copy put to expire at put_until serves past fresh_until: L1 stops serving it
+        ttl_buffer_seconds before put_until."""
+        assert _l1_cache is not None  # noqa: S101 - callers check
+        return put_until - _l1_cache.ttl_buffer_seconds > fresh_until
 
     def _defer_write(cache_key: str, twin: str | None, envelope: bytes, *, copy: _DeferredCopy) -> bool:
         """Hand a miss's serialized value to the writer. False if it refused: the caller writes it now."""
@@ -2591,8 +2608,11 @@ def create_cache_wrapper(
             if outcome.deferred and deferred_copy is not None:
                 _put_deferred_copy(cache_key, outcome.envelope, twin_key, deferred_copy)
             else:
-                fresh_for = outcome.fresh_for  # None on every backend but CachekitIO: skip the helper's frame
-                _put_l1(cache_key, outcome.envelope, ttl if fresh_for is None else _l1_bounded_ttl(fresh_for), twin=twin_key)
+                fresh_until = outcome.fresh_until  # None on every backend but CachekitIO: skip the helper's frame
+                if fresh_until is None:
+                    _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
+                else:
+                    _put_l1_written(cache_key, outcome.envelope, fresh_until, twin=twin_key)
             if outcome.stored and trackable and not outcome.tracked:
                 _track_and_record(cache_key)
 
@@ -3119,12 +3139,12 @@ def create_cache_wrapper(
                             )
 
                             # Store in Redis with TTL
-                            stored, tracked, fresh_for = await _set_l2_async(cache_key, serialized_data)
+                            stored, tracked, fresh_until = await _set_l2_async(cache_key, serialized_data)
                             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes),
                             # bounded by the write's Fresh-For (API-103)
-                            _put_l1(cache_key, serialized_data, _l1_bounded_ttl(fresh_for), twin=twin_key)
+                            _put_l1_written(cache_key, serialized_data, fresh_until, twin=twin_key)
                             if stored and not tracked:
                                 await _track_and_record_async(cache_key)
 
@@ -3241,9 +3261,9 @@ def create_cache_wrapper(
             deferred_copy = None if _write_behind is None else _DeferredCopy()
             deferred = deferred_copy is not None and _defer_write(cache_key, twin_key, serialized_data, copy=deferred_copy)
             stored = tracked = False  # a deferred write is not stored yet: the writer tracks it once it lands
-            fresh_for = None
+            fresh_until = None
             if not deferred:
-                stored, tracked, fresh_for = await _set_l2_async(cache_key, serialized_data)
+                stored, tracked, fresh_until = await _set_l2_async(cache_key, serialized_data)
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes), bounded by the
@@ -3251,7 +3271,7 @@ def create_cache_wrapper(
             if deferred and deferred_copy is not None:
                 _put_deferred_copy(cache_key, serialized_data, twin_key, deferred_copy)
             else:
-                _put_l1(cache_key, serialized_data, _l1_bounded_ttl(fresh_for), twin=twin_key)
+                _put_l1_written(cache_key, serialized_data, fresh_until, twin=twin_key)
             if stored and not tracked:
                 await _track_and_record_async(cache_key)
 

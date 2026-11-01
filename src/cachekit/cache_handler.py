@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import math
 import sys
 import threading
 import types
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol,
 from pydantic import SecretBytes, SecretStr
 
 from cachekit.backends.base import (
+    WRITE_FRESH_UNTIL,
     BackendError,
     BaseBackend,
     BufferHandle,
@@ -397,21 +399,15 @@ def _fuses_tracked_write(backend: object) -> bool:
     return True
 
 
-def _reports_write_freshness(backend: object) -> bool:
-    """Whether a write can report the ``X-CacheKit-Fresh-For`` of its ``PUT`` 2xx: a private
-    ``_set_with_freshness``, whose class records the ``set`` it stands in for as
-    ``_set_with_freshness_replaces`` (captured at class creation, as ``_set_tracked_replaces`` is).
+def _write_fresh_until(seen: list[float]) -> Optional[float]:
+    """The bound a write reported through ``WRITE_FRESH_UNTIL`` (API-103): None for no bound (the
+    stated TTL bounds the copy), else the instant its L1 copy must stop serving by.
 
-    Only while the instance resolves ``set`` to that function, as a plain method bound to the backend
-    itself: an override, patch, wrapper or proxy of ``set`` keeps ``set``, so it still runs on every
-    write. Such a write reports no bound, which is the absent-header path (the stated TTL bounds the
-    copy). One class-attribute lookup answers every other backend: this runs on every miss.
+    An empty list means the write never reached the backend's own ``set`` (an override or patch that
+    does not delegate, or delegates on another thread), so the 2xx's bound is unknown: 0.0, no copy.
     """
-    replaces = getattr(type(backend), "_set_with_freshness_replaces", None)
-    if replaces is None:
-        return False
-    bound = getattr(backend, "set", None)
-    return type(bound) is types.MethodType and bound.__func__ is replaces and bound.__self__ is backend
+    fresh_until = min(seen, default=0.0)
+    return None if fresh_until == math.inf else fresh_until
 
 
 def _set_l2(
@@ -422,13 +418,13 @@ def _set_l2(
     stale_ttl: int | None,
     registry_id: str | None,
     on_track_error: Callable[[str, Exception], None],
-) -> tuple[bool, bool, Optional[int]]:
-    """A buffered L2 write through ``handler``: (stored, tracked, fresh_for).
+) -> tuple[bool, bool, Optional[float]]:
+    """A buffered L2 write through ``handler``: (stored, tracked, fresh_until).
 
     With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
     (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
-    False and the caller tracks a stored key itself. fresh_for is the write's ``X-CacheKit-Fresh-For``
-    where the handler reports one (``set_with_freshness``), else None. getattr: custom CacheHandlerStrategy
+    False and the caller tracks a stored key itself. fresh_until is when the server's freshness for the
+    written value runs out, where the handler reports it (``set_with_freshness``), else None. getattr: custom CacheHandlerStrategy
     impls predate set_tracked and set_with_freshness, as they predate set_streaming.
     """
     set_tracked = None if registry_id is None else getattr(handler, "set_tracked", None)
@@ -438,8 +434,8 @@ def _set_l2(
             return stored, True, None
     set_with_freshness = getattr(handler, "set_with_freshness", None)
     if set_with_freshness is not None:
-        stored, fresh_for = set_with_freshness(key, value, ttl, stale_ttl)
-        return bool(stored), False, fresh_for
+        stored, fresh_until = set_with_freshness(key, value, ttl, stale_ttl)
+        return bool(stored), False, fresh_until
     # Only thread the SWR kwarg when set: strategy implementations without
     # **metadata (tests, custom handlers) must keep working unchanged.
     if stale_ttl is not None:
@@ -1712,15 +1708,16 @@ class StoreOutcome(NamedTuple):
     a successful stream has none. Key tracking follows stored, L1 follows envelope. deferred says the
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
-    already reported: the caller must not track the key again. fresh_for is the stored write's
-    ``X-CacheKit-Fresh-For`` (None when the backend reports none): the caller bounds its L1 copy by it.
+    already reported: the caller must not track the key again. fresh_until is when the server's
+    freshness for the stored value runs out (None when the backend reports none): the caller's L1 copy
+    stops serving by then.
     """
 
     envelope: Optional[bytes]
     stored: bool
     deferred: bool = False
     tracked: bool = False
-    fresh_for: Optional[int] = None
+    fresh_until: Optional[float] = None
 
 
 class CacheOperationHandler:
@@ -2205,14 +2202,14 @@ class CacheOperationHandler:
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
-            stored, tracked, fresh_for = _set_l2(
+            stored, tracked, fresh_until = _set_l2(
                 self._cache_handler, cache_key, serialized_data, ttl, stale_ttl, registry_id, on_track_error
             )
             if stored:
                 get_logger().cache_stored(cache_key, ttl)
 
             # The envelope goes to L1 even when the backend write failed (L1 serves it only within the per-entry share)
-            return StoreOutcome(envelope=serialized_data, stored=bool(stored), tracked=tracked, fresh_for=fresh_for)
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored), tracked=tracked, fresh_until=fresh_until)
         except (InteropError, KeyringConfigurationError):
             # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts), or
             # a LOCAL keyring config fault, which a cold key first hits here, on the
@@ -2572,31 +2569,29 @@ class StandardCacheHandler:
 
     def set_with_freshness(
         self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, stale_ttl: Optional[int] = None
-    ) -> tuple[bool, Optional[int]]:
-        """:meth:`set`, plus the server's remaining freshness for the stored value: (stored, fresh_for).
+    ) -> tuple[bool, Optional[float]]:
+        """:meth:`set`, plus when the server's freshness for the stored value runs out: (stored, fresh_until).
 
-        fresh_for is the ``X-CacheKit-Fresh-For`` of the write's 2xx (spec/saas-api.md#remaining-freshness),
-        read with the GET grammar: 0 when malformed, None when absent, when the backend reports none
-        (every backend but CachekitIO) and when the write failed.
+        fresh_until is a ``time.time()`` instant the backend times from the 2xx's receipt
+        (``WRITE_FRESH_UNTIL``; spec/saas-api.md#remaining-freshness), the receipt itself when the 2xx's
+        ``X-CacheKit-Fresh-For`` is malformed. None when the 2xx reports no bound, when the backend reports
+        none (every backend but CachekitIO) and when the write failed.
         """
         if isinstance(value, str):
             value = value.encode("utf-8")
 
+        args = (key, value, ttl, stale_ttl) if stale_ttl is not None and supports_swr(self.backend) else (key, value, ttl)
         try:
-            if _reports_write_freshness(self.backend):
-                fresh_for: Optional[int] = self._with_backpressure_and_timeout(
-                    self.backend._set_with_freshness,  # type: ignore[attr-defined]
-                    key,
-                    value,
-                    ttl,
-                    stale_ttl,
-                )
-                return True, fresh_for
-            if stale_ttl is not None and supports_swr(self.backend):
-                self._with_backpressure_and_timeout(self.backend.set, key, value, ttl, stale_ttl)
-            else:
-                self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
-            return True, None
+            if not getattr(type(self.backend), "reports_write_freshness", False):
+                self._with_backpressure_and_timeout(self.backend.set, *args)
+                return True, None
+            seen: list[float] = []
+            token = WRITE_FRESH_UNTIL.set(seen)
+            try:
+                self._with_backpressure_and_timeout(self.backend.set, *args)
+            finally:
+                WRITE_FRESH_UNTIL.reset(token)
+            return True, _write_fresh_until(seen)
         except BackendError as e:
             get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False, None
@@ -2745,26 +2740,23 @@ class StandardCacheHandler:
 
     async def set_with_freshness_async(
         self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, stale_ttl: Optional[int] = None
-    ) -> tuple[bool, Optional[int]]:
+    ) -> tuple[bool, Optional[float]]:
         """Async variant of :meth:`set_with_freshness` (sync backend call in the thread pool)."""
         if isinstance(value, str):
             value = value.encode("utf-8")
 
+        args = (key, value, ttl, stale_ttl) if stale_ttl is not None and supports_swr(self.backend) else (key, value, ttl)
         try:
-            if _reports_write_freshness(self.backend):
-                fresh_for: Optional[int] = await self._with_backpressure_and_timeout_async(
-                    self.backend._set_with_freshness,  # type: ignore[attr-defined]
-                    key,
-                    value,
-                    ttl,
-                    stale_ttl,
-                )
-                return True, fresh_for
-            if stale_ttl is not None and supports_swr(self.backend):
-                await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl, stale_ttl)
-            else:
-                await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
-            return True, None
+            if not getattr(type(self.backend), "reports_write_freshness", False):
+                await self._with_backpressure_and_timeout_async(self.backend.set, *args)
+                return True, None
+            seen: list[float] = []
+            token = WRITE_FRESH_UNTIL.set(seen)
+            try:
+                await self._with_backpressure_and_timeout_async(self.backend.set, *args)
+            finally:
+                WRITE_FRESH_UNTIL.reset(token)
+            return True, _write_fresh_until(seen)
         except BackendError as e:
             get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False, None

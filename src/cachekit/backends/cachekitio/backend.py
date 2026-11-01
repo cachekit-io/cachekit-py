@@ -23,6 +23,7 @@ from pydantic import SecretBytes, SecretStr, ValidationError
 from urllib3.exceptions import ClosedPoolError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted, _clear_interrupted, _raised_during_request
+from cachekit.backends.base import WRITE_FRESH_UNTIL
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
@@ -637,19 +638,27 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        self._set_with_freshness(key, value, ttl, stale_ttl)
+        response = self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
+        seen = WRITE_FRESH_UNTIL.get()
+        if seen is not None:
+            seen.append(self._write_fresh_until(response))
 
-    def _set_with_freshness(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> int | None:
-        """``set``, returning the ``X-CacheKit-Fresh-For`` of the PUT's 2xx (spec/saas-api.md#remaining-freshness).
+    # set reports its write's freshness through WRITE_FRESH_UNTIL; see cache_handler._set_reporting_freshness.
+    reports_write_freshness = True
+
+    @staticmethod
+    def _write_fresh_until(response: BaseHTTPResponse) -> float:
+        """When the server's freshness for a value this PUT stored runs out (spec/saas-api.md#remaining-freshness).
 
         The decorator bounds its L1 copy of the value by it (API-103): the server may have clamped
-        ``ttl`` to the plan's maximum. Read with the GET grammar (``_parse_fresh_for``): None when the
-        header is absent (the stated TTL was applied), 0 when it is malformed. Private, like
-        ``_set_tracked``: the handler calls it only while ``set`` is this class's own (see
-        ``cache_handler._reports_write_freshness``), so an override or patch of ``set`` still runs.
+        ``ttl`` to the plan's maximum. Timed from the 2xx's receipt, on the thread that received it, so
+        a later hop back to the event loop cannot restart the bound. ``X-CacheKit-Fresh-For`` is read
+        with the GET grammar (``_parse_fresh_for``): absent (the stated TTL was applied) gives
+        ``math.inf``, malformed gives the receipt itself.
         """
-        response = self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
-        return self._fresh_for(response)
+        received = time.time()
+        fresh_for = CachekitIOBackend._fresh_for(response)
+        return math.inf if fresh_for is None else received + fresh_for
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
@@ -660,10 +669,6 @@ class CachekitIOBackend:
         if stale_ttl is not None and stale_ttl > 0 and ttl is not None:
             headers[STALE_TTL_HEADER] = str(_wire_seconds(stale_ttl))
         return headers
-
-    # The set that _set_with_freshness stands in for, captured at class creation; see
-    # cache_handler._reports_write_freshness.
-    _set_with_freshness_replaces = set
 
     def delete(self, key: str) -> bool:
         """Delete key from cache (sync).

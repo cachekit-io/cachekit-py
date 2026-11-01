@@ -8,13 +8,15 @@ sends a Fresh-For below the stated TTL when it clamped the TTL to the plan's max
 API-104: a PATCH /ttl response never creates, refreshes or extends an L1 bound.
 
 Everything runs through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py), so the
-header is parsed exactly as in production. L1 time is a fake clock: ``cachekit.l1_cache.time`` is swapped
-for a shim whose ``time()`` the test advances.
+header is parsed exactly as in production. Wall-clock time is a fake clock: the ``time`` module of L1, the
+decorator and the backend is swapped for a shim whose ``time()`` the test advances, so the PUT's receipt, the
+L1 put and L1 expiry all read one clock.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 import types
@@ -28,8 +30,11 @@ from urllib3 import HTTPResponse
 
 from cachekit import cache
 from cachekit import l1_cache as l1_module
+from cachekit.backends.base import WRITE_FRESH_UNTIL
+from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
 from cachekit.cache_handler import StandardCacheHandler
+from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators import write_behind as wb
 from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
 
@@ -83,7 +88,7 @@ class _FakeSaaS:
 
 
 class _Clock:
-    """The L1 clock: ``now`` is what ``cachekit.l1_cache`` reads as ``time.time()``."""
+    """The wall clock: ``now`` is what L1, the decorator and the backend read as ``time.time()``."""
 
     def __init__(self) -> None:
         self.now = 1_000_000.0
@@ -95,8 +100,10 @@ class _Clock:
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     clock = _Clock()
-    shim = types.SimpleNamespace(time=lambda: clock.now, sleep=time.sleep, monotonic=time.monotonic)
-    monkeypatch.setattr(l1_module, "time", shim)
+    shim = types.SimpleNamespace(**{name: getattr(time, name) for name in dir(time) if not name.startswith("_")})
+    shim.time = lambda: clock.now
+    for module in (l1_module, wrapper_module, backend_module):
+        monkeypatch.setattr(module, "time", shim)
     return clock
 
 
@@ -119,8 +126,19 @@ def _namespace() -> str:
     return f"write-bound-{next(_namespaces)}-{time.monotonic_ns()}"
 
 
+def _reported(backend: CachekitIOBackend) -> list[float]:
+    """What one ``backend.set`` reports through WRITE_FRESH_UNTIL."""
+    seen: list[float] = []
+    token = WRITE_FRESH_UNTIL.set(seen)
+    try:
+        backend.set("k", b"v", ttl=60)
+    finally:
+        WRITE_FRESH_UNTIL.reset(token)
+    return seen
+
+
 class TestBackendReportsPutFreshFor:
-    """``_set_with_freshness`` reads the PUT 2xx's header with the GET grammar (API-32/33)."""
+    """``set`` reports the PUT 2xx's header, read with the GET grammar (API-32/33), as a receipt deadline."""
 
     @pytest.mark.parametrize(
         ("header", "expected"),
@@ -136,26 +154,50 @@ class TestBackendReportsPutFreshFor:
             ("00000005", 0),  # eight digits: the length check runs first
         ],
     )
-    def test_header_grammar(self, saas: _FakeSaaS, backend: CachekitIOBackend, header: str | None, expected: int | None) -> None:
+    def test_header_grammar(
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, header: str | None, expected: int | None
+    ) -> None:
         saas.put_fresh_for = header
-        assert backend._set_with_freshness("k", b"v", ttl=60) == expected
+        assert _reported(backend) == [math.inf if expected is None else clock.now + expected]
         assert saas.ops == ["PUT"]
+
+    def test_timed_from_receipt(
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deadline is fixed when the 2xx arrives: time spent after it, parsing included, does not move it."""
+        parse = CachekitIOBackend._fresh_for
+
+        def slow_parse(response: Any) -> int | None:
+            clock.advance(3)
+            return parse(response)
+
+        monkeypatch.setattr(CachekitIOBackend, "_fresh_for", staticmethod(slow_parse))
+        saas.put_fresh_for = "5"
+        received = clock.now
+        assert _reported(backend) == [received + 5]
 
     def test_set_keeps_its_none_return(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         saas.put_fresh_for = "5"
         assert backend.set("k", b"v", ttl=60) is None  # type: ignore[func-returns-value]
+        assert WRITE_FRESH_UNTIL.get() is None  # nobody listening: nothing reported
 
 
 class TestHandlerSetWithFreshness:
-    def test_cachekitio_write_reports_fresh_for(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
+    def test_cachekitio_write_reports_fresh_until(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         saas.put_fresh_for = "5"
         handler = StandardCacheHandler(backend)
-        assert handler.set_with_freshness("k", b"v", ttl=60) == (True, 5)
+        assert handler.set_with_freshness("k", b"v", ttl=60) == (True, clock.now + 5)
         assert handler.set("k", b"v", ttl=60) is True
+        assert WRITE_FRESH_UNTIL.get() is None  # the handler closed what it opened
 
-    async def test_async_variant(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
+    def test_absent_header_reports_no_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
+        assert StandardCacheHandler(backend).set_with_freshness("k", b"v", ttl=60) == (True, None)
+
+    async def test_async_variant(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
+        """The write runs on a worker thread, in a copy of the context: the list still reaches it."""
         saas.put_fresh_for = "7"
-        assert await StandardCacheHandler(backend).set_with_freshness_async("k", b"v", ttl=60) == (True, 7)
+        assert await StandardCacheHandler(backend).set_with_freshness_async("k", b"v", ttl=60) == (True, clock.now + 7)
+        assert WRITE_FRESH_UNTIL.get() is None
 
     def test_failed_write_reports_no_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         saas.fail_writes = True
@@ -171,9 +213,9 @@ class TestHandlerSetWithFreshness:
         assert StandardCacheHandler(_Plain()).set_with_freshness("k", b"v", ttl=60) == (True, None)  # type: ignore[arg-type]
         assert written == [("k", b"v", 60)]
 
-    def test_set_override_still_runs(self, saas: _FakeSaaS) -> None:
-        """A subclass or patch of ``set`` must keep running on every write: the fresh_for fast path then
-        steps aside, which is the absent-header path (no bound beyond the stated TTL)."""
+    def test_set_override_still_runs(self, saas: _FakeSaaS, clock: _Clock) -> None:
+        """A subclass of ``set`` keeps running on every write, and one that delegates still reports its
+        write's bound: the base ``set`` reports it, not a private variant the override would bypass."""
         seen: list[str] = []
 
         class _Recording(CachekitIOBackend):
@@ -184,11 +226,25 @@ class TestHandlerSetWithFreshness:
         backend, _ = fake_backend(saas.respond)
         backend.__class__ = _Recording
         saas.put_fresh_for = "5"
-        assert StandardCacheHandler(backend).set_with_freshness("k", b"v", ttl=60) == (True, None)
+        assert StandardCacheHandler(backend).set_with_freshness("k", b"v", ttl=60) == (True, clock.now + 5)
         assert seen == ["k"]
 
+    def test_override_that_never_reports_keeps_no_copy(self, saas: _FakeSaaS) -> None:
+        """A CachekitIO ``set`` override that writes without reaching the base ``set`` reports nothing: its
+        2xx's bound is unknown, so the write keeps no L1 copy (0.0) rather than assume the stated TTL."""
+
+        class _Bypassing(CachekitIOBackend):
+            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+                self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
+
+        backend, _ = fake_backend(saas.respond)
+        backend.__class__ = _Bypassing
+        saas.put_fresh_for = "5"
+        assert StandardCacheHandler(backend).set_with_freshness("k", b"v", ttl=60) == (True, 0.0)
+        assert saas.ops == ["PUT"]
+
     def test_patched_class_set_still_runs(
-        self, saas: _FakeSaaS, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         seen: list[str] = []
         original = CachekitIOBackend.set
@@ -201,7 +257,7 @@ class TestHandlerSetWithFreshness:
 
         monkeypatch.setattr(CachekitIOBackend, "set", recording_set)
         saas.put_fresh_for = "5"
-        assert StandardCacheHandler(backend).set_with_freshness("k", b"v", ttl=60) == (True, None)
+        assert StandardCacheHandler(backend).set_with_freshness("k", b"v", ttl=60) == (True, clock.now + 5)
         assert seen == ["k"]
 
 
@@ -290,6 +346,44 @@ class TestWriterCopyBound:
         assert compute() == 1
         assert saas.gets() == gets + 1
 
+    def test_time_after_receipt_shortens_the_copy(
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
+    ) -> None:
+        """The bound runs from the 2xx's receipt, not from the L1 put: a stall between the two (here 2.2 s,
+        on the async path the hop back to a busy event loop) is spent from the copy, not added to it."""
+        parse = CachekitIOBackend._fresh_for
+
+        def stalled_parse(response: Any) -> int | None:
+            clock.advance(2.2)
+            return parse(response)
+
+        monkeypatch.setattr(CachekitIOBackend, "_fresh_for", staticmethod(stalled_parse))
+        saas.put_fresh_for = "2"
+        compute, calls = _decorated(backend, is_async=is_async, distributed_lock=False)
+        assert compute() == 1
+        gets = saas.gets()
+        assert compute() == 1  # the receipt is already 2.2 s ago: no copy may serve
+        assert saas.gets() == gets + 1
+        assert len(calls) == 1
+
+    def test_delegating_override_keeps_the_bound(
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool
+    ) -> None:
+        """A ``set`` override that records and delegates must not erase a 0 Fresh-For: no copy is kept."""
+
+        class _Recording(CachekitIOBackend):
+            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+                super().set(key, value, ttl, stale_ttl)
+
+        backend.__class__ = _Recording
+        saas.put_fresh_for = "0"
+        compute, calls = _decorated(backend, is_async=is_async)
+        assert compute() == 1
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+        assert len(calls) == 1
+
     @pytest.mark.parametrize("header", ["0", "garbage", "+5", "3000000"])
     def test_malformed_or_zero_keeps_no_copy(
         self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool, header: str
@@ -366,6 +460,33 @@ class TestWriteBehindCopyBound:
         assert compute() == 1
         assert saas.gets() == (1 if copy_kept else 2)
 
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    def test_put_long_after_landing_is_dropped(
+        self,
+        saas: _FakeSaaS,
+        backend: CachekitIOBackend,
+        clock: _Clock,
+        monkeypatch: pytest.MonkeyPatch,
+        is_async: bool,
+    ) -> None:
+        """A copy put 10 s after its write's 2xx would serve until receipt + 69 (less the buffer) against a
+        receipt + 59 bound: the bound is compared as instants, so a Fresh-For that covers ttl from the
+        receipt does not cover it from a later put."""
+        original_put = l1_module.L1Cache.put
+
+        def put_after_landing(self_: l1_module.L1Cache, key: str, value: bytes, **kwargs: Any) -> None:
+            self._drain()
+            clock.advance(10)
+            original_put(self_, key, value, **kwargs)
+
+        monkeypatch.setattr(l1_module.L1Cache, "put", put_after_landing)
+        saas.put_fresh_for = "59"
+        compute, _ = _decorated(backend, is_async=is_async, write_behind=True, distributed_lock=False)
+        assert compute() == 1
+        self._drain()
+        assert compute() == 1
+        assert saas.gets() == 2
+
 
 class TestPatchTtlNeverExtendsL1:
     """API-104: refresh_ttl_on_get's background PATCH /ttl leaves every L1 bound as it was."""
@@ -416,13 +537,13 @@ class TestRevalidationCopyBound:
     ) -> None:
         namespace = _namespace()
         calls: list[int] = []
-        puts: list[Any] = []  # redis_ttl of each L1 put
+        puts: list[Any] = []  # lifetime of each L1 put, from the put
         put_seen = threading.Event()
         original_put = l1_module.L1Cache.put
 
         def spy(self: l1_module.L1Cache, key: str, value: bytes, redis_ttl: Any = None, expires_at: Any = None) -> None:
             original_put(self, key, value, redis_ttl=redis_ttl, expires_at=expires_at)
-            puts.append(redis_ttl)
+            puts.append(redis_ttl if expires_at is None else expires_at - clock.now)
             put_seen.set()
 
         if is_async:
