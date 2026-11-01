@@ -35,7 +35,7 @@ from cachekit import l1_cache as l1_module
 from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
-from cachekit.cache_handler import StandardCacheHandler, _reaches_write_deadlines, _set_l2
+from cachekit.cache_handler import _REACH_CHECKS, StandardCacheHandler, _reach_children, _reaches_write_deadlines, _set_l2
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators import write_behind as wb
 from cachekit.l1_cache import DEFAULT_L1_TTL_SECONDS
@@ -371,6 +371,108 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Holder({backend}))
         assert _reaches_write_deadlines(_Holder({"tier": [[{"x": backend}]]}))  # nested, one wrapper level
         assert _reaches_write_deadlines(_Holder([object()] * 1_000_000 + [backend])) is False  # budget, quickly
+
+    def test_an_ordinary_backend_answers_false_without_failing_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A plain backend with dicts, lists, sets and slots in its attributes is searched to a clean False:
+        a search that raised would answer True, opening the list on every write of a non-reporting backend."""
+        failed: list[str] = []
+        monkeypatch.setattr(cache_handler_module.get_logger(), "debug", lambda message, *a, **k: failed.append(message))
+
+        class _Plain:
+            __slots__ = ("store", "pool", "tags", "__dict__")
+
+            def __init__(self) -> None:
+                self.store = {"k": b"v", "n": {"nested": [object()]}}
+                self.pool = [object(), (object(), {"x": object()})]
+                self.tags = {"a", "b"}
+                self.extra = frozenset({1})
+
+        assert _reaches_write_deadlines(_Plain()) is False
+        assert failed == []
+
+    def test_a_cyclic_container_ends(self) -> None:
+        ring: list[object] = []
+        ring.append(ring)
+
+        class _Holder:
+            def __init__(self) -> None:
+                self.ring = ring
+
+        assert _reaches_write_deadlines(_Holder()) is False  # returns, and finds nothing
+
+    def test_container_reads_stay_within_the_budget(self) -> None:
+        """Every container item read counts, leaves included, however the containers nest."""
+
+        class _Wide:
+            def __init__(self) -> None:
+                self.groups = [[object() for _ in range(200)] for _ in range(100)]
+                self.table = [[0] * 4096 for _ in range(200)]
+
+        _, reads = _reach_children(_Wide(), _REACH_CHECKS)
+        assert reads <= _REACH_CHECKS
+
+    def test_a_full_bucket_does_not_starve_a_route(self, backend: CachekitIOBackend) -> None:
+        """Containers at one nesting level are read round-robin: a 4,096-item bucket before a router does
+        not use up the budget before the router's backend is read."""
+
+        class _Wrapper:
+            def __init__(self) -> None:
+                self.buckets = [[object() for _ in range(_REACH_CHECKS)]]
+                self.routes = {"us": [backend]}
+
+        class _Root:
+            def __init__(self) -> None:
+                self.wrapper = _Wrapper()
+
+        assert _reaches_write_deadlines(_Wrapper())
+        assert _reaches_write_deadlines(_Root())
+
+    def test_a_wide_sibling_does_not_starve_another_wrapper(self, backend: CachekitIOBackend) -> None:
+        """Each object at a wrapper level gets a fair share of the budget."""
+
+        class _Wide:
+            def __init__(self) -> None:
+                self.items = [object() for _ in range(10 * _REACH_CHECKS)]
+
+        class _Holder:
+            def __init__(self, inner: object) -> None:
+                self.inner = inner
+
+        class _Root:
+            def __init__(self) -> None:
+                self.a = _Wide()
+                self.b = _Holder(backend)
+
+        assert _reaches_write_deadlines(_Root())
+
+    def test_properties_named_like_storage_never_run(self, backend: CachekitIOBackend) -> None:
+        """A property named ``__dict__`` (a lazy proxy) or overriding a slot name is skipped, not called."""
+        ran: list[str] = []
+
+        class _LazyProxy:
+            @property
+            def __dict__(self) -> dict[str, object]:  # type: ignore[override]
+                ran.append("__dict__")
+                return {"inner": backend}
+
+        class _Base:
+            __slots__ = ("computed",)
+
+        class _Overriding(_Base):
+            __slots__ = ()
+
+            @property
+            def computed(self) -> object:  # type: ignore[override]
+                ran.append("computed")
+                return backend
+
+        class _Holder:
+            def __init__(self) -> None:
+                self.lazy = _LazyProxy()
+                self.overriding = _Overriding()
+
+        assert _reaches_write_deadlines(_Holder()) is False
+        assert ran == []
 
     def test_forwarding_proxy_is_reached(self, backend: CachekitIOBackend) -> None:
         class _Proxy:

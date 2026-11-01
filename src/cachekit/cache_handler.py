@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import contextvars
 import inspect
-import itertools
 import sys
 import threading
 import types
@@ -404,10 +403,11 @@ def _fuses_tracked_write(backend: object) -> bool:
 _unreported_write_classes: set[type] = set()
 _REACH_DEPTH = 3  # wrapper levels searched for a reporting backend
 _REACH_CHECKS = 4096  # objects read at most, containers' items included, so a large object graph stays cheap
+_REACH_SHARE_MIN = 64  # reads one object may always spend, however many siblings it has
 _REACH_LEAVES = (str, bytes, bytearray, memoryview, int, float, complex, bool, type(None), type)
 # Containers are walked with the base type's own iterator, so a subclass's __iter__ never runs.
 _REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
-    (dict, dict.values),
+    (dict, lambda d: iter(dict.values(d))),  # a view, not an iterator; iter() on the C view runs no user code
     (list, list.__iter__),
     (tuple, tuple.__iter__),
     (set, set.__iter__),
@@ -416,40 +416,83 @@ _REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
 _unreachable_wrapper_classes: set[type] = set()
 
 
-def _reach_children(obj: object, budget: int) -> list[object]:
-    """Up to ``budget`` non-leaf objects ``obj`` holds in its ``__dict__`` and ``__slots__``, containers
-    flattened without spending depth. Reads run no user code: ``object.__getattribute__`` for attributes, the
-    base types' iterators for containers, and ``type(v)`` for every type test."""
+def _instance_values(obj: object) -> list[object]:
+    """``obj``'s attribute values from its instance ``__dict__`` and its ``__slots__``, read only through the C
+    descriptors Python makes for them (a getset ``__dict__``, member slots), found on the type: a property
+    named ``__dict__`` or overriding a slot name (a lazy proxy) is skipped, never called."""
+    kind = type(obj)
     values: list[object] = []
-    with contextlib.suppress(AttributeError, TypeError):  # no __dict__
-        values += dict.values(object.__getattribute__(obj, "__dict__"))
-    for klass in type(obj).__mro__:
+
+    def descriptor(name: str) -> object:
+        for klass in kind.__mro__:
+            if name in klass.__dict__:
+                return klass.__dict__[name]
+        return None
+
+    instance_dict = descriptor("__dict__")
+    if type(instance_dict) is types.GetSetDescriptorType:
+        with contextlib.suppress(AttributeError, TypeError):
+            held = instance_dict.__get__(obj, kind)  # type: ignore[attr-defined]
+            if type(held) is dict:
+                values += dict.values(held)
+    for klass in kind.__mro__:
         slots: Any = klass.__dict__.get("__slots__", ())
         names: tuple[str, ...] = (slots,) if issubclass(type(slots), str) else tuple(slots)
         for name in names:
-            if name in ("__dict__", "__weakref__"):
-                continue
             if name.startswith("__") and not name.endswith("__"):  # name-mangled private slot
                 name = f"_{klass.__name__.lstrip('_')}{name}"
-            with contextlib.suppress(AttributeError):  # an unset slot
-                values.append(object.__getattribute__(obj, name))
+            slot = descriptor(name)
+            if type(slot) is types.MemberDescriptorType:
+                with contextlib.suppress(AttributeError):  # an unset slot
+                    values.append(slot.__get__(obj, kind))  # type: ignore[attr-defined]
+    return values
+
+
+_END = object()
+
+
+def _reach_children(obj: object, budget: int) -> tuple[list[object], int]:
+    """The non-leaf, non-container objects ``obj`` holds in its attributes and in dicts, lists, tuples and sets
+    there (flattened without spending depth), and the container items read to find them: at most ``budget``.
+
+    Reads run no user code: ``_instance_values`` for attributes, the base types' own iterators for
+    containers, ``type(v)`` for every type test. A container is read once, so a cycle ends. Containers at the
+    same nesting level are read round-robin, so a full bucket cannot starve a route beside it, and objects
+    held directly come before those held in containers."""
     found: list[object] = []
-    pending = values
-    while pending and len(found) < budget:
-        nested: list[object] = []
-        for value in pending:
-            kind = type(value)
-            if issubclass(kind, _REACH_LEAVES):
-                continue
-            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(kind, base)), None)
-            if walk is None:
-                found.append(value)
-            else:
-                nested += itertools.islice(walk(value), budget - len(found))
-            if len(found) >= budget:
-                break
-        pending = nested
-    return found
+    containers: list[Any] = []
+    seen: set[int] = set()
+
+    def take(value: object) -> None:
+        kind = type(value)
+        if issubclass(kind, _REACH_LEAVES):
+            return
+        walk = next((it for base, it in _REACH_CONTAINERS if issubclass(kind, base)), None)
+        if walk is None:
+            found.append(value)
+        elif id(value) not in seen:
+            seen.add(id(value))
+            containers.append(walk(value))
+
+    values = _instance_values(obj)
+    for value in values:
+        take(value)
+    reads = len(values)  # the attribute values count as reads too
+    while containers and reads < budget:
+        iterators, containers = containers, []
+        while iterators and reads < budget:
+            alive = []
+            for iterator in iterators:
+                if reads >= budget:
+                    break
+                item = next(iterator, _END)
+                if item is _END:
+                    continue
+                reads += 1
+                take(item)
+                alive.append(iterator)
+            iterators = alive
+    return found, reads
 
 
 def _reaches_write_deadlines(backend: object) -> bool:
@@ -459,8 +502,9 @@ def _reaches_write_deadlines(backend: object) -> bool:
     tuple or set there (a metrics, timeout, router or shard-ring wrapper over a CachekitIOBackend).
 
     Below the root nothing runs user code (``inspect.getattr_static``, ``_reach_children``), so a lazy object
-    is never evaluated. Breadth first, with direct attributes before container items, so a shallow backend
-    is never starved by a large sibling; at most ``_REACH_CHECKS`` objects are read. If the search raises
+    is never evaluated. Breadth first, with direct attributes before container items, containers read
+    round-robin, and each object at a level given a fair share of the budget, so a shallow backend is not
+    starved by a large sibling; at most ``_REACH_CHECKS`` objects are read in all, and a cycle ends. If the search raises
     anyway, the answer is True: opening the deadline list is always safe, skipping it is not. A wrapper
     that holds its backend only in a closure, or builds it inside ``set``, is out of reach: logged once per
     class, and its L1 copies keep the stated ttl.
@@ -470,17 +514,22 @@ def _reaches_write_deadlines(backend: object) -> bool:
             return True
         level = [backend]
         seen = {id(backend)}
+        budget = _REACH_CHECKS
         for _depth in range(_REACH_DEPTH):
             next_level: list[object] = []
-            for obj in level:
-                for child in _reach_children(obj, _REACH_CHECKS - len(seen)):
+            for index, obj in enumerate(level):
+                # A fair share of what is left, so one wide object cannot starve its siblings.
+                share = max(_REACH_SHARE_MIN, budget // (len(level) - index))
+                children, reads = _reach_children(obj, min(share, budget))
+                budget -= reads
+                for child in children:
                     if id(child) in seen:
                         continue
                     seen.add(id(child))
                     if inspect.getattr_static(child, "_reports_write_deadline", False) is True:
                         return True
                     next_level.append(child)
-                if len(seen) >= _REACH_CHECKS:
+                if budget <= 0:
                     return False
             level = next_level
     except Exception as exc:  # noqa: BLE001 - the safe answer: open the list
