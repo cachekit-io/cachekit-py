@@ -75,7 +75,7 @@ With an L2 backend configured, L1 holds the serialized bytes instead, and a hit 
 
 Every read with the default serializer decodes its MessagePack in the Rust extension, in one pass that also enforces the bounds on untrusted MessagePack: nesting at most 1,024 levels deep, and no header declaring more elements or bytes than the rest of the input can back. That covers L2 reads, L1 hits and the decrypted plaintext of encrypted reads. The decode builds the Python objects directly. It shares most repeated short strings, map keys up to 64 bytes and values up to 32, as one object within a value (a small table per decode; two strings that land in one slot replace each other). It runs the Python hook that restores datetimes only on maps holding a `__datetime__`, `__date__` or `__time__` key, because the hook hands back any other map unchanged. It returns the same values and refuses the same inputs with the same exception classes as the decode it replaced: cachekit-core's structure walk, then msgpack-python's C unpacker calling the hook once per map. On the 100-user dict (23,547 bytes of MessagePack, about 3,400 objects), the decode fell from 2,580,104 to 1,238,204 instructions on CPython 3.14 (−52.0%, callgrind main-thread instructions per call, the [Instruction Budgets](#instruction-budgets) method), level with `pickle.loads` of the same value (1,203,437). The 1,000-user dict (239 KB) fell 51.0% and a 1,090-byte one 45.3%. A list of 200 records each holding a datetime fell 33.2%, since every datetime still runs the hook. On the abi3t extension that CPython 3.15 and later load, the 100-user dict fell 50.5%.
 
-For a plaintext cache with the default serializer and integrity checking on, an entry's first L1 hit decodes it as every read does, and then, when its verified MessagePack is no longer than the envelope, which is true of small values and incompressible ones, L1 holds that MessagePack in the envelope's place. Later hits on it skip the envelope's LZ4 decompress and xxHash3-64 checksum. Every hit still runs the bounded decode, which costs no more than the unbounded one did. The 100-user dict compresses to a 3,171-byte envelope from 23.5KB of MessagePack, so L1 keeps its envelope; no budget gates this large-value hit, and `l1_hit_backed` in [Instruction Budgets](#instruction-budgets) gates the small-value hit on held MessagePack. Encrypted caches always keep the ciphertext envelope, and every hit on one decrypts and decodes.
+For a plaintext cache with the default or auto serializer and integrity checking on, an entry's first L1 hit decodes it as every read does, and then, when its verified MessagePack is no longer than the envelope, which is true of small values and incompressible ones, L1 holds that MessagePack in the envelope's place. Later hits on it skip the envelope's LZ4 decompress and xxHash3-64 checksum. The auto serializer keeps only plain MessagePack envelopes; its NumPy, Arrow, DataFrame and Series entries are verified on every hit. The orjson serializer keeps the JSON under its checksum, which is always shorter than the envelope, so its later hits skip the checksum. Every hit still runs the bounded decode, which costs no more than the unbounded one did. The 100-user dict compresses to a 3,171-byte envelope from 23.5KB of MessagePack, so L1 keeps its envelope; no budget gates this large-value hit, and `l1_hit_backed` and `l1_hit_backed_auto` in [Instruction Budgets](#instruction-budgets) gate the small-value hit on held MessagePack. Encrypted caches always keep the ciphertext envelope, and every hit on one decrypts and decodes.
 
 ### Decorator + L1 Hit (Hot Path)
 
@@ -321,20 +321,21 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 2,595 | 2,487 |
 | `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CachekitIO backend with telemetry on does, so each call pays the 1-in-256 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 80,413 | 81,213 |
+| `l1_hit_backed_auto` | `@cache` with `serializer="auto"` and a backend that keeps no hit-latency report, L1 hit (decodes the verified MessagePack the auto serializer keeps) | 91,986 | 92,950 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,595 | 2,487 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 172,539 | 167,686 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 134,323 | 134,972 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,976 | 167,728 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 58,733 | 59,574 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 47,895 | 48,623 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,420,388 | 1,424,292 |
-| `serializer_auto` | `AutoSerializer` round trip | 65,942 | 66,628 |
+| `serializer_auto` | `AutoSerializer` round trip | 64,722 | 65,653 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 22,135 | 22,825 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,969,626 | 1,980,777 |
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,781,406 | 61,324,948 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,793,577 | 61,344,459 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 100,097 | 101,938 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,656 | 2,532 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 89,289 | 90,918 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,690 | 2,565 |
 | `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,631 | 720,751 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 76,035 | 74,112 |
 | `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,014 | 160,608 |

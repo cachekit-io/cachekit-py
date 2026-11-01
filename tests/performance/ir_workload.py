@@ -127,10 +127,12 @@ def build_workload(path: str) -> Callable[[], object]:
     # Every metrics path records through the same AsyncMetricsCollector.record_cache_operation, once
     # per call, so one batched-mode variant covers that mode; the L1-only hits record no metric.
     # With a backend, L1 holds serialized bytes and every hit decodes them, where an L1-only hit returns
-    # the stored object: after its first hit, this small value's entry is held as its verified MessagePack.
+    # the stored object: after its first hit, this small value's entry is held as its verified MessagePack, with
+    # the default serializer and with the auto one.
     decorated: dict[str, Callable[[], Callable[..., dict]]] = {
         "l1_hit": lambda: cache(backend=None, ttl=300)(body),
         "l1_hit_backed": lambda: cache(backend=ReportingBackend(), ttl=300)(body),
+        "l1_hit_backed_auto": lambda: cache(backend=DictBackend(), ttl=300, serializer="auto")(body),
         "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
         "l2_hit": l2,
         "miss": lambda: cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body),

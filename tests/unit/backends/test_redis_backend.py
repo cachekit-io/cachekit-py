@@ -464,6 +464,12 @@ class _FakeRedis:
         with self._mutex:
             return self._store.get(name)
 
+    def entry_keys(self) -> list[str]:
+        """The cache entries' keys, read under the mutex. An async miss releases its fill lock on an executor
+        thread after the call returns, so the release can land mid-read and the ``:lock`` key may or may not be here."""
+        with self._mutex:
+            return [key for key in self._store if not key.endswith(":lock")]
+
     def delete(self, name: str) -> int:
         with self._mutex:
             return int(self._store.pop(name, None) is not None)
@@ -792,7 +798,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         assert runs == [1, 2]
         assert any("Lock operation failed" in r.getMessage() for r in caplog.records)
-        cache_keys = [k for k in fake._store if not k.endswith(":lock")]
+        cache_keys = fake.entry_keys()
         formatter = logging.Formatter()
         for record in caplog.records:
             text = formatter.format(record)
@@ -895,7 +901,7 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
 
     @staticmethod
     def _tenants(fake: _FakeRedis) -> set[str]:
-        return {key.split(":", 2)[1] for key in fake._store}
+        return {key.split(":", 2)[1] for key in fake.entry_keys()}
 
     @pytest.mark.parametrize(
         ("tenant", "wire"),
@@ -991,7 +997,7 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         assert self._tenants(fake) == {"tenant-b"}
         with as_tenant("tenant-b"):
             await lookup.ainvalidate_cache()
-        assert fake._store == {}
+        assert fake.entry_keys() == []
 
 
 @pytest.mark.unit
@@ -1137,7 +1143,7 @@ class TestUnsupportedTenantIdRaisesThroughTheDecorator:
         with as_tenant("tenant-b"):
             assert await _call(lookup, 1) == 1
         assert calls == [1]
-        assert {key.split(":", 2)[1] for key in fake._store} == {"tenant-b"}
+        assert {key.split(":", 2)[1] for key in fake.entry_keys()} == {"tenant-b"}
 
     @_BOTH_PATHS
     async def test_raises_while_the_breaker_is_open(self, tenant_backend, live_breakers, is_async):
