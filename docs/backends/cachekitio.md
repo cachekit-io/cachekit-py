@@ -194,14 +194,15 @@ backends and L1-only caches send none.
 
 | Headers | What they carry |
 |---------|-----------------|
-| `X-CacheKit-Session-ID`, `X-CacheKit-Session-Start` | A random per-process session id and its start time |
+| `X-CacheKit-Session-ID`, `X-CacheKit-Session-Start` | A per-function session id, a random per-process id joined to the decorated function's `module.qualname` (so it carries the function's name), and its start time |
 | `X-CacheKit-L1-Hits`, `X-CacheKit-L2-Hits`, `X-CacheKit-Misses` | The calling function's hit and miss counts this session |
 | `X-CacheKit-L1-Hit-Rate` | L1 hits / (L1 hits + L2 hits + misses), three decimals |
 | `X-CacheKit-L1-Latency-Buckets`, `-Sum-Ns`, `-One-In` | How long the L1 hits timed since the previous request took (below) |
 
 **L1 hit latency.** Each `@cache` call through the backend is timed with probability 1/256, chosen at random before
 the call runs. A timed call that is an L1 hit adds its duration, from entering the wrapper to returning the value,
-to a report: sixteen duration buckets doubling from 128 ns, and their sum in nanoseconds. The next request to
+to a report: sixteen duration buckets doubling from 128 ns, and their sum in nanoseconds. A duration over 60 s is
+dropped and counts toward neither. The next request to
 cachekit.io carries the report and empties it, so each hit is reported once. A call that waited on another call's
 miss for the same key, a miss, an L2 hit and a direct `backend.get()` are never timed, and the health check never
 carries a report. A forked child starts with an empty report and its own random draws. Under uWSGI without
