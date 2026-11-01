@@ -44,6 +44,18 @@ Run (from a checkout, after ``uv sync``, against a Redis you can write to)::
 The harness cannot tell from the URL (a tunnel or port-forward on localhost reaches a remote Redis),
 so it always asks.
 
+A recording you publish should measure a release. Install it into a fresh environment and run this
+file from the checkout with that environment's Python, so ``import cachekit`` finds the release::
+
+  uv venv --python 3.14 /tmp/terrain-env
+  uv pip install --python /tmp/terrain-env 'cachekit==<version>'
+  /tmp/terrain-env/bin/python tests/performance/terrain_canary.py --redis ...  # the flags above
+
+The recording names what it ran. It gives cachekit's version, plus the commit when cachekit was not
+installed from a package index (``cachekit_label``), because a checkout reports the last release's
+version until the next release bumps it. It gives the Python and, on a free-threaded build, whether
+the GIL was on (``python_label``). It gives the CPU, which macOS names through ``sysctl``.
+
 The summary printed at the end gives each layer's share and its exact p50 and p99 from the raw
 samples; the histograms' own percentiles are only good to a bin (about 15%).
 """
@@ -52,18 +64,23 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.metadata
 import itertools
 import json
 import math
 import platform
 import random
+import shutil
+import subprocess
 import sys
+import sysconfig
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import url2pathname
 
 import msgpack
 
@@ -210,17 +227,80 @@ def cpu_model() -> str:
                 return line.split(":", 1)[1].strip()
     except OSError:
         pass  # no /proc (macOS, Windows) or unreadable: fall back to what platform reports
+    if platform.system() == "Darwin":
+        # platform.processor() says only "arm" on Apple silicon; sysctl names the chip ("Apple M5 Pro").
+        try:
+            name = subprocess.run(  # noqa: S603 (trusted: literal argv)
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, check=True, timeout=30
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            name = ""  # no sysctl, or no such key: fall back to what platform reports
+        if name:
+            return name
     return platform.processor() or platform.machine()
+
+
+def cachekit_label() -> str:
+    """Name the cachekit this run measures: its version, and its commit when it is not a release.
+
+    A checkout reports the last release's version until the next release bumps it, so a recording made
+    from one would pass its figures off as that release's. An install from a package index leaves no
+    ``direct_url.json`` (PEP 610) and is the release its version names. An install from a git checkout or
+    a VCS URL adds the commit, and ``.dirty`` when the checkout has uncommitted changes. Any other direct
+    install, a wheel file for one, cannot say which commit it was built from, so the run is refused
+    before it starts.
+    """
+    import cachekit
+
+    version = cachekit.__version__
+    direct_url = importlib.metadata.distribution("cachekit").read_text("direct_url.json")
+    if direct_url is None:
+        return f"cachekit {version}"
+    origin = json.loads(direct_url)
+    if "vcs_info" in origin:
+        return f"cachekit {version}+{origin['vcs_info']['commit_id'][:8]}"
+    git = shutil.which("git")
+    if "dir_info" in origin and git:
+        checkout = url2pathname(urlsplit(origin["url"]).path)
+
+        def git_out(*cmd: str) -> str:
+            return subprocess.run(  # noqa: S603 (trusted: git on PATH, run in the install's own checkout)
+                [git, "-C", checkout, *cmd], capture_output=True, text=True, check=True, timeout=30
+            ).stdout.strip()
+
+        try:
+            commit = git_out("rev-parse", "--short=8", "HEAD")
+            changes = git_out("status", "--porcelain", "--untracked-files=no")
+        except (OSError, subprocess.SubprocessError):
+            pass  # not a git checkout: refused below
+        else:
+            return f"cachekit {version}+{commit}{'.dirty' if changes else ''}"
+    raise SystemExit(
+        f"terrain_canary: cachekit {version} was installed from {origin.get('url')}, and which commit it was built "
+        "from is unknown. Install a release from a package index, or run from a git checkout with git on PATH."
+    )
+
+
+def python_label() -> str:
+    """Name the Python this run measures; a free-threaded build also says whether the GIL was on.
+
+    Read after the run: importing an extension that does not declare free-threaded support turns the
+    GIL back on for the whole process.
+    """
+    label = f"Python {platform.python_version()}"
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        label += f", free-threaded, GIL {'on' if sys._is_gil_enabled() else 'off'}"  # type: ignore[attr-defined]
+    return label
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import redis
 
-    import cachekit
     from cachekit import cache
     from cachekit.backends.redis import RedisBackend
     from cachekit.config.nested import L1CacheConfig
 
+    sdk = cachekit_label()  # before the run: an install it cannot place is refused, not recorded for minutes
     namespace = f"terrain-canary-{uuid.uuid4().hex[:12]}"
     executed = [False]
     value_p50, value_p95 = value_size_quantiles(args.keys)
@@ -305,7 +385,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source": {
             "kind": "recorded",
             "recordedAt": datetime.fromtimestamp(start_wall, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "sdk": f"cachekit {cachekit.__version__} (Python {platform.python_version()})",
+            "sdk": f"{sdk} ({python_label()})",
             "l2": f"Redis {redis_version}, {args.l2_where}",
             "cache": (
                 f"L1 budget {args.l1_mb} MB, ttl {args.ttl} s, values {value_p50 / 1000:.1f} KB median as MessagePack "
