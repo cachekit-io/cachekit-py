@@ -24,6 +24,7 @@ from __future__ import annotations
 import gc
 import subprocess
 import sys
+import sysconfig
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -322,6 +323,10 @@ sys.exit(3)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS is enforced on Linux")
+@pytest.mark.skipif(
+    bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+    reason="mimalloc's reserved arenas hold the allocation, so RLIMIT_AS never refuses it; the GIL legs run the same Rust",
+)
 @pytest.mark.parametrize(
     "shape",
     ['b"\\xc6" + n.to_bytes(4, "big") + bytes(n)', 'b"\\xdd" + (n >> 3).to_bytes(4, "big") + b"\\xc0" * (n >> 3)'],
