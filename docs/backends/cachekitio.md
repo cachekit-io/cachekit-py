@@ -150,8 +150,10 @@ longest an entry is kept, its stale window included:
 
 A longer TTL is clamped to the maximum, not rejected, and the stale window gets only what the
 maximum leaves after the fresh TTL. A write without a TTL (`ttl=None`) is stored for the plan
-maximum; only a plan without one stores an entry that never expires. `refresh_ttl` is clamped
-the same way.
+maximum. An entry never expires only on a plan without a maximum, or where none applied when
+it was written: a write whose plan the service could not determine is stored as stated, and an
+entry written before the maximum applied keeps its timing until its next write. `refresh_ttl` is
+clamped the same way.
 
 The server reports the result in the `PUT` response's `X-CacheKit-Fresh-For`, and the decorator
 bounds its in-process (L1) copy of the value it wrote by it: the copy lives at most

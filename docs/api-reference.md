@@ -222,7 +222,7 @@ def get_exchange_rates():
 
 - Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
 - L1 in-memory cache is enabled — hot data is served from process memory without an HTTP round-trip (each L1 hit deserializes the stored bytes)
-- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` sends no TTL and disables SWR: the server stores the entry for your plan's maximum TTL, and never expires it only on a plan without one ([plan maximums](backends/cachekitio.md#ttl-range-and-plan-maximum)).
+- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` sends no TTL and disables SWR: the server stores the entry for your plan's maximum TTL, and never expires it only on a plan without a maximum, or where none applied when the entry was written ([plan maximums](backends/cachekitio.md#ttl-range-and-plan-maximum)).
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
 ### Health Check Methods

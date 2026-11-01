@@ -304,7 +304,9 @@ class L1Cache:
         """Store value in L1 cache with TTL.
 
         A value larger than an eighth of max_memory_bytes is not stored, and any older entry under
-        the key is dropped; callers serve it from L2, or recompute it if L2 did not store it.
+        the key is dropped; callers serve it from L2, or recompute it if L2 did not store it. The
+        same holds, for every caller, for a value whose expiry is non-finite or already past once
+        ttl_buffer_seconds is taken off: a declined put never leaves the previous value serving.
 
         Args:
             key: Cache key

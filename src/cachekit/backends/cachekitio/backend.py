@@ -630,7 +630,8 @@ class CachekitIOBackend:
             key: Cache key
             value: Bytes to cache
             ttl: Time-to-live in seconds (optional). Omitted, the entry gets the plan's
-                maximum TTL, and never expires only on a plan without one.
+                maximum TTL, and never expires only on a plan without a maximum, or where
+                none applied when the entry was written.
             stale_ttl: Stale-grace window in seconds past the fresh TTL
                 (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
@@ -843,7 +844,8 @@ class CachekitIOBackend:
             key: Cache key
             value: Bytes to cache
             ttl: Time-to-live in seconds (optional). Omitted, the entry gets the plan's
-                maximum TTL, and never expires only on a plan without one.
+                maximum TTL, and never expires only on a plan without a maximum, or where
+                none applied when the entry was written.
             stale_ttl: Stale-grace window in seconds past the fresh TTL
                 (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
@@ -1162,7 +1164,8 @@ class CachekitIOBackend:
         Returns:
             Seconds until the entry is evicted, its stale window included; None if the key
             doesn't exist, the request failed, or the entry has no expiry (stored without a TTL
-            on a plan with no maximum TTL; on any other plan an omitted TTL gets the plan maximum)
+            on a plan without a maximum, or where none applied when it was written, which can
+            happen on any plan)
 
         Raises:
             BackendError: If the key is reserved (see ``_encode_key``); encoded outside the
