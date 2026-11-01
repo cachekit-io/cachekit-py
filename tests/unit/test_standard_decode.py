@@ -22,6 +22,7 @@ trailing-byte paths are reached as well as the happy path.
 from __future__ import annotations
 
 import gc
+import os
 import subprocess
 import sys
 import sysconfig
@@ -348,7 +349,8 @@ _OUT_OF_MEMORY_SHAPES = {
 def test_an_allocation_the_input_sizes_raises_memory_error(shape: str) -> None:
     """With panic = "abort", a PyO3 constructor that meets a NULL would kill the process, not raise."""
     script = _OUT_OF_MEMORY.format(shape=shape)
-    run = subprocess.run([sys.executable, "-c", script], capture_output=True, check=False)  # noqa: S603 - this module's own script
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}  # import this checkout's cachekit, as pytest does
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, check=False, env=env)  # noqa: S603 - this module's own script
     assert run.returncode == 0, run.stderr.decode()[-2000:]
 
 
