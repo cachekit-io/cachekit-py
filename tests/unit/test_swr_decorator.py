@@ -255,7 +255,7 @@ class TestSWRConfig:
     def test_preset_default_window_fits_the_cap_after_rounding(self) -> None:
         """A fractional ttl is ceiled on the wire, so the derived window is bounded by the ceiled TTL."""
         backend = FakeSWRBackend()
-        ttl = _CAP / 2 + 0.5  # goes out as 1_296_001
+        ttl = _CAP / 2 + 0.5  # goes out as 3_888_001
         config = DecoratorConfig(backend=backend, ttl=ttl, swr_by_default=True)  # type: ignore[arg-type]
 
         @cache(config=config)
