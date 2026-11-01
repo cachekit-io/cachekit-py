@@ -2591,7 +2591,8 @@ def create_cache_wrapper(
             if outcome.deferred and deferred_copy is not None:
                 _put_deferred_copy(cache_key, outcome.envelope, twin_key, deferred_copy)
             else:
-                _put_l1(cache_key, outcome.envelope, _l1_bounded_ttl(outcome.fresh_for), twin=twin_key)
+                fresh_for = outcome.fresh_for  # None on every backend but CachekitIO: skip the helper's frame
+                _put_l1(cache_key, outcome.envelope, ttl if fresh_for is None else _l1_bounded_ttl(fresh_for), twin=twin_key)
             if outcome.stored and trackable and not outcome.tracked:
                 _track_and_record(cache_key)
 

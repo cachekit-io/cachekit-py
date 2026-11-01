@@ -399,22 +399,19 @@ def _fuses_tracked_write(backend: object) -> bool:
 
 def _reports_write_freshness(backend: object) -> bool:
     """Whether a write can report the ``X-CacheKit-Fresh-For`` of its ``PUT`` 2xx: a private
-    ``_set_with_freshness``, found on the CLASS as ``_fuses_tracked_write`` finds ``_set_tracked``.
+    ``_set_with_freshness``, whose class records the ``set`` it stands in for as
+    ``_set_with_freshness_replaces`` (captured at class creation, as ``_set_tracked_replaces`` is).
 
-    Only while the instance resolves ``set`` to the function the owner recorded in
-    ``_set_with_freshness_replaces``, as a plain method bound to the backend itself: an override,
-    patch, wrapper or proxy of ``set`` keeps ``set``, so it still runs on every write. Such a write
-    reports no bound, which is the absent-header path (the stated TTL bounds the copy).
+    Only while the instance resolves ``set`` to that function, as a plain method bound to the backend
+    itself: an override, patch, wrapper or proxy of ``set`` keeps ``set``, so it still runs on every
+    write. Such a write reports no bound, which is the absent-header path (the stated TTL bounds the
+    copy). One class-attribute lookup answers every other backend: this runs on every miss.
     """
-    owner = next((klass for klass in type(backend).__mro__ if "_set_with_freshness" in vars(klass)), None)
-    if owner is None:
+    replaces = getattr(type(backend), "_set_with_freshness_replaces", None)
+    if replaces is None:
         return False
     bound = getattr(backend, "set", None)
-    return (
-        type(bound) is types.MethodType
-        and bound.__func__ is vars(owner).get("_set_with_freshness_replaces")
-        and bound.__self__ is backend
-    )
+    return type(bound) is types.MethodType and bound.__func__ is replaces and bound.__self__ is backend
 
 
 def _set_l2(
@@ -2586,24 +2583,26 @@ class StandardCacheHandler:
             value = value.encode("utf-8")
 
         try:
-            fresh_for: Optional[int] = self._with_backpressure_and_timeout(self._backend_set, key, value, ttl, stale_ttl)
-            return True, fresh_for
+            if _reports_write_freshness(self.backend):
+                fresh_for: Optional[int] = self._with_backpressure_and_timeout(
+                    self.backend._set_with_freshness,  # type: ignore[attr-defined]
+                    key,
+                    value,
+                    ttl,
+                    stale_ttl,
+                )
+                return True, fresh_for
+            if stale_ttl is not None and supports_swr(self.backend):
+                self._with_backpressure_and_timeout(self.backend.set, key, value, ttl, stale_ttl)
+            else:
+                self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
+            return True, None
         except BackendError as e:
             get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False, None
         except Exception as e:
             get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False, None
-
-    def _backend_set(self, key: str, value: bytes, ttl: Optional[int], stale_ttl: Optional[int]) -> Optional[int]:
-        """The backend write behind :meth:`set_with_freshness`; returns the write's fresh_for, or None."""
-        if _reports_write_freshness(self.backend):
-            return self.backend._set_with_freshness(key, value, ttl, stale_ttl)  # type: ignore[attr-defined]
-        if stale_ttl is not None and supports_swr(self.backend):
-            self.backend.set(key, value, ttl, stale_ttl)
-        else:
-            self.backend.set(key, value, ttl)
-        return None
 
     def set_tracked(
         self,
@@ -2752,10 +2751,20 @@ class StandardCacheHandler:
             value = value.encode("utf-8")
 
         try:
-            fresh_for: Optional[int] = await self._with_backpressure_and_timeout_async(
-                self._backend_set, key, value, ttl, stale_ttl
-            )
-            return True, fresh_for
+            if _reports_write_freshness(self.backend):
+                fresh_for: Optional[int] = await self._with_backpressure_and_timeout_async(
+                    self.backend._set_with_freshness,  # type: ignore[attr-defined]
+                    key,
+                    value,
+                    ttl,
+                    stale_ttl,
+                )
+                return True, fresh_for
+            if stale_ttl is not None and supports_swr(self.backend):
+                await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl, stale_ttl)
+            else:
+                await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
+            return True, None
         except BackendError as e:
             get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False, None
