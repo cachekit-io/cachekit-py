@@ -1319,15 +1319,18 @@ def create_cache_wrapper(
             if stored is not None:
                 return stored, True, None
         reachable = getattr(handler, "_write_deadlines_reachable", None)  # inline, as in _set_l2
-        if not (write_deadlines_reachable(handler) if reachable is None else reachable):
-            return await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl), False, None  # type: ignore[union-attr]
-        # As _set_l2: around the handler's own set_async. to_thread copies the context.
-        seen: list[tuple[float, float]] = []
-        token = _WRITE_DEADLINES.set(seen)
+        seen: list[tuple[float, float]] | None = (
+            [] if (write_deadlines_reachable(handler) if reachable is None else reachable) else None
+        )
+        # Around the handler's own set_async. to_thread copies the context.
+        token = None if seen is None else _WRITE_DEADLINES.set(seen)
         try:
             stored = await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl)  # type: ignore[union-attr]
         finally:
-            _WRITE_DEADLINES.reset(token)
+            if token is not None:
+                _WRITE_DEADLINES.reset(token)
+        if seen is None:
+            return stored, False, None
         return stored, False, _written_copy_expiry(getattr(handler, "backend", None), seen, stored, ttl)
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
@@ -2617,7 +2620,7 @@ def create_cache_wrapper(
             if outcome.deferred and deferred_copy is not None:
                 _put_deferred_copy(cache_key, outcome.envelope, twin_key, deferred_copy)
             else:
-                # None on every backend but CachekitIO: the stated ttl, without the helper's frame on the gated miss path.
+                # None on every backend but CachekitIO: the stated ttl, without the helper's frame (gated miss path).
                 l1_until = outcome.l1_until
                 if l1_until is None:
                     _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)

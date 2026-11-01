@@ -162,13 +162,15 @@ plan maximum. A malformed or `0` value keeps no L1 copy; a server that sends no 
 copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied TTL, so it never
 lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
 as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
-backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread, provided the wrapper
-holds that backend when it is passed to `@cache`: as an attribute (`__slots__` included), or in a list or tuple attribute,
-at most three wrappers down. A wrapper that builds its backend on first use is not found, and its
-L1 copies keep `ttl`. A wrapper that delegates on another thread (a timeout wrapper with its own
-executor) must run the call under `contextvars.copy_context().run`; otherwise its L1 copies keep
-`ttl` and ignore Fresh-For. A subclass that writes any other way gives the decorator no response to
-read, so it keeps no L1 copy of that write.
+backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread, provided the decorator
+can find that backend at its first L2 write: in an attribute (`__slots__` included), or in a dict,
+list, tuple or set there (a router or a shard ring), at most three wrappers down. A wrapper that
+holds its backend only in a closure, or creates it inside `set`, is not found: its L1 copies keep
+`ttl`, and the decorator logs this once per wrapper class. Hold the backend in an attribute to get
+the bound. A wrapper that delegates on another thread (a timeout wrapper with its own executor) must
+run the call under `contextvars.copy_context().run`; otherwise its L1 copies keep `ttl` and ignore
+Fresh-For. A subclass that writes any other way gives the decorator no response to read, so it
+keeps no L1 copy of that write.
 
 ## TTL Inspection (async only)
 

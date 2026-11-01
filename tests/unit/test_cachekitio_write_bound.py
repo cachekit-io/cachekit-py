@@ -30,6 +30,7 @@ import pytest
 from urllib3 import HTTPResponse
 
 from cachekit import cache
+from cachekit import cache_handler as cache_handler_module
 from cachekit import l1_cache as l1_module
 from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio import backend as backend_module
@@ -336,16 +337,87 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Wrapper(backend, first=True))
         assert _reaches_write_deadlines(_Wrapper(backend, first=False))
 
-    def test_lazily_built_backend_keeps_the_stated_ttl(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
-        """A wrapper that builds its CachekitIOBackend on first use is out of reach when the handler first
-        asks, so its writes keep the stated ttl, as before API-103 (documented)."""
+    def test_closure_held_backend_is_reached_once_held_in_an_attribute(
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock
+    ) -> None:
+        """The documented blind spot and its remedy: a wrapper holding its CachekitIOBackend only in a
+        closure is out of reach (its copies keep the stated ttl); the same wrapper holding it in an
+        attribute gets the bound."""
 
-        class _Lazy:
+        class _Closure:
             def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
                 backend.set(key, value, ttl)
 
+        class _Attribute:
+            def __init__(self) -> None:
+                self.inner = backend
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.inner.set(key, value, ttl)
+
         saas.put_fresh_for = "0"
-        assert _write(StandardCacheHandler(_Lazy())) == (True, False, None)  # type: ignore[arg-type]
+        assert _write(StandardCacheHandler(_Closure())) == (True, False, None)  # type: ignore[arg-type]
+        assert _write(StandardCacheHandler(_Attribute())) == (True, False, clock.now)  # type: ignore[arg-type]
+
+    def test_reachability_through_containers(self, backend: CachekitIOBackend) -> None:
+        """Routers, shard rings and pools: dict values, sets and nested containers, without spending depth."""
+
+        class _Holder:
+            def __init__(self, held: object) -> None:
+                self.held = held
+
+        assert _reaches_write_deadlines(_Holder({"eu": object(), "us": backend}))  # router
+        assert _reaches_write_deadlines(_Holder([(17, object()), (42, backend)]))  # (hash, backend) ring
+        assert _reaches_write_deadlines(_Holder({backend}))
+        assert _reaches_write_deadlines(_Holder({"tier": [[{"x": backend}]]}))  # nested, one wrapper level
+        assert _reaches_write_deadlines(_Holder([object()] * 1_000_000 + [backend])) is False  # budget, quickly
+
+    def test_forwarding_proxy_is_reached(self, backend: CachekitIOBackend) -> None:
+        class _Proxy:
+            def __init__(self, inner: CachekitIOBackend) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        assert _reaches_write_deadlines(_Proxy(backend))
+
+    def test_search_runs_no_user_code_below_the_root(self, backend: CachekitIOBackend) -> None:
+        """A lazy object is never evaluated, a list subclass's ``__iter__`` never runs, and a property never
+        fires: nothing below the root raises into the write."""
+        ran: list[str] = []
+
+        class _Lazy:
+            def __getattr__(self, name: str) -> Any:
+                ran.append(name)
+                raise RuntimeError("factory failed")
+
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                ran.append("__class__")
+                raise RuntimeError("factory failed")
+
+        class _List(list):  # type: ignore[type-arg]
+            def __iter__(self) -> Any:
+                ran.append("__iter__")
+                raise RuntimeError("iteration failed")
+
+        class _Holder:
+            def __init__(self) -> None:
+                self.lazy = _Lazy()
+                self.items = _List([object(), backend])
+
+        assert _reaches_write_deadlines(_Holder())
+        assert ran == []
+
+    def test_a_search_that_raises_opens_the_list(self, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Opening the list is always safe, so a search that fails answers True."""
+
+        def broken(obj: object, budget: int) -> list[object]:
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(cache_handler_module, "_reach_children", broken)
+        assert _reaches_write_deadlines(object())
 
     def test_composing_wrapper_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         """A wrapper that composes a CachekitIO backend without forwarding its attributes (a metrics class)
@@ -541,6 +613,31 @@ class TestWriterCopyBound:
         assert compute() == 1
         assert calls
         assert "PUT" not in saas.ops
+
+    def test_forwarding_proxy_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
+        """A proxy that forwards attributes and ``set`` to a CachekitIO backend keeps its writes' bounds."""
+
+        class _Proxy:
+            def __init__(self, inner: CachekitIOBackend) -> None:
+                self.inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.inner, name)
+
+            def get_with_freshness(self, key: str) -> Any:
+                return self.inner.get_with_freshness(key)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+                self.inner.set(key, value, ttl, stale_ttl)
+
+        saas.put_fresh_for = "0"
+        saas.get_fresh_for = "0"
+        compute, calls = _decorated(_Proxy(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
+        assert compute() == 1
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+        assert len(calls) == 1
 
     def test_slotted_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
         """A ``@dataclass(slots=True)`` wrapper over CachekitIO: a 0 Fresh-For keeps no copy."""

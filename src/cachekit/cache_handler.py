@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import inspect
+import itertools
 import sys
 import threading
 import types
@@ -401,73 +403,105 @@ def _fuses_tracked_write(backend: object) -> bool:
 
 _unreported_write_classes: set[type] = set()
 _REACH_DEPTH = 3  # wrapper levels searched for a reporting backend
-_REACH_CHECKS = 4096  # objects checked at most, so a backend holding a large object graph stays cheap
-_REACH_LEAVES = (str, bytes, int, float, bool, type(None), type)
+_REACH_CHECKS = 4096  # objects read at most, containers' items included, so a large object graph stays cheap
+_REACH_LEAVES = (str, bytes, bytearray, memoryview, int, float, complex, bool, type(None), type)
+# Containers are walked with the base type's own iterator, so a subclass's __iter__ never runs.
+_REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
+    (dict, dict.values),
+    (list, list.__iter__),
+    (tuple, tuple.__iter__),
+    (set, set.__iter__),
+    (frozenset, frozenset.__iter__),
+)
+_unreachable_wrapper_classes: set[type] = set()
 
 
-def _attribute_values(obj: object) -> tuple[list[object], list[object]]:
-    """``obj``'s attribute values, from its ``__dict__`` and the ``__slots__`` across its MRO (a slotted
-    dataclass has no ``__dict__``): (direct values, items of list and tuple values)."""
-    values: list[object] = list(getattr(obj, "__dict__", {}).values())
+def _reach_children(obj: object, budget: int) -> list[object]:
+    """Up to ``budget`` non-leaf objects ``obj`` holds in its ``__dict__`` and ``__slots__``, containers
+    flattened without spending depth. Reads run no user code: ``object.__getattribute__`` for attributes, the
+    base types' iterators for containers, and ``type(v)`` for every type test."""
+    values: list[object] = []
+    with contextlib.suppress(AttributeError, TypeError):  # no __dict__
+        values += dict.values(object.__getattribute__(obj, "__dict__"))
     for klass in type(obj).__mro__:
-        slots = vars(klass).get("__slots__", ())
-        for name in (slots,) if isinstance(slots, str) else slots:
+        slots: Any = klass.__dict__.get("__slots__", ())
+        names: tuple[str, ...] = (slots,) if issubclass(type(slots), str) else tuple(slots)
+        for name in names:
             if name in ("__dict__", "__weakref__"):
                 continue
             if name.startswith("__") and not name.endswith("__"):  # name-mangled private slot
                 name = f"_{klass.__name__.lstrip('_')}{name}"
             with contextlib.suppress(AttributeError):  # an unset slot
-                values.append(getattr(obj, name))
-    direct = [v for v in values if not isinstance(v, (list, tuple, *_REACH_LEAVES))]
-    items = [i for v in values if isinstance(v, (list, tuple)) for i in v if not isinstance(i, _REACH_LEAVES)]
-    return direct, items
+                values.append(object.__getattribute__(obj, name))
+    found: list[object] = []
+    pending = values
+    while pending and len(found) < budget:
+        nested: list[object] = []
+        for value in pending:
+            kind = type(value)
+            if issubclass(kind, _REACH_LEAVES):
+                continue
+            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(kind, base)), None)
+            if walk is None:
+                found.append(value)
+            else:
+                nested += itertools.islice(walk(value), budget - len(found))
+            if len(found) >= budget:
+                break
+        pending = nested
+    return found
 
 
 def _reaches_write_deadlines(backend: object) -> bool:
-    """Whether a write through ``backend`` can report a write deadline (API-103): the backend says it reports,
-    attribute-forwarding proxies included, or it holds such a backend in an attribute (``__dict__`` or
-    ``__slots__``), a list or a tuple, up to ``_REACH_DEPTH`` wrappers down (a metrics or timeout wrapper
-    that composes a CachekitIOBackend).
+    """Whether a write through ``backend`` can report a write deadline (API-103): the backend says it reports
+    (read with ``getattr``, so an attribute-forwarding proxy forwards it), or it holds a backend that says so,
+    up to ``_REACH_DEPTH`` wrappers down, in an attribute (``__dict__`` or ``__slots__``) or in a dict, list,
+    tuple or set there (a metrics, timeout, router or shard-ring wrapper over a CachekitIOBackend).
 
-    Breadth first, and each object is checked as it is found, direct attributes before list items: a
-    shallow ``inner`` is never starved by a large sibling list or a deep branch. At most ``_REACH_CHECKS``
-    objects are checked. Asked once per handler (``write_deadlines_reachable``): a backend that cannot
-    report never pays for the deadline list on its writes, which costs the instruction-gated miss path
-    about 2%. A wrapper that builds its CachekitIOBackend on first use, or holds it out of reach, keeps L1
-    copies at the stated ttl.
+    Below the root nothing runs user code (``inspect.getattr_static``, ``_reach_children``), so a lazy object
+    is never evaluated. Breadth first, with direct attributes before container items, so a shallow backend
+    is never starved by a large sibling; at most ``_REACH_CHECKS`` objects are read. If the search raises
+    anyway, the answer is True: opening the deadline list is always safe, skipping it is not. A wrapper
+    that holds its backend only in a closure, or builds it inside ``set``, is out of reach: logged once per
+    class, and its L1 copies keep the stated ttl.
     """
-    level = [backend]
-    seen: set[int] = set()
-    for depth in range(_REACH_DEPTH + 1):
-        next_direct: list[object] = []
-        next_items: list[object] = []
-        for obj in level:
-            if id(obj) in seen:
-                continue
-            seen.add(id(obj))
-            try:
-                if getattr(obj, "_reports_write_deadline", False) is True:
-                    return True
+    try:
+        if getattr(backend, "_reports_write_deadline", False) is True:
+            return True
+        level = [backend]
+        seen = {id(backend)}
+        for _depth in range(_REACH_DEPTH):
+            next_level: list[object] = []
+            for obj in level:
+                for child in _reach_children(obj, _REACH_CHECKS - len(seen)):
+                    if id(child) in seen:
+                        continue
+                    seen.add(id(child))
+                    if inspect.getattr_static(child, "_reports_write_deadline", False) is True:
+                        return True
+                    next_level.append(child)
                 if len(seen) >= _REACH_CHECKS:
                     return False
-                if depth < _REACH_DEPTH:
-                    direct, items = _attribute_values(obj)
-                    next_direct += direct
-                    next_items += items
-            except Exception as exc:  # noqa: BLE001 - an object that cannot be inspected holds no reachable backend
-                get_logger().debug(f"write-deadline search skipped a {type(obj).__name__}: {type(exc).__name__}")
-        # Direct attributes of the whole level before any list item, so a big list cannot hide an inner.
-        level = next_direct + next_items
+            level = next_level
+    except Exception as exc:  # noqa: BLE001 - the safe answer: open the list
+        get_logger().debug(f"write-deadline search failed on a {type(backend).__name__}: {type(exc).__name__}")
+        return True
+    kind = type(backend)
+    if not kind.__module__.startswith("cachekit.") and kind not in _unreachable_wrapper_classes:
+        _unreachable_wrapper_classes.add(kind)
+        get_logger().info(
+            f"{kind.__name__} holds no CachekitIOBackend in its attributes: its writes keep L1 copies for their "
+            "ttl. If it wraps one, hold it in an attribute (or a dict, list, tuple or set attribute)."
+        )
     return False
 
 
 def write_deadlines_reachable(handler: Any) -> bool:
-    """``_reaches_write_deadlines`` for the handler's backend, cached on the handler."""
-    reachable = getattr(handler, "_write_deadlines_reachable", None)
-    if reachable is None:
-        reachable = _reaches_write_deadlines(getattr(handler, "backend", None))
-        with contextlib.suppress(AttributeError):  # a custom strategy with __slots__: asked again next time
-            handler._write_deadlines_reachable = reachable
+    """``_reaches_write_deadlines`` for the handler's backend, cached on the handler. A custom strategy that
+    cannot take the attribute (``__slots__``) is searched again on its next write."""
+    reachable = _reaches_write_deadlines(getattr(handler, "backend", None))
+    with contextlib.suppress(AttributeError):
+        handler._write_deadlines_reachable = reachable
     return reachable
 
 
@@ -522,7 +556,8 @@ def _set_l2(
         stored = set_tracked(key, value, ttl, registry_id, on_track_error)
         if stored is not None:
             return stored, True, None
-    # The cached answer read inline: a call here costs the gated miss path 0.4%.
+    # The instruction-gated miss path: the cached answer is read inline, and a backend that cannot report
+    # takes its own early return, which costs measurably less than one set call under conditional reporting.
     reachable = getattr(handler, "_write_deadlines_reachable", None)
     if not (write_deadlines_reachable(handler) if reachable is None else reachable):
         # Only thread the SWR kwarg when set: strategy implementations without
@@ -534,8 +569,6 @@ def _set_l2(
     seen: list[tuple[float, float]] = []
     token = _WRITE_DEADLINES.set(seen)
     try:
-        # Only thread the SWR kwarg when set: strategy implementations without
-        # **metadata (tests, custom handlers) must keep working unchanged.
         if stale_ttl is not None:
             stored = bool(handler.set(key, value, ttl, stale_ttl=stale_ttl))
         else:
