@@ -38,8 +38,12 @@ def build_workload(path: str) -> Callable[[], object]:
 
     import cachekit.decorators.orchestrator as orchestrator
     from cachekit import cache
-    from cachekit.decorators.l1_latency import L1LatencyReport
+    from cachekit.decorators.l1_latency import L1LatencyReport, sampling_rng
     from cachekit.serializers import EncryptionWrapper, get_serializer
+
+    # The timing draw has its own generator, unseeded by pin_main_thread_clocks: seeded here, every run times the
+    # same calls of l1_hit_backed.
+    sampling_rng.seed(0)
 
     value = {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
     # Dict-heavy value (about 6 KB): the decoder's object_hook runs once per record.

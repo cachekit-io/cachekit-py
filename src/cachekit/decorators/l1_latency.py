@@ -59,12 +59,14 @@ class _State:
 
 
 # One lock per process, for replacing an inherited state. dict.setdefault is atomic, so every thread of a process
-# gets the same lock, and a child never uses one its parent's threads could hold.
-_REPLACEMENT_LOCKS: dict[int, threading.Lock] = {}
+# gets the same lock, and a child never uses one its parent's threads could hold. Reentrant: the reseed and the new
+# state allocate under it, and a garbage-collection finalizer that calls cachekit on the same thread must not
+# deadlock the process's first use.
+_REPLACEMENT_LOCKS: dict[int, threading.RLock] = {}
 
 
-def _replacement_lock(pid: int) -> threading.Lock:
-    return _REPLACEMENT_LOCKS.setdefault(pid, threading.Lock())
+def _replacement_lock(pid: int) -> threading.RLock:
+    return _REPLACEMENT_LOCKS.setdefault(pid, threading.RLock())
 
 
 # The wrappers' sampling draw (spec API-81). A private generator, never the module-level one: drawing from the
@@ -73,34 +75,27 @@ def _replacement_lock(pid: int) -> threading.Lock:
 # sibling workers, and every job a prefork master forks from one state, would time the same call positions. The
 # at-fork hook reseeds it; a fork made from C runs no hook (uWSGI without --py-call-uwsgi-fork-hooks), so the
 # child's first report construction or use reseeds it too: a backend it builds, or its first request or first timed
-# hit on one it inherited, whichever comes first. The call that reseeds it on a timed hit is drawn again
-# (L1LatencyReport.record), so no worker times its parent's choice. The calls before it were each passed over by a
-# replayed draw: in such a child, the calls before its first reseed are never timed, in every worker alike, on
-# average the first ONE_IN. A PID check on every draw would close that gap, but os.getpid() is a system call,
-# several times the cost of the draw on the hit path.
+# hit on one it inherited, whichever comes first. Until then such a worker draws the same sequence as its siblings:
+# every call is still timed with probability 1/N, but the workers time the same call positions. A PID check on every
+# draw would close that window, at the cost of an os.getpid() system call on every call.
 sampling_rng = random.Random()  # noqa: S311 (a sampling draw, not a secret)
 _sampling_pid = os.getpid()
 
 
-def _reseed_sampling(pid: int) -> bool:
-    """Reseed the sampling draw once per process; True for the one call that did. The caller holds
-    ``_replacement_lock(pid)`` or is the at-fork hook."""
+def _reseed_sampling(pid: int) -> None:
+    """Reseed the sampling draw once per process; the caller holds ``_replacement_lock(pid)`` or is the at-fork hook."""
     global _sampling_pid
-    if _sampling_pid == pid:
-        return False
-    sampling_rng.seed()
-    _sampling_pid = pid
-    return True
+    if _sampling_pid != pid:
+        sampling_rng.seed()
+        _sampling_pid = pid
 
 
-def _reseed_if_forked(pid: int) -> bool:
+def _reseed_if_forked(pid: int) -> None:
     """Reseed the draw if this process has not yet: the check every report construction and use makes, so a
-    report built inside a child forked from C, whose state never carries the parent's PID, reseeds it too. True for
-    the one call that reseeded."""
-    if _sampling_pid == pid:
-        return False
-    with _replacement_lock(pid):
-        return _reseed_sampling(pid)
+    report built inside a child forked from C, whose state never carries the parent's PID, reseeds it too."""
+    if _sampling_pid != pid:
+        with _replacement_lock(pid):
+            _reseed_sampling(pid)
 
 
 if hasattr(os, "register_at_fork"):
@@ -170,13 +165,7 @@ class L1LatencyReport:
 
         The clock is read once the lock is held, so the time spent waiting for it, which the caller pays before it
         gets its value, is in the duration.
-
-        In a child forked from C, the call whose record first reseeds the draw was chosen by a draw replayed from
-        the parent, so every such worker would time the same startup call. That call is drawn again, from the
-        child's own sequence, and counted only if the new draw chooses it (spec API-81).
         """
-        if _reseed_if_forked(os.getpid()) and sampling_rng.getrandbits(SAMPLE_BITS):
-            return
         state = self._current()
         with state.lock:
             self._count(state, clock() - start_ns)
