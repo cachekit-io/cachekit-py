@@ -23,7 +23,7 @@ from pydantic import SecretBytes, SecretStr, ValidationError
 from urllib3.exceptions import ClosedPoolError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted, _clear_interrupted, _raised_during_request
-from cachekit.backends.base import WRITE_FRESH_UNTIL
+from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
@@ -640,12 +640,12 @@ class CachekitIOBackend:
             BackendError: If operation fails
         """
         response = self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
-        seen = WRITE_FRESH_UNTIL.get()
+        seen = _WRITE_DEADLINES.get()
         if seen is not None:
             seen.append(self._write_freshness(response))
 
-    # set reports its write's freshness through WRITE_FRESH_UNTIL; see cache_handler.open_write_report.
-    reports_write_freshness = True
+    # set reports its write's freshness through _WRITE_DEADLINES; see cache_handler._l1_write_until.
+    _reports_write_deadline = True
 
     @staticmethod
     def _write_freshness(response: BaseHTTPResponse) -> tuple[float, float]:

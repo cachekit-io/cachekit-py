@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol,
 from pydantic import SecretBytes, SecretStr
 
 from cachekit.backends.base import (
-    WRITE_FRESH_UNTIL,
+    _WRITE_DEADLINES,
     BackendError,
     BaseBackend,
     BufferHandle,
@@ -399,35 +399,24 @@ def _fuses_tracked_write(backend: object) -> bool:
     return True
 
 
-def open_write_report(handler: Any) -> Optional[list[tuple[float, float]]]:
-    """A list for the handler's backend to report its write's freshness into (``WRITE_FRESH_UNTIL``),
-    or None when the backend reports none.
+def _l1_write_until(handler: Any, seen: list[tuple[float, float]], stored: bool, ttl: Optional[float]) -> Optional[float]:
+    """The instant the writer's L1 copy of a value must stop serving by (API-103), from what the write's
+    backend reported into ``seen`` (``_WRITE_DEADLINES``); None keeps the stated ttl from the put.
 
-    Read off the backend instance, so a proxy that forwards attributes forwards the capability too;
-    ``is True`` keeps a Mock's auto-created attribute out. The caller opens the list around the
-    handler's own ``set`` / ``set_async``, so an override or patch of either still runs.
+    ``min(local_ttl, effective_ttl, fresh_for)``, every term timed from the 2xx's receipt: ttl stands for
+    local_ttl and effective_ttl (the L1 default for ttl=None), Fresh-For for the last, unbounded when
+    absent. A report wins even when the write then failed (an override that raised after its 2xx). With
+    none: None for a failed write (API-36/37 bound the copy) or a backend that never reports, and 0.0, no
+    copy, when the handler's backend says it reports but the write never reached its own ``set`` (an
+    override that does not delegate, or delegates on another thread), so the bound is unknown. A nested
+    write that reports into the same list can only shorten the bound.
     """
-    backend = getattr(handler, "backend", None)
-    return [] if getattr(backend, "reports_write_freshness", False) is True else None
-
-
-def l1_write_until(seen: Optional[list[tuple[float, float]]], stored: bool, ttl: Optional[float]) -> Optional[float]:
-    """The instant the writer's L1 copy of a stored value must stop serving by (API-103), from what
-    its backend reported into ``seen`` (``open_write_report``); None keeps the stated ttl from the put.
-
-    ``min(local_ttl, effective_ttl, fresh_for)``, every term timed from the 2xx's receipt: ttl stands
-    for local_ttl and effective_ttl (the L1 default for ttl=None), Fresh-For for the last, unbounded
-    when absent. None when the backend reports nothing or the write failed (API-36/37 bound the copy).
-    An empty list means the write never reached the backend's own ``set`` (an override that does not
-    delegate, or delegates on another thread), so its bound is unknown: 0.0, no copy. A nested write
-    that reports into the same list can only shorten the bound.
-    """
-    if seen is None or not stored:
+    if seen:
+        local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
+        return min(min(received + local_ttl, fresh_until) for received, fresh_until in seen)
+    if not stored or getattr(getattr(handler, "backend", None), "_reports_write_deadline", False) is not True:
         return None
-    if not seen:
-        return 0.0
-    local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
-    return min(min(received + local_ttl, fresh_until) for received, fresh_until in seen)
+    return 0.0
 
 
 def _set_l2(
@@ -444,7 +433,7 @@ def _set_l2(
     With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
     (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
     False and the caller tracks a stored key itself. l1_until bounds the writer's L1 copy
-    (``l1_write_until``), None where the backend reports no freshness. getattr: custom CacheHandlerStrategy
+    (``_l1_write_until``), None where the backend reports no freshness. getattr: custom CacheHandlerStrategy
     impls predate set_tracked, as they predate set_streaming.
     """
     set_tracked = None if registry_id is None else getattr(handler, "set_tracked", None)
@@ -452,8 +441,11 @@ def _set_l2(
         stored = set_tracked(key, value, ttl, registry_id, on_track_error)
         if stored is not None:
             return stored, True, None
-    seen = open_write_report(handler)
-    token = None if seen is None else WRITE_FRESH_UNTIL.set(seen)
+    # Opened around every write, not only a reporting backend's: a wrapper that composes one (metrics,
+    # wrapt.ObjectProxy) reaches its set without forwarding the capability. Around the handler's own set,
+    # so an override of it still runs.
+    seen: list[tuple[float, float]] = []
+    token = _WRITE_DEADLINES.set(seen)
     try:
         # Only thread the SWR kwarg when set: strategy implementations without
         # **metadata (tests, custom handlers) must keep working unchanged.
@@ -462,9 +454,8 @@ def _set_l2(
         else:
             stored = bool(handler.set(key, value, ttl))
     finally:
-        if token is not None:
-            WRITE_FRESH_UNTIL.reset(token)
-    return stored, False, l1_write_until(seen, stored, ttl)
+        _WRITE_DEADLINES.reset(token)
+    return stored, False, _l1_write_until(handler, seen, stored, ttl)
 
 
 class _MultiDeleteBackend(Protocol):
@@ -1733,7 +1724,7 @@ class StoreOutcome(NamedTuple):
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
     already reported: the caller must not track the key again. l1_until is the instant the
-    caller's L1 copy must stop serving by (``l1_write_until``; None keeps the stated ttl).
+    caller's L1 copy must stop serving by (``_l1_write_until``; None keeps the stated ttl).
     """
 
     envelope: Optional[bytes]

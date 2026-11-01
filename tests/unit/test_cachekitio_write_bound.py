@@ -30,7 +30,7 @@ from urllib3 import HTTPResponse
 
 from cachekit import cache
 from cachekit import l1_cache as l1_module
-from cachekit.backends.base import WRITE_FRESH_UNTIL
+from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
 from cachekit.cache_handler import StandardCacheHandler, _set_l2
@@ -128,13 +128,13 @@ def _namespace() -> str:
 
 
 def _reported(backend: CachekitIOBackend) -> list[tuple[float, float]]:
-    """What one ``backend.set`` reports through WRITE_FRESH_UNTIL."""
+    """What one ``backend.set`` reports through _WRITE_DEADLINES."""
     seen: list[tuple[float, float]] = []
-    token = WRITE_FRESH_UNTIL.set(seen)
+    token = _WRITE_DEADLINES.set(seen)
     try:
         backend.set("k", b"v", ttl=60)
     finally:
-        WRITE_FRESH_UNTIL.reset(token)
+        _WRITE_DEADLINES.reset(token)
     return seen
 
 
@@ -185,7 +185,7 @@ class TestBackendReportsPutFreshFor:
     def test_set_keeps_its_none_return(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         saas.put_fresh_for = "5"
         assert backend.set("k", b"v", ttl=60) is None  # type: ignore[func-returns-value]
-        assert WRITE_FRESH_UNTIL.get() is None  # nobody listening: nothing reported
+        assert _WRITE_DEADLINES.get() is None  # nobody listening: nothing reported
 
 
 class TestWriteBound:
@@ -194,7 +194,7 @@ class TestWriteBound:
     def test_header_below_ttl(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         saas.put_fresh_for = "5"
         assert _write(StandardCacheHandler(backend)) == (True, False, clock.now + 5)
-        assert WRITE_FRESH_UNTIL.get() is None  # closed what it opened
+        assert _WRITE_DEADLINES.get() is None  # closed what it opened
 
     def test_absent_header_bounds_the_stated_ttl_from_receipt(
         self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock
@@ -208,11 +208,11 @@ class TestWriteBound:
         """``set_async`` runs the write on a worker thread, in a copy of the context: the list still reaches it."""
         saas.put_fresh_for = "7"
         seen: list[tuple[float, float]] = []
-        token = WRITE_FRESH_UNTIL.set(seen)
+        token = _WRITE_DEADLINES.set(seen)
         try:
             assert await StandardCacheHandler(backend).set_async("k", b"v", ttl=60) is True
         finally:
-            WRITE_FRESH_UNTIL.reset(token)
+            _WRITE_DEADLINES.reset(token)
         assert seen == [(clock.now, clock.now + 7)]
 
     def test_failed_write_reports_no_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
@@ -308,7 +308,36 @@ class TestWriteBound:
         saas.put_fresh_for = "0"
         assert _write(StandardCacheHandler(outer)) == (True, False, clock.now)
         assert nested == [(True, False, clock.now + 60)]
-        assert WRITE_FRESH_UNTIL.get() is None
+        assert _WRITE_DEADLINES.get() is None
+
+    def test_composing_wrapper_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
+        """A wrapper that composes a CachekitIO backend without forwarding its attributes (a metrics class)
+        still reaches the base ``set`` on the same thread: the list is open around every write."""
+
+        class _Metrics:
+            def __init__(self, inner: CachekitIOBackend) -> None:
+                self.inner = inner
+                self.writes = 0
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.writes += 1
+                self.inner.set(key, value, ttl)
+
+        saas.put_fresh_for = "0"
+        assert _write(StandardCacheHandler(_Metrics(backend))) == (True, False, clock.now)  # type: ignore[arg-type]
+
+    def test_override_raising_after_its_2xx_keeps_the_bound(self, saas: _FakeSaaS, clock: _Clock) -> None:
+        """The write failed as far as the handler knows, but a 2xx was received: its bound still applies."""
+
+        class _Raising(CachekitIOBackend):
+            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+                super().set(key, value, ttl, stale_ttl)
+                raise RuntimeError("audit hook failed")
+
+        backend, _ = fake_backend(saas.respond)
+        backend.__class__ = _Raising
+        saas.put_fresh_for = "5"
+        assert _write(StandardCacheHandler(backend)) == (False, False, clock.now + 5)
 
     def test_forwarding_proxy_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         """The capability is read off the instance, so a proxy that forwards attributes forwards it."""
@@ -492,6 +521,33 @@ class TestWriterCopyBound:
         saas.put_fresh_for = "0"
         saas.get_fresh_for = "0"
         compute, calls = _decorated(_Proxy(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
+        assert compute() == 1
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+        assert len(calls) == 1
+
+    def test_composing_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
+        """A composing wrapper (no attribute forwarding) over CachekitIO: a 0 Fresh-For keeps no copy."""
+
+        class _Metrics:
+            def __init__(self, inner: CachekitIOBackend) -> None:
+                self.inner = inner
+
+            def get(self, key: str) -> bytes | None:
+                return self.inner.get(key)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.inner.set(key, value, ttl)
+
+            def delete(self, key: str) -> bool:
+                return self.inner.delete(key)
+
+            def exists(self, key: str) -> bool:
+                return self.inner.exists(key)
+
+        saas.put_fresh_for = "0"
+        compute, calls = _decorated(_Metrics(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
         assert compute() == 1
         gets = saas.gets()
         assert compute() == 1

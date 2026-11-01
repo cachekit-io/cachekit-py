@@ -20,7 +20,7 @@ from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 from .. import invalidation, l1_cache
 from .._rust_serializer import HitCounter, HitMemo
 from .._rust_serializer import memo_key as _memo_key
-from ..backends.base import WRITE_FRESH_UNTIL
+from ..backends.base import _WRITE_DEADLINES
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHandlerStrategy,
@@ -30,13 +30,12 @@ from ..cache_handler import (
     L2MissProbe,
     StandardCacheHandler,
     TenantResolutionError,
+    _l1_write_until,
     _set_l2,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
     handle_decrypt_failure,
-    l1_write_until,
-    open_write_report,
     probe_l2_miss,
     redact_cache_key,
     supports_fill_lock,
@@ -1236,7 +1235,7 @@ def create_cache_wrapper(
 
     def _put_l1_written(cache_key: str, serialized_data: Any, l1_until: float | None, *, twin: str | None) -> None:
         """The writer's own L1 copy of a value it stored (API-103): served until l1_until, the instant its
-        write's 2xx bounds it to (``cache_handler.l1_write_until``).
+        write's 2xx bounds it to (``cache_handler._l1_write_until``).
 
         l1_until is timed from the 2xx's receipt, not from this put, so a stall between the two (the hop
         back to the event loop) shortens the copy instead of restarting its bound. None (the backend
@@ -1310,7 +1309,7 @@ def create_cache_wrapper(
         """An async L2 write: (stored, tracked, l1_until). Where the handler can (set_tracked_async), the
         key-registry write rides in the same round trip and thread hop, and tracked is True; otherwise the
         caller tracks a stored key itself (_track_and_record_async). l1_until bounds the writer's L1 copy
-        (cache_handler.l1_write_until), None where the backend reports no freshness."""
+        (cache_handler._l1_write_until), None where the backend reports no freshness."""
         handler = operation_handler.cache_handler
         # Asked first: a backend without a registry never pays for the probe. Custom strategies predate set_tracked_async.
         set_tracked_async = getattr(handler, "set_tracked_async", None) if _is_trackable() else None
@@ -1318,15 +1317,14 @@ def create_cache_wrapper(
             stored = await set_tracked_async(cache_key, serialized_data, ttl, _registry_id, _warn_track_failure)
             if stored is not None:
                 return stored, True, None
-        # Around the handler's own set_async, so an override of it still runs: to_thread copies the context.
-        seen = open_write_report(handler)
-        token = None if seen is None else WRITE_FRESH_UNTIL.set(seen)
+        # As _set_l2: around every write, and the handler's own set_async. to_thread copies the context.
+        seen: list[tuple[float, float]] = []
+        token = _WRITE_DEADLINES.set(seen)
         try:
             stored = await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl)  # type: ignore[union-attr]
         finally:
-            if token is not None:
-                WRITE_FRESH_UNTIL.reset(token)
-        return stored, False, l1_write_until(seen, stored, ttl)
+            _WRITE_DEADLINES.reset(token)
+        return stored, False, _l1_write_until(handler, seen, stored, ttl)
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
@@ -1821,7 +1819,7 @@ def create_cache_wrapper(
         duration_ms = (time.perf_counter() - start) * 1000
         if stored:
             get_logger().cache_stored(cache_key, ttl)
-            _bound_deferred_copy(cache_key, l1_until, copy)
+            _drop_copy_outliving_write(cache_key, l1_until, copy)
             _record(cache_key, twin)
             if not tracked:
                 _track_and_record(cache_key)
@@ -1836,7 +1834,7 @@ def create_cache_wrapper(
                 serializer="rust",
             )
 
-    def _bound_deferred_copy(cache_key: str, l1_until: float | None, copy: _DeferredCopy) -> None:
+    def _drop_copy_outliving_write(cache_key: str, l1_until: float | None, copy: _DeferredCopy) -> None:
         """Hold a write-behind copy to the bound of its write's 2xx (API-103), once that write lands.
 
         A copy the miss already put, for ttl before the bound was known, that would serve past l1_until (the
@@ -1855,14 +1853,14 @@ def create_cache_wrapper(
     def _put_deferred_copy(cache_key: str, serialized_data: bytes, twin: str | None, copy: _DeferredCopy) -> None:
         """A deferred miss's L1 put. Under the latch, so it never publishes a copy past a bound its write has
         already landed with: bounded by it when the write came first, else for ttl, and then dropped by
-        _bound_deferred_copy if the bound turns out shorter."""
+        _drop_copy_outliving_write if the bound turns out shorter."""
         with copy.lock:
             if copy.l1_until is not None:
                 _put_l1(cache_key, serialized_data, None, twin=twin, expires_at=copy.l1_until)
                 return
-            _put_l1(cache_key, serialized_data, ttl, twin=twin)
-            # Read after the put, so it is no earlier than the expiry L1 computed: the comparison errs to dropping.
+            # The exact expiry the copy is put with, so the writer compares against what L1 holds.
             copy.put_until = time.time() + (DEFAULT_L1_TTL_SECONDS if ttl is None else ttl)
+            _put_l1(cache_key, serialized_data, None, twin=twin, expires_at=copy.put_until)
 
     def _outlives(put_until: float, l1_until: float) -> bool:
         """Whether an L1 copy put to expire at put_until serves past l1_until: L1 stops serving it
@@ -2614,11 +2612,7 @@ def create_cache_wrapper(
             if outcome.deferred and deferred_copy is not None and outcome.envelope is not None:
                 _put_deferred_copy(cache_key, outcome.envelope, twin_key, deferred_copy)
             else:
-                l1_until = outcome.l1_until  # None on every backend but CachekitIO: skip the helper's frame
-                if l1_until is None:
-                    _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
-                else:
-                    _put_l1_written(cache_key, outcome.envelope, l1_until, twin=twin_key)
+                _put_l1_written(cache_key, outcome.envelope, outcome.l1_until, twin=twin_key)
             if outcome.stored and trackable and not outcome.tracked:
                 _track_and_record(cache_key)
 

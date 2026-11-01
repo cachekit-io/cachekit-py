@@ -18,14 +18,14 @@ from typing import Any, BinaryIO, Optional, Protocol, runtime_checkable
 # Re-export BackendError for convenience (public API)
 from cachekit.backends.errors import BackendError  # noqa: F401
 
-# Write freshness (API-103). A backend with ``reports_write_freshness = True`` appends to this list, on each
+# Write freshness (API-103). A backend with ``_reports_write_deadline = True`` appends to this list, on each
 # successful ``set`` while the decorator holds one open, ``(received, fresh_until)``: the ``time.time()`` its
 # 2xx arrived, and the instant the server's freshness for the written value runs out (``received`` plus the
 # remaining freshness the response reports, ``math.inf`` when it reports none). The decorator bounds its L1
-# copy of the value from them (``cache_handler.l1_write_until``), and keeps no copy when the list stays empty:
-# the write never reached that backend's own ``set``. A list, not a value: a write run by ``asyncio.to_thread``
-# sees a copy of the context, which shares the list but not a rebinding.
-WRITE_FRESH_UNTIL: ContextVar[Optional[list[tuple[float, float]]]] = ContextVar("cachekit_write_fresh_until", default=None)
+# copy of the value from them (``cache_handler._l1_write_until``). A list, not a value: a write run by
+# ``asyncio.to_thread`` sees a copy of the context, which shares the list but not a rebinding. Private, like
+# ``_set_tracked``: not part of the backend contract, and free to change.
+_WRITE_DEADLINES: ContextVar[Optional[list[tuple[float, float]]]] = ContextVar("cachekit_write_deadlines", default=None)
 
 
 @runtime_checkable

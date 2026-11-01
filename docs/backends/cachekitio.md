@@ -161,9 +161,9 @@ bounds its in-process (L1) copy of the value it wrote by it: the copy lives at m
 plan maximum. A malformed or `0` value keeps no L1 copy; a server that sends no header leaves the
 copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied TTL, so it never
 lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
-as its override calls `super().set(...)` on the same thread. The same holds for a proxy backend
-that forwards attribute access and `set` to a `CachekitIOBackend`. If either writes any other way,
-the decorator cannot see the response, so it keeps no L1 copy of that write.
+as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
+backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread. A subclass that writes
+any other way gives the decorator no response to read, so it keeps no L1 copy of that write.
 
 ## TTL Inspection (async only)
 
