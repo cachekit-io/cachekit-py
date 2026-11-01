@@ -153,15 +153,18 @@ class L1LatencyReport:
 
         bucket_index, inlined without min and max: each timed hit runs this, and on CPython 3.12 the builtin calls
         cost more than the rest of the count.
+
+        Every step that can raise (each allocates an int) runs before the sum is stored, and storing it cannot raise,
+        so a failure leaves the buckets and the sum describing the same hits.
         """
         if not 0 <= duration_ns <= MAX_DURATION_NS:
             return
         total = state.sum + duration_ns
         if total > _MAX_WIRE_INT:  # never reached in practice: about 150,000 hits of 60 s in one report
             return
-        state.sum = total
         i = (duration_ns - 1).bit_length() - 7
         state.buckets[0 if i < 0 else BUCKETS - 1 if i >= BUCKETS else i] += 1
+        state.sum = total
 
     def add(self, duration_ns: int) -> None:
         """Count one timed L1 hit of ``duration_ns``."""

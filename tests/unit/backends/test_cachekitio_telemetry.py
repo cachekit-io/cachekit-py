@@ -712,6 +712,32 @@ class TestEncoding:
         taken = report.take()
         assert taken is not None and taken["X-CacheKit-L1-Latency-Buckets"].endswith(",1")
 
+    @pytest.mark.parametrize("step", ["index", "increment"])
+    def test_api85_a_count_that_fails_leaves_buckets_and_sum_consistent(self, step: str) -> None:
+        """An allocation can fail after the sum is computed. The report must still describe the same hits, or its next
+        header set fails the server's range check and the whole batch is lost."""
+
+        class FailingSub(int):  # (d - 1) is the bucket index's first step
+            def __sub__(self, other: object) -> int:
+                raise MemoryError
+
+        class FailingIncrement(list[int]):
+            def __setitem__(self, index: object, value: object) -> None:
+                raise MemoryError
+
+        report = L1LatencyReport()
+        for _ in range(3):
+            report.add(8_192)
+        if step == "index":
+            duration: int = FailingSub(8_192)
+        else:
+            duration = 8_192
+            report._state.buckets = FailingIncrement(report._state.buckets)
+        with pytest.raises(MemoryError):
+            report.add(duration)
+        assert report._state.sum == 3 * 8_192
+        assert list(report._state.buckets) == [3 if i == 6 else 0 for i in range(l1_latency.BUCKETS)]
+
     def test_api87_the_sum_never_passes_2_pow_53(self) -> None:
         report = L1LatencyReport()
         report._state.sum = 2**53 - 10
