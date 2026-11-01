@@ -42,7 +42,7 @@ from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
 from cachekit.decorators.tenant_context import ContextVarExtractor
 from cachekit.l1_cache import L1Cache, get_l1_cache_manager
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitState
-from cachekit.serializers.standard_serializer import VerifiedMsgpack
+from cachekit.serializers.base import VerifiedPayload
 from tests.utils.clock import shared_clock
 
 pytestmark = pytest.mark.unit
@@ -1001,7 +1001,7 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
     assert fn(1) == {"x": 1}
 
     assert (runs, backend.requests) == (1, ["get", "set"])  # one function call and one backend read in all
-    assert decoded == [bytes, VerifiedMsgpack]  # the other caller's hit, then this caller's re-check
+    assert decoded == [bytes, VerifiedPayload]  # the other caller's hit, then this caller's re-check
 
 
 def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(

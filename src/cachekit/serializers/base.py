@@ -6,7 +6,7 @@ This module contains shared types and utilities used by all serializers.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, final, runtime_checkable
 
 import msgpack
 
@@ -427,6 +427,28 @@ def bounded_error(exc: BaseException | str) -> str:
     if len(text) > ERROR_ECHO_MAX:
         text = f"{text[:ERROR_ECHO_MAX]}… [truncated, {len(text)} chars total]"
     return text.translate(_LOG_UNSAFE_ESCAPES)
+
+
+@final  # the read paths test `type(data) is VerifiedPayload`
+class VerifiedPayload:
+    """A payload its serializer's own integrity check returned and a decode in this process accepted, which an L1
+    entry holds in place of its envelope (``CacheSerializationHandler.deserialize_l1``). ``owner`` (the serializer's
+    class) decodes it without that check again: the MessagePack ``ByteStorage.retrieve()`` returned for
+    StandardSerializer and AutoSerializer, the JSON under a matching xxHash3-64 for OrjsonSerializer.
+
+    The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never skip the check,
+    whatever they hold. ``owner`` keeps one serializer from decoding another's payload. Its length is that of
+    ``data``, which L1 accounts.
+    """
+
+    __slots__ = ("data", "owner")
+
+    def __init__(self, data: bytes, owner: type) -> None:
+        self.data = data
+        self.owner = owner
+
+    def __len__(self) -> int:
+        return len(self.data)
 
 
 def immutable_buffer(data: bytes | bytearray | memoryview) -> bytes | memoryview:
