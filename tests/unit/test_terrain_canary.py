@@ -191,18 +191,19 @@ def test_reads_pth_lines_as_every_site_does(tmp_path: Path) -> None:
         "import sys",
         "   ",
         f"{tmp_path}/src  ",  # trailing whitespace is stripped
-        f"  {tmp_path}/alternate",  # up to 3.14 a path under site-packages; from 3.15 the directory itself
         "relative",
+        "  alternate",  # up to 3.14 the directory "  alternate"; from 3.15 "alternate"
         "  # indented",  # up to 3.14 a path; from 3.15 a comment
         "  import os",  # up to 3.14 a path; from 3.15 code
     ]
+    # Relative names only, so every candidate is a legal directory name on Windows too.
     for named in (
         tmp_path / "src",
-        tmp_path / "alternate",
         sitedir / "relative",
-        Path(f"{sitedir}/  {tmp_path}/alternate"),
-        Path(f"{sitedir}/  # indented"),
-        Path(f"{sitedir}/  import os"),
+        sitedir / "alternate",
+        sitedir / "  alternate",
+        sitedir / "  # indented",
+        sitedir / "  import os",
     ):
         named.mkdir(parents=True, exist_ok=True)
     (sitedir / "cachekit.pth").write_text("\n".join(lines) + "\n")
@@ -219,7 +220,8 @@ def test_reads_pth_lines_as_every_site_does(tmp_path: Path) -> None:
     assert named <= added
     assert named == {(tmp_path / "src").resolve(), (sitedir / "relative").resolve()}
     # The divergence this guards: 3.15 (PEP 829) strips leading whitespace, earlier versions keep it.
-    assert ((tmp_path / "alternate").resolve() in added) == (sys.version_info >= (3, 15))
+    assert ((sitedir / "alternate").resolve() in added) == (sys.version_info >= (3, 15))
+    assert ((sitedir / "  alternate").resolve() in added) == (sys.version_info < (3, 15))
 
 
 def test_refuses_a_package_that_shadows_the_install(tmp_path: Path) -> None:
