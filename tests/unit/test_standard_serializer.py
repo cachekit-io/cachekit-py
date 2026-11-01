@@ -701,14 +701,14 @@ class TestStandardSerializerIntegrityChecking:
         if not healthy_at_decode:
             buf[pos] ^= 1
         decoded_fields = msgpack.unpackb(bytes(buf))
-        real_unpackb_bounded = standard_serializer.unpackb_bounded
+        real_unpackb_standard = standard_serializer.unpackb_standard
 
-        def decode_then_flip(*args, **kwargs):
-            value = real_unpackb_bounded(*args, **kwargs)
+        def decode_then_flip(*args):
+            value = real_unpackb_standard(*args)
             buf[pos] ^= 1  # the caller's buffer changes after the decode has read it
             return value
 
-        monkeypatch.setattr(standard_serializer, "unpackb_bounded", decode_then_flip)
+        monkeypatch.setattr(standard_serializer, "unpackb_standard", decode_then_flip)
         off = StandardSerializer(enable_integrity_checking=False)
         if healthy_at_decode:
             with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
