@@ -8,6 +8,7 @@ it sends. Here, not in the backend package, because the wrapper imports it and m
 from __future__ import annotations
 
 import os
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -66,6 +67,30 @@ def _replacement_lock(pid: int) -> threading.Lock:
     return _REPLACEMENT_LOCKS.setdefault(pid, threading.Lock())
 
 
+# The wrappers' sampling draw (spec API-81). A private generator, never the module-level one: drawing from the
+# user's own `random` stream would change the output of their seeded code, and a worker that re-seeds `random` per
+# job would time the same call positions in every job. A forked child must not replay its parent's sequence, or
+# sibling workers, and every job a prefork master forks from one state, would time the same call positions. The
+# at-fork hook reseeds it; a fork made from C runs no hook (uWSGI without --py-call-uwsgi-fork-hooks), so the
+# child's first report use reseeds it too: its first request or first timed hit, whichever comes first. Until then
+# such a child replays its parent's draws. A PID check on every draw would close that gap, but os.getpid() is a
+# system call, several times the cost of the draw on the hit path.
+sampling_rng = random.Random()  # noqa: S311 (a sampling draw, not a secret)
+_sampling_pid = os.getpid()
+
+
+def _reseed_sampling(pid: int) -> None:
+    """Reseed the sampling draw once per process; the caller holds ``_replacement_lock(pid)`` or is the at-fork hook."""
+    global _sampling_pid
+    if _sampling_pid != pid:
+        sampling_rng.seed()
+        _sampling_pid = pid
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=lambda: _reseed_sampling(os.getpid()))
+
+
 class L1LatencyReport:
     """One CachekitIO backend's accumulator of timed L1 hits since its last report.
 
@@ -99,6 +124,7 @@ class L1LatencyReport:
             # discards hits another already counted into its own. The lock is this process's own, never one
             # inherited from the parent, which a parent thread may have held at the fork.
             with _replacement_lock(pid):
+                _reseed_sampling(pid)  # a fork no hook reached: see sampling_rng
                 state = self._state
                 if state.pid != pid:
                     state = _State()

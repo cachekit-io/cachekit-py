@@ -339,7 +339,38 @@ class TestSampling:
             got.append(random.random())
         assert got == expected
 
-    def test_api81_a_forked_child_draws_its_own_sequence(self) -> None:
+    def test_api81_a_child_forked_from_c_reseeds_at_its_first_report_use(self) -> None:
+        """A fork made from C runs no at-fork hook (uWSGI): the child replays its parent's draws until its first
+        report use (a request or a timed hit) reseeds them. Two children of one parent state then diverge."""
+        import ctypes
+
+        libc_fork = ctypes.PyDLL(None).fork
+        report = L1LatencyReport()
+
+        def child() -> list[int]:
+            r, w = os.pipe()
+            pid = libc_fork()
+            if pid == 0:  # pragma: no cover - child
+                os.close(r)
+                try:
+                    replayed = [wrapper._getrandbits(32) for _ in range(4)]  # still the parent's sequence
+                    report.take()  # the child's first request
+                    outcome: object = (replayed, [wrapper._getrandbits(32) for _ in range(4)])
+                except BaseException as exc:  # never return into pytest from the child
+                    outcome = f"child raised {exc!r}"
+                report_to_parent(w, outcome)
+            os.close(w)
+            return child_outcome(pid, r)  # type: ignore[return-value]
+
+        state = l1_latency.sampling_rng.getstate()
+        first = child()
+        l1_latency.sampling_rng.setstate(state)  # a prefork master forks every worker from one state
+        second = child()
+        l1_latency.sampling_rng.setstate(state)
+        parent = [wrapper._getrandbits(32) for _ in range(4)]
+        assert first[0] == second[0] == parent  # before the first report use: replayed, as documented
+        assert first[1] != second[1]  # after it: each child draws its own sequence
+
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - child
