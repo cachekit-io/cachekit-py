@@ -25,6 +25,7 @@ pinned here:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import random
 import uuid
@@ -54,6 +55,13 @@ pytestmark = pytest.mark.unit
 
 MASTER_KEY = "a" * 64
 GUARD_ERROR_PREFIX = "Unpack failed: MessagePack document "  # only the structure bounds raise this
+_JSON_EXTRA = pytest.mark.skipif(importlib.util.find_spec("orjson") is None, reason="requires the [json] extra")
+
+
+def _param(*values: Any, name: str) -> Any:
+    """``values`` as the parameter set ``name``; one that builds an orjson handler needs the [json] extra, which the
+    free-threaded CI lanes do not install, so it skips there."""
+    return pytest.param(*values, id=name, marks=_JSON_EXTRA if "orjson" in name else ())
 
 
 @pytest.fixture(autouse=True)
@@ -279,7 +287,7 @@ def _planted() -> VerifiedPayload:
     return VerifiedPayload(msgpack.packb({"x": 2}), StandardSerializer)
 
 
-@pytest.mark.parametrize(("make", "refusal"), list(_OTHER_HANDLERS.values()), ids=list(_OTHER_HANDLERS))
+@pytest.mark.parametrize(("make", "refusal"), [_param(*v, name=k) for k, v in _OTHER_HANDLERS.items()])
 def test_other_handlers_keep_their_envelope_and_refuse_a_kept_entry(
     make: Callable[[], CacheSerializationHandler], refusal: tuple[type[Exception], str]
 ) -> None:
@@ -871,6 +879,7 @@ def _auto_value() -> dict[str, Any]:
 
 
 _KEEPING = {"auto": _auto_value, "orjson": lambda: {"id": 7, "tags": ["a"], "score": 97.5}}
+_KEEPING_PARAMS = [_param(s, name=s) for s in _KEEPING]
 
 
 def _verified_payload(serializer_name: str, envelope: bytes) -> bytes:
@@ -884,8 +893,6 @@ def checks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """One entry per integrity check either serializer runs: ByteStorage.retrieve(), or orjson's xxHash3-64."""
     import xxhash
 
-    from cachekit.serializers import orjson_serializer
-
     seen: list[str] = []
     real_retrieve, real_digest = ByteStorage.retrieve, xxhash.xxh3_64_digest
 
@@ -898,11 +905,11 @@ def checks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         return real_digest(data)
 
     monkeypatch.setattr(ByteStorage, "retrieve", retrieve)
-    monkeypatch.setattr(orjson_serializer.xxhash, "xxh3_64_digest", digest)
+    monkeypatch.setattr(xxhash, "xxh3_64_digest", digest)  # the module both serializers call it through
     return seen
 
 
-@pytest.mark.parametrize("serializer_name", list(_KEEPING))
+@pytest.mark.parametrize("serializer_name", _KEEPING_PARAMS)
 def test_auto_and_orjson_hits_keep_their_verified_payload_and_skip_the_check(serializer_name: str, checks: list[str]) -> None:
     """The first hit verifies the envelope and keeps what it verified, owned by its serializer; later hits decode
     the kept payload with no integrity check, through the same decoder, so they return equal fresh objects."""
@@ -930,7 +937,7 @@ def test_auto_and_orjson_hits_keep_their_verified_payload_and_skip_the_check(ser
     assert (checks, backend.gets) == ([], 1)
 
 
-@pytest.mark.parametrize("serializer_name", list(_KEEPING))
+@pytest.mark.parametrize("serializer_name", _KEEPING_PARAMS)
 def test_a_corrupt_auto_or_orjson_entry_in_l1_is_never_kept(serializer_name: str) -> None:
     """A payload enters L1 only from a check that verified it: a corrupt envelope in L1 is refused, never kept."""
     handler = CacheSerializationHandler(serializer_name=serializer_name)
@@ -941,7 +948,12 @@ def test_a_corrupt_auto_or_orjson_entry_in_l1_is_never_kept(serializer_name: str
 
 @pytest.mark.parametrize(
     ("reader", "minter"),
-    [("auto", StandardSerializer), ("orjson", StandardSerializer), ("default", "auto"), ("auto", "orjson")],
+    [
+        _param("auto", StandardSerializer, name="auto-StandardSerializer"),
+        _param("orjson", StandardSerializer, name="orjson-StandardSerializer"),
+        _param("default", "auto", name="default-auto"),
+        _param("auto", "orjson", name="auto-orjson"),
+    ],
 )
 def test_a_keeping_handler_refuses_another_serializers_kept_entry(reader: str, minter: Any) -> None:
     """The owner is the mark of which decoder may read a kept payload: a kept entry under a key another serializer's
@@ -1018,7 +1030,7 @@ _KEEPING_FRAME_NAMES = {
 }
 
 
-@pytest.mark.parametrize("serializer_name", list(_KEEPING))
+@pytest.mark.parametrize("serializer_name", _KEEPING_PARAMS)
 def test_keeping_frame_names_list_every_frame(serializer_name: str) -> None:
     assert set(_keeping_frames(serializer_name)) == set(_KEEPING_FRAME_NAMES[serializer_name])
 
@@ -1034,7 +1046,7 @@ def _same(a: Any, b: Any) -> bool:
 
 @pytest.mark.parametrize(
     ("serializer_name", "name"),
-    [(s, n) for s, names in _KEEPING_FRAME_NAMES.items() for n in names],
+    [_param(s, n, name=f"{s}-{n}") for s, names in _KEEPING_FRAME_NAMES.items() for n in names],
 )
 def test_auto_and_orjson_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
     serializer_name: str, name: str, monkeypatch: pytest.MonkeyPatch
