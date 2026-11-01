@@ -313,14 +313,14 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |
 | `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 140,428 | 141,391 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,976 | 167,728 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 57,744 | 58,608 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 47,895 | 48,623 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,420,388 | 1,424,292 |
 | `serializer_auto` | `AutoSerializer` round trip | 64,722 | 65,653 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 22,135 | 22,825 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,969,626 | 1,980,777 |
 | `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,781,406 | 61,324,948 |
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,793,577 | 61,344,459 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 99,162 | 100,937 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 89,289 | 90,918 |
 | `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,688 | 2,558 |
 | `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,631 | 720,751 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 76,035 | 74,112 |

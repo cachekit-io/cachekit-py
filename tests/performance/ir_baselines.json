@@ -17,9 +17,9 @@
         "serializer_arrow_usgs": 61781406,
         "serializer_auto": 64722,
         "serializer_auto_usgs": 61793577,
-        "serializer_default": 57744,
+        "serializer_default": 47895,
         "serializer_default_records": 1420388,
-        "serializer_encrypted": 99162,
+        "serializer_encrypted": 89289,
         "serializer_orjson": 22135
       },
       "python": "3.12.12"
@@ -41,9 +41,9 @@
         "serializer_arrow_usgs": 61324948,
         "serializer_auto": 65653,
         "serializer_auto_usgs": 61344459,
-        "serializer_default": 58608,
+        "serializer_default": 48623,
         "serializer_default_records": 1424292,
-        "serializer_encrypted": 100937,
+        "serializer_encrypted": 90918,
         "serializer_orjson": 22825
       },
       "python": "3.14.3"
