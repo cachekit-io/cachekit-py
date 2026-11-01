@@ -35,15 +35,16 @@ def _sigusr1_has_handler() -> bool:
     return ctypes.c_void_p.from_buffer(action).value not in (None, 1)  # SIG_DFL is 0, SIG_IGN is 1
 
 
-def fork_dumping_stacks() -> int:
-    """os.fork(), with a child that writes every thread's stack to stderr on SIGUSR1; pass dump_stacks=True to child_outcome.
+def fork_dumping_stacks() -> tuple[int, bool]:
+    """os.fork(), with a child that writes every thread's stack to stderr on SIGUSR1: (pid, whether that dump is armed).
 
     Armed before the fork, so a child hung in an at-fork hook, before os.fork() returns there, still dumps.
-    A SIGUSR1 handler the parent already has is left alone, and its child does not dump.
+    A SIGUSR1 handler the parent already has is left alone, and the dump stays unarmed. Pass armed to
+    child_outcome as dump_stacks, so SIGUSR1 never reaches a handler this helper did not install.
     """
     if _sigusr1_has_handler():  # faulthandler.unregister would restore SIG_DFL over it, not the handler
         warnings.warn("SIGUSR1 already has a handler: a hung child is killed without dumping its stacks", stacklevel=2)
-        return os.fork()
+        return os.fork(), False
     faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # the child inherits it
     try:
         pid = os.fork()
@@ -52,13 +53,13 @@ def fork_dumping_stacks() -> int:
         raise
     if pid:
         faulthandler.unregister(signal.SIGUSR1)
-    return pid
+    return pid, True
 
 
 def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = False) -> object:
     """What the child at pid reported on the pipe r, or why it reported nothing; a hung child is killed.
 
-    dump_stacks: the child came from fork_dumping_stacks, so a hung one is asked for its stacks before the kill.
+    dump_stacks: fork_dumping_stacks armed the child's dump, so a hung one is asked for its stacks before the kill.
     """
     if pid <= 0:  # not an assert: python -O strips those, and os.kill(0, ...) signals pytest's whole process group
         raise ValueError("no child was forked")

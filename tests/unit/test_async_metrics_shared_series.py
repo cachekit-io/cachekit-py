@@ -123,7 +123,7 @@ def _child_outcome(child: Callable[[], bool]) -> object:
     when child_outcome's deadline kills it.
     """
     r, w = os.pipe()
-    pid = fork_dumping_stacks()
+    pid, armed = fork_dumping_stacks()
     if pid == 0:
         os.close(r)
         outcome = on_new_thread(child)
@@ -131,7 +131,7 @@ def _child_outcome(child: Callable[[], bool]) -> object:
             faulthandler.dump_traceback(sys.__stderr__)
         report(w, outcome)
     os.close(w)
-    return child_outcome(pid, r, dump_stacks=True)
+    return child_outcome(pid, r, dump_stacks=armed)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
