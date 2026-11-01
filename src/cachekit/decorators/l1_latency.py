@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-import weakref
 from collections.abc import Callable
 
 # Bucket i (0-based) holds the durations up to 2**(i + 7) ns, the last up to the 60 s ceiling (spec table).
@@ -58,16 +57,6 @@ class _State:
         self.sum = 0
 
 
-# A forked child empties every report before any thread of its own runs, where the fork runs Python's at-fork
-# hooks. The per-call PID check below covers a fork that does not (uWSGI).
-_REPORTS: weakref.WeakSet[L1LatencyReport] = weakref.WeakSet()
-
-
-def _empty_reports_in_child() -> None:
-    for report in list(_REPORTS):
-        report._empty_in_child()  # pyright: ignore[reportPrivateUsage]
-
-
 # One lock per process, for replacing an inherited state. dict.setdefault is atomic, so every thread of a process
 # gets the same lock, and a child never uses one its parent's threads could hold.
 _REPLACEMENT_LOCKS: dict[int, threading.Lock] = {}
@@ -77,20 +66,15 @@ def _replacement_lock(pid: int) -> threading.Lock:
     return _REPLACEMENT_LOCKS.setdefault(pid, threading.Lock())
 
 
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_empty_reports_in_child)
-
-
 class L1LatencyReport:
     """One CachekitIO backend's accumulator of timed L1 hits since its last report.
 
     ``add``, ``record`` and ``take`` hold one lock, so a report's buckets and sum always describe the same hits and
-    no two requests carry the same hit (API-85). A forked child starts empty (API-83): an at-fork hook gives every
-    report a new state before the child's own threads run. A fork that skips Python's hooks (uWSGI) is caught by
-    the PID check on each use instead. The child never touches the parent's state, whose lock a parent thread may
-    have held at the fork: it builds a complete new state and publishes it with one assignment, so a thread sees
-    either the inherited state, whose PID sends it to build its own, or a new empty one. Without the hook, child
-    threads racing their first use build that state once, under a lock of the child's own.
+    no two requests carry the same hit (API-85). A forked child starts empty (API-83): each use checks the state's
+    PID rather than relying on an at-fork hook, which uWSGI forks without running. The child never touches the
+    parent's state, whose lock a parent thread may have held at the fork: it builds a complete new state and
+    publishes it with one assignment, under a lock of the child's own, so threads racing their first use agree on
+    one state and none loses hits another counted.
 
     Examples:
         >>> report = L1LatencyReport()
@@ -102,20 +86,16 @@ class L1LatencyReport:
         True
     """
 
-    __slots__ = ("__weakref__", "_state")
+    __slots__ = ("_state",)
 
     def __init__(self) -> None:
-        self._state = _State()
-        _REPORTS.add(self)
-
-    def _empty_in_child(self) -> None:
         self._state = _State()
 
     def _current(self) -> _State:
         state = self._state
         pid = os.getpid()
         if state.pid != pid:
-            # A fork that skipped the hook: threads racing their first use agree on one new state, so none
+            # A forked child's first use: threads racing their first use agree on one new state, so none
             # discards hits another already counted into its own. The lock is this process's own, never one
             # inherited from the parent, which a parent thread may have held at the fork.
             with _replacement_lock(pid):

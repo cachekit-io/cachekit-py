@@ -637,7 +637,13 @@ _MEMO_MAX_ENTRIES = 1024
 # The L1 hit-latency timer's draw, chance and clock. Globals, not closure cells: a wrapper's every free variable
 # costs its every call, the memoised L1-only hit included, which never times anything. A test can replace them.
 # getrandbits(k) == 0 holds with probability 2**-k: one draw, and a cached small int rather than a new float.
-_getrandbits = random.getrandbits
+# A private generator, never the module-level one: drawing from the user's own `random` stream would change the
+# output of their seeded code, and a worker that re-seeds `random` per job would time the same call positions in
+# every job (spec API-81). A forked child reseeds it, so sibling workers do not draw the same sequence.
+_rng = random.Random()  # noqa: S311 (a sampling draw, not a secret)
+_getrandbits = _rng.getrandbits
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_rng.seed)
 _perf_counter_ns = time.perf_counter_ns
 
 

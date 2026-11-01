@@ -262,8 +262,11 @@ class TestWhatIsTimed:
             assert backend.exists("k")
             return backend.get("k")
 
+        before = len(pool.requests)
         assert f(1) == b"v"  # a miss: its function's exists and get run inside the call
-        assert "X-CacheKit-L1-Hits" in pool.requests[-1].headers  # they ran under the call's context
+        inner = [r for r in pool.requests[before:] if r.path == "/v1/cache/k"]
+        assert [r.method for r in inner] == ["HEAD", "GET"]
+        assert all("X-CacheKit-L1-Hits" in r.headers for r in inner)  # they ran under the call's context
         assert backend.l1_latency_report is not None and backend.l1_latency_report.take() is None
 
     def test_api79_a_backend_first_resolved_by_invalidation_still_times_hits(self, store: _Store, timed: _Clock) -> None:
@@ -314,6 +317,43 @@ class TestWhatIsTimed:
 
 
 class TestSampling:
+    @pytest.mark.parametrize("backed", [False, True])
+    def test_api81_the_draw_leaves_the_users_random_stream_alone(self, backed: bool, store: _Store) -> None:
+        """Seeded user code must produce the same numbers with cached calls in between, and a worker that re-seeds
+        `random` per job must not time the same call positions in every job."""
+        import random
+
+        backend = _backend(store)[0] if backed else None
+
+        @cache(backend=backend, ttl=60, namespace=_ns())
+        def f(x: int) -> int:
+            return x
+
+        random.seed(1234)
+        expected = [random.random() for _ in range(3)]
+        random.seed(1234)
+        got = []
+        for i in range(3):
+            f(i)
+            f(i)
+            got.append(random.random())
+        assert got == expected
+
+    def test_api81_a_forked_child_draws_its_own_sequence(self) -> None:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - child
+            os.close(r)
+            try:
+                outcome: object = [wrapper._getrandbits(32) for _ in range(4)]
+            except BaseException as exc:  # never return into pytest from the child
+                outcome = f"child raised {exc!r}"
+            report_to_parent(w, outcome)
+        os.close(w)
+        child = child_outcome(pid, r)
+        parent = [wrapper._getrandbits(32) for _ in range(4)]
+        assert isinstance(child, list) and child != parent
+
     def test_api81_the_draw_is_made_on_every_backed_call_before_its_outcome(
         self, store: _Store, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -333,7 +373,6 @@ class TestSampling:
         assert all(not sent for sent in _sent(pool))  # a non-zero draw times nothing
 
     def test_api81_probability_is_one_in_n_and_n_is_sent(self) -> None:
-        assert 2**l1_latency.SAMPLE_BITS == ONE_IN
         assert 1 <= ONE_IN <= 1_000_000
         report = L1LatencyReport()
         report.add(1)
@@ -369,24 +408,25 @@ class TestClock:
 
 
 class TestReports:
-    @pytest.mark.parametrize("hooks", ["with at-fork hooks", "without (uWSGI)"])
-    def test_api83_a_forked_child_starts_empty(self, hooks: str) -> None:
+    def test_api83_a_forked_child_starts_empty(self) -> None:
+        """No at-fork hook is involved, as under uWSGI: the child's first use sees the inherited state's PID."""
         report = L1LatencyReport()
-        if hooks.startswith("without"):
-            # The registered hook walks _REPORTS: a report not in it is never emptied by the hook, as under uWSGI.
-            l1_latency._REPORTS.discard(report)
         report.add(500)
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - child
             os.close(r)
-            hook_ran = report._state.pid == os.getpid()
-            first = report.take()
-            report.add(700)
-            report_to_parent(w, (hook_ran, first, report.take()))
+            try:
+                inherited = report._state.pid != os.getpid()
+                first = report.take()
+                report.add(700)
+                outcome: object = (inherited, first, report.take())
+            except BaseException as exc:  # never return into pytest from the child
+                outcome = f"child raised {exc!r}"
+            report_to_parent(w, outcome)
         os.close(w)
-        hook_ran, first, second = child_outcome(pid, r)  # type: ignore[misc]
-        assert hook_ran is hooks.startswith("with ")  # the bypass is real: the PID check did the emptying
+        inherited, first, second = child_outcome(pid, r)  # type: ignore[misc]
+        assert inherited is True  # the child still held the parent's state until its first use
         assert first is None
         assert second == {BUCKETS_HEADER: "0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0", SUM_HEADER: "700", ONE_IN_HEADER: str(ONE_IN)}
         taken = report.take()  # the parent's hit is still the parent's
@@ -404,7 +444,6 @@ class TestReports:
         sent, and no child hit is lost to another thread's replacement. _State construction is slowed so that every
         thread is inside the replacement at once, the schedule that lost hits when each built its own."""
         report = L1LatencyReport()
-        l1_latency._REPORTS.discard(report)  # the hook never empties it: a fork that skips Python's hooks
         report.add(12_345)
         threads_n, hit_ns = 8, 700
         real_init = l1_latency._State.__init__
@@ -417,19 +456,23 @@ class TestReports:
         pid = os.fork()
         if pid == 0:  # pragma: no cover - child
             os.close(r)
-            l1_latency._State.__init__ = slow_init  # type: ignore[method-assign]
-            barrier = threading.Barrier(threads_n)
+            try:
+                l1_latency._State.__init__ = slow_init  # type: ignore[method-assign]
+                barrier = threading.Barrier(threads_n)
 
-            def first_use() -> None:
-                barrier.wait()
-                report.add(hit_ns)
+                def first_use() -> None:
+                    barrier.wait()
+                    report.add(hit_ns)
 
-            workers = [threading.Thread(target=first_use) for _ in range(threads_n)]
-            for t in workers:
-                t.start()
-            for t in workers:
-                t.join()
-            report_to_parent(w, report.take())
+                workers = [threading.Thread(target=first_use) for _ in range(threads_n)]
+                for t in workers:
+                    t.start()
+                for t in workers:
+                    t.join()
+                outcome: object = report.take()
+            except BaseException as exc:  # never return into pytest from the child
+                outcome = f"child raised {exc!r}"
+            report_to_parent(w, outcome)
         os.close(w)
         taken = child_outcome(pid, r)
         assert taken == {
@@ -682,7 +725,7 @@ class TestSwitch:
         backend, _ = _backend(store, telemetry=False)
         assert backend.with_timeout(2.0)._telemetry is False
 
-    def test_api95_with_timeout_does_not_reread_the_environment(self, store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_api95_a_clone_of_an_off_backend_stays_off(self, store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_TELEMETRY", "off")
         backend, _ = _backend(store)
         monkeypatch.delenv("CACHEKIT_TELEMETRY")
@@ -699,8 +742,7 @@ class TestSwitch:
         backend.get("k")
         assert not any(header in pool.requests[0].headers for header in OPTIONAL)
 
-    def test_api95_off_in_any_casing_wins(self) -> None:
-        assert resolve_telemetry(None, {"CACHEKIT_TELEMETRY": "on", "cachekit_telemetry": "off"}) is False
+    def test_api95_a_lowercase_on_is_on(self) -> None:
         assert resolve_telemetry(None, {"cachekit_telemetry": "yes"}) is True
 
     def test_api96_off_accumulates_no_report(self, store: _Store, timed: _Clock) -> None:

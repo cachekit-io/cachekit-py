@@ -206,7 +206,7 @@ cachekit.io carries the report and empties it, so each hit is reported once. A c
 miss for the same key, a miss, an L2 hit and a direct `backend.get()` are never timed, and the health check never
 carries a report. A forked child starts with an empty report. Hits timed after the last request are not sent.
 
-**Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` to `false`, `0`, `off` or `no` (any case).
+**Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` (name and value in any case) to `false`, `0`, `off` or `no`.
 Off from either wins over on from the other; both unset is on. Any other value of the variable also turns telemetry
 off and logs one warning. Both are read once, when the backend is constructed: set the variable before creating it.
 `@cache.io()` builds its own backend, so use the variable there.
