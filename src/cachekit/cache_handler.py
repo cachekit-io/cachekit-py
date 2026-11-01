@@ -604,9 +604,13 @@ def _set_l2(
         stored = set_tracked(key, value, ttl, registry_id, on_track_error)
         if stored is not None:
             return stored, True, None
-    # The instruction-gated miss path: the cached answer is read inline, and a backend that cannot report
-    # takes its own early return (one set call under a conditional token measured +1.02% on `miss`, this +0.79%).
-    reachable = getattr(handler, "_write_deadlines_reachable", None)
+    # The instruction-gated miss path: the cached answer is a plain attribute load (getattr's call costs the
+    # gate measurably; try is free until it raises), and a backend that cannot report takes its own early return
+    # (one set call under a conditional token measured +1.02% on `miss`, this +0.79%).
+    try:
+        reachable = handler._write_deadlines_reachable
+    except AttributeError:  # a custom strategy that does not carry the cache
+        reachable = None
     if not (write_deadlines_reachable(handler) if reachable is None else reachable):
         # Only thread the SWR kwarg when set: strategy implementations without
         # **metadata (tests, custom handlers) must keep working unchanged.
