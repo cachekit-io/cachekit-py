@@ -507,27 +507,31 @@ def _reaches_write_deadlines(backend: object) -> bool:
         reads = 0
         while queue:
             obj, depth = queue.popleft()
-            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(type(obj), base)), None)
+            kind = type(obj)
+            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(kind, base)), None)
+            batches: list[tuple[Iterable[object], int]] = []
             if walk is not None:
-                children: Iterable[object] = walk(obj)  # a container: its items stay at the holder's depth
-            else:
-                reports, children, scanned = _read_object(obj, types_read, depth < _REACH_DEPTH)
+                batches.append((walk(obj), depth))  # a container: its items stay at the holder's depth
+            # An object, or a container subclass (a dict router with self.inner): read its own storage too.
+            # Identity, not `in`: hashing the type could run a metaclass __hash__.
+            if walk is None or not any(kind is base for base, _ in _REACH_CONTAINERS):
+                reports, values, scanned = _read_object(obj, types_read, depth < _REACH_DEPTH)
                 if reports and obj is not backend:  # the root's own flag was read with getattr above
                     return True
                 reads += scanned
                 if reads > _REACH_READS:
                     return True
-                if depth == _REACH_DEPTH:  # its flag is read; its own attributes are past the reach
-                    continue
-                depth += 1
-            for child in children:
-                reads += 1
-                if reads > _REACH_READS:
-                    return True
-                if issubclass(type(child), _REACH_LEAVES) or seen.get(id(child), _REACH_DEPTH + 1) <= depth:
-                    continue
-                seen[id(child)] = depth
-                queue.append((child, depth))
+                if depth < _REACH_DEPTH:  # at the limit its flag is read; its own attributes are past the reach
+                    batches.append((values, depth + 1))
+            for children, child_depth in batches:
+                for child in children:
+                    reads += 1
+                    if reads > _REACH_READS:
+                        return True
+                    if issubclass(type(child), _REACH_LEAVES) or seen.get(id(child), _REACH_DEPTH + 1) <= child_depth:
+                        continue
+                    seen[id(child)] = child_depth
+                    queue.append((child, child_depth))
         kind = type(backend)
         module = _TYPE_MODULE.__get__(kind)
         name = (module if isinstance(module, str) else "", _TYPE_QUALNAME.__get__(kind))

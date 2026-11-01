@@ -494,6 +494,23 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Pair("us", backend))
         assert _reaches_write_deadlines(_Router(us=object())) is False
 
+    def test_a_container_subclass_attribute_is_reached(self, backend: CachekitIOBackend) -> None:
+        """A dict-subclass router holding its backend in an attribute, not as an item: its storage is read
+        as well as its items, at the root and below it."""
+
+        class _Router(dict):  # type: ignore[type-arg]
+            def __init__(self, inner: object) -> None:
+                super().__init__(eu=object())
+                self.inner = inner
+
+        class _Holder:
+            def __init__(self, inner: object) -> None:
+                self.router = _Router(inner)
+
+        assert _reaches_write_deadlines(_Router(backend))
+        assert _reaches_write_deadlines(_Holder(backend))
+        assert _reaches_write_deadlines(_Router(object())) is False
+
     def test_a_none_flag_on_a_subclass_stops_the_lookup(self) -> None:
         """As Python's own lookup: the first namespace holding the name wins, even with None."""
 
@@ -830,6 +847,36 @@ class TestWriterCopyBound:
         assert compute() == 1
         assert calls
         assert "PUT" not in saas.ops
+
+    def test_container_subclass_router_keeps_a_zero_bound(
+        self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool
+    ) -> None:
+        """Helena Eagen's probe: a dict-subclass router with ``self.inner``, Fresh-For 0, keeps no copy."""
+
+        class _Router(dict):  # type: ignore[type-arg]
+            def __init__(self, inner: CachekitIOBackend) -> None:
+                super().__init__()
+                self.inner = inner
+
+            def get(self, key: str) -> bytes | None:  # type: ignore[override]
+                return self.inner.get(key)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.inner.set(key, value, ttl)
+
+            def delete(self, key: str) -> bool:
+                return self.inner.delete(key)
+
+            def exists(self, key: str) -> bool:
+                return self.inner.exists(key)
+
+        saas.put_fresh_for = "0"
+        compute, calls = _decorated(_Router(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
+        assert compute() == 1
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+        assert len(calls) == 1
 
     def test_composing_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
         """A composing wrapper (no attribute forwarding) over CachekitIO: a 0 Fresh-For keeps no copy."""
