@@ -182,9 +182,11 @@ class OrjsonSerializer:
             >>> result == {"test": 123}
             True
         """
-        # No bytes() copy of unwrap's zero-copy memoryview, and no slice copy of the JSON: orjson and xxhash read
-        # buffers. A mutable one is snapshotted, so the checksum and the decode judge the same bytes.
-        data = immutable_buffer(data)
+        # No bytes() copy of unwrap's zero-copy memoryview, and no slice copy of the JSON in it: orjson and xxhash
+        # read buffers. A mutable one is snapshotted, so the checksum and the decode judge the same bytes. bytes
+        # skips the call, which costs more than the copy it saves on a small value.
+        if type(data) is not bytes:
+            data = immutable_buffer(data)
         try:
             if self.enable_integrity_checking:
                 return orjson.loads(self._verified_json(data))
@@ -196,7 +198,7 @@ class OrjsonSerializer:
             raise SerializationError(f"Failed to deserialize JSON data: {e}") from e
 
     @staticmethod
-    def _verified_json(data: bytes | memoryview) -> memoryview:
+    def _verified_json(data: bytes | memoryview) -> bytes | memoryview:
         """The JSON of a ``[8-byte xxHash3-64][JSON]`` envelope, as a view, once its checksum matches.
 
         Raises:
@@ -208,7 +210,7 @@ class OrjsonSerializer:
             raise SerializationError(
                 f"Invalid data: Expected at least 10 bytes (8-byte checksum + 2-byte JSON), got {len(data)} bytes"
             )
-        json_data = memoryview(data)[8:]
+        json_data = data[8:]  # a view of a view; bytes, which only direct callers pass, copies as it always did
         if xxhash.xxh3_64_digest(json_data) != data[:8]:
             raise SerializationError("Checksum validation failed - data corruption detected")
         return json_data

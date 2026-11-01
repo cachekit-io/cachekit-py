@@ -813,8 +813,9 @@ class AutoSerializer:
                 rather than failing closed.
         """
         # No bytes() copy of unwrap's zero-copy memoryview: every route below reads a buffer. A mutable one is
-        # snapshotted, so the routing tests and the decode judge the same bytes.
-        data = immutable_buffer(data)
+        # snapshotted, so the routing tests and the decode judge the same bytes. bytes skips the call.
+        if type(data) is not bytes:
+            data = immutable_buffer(data)
         # The header's claim about the stored format. Read once: binding it twice under two names
         # is how a header-sourced value reached a variable holding the envelope's format before.
         # Typed once too, here rather than at each of the three sites that compare or echo it —
