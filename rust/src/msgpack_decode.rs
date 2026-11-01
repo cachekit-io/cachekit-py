@@ -18,6 +18,9 @@
 //! memory (the release profile sets `panic = "abort"`), so the two allocations the input sizes, an
 //! array's list and a bin's bytes, go through ones that raise MemoryError, as the old decode did.
 
+// cargo-geiger checks the crate only after a merge; this fails any build, a PR's included.
+#![forbid(unsafe_code)]
+
 use cachekit_core::check_msgpack_structure;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
