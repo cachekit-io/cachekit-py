@@ -651,6 +651,16 @@ def _latency_report_of(backend: object) -> L1LatencyReport | None:
     return report if isinstance(report, L1LatencyReport) else None
 
 
+def _record_l1_latency(report: L1LatencyReport, timed_from: int) -> None:
+    """Record a timed L1 hit that has its value. Telemetry never costs a served hit: the call sits inside the hit's
+    ``try``, whose broad handler would read a failure here as a poisoned entry, invalidate it and go to L2, a second
+    outcome for one call. So a failure is logged and the hit's duration dropped."""
+    try:
+        report.record(timed_from, _perf_counter_ns)
+    except Exception as e:  # noqa: BLE001 (see the docstring)
+        _logger.debug("L1 hit latency not recorded: %s", type(e).__name__)
+
+
 # What HitMemo.get returns when it cannot answer a call.
 _MISS = object()
 
@@ -2246,7 +2256,7 @@ def create_cache_wrapper(
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
                         if timed_from is not None and _l1_latency is not None:
-                            _l1_latency.record(timed_from, _perf_counter_ns)
+                            _record_l1_latency(_l1_latency, timed_from)
                         return l1_value
                     except TenantResolutionError:
                         # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
@@ -2733,7 +2743,7 @@ def create_cache_wrapper(
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
                         if timed_from is not None and _l1_latency is not None:
-                            _l1_latency.record(timed_from, _perf_counter_ns)
+                            _record_l1_latency(_l1_latency, timed_from)
 
                         return l1_value
                     except TenantResolutionError:

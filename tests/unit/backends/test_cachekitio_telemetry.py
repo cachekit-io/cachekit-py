@@ -174,6 +174,40 @@ class TestWhatIsTimed:
         assert events == ["clock", "key", "clock"]
 
     @pytest.mark.parametrize("mode", ["sync", "async"])
+    def test_a_failing_record_still_serves_the_hit_from_l1(
+        self, mode: str, store: _Store, timed: _Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The record runs inside the hit's try, whose broad handler treats an error as a poisoned entry. A recorder
+        failure must not reach it: the hit keeps its value and its one outcome, with no GET, and the entry stays."""
+        backend, pool = _backend(store)
+
+        def fail(self: L1LatencyReport, start_ns: int, clock: object) -> None:
+            raise MemoryError
+
+        if mode == "sync":
+
+            @cache(backend=backend, ttl=60, namespace=_ns())
+            def f(x: int) -> int:
+                return x * 2
+
+            call = lambda: f(1)  # noqa: E731
+        else:
+
+            @cache(backend=backend, ttl=60, namespace=_ns())
+            async def g(x: int) -> int:
+                return x * 2
+
+            call = lambda: asyncio.run(g(1))  # noqa: E731
+
+        assert call() == 2  # miss: GET, PUT
+        sent = len(pool.requests)
+        monkeypatch.setattr(L1LatencyReport, "record", fail)
+        assert call() == 2  # L1 hit whose record fails
+        monkeypatch.undo()
+        assert call() == 2  # still an L1 hit: the entry was not invalidated
+        assert len(pool.requests) == sent  # neither hit reached the backend
+
+    @pytest.mark.parametrize("mode", ["sync", "async"])
     def test_api79_the_wait_for_the_reports_lock_is_in_the_duration(
         self, mode: str, store: _Store, monkeypatch: pytest.MonkeyPatch
     ) -> None:
