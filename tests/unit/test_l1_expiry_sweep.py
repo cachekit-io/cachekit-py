@@ -7,10 +7,15 @@ keeps every live deadline, and that each lock hold handles a bounded batch.
 
 from __future__ import annotations
 
+import ast
+import sys
+import threading
+
 import pytest
 
-from cachekit import l1_cache
+from cachekit import cache, l1_cache
 from cachekit.l1_cache import _INVALIDATE_BATCH, _SWEEP_BATCH, L1Cache
+from tests.utils.fork_helpers import fork_warns, run_fresh
 
 
 class _Clock:
@@ -223,3 +228,26 @@ def test_put_rebuilds_the_heap_where_no_sweep_runs(clock: _Clock) -> None:
     clock.now += 100 + 999
     assert l1.cleanup_expired() == 10  # every entry kept its latest deadline through the rebuilds
     assert not l1._state.cache
+
+
+def _fork_warns_after_a_minimal_miss() -> object:
+    """Run fresh: does os.fork() warn after one default @cache.minimal miss?"""
+
+    @cache.minimal(backend=None)
+    def fn(x: int) -> int:
+        return x
+
+    fn(1)
+    return {"threads": sorted(t.name for t in threading.enumerate()), "warned": fork_warns()}
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="os.fork() warns about threads from 3.12")
+def test_the_sweeper_makes_fork_warn_for_good() -> None:
+    """A process with an L1 cache runs the sweeper thread for good, so os.fork() warns there whatever else runs.
+    That is why write-behind's waiting threads need no before-fork hook (test_write_behind pins the L1-off case)."""
+    run = run_fresh(_fork_warns_after_a_minimal_miss)
+    assert run.returncode == 0, run.stderr
+    outcome = ast.literal_eval(run.stdout)
+    assert outcome["warned"] is True, outcome
+    assert any("cleanup_worker" in name for name in outcome["threads"]), outcome  # the sweeper's target

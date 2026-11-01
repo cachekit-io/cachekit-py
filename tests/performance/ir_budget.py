@@ -9,7 +9,7 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   is not counted either: about half of the real-data Arrow round trip runs on pyarrow's threads.
 - Interpreter startup is ~2 billion instructions. Each path runs at two loop sizes and the
   per-op cost is the difference, ``(Ir[N_HI] - Ir[N_LO]) / (N_HI - N_LO)``, so startup and
-  warmup cancel. The real-data paths run at smaller sizes (``LOOPS``).
+  warmup cancel. The real-data paths run at smaller sizes, and the cheapest paths at larger ones (``LOOPS``).
 - Code that observes its own wall-clock duration executes more instructions when it runs
   slower, so the measured process pins its main-thread clocks (``ir_workload.pin_main_thread_clocks``).
   Pinned clocks never let the metrics collector's 5 s mode check fire, so the collector stays
@@ -20,7 +20,8 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   cache is warmed first, and the heap layout is sampled (``ir_workload.run_workload``, ``measure``
   and ``LAYOUTS``).
 
-Two full runs agree within 0.08% per op (0.01% on 3.12), against a 1% fail threshold.
+Two full runs agree within 0.08% per op (0.01% on 3.12; byte_storage_store_40b within 0.22%), against a
+1% fail threshold.
 
 The measured process is ``ir_workload.py``. Its text is compiled into every measured run, so
 editing it moves the heap layout the budgets were recorded at; this gate is kept out of that
@@ -71,6 +72,13 @@ WARMUP = 50
 # 3000 would take hours under callgrind. Fewer ops still cancel startup: it is a few hundred
 # thousand Ir of run-to-run spread against a difference of over a billion.
 LOOPS = dict.fromkeys(("serializer_arrow_usgs", "serializer_auto_usgs"), (5, 10, 30))  # path: (warmup, n_lo, n_hi)
+# The cheapest paths run longer. Startup does not cancel exactly: importing pandas loads pyarrow's
+# jemalloc, which starts a background thread, and depending on how that thread is scheduled against
+# the main thread a run starts in one of two states, whose totals differ by up to about 1.2M Ir (with
+# the thread turned off, by under 5,000). Over 2,000 calls of a 2,600 Ir path that is up to 13% in one
+# layout, and such layouts moved byte_storage_store_40b's median by up to 8.4% in 8 of 80 gate runs.
+# Over 299,000 calls its figure held within 0.22% in 40 runs.
+LOOPS |= dict.fromkeys(("l1_hit", "minimal_l1_hit", "byte_storage_store_40b"), (WARMUP, N_LO, 300_000))
 # Heap layout moves per-op counts: the allocators take shorter or longer paths in some heap
 # states. Any code change shifts the layout, even an edit to ir_workload.py's comments, so a single
 # run can fail an untouched path or hide a real regression. Each path runs at these layout shifts
@@ -97,6 +105,7 @@ WORKLOAD = Path(__file__).with_name("ir_workload.py")  # the measured process
 PATHS = (
     "l1_hit",
     "l1_hit_backed",
+    "l1_hit_backed_auto",
     "minimal_l1_hit",
     "l2_hit",
     "miss",

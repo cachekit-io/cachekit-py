@@ -21,7 +21,7 @@ from cachekit import _fork
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
 if TYPE_CHECKING:
-    from cachekit.serializers.standard_serializer import VerifiedMsgpack
+    from cachekit.serializers.base import VerifiedPayload
 
 # Default L1 entry lifetime when the caller supplies no TTL. Shared with the
 # decorator's freshness backfill bound: the server's Fresh-For may only ever
@@ -55,12 +55,12 @@ class CacheEntry:
     """L1 cache entry with value, TTL, and size tracking.
 
     Storage: Stores bytes (encrypted or plaintext msgpack) for unified
-    encrypted-at-rest architecture, or the VerifiedMsgpack a hit swapped in for a
+    encrypted-at-rest architecture, or the VerifiedPayload a hit swapped in for a
     plaintext entry. Decryption/deserialization happens at read time in
     CacheHandler, not storage time.
     """
 
-    value: "bytes | VerifiedMsgpack"  # a VerifiedMsgpack once a hit swapped it in (shrink_if_held)
+    value: "bytes | VerifiedPayload"  # a VerifiedPayload once a hit swapped it in (shrink_if_held)
     expires_at: float
     size_bytes: int
     # This entry's tuple in its state's expiry heap. A tuple is live only while it is this very object,
@@ -161,7 +161,7 @@ class L1Cache:
     - LRU eviction when memory limit reached
     - In-process lookups, with no network round trip
     - Background TTL synchronization
-    - Stores bytes (encrypted or plaintext msgpack), or the VerifiedMsgpack a hit swapped in, not Python objects
+    - Stores bytes (encrypted or plaintext msgpack), or the VerifiedPayload a hit swapped in, not Python objects
 
     Storage Architecture:
     - Stores serialized bytes for unified encrypted-at-rest
@@ -211,21 +211,21 @@ class L1Cache:
             ttl_buffer_seconds,
         )
 
-    def _estimate_size(self, value: "bytes | VerifiedMsgpack") -> int:
+    def _estimate_size(self, value: "bytes | VerifiedPayload") -> int:
         """Estimate memory size of an entry's value.
 
         Simplified from recursive sys.getsizeof() - faster and more accurate
-        for bytes storage. A VerifiedMsgpack's length is that of the bytes it holds.
+        for bytes storage. A VerifiedPayload's length is that of the bytes it holds.
 
         Args:
-            value: Bytes, or a VerifiedMsgpack, to estimate size for
+            value: Bytes, or a VerifiedPayload, to estimate size for
 
         Returns:
             Size in bytes
         """
         return len(value)
 
-    def get(self, key: str) -> "tuple[bool, Optional[bytes | VerifiedMsgpack]]":
+    def get(self, key: str) -> "tuple[bool, Optional[bytes | VerifiedPayload]]":
         """Get value from L1 cache if present and not expired.
 
         Args:
@@ -233,7 +233,7 @@ class L1Cache:
 
         Returns:
             Tuple of (found, value) where found is True if hit.
-            Value is bytes (encrypted or plaintext msgpack), or the VerifiedMsgpack a hit swapped in
+            Value is bytes (encrypted or plaintext msgpack), or the VerifiedPayload a hit swapped in
             (shrink_if_held), not deserialized object.
             Caller (CacheHandler) is responsible for decryption/deserialization.
         """
@@ -259,8 +259,8 @@ class L1Cache:
 
             return True, entry.value
 
-    def peek(self, key: str) -> "Optional[bytes | VerifiedMsgpack]":
-        """The value ``get`` would return (bytes, or the VerifiedMsgpack a hit swapped in), without counting a hit or miss or moving the entry in LRU order.
+    def peek(self, key: str) -> "Optional[bytes | VerifiedPayload]":
+        """The value ``get`` would return (bytes, or the VerifiedPayload a hit swapped in), without counting a hit or miss or moving the entry in LRU order.
 
         For a second lookup within one call, such as the single-flight re-check after a miss, which
         the call's first lookup already counted. An expired entry reads as absent and is left for
@@ -276,7 +276,7 @@ class L1Cache:
             entry = s.cache.get(key)
             return None if entry is None or entry.is_expired() else entry.value
 
-    def shrink_if_held(self, key: str, held: "bytes | VerifiedMsgpack", smaller: "VerifiedMsgpack") -> bool:
+    def shrink_if_held(self, key: str, held: "bytes | VerifiedPayload", smaller: "VerifiedPayload") -> bool:
         """Hold ``smaller`` in place of ``held``, the very object a read of ``key`` returned, if the entry still
         holds it and ``smaller`` is no longer. The entry keeps its expiry and LRU place. Returns whether it did.
 
