@@ -305,11 +305,11 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 2,596 | 2,482 |
-| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit) | 89,226 | 90,146 |
+| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit) | 83,015 | 83,882 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,596 | 2,488 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 172,539 | 167,686 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 140,428 | 141,391 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 134,323 | 134,972 |
 | `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 171,976 | 167,728 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 58,733 | 59,574 |
 | `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,420,388 | 1,424,292 |
