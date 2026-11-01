@@ -71,9 +71,9 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "cachekit-core"
-version = "0.7.2"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "101672176881ef05b17e8399476eb6fc2082e6a5c33788c84c9bb4d1a8d512d7"
+checksum = "d9217fe47d4024d7b0d1dda460bbcfc0f613bd80fb94c4fbbc4e7e6d829d7342"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -321,9 +321,9 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
-version = "0.12.2"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90071f8077f8e40adfc4b7fe9cd495ce316263f19e75c2211eeff3fdf475a3d9"
+checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 
 [[package]]
 name = "num-traits"
