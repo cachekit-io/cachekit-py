@@ -37,6 +37,9 @@ const VALUE_CACHE_MAX_LEN: usize = 32;
 const CACHE_BITS: u32 = 8;
 const CACHE_SLOTS: usize = 1 << CACHE_BITS;
 
+/// Lists at most this long (512 bytes of slots) are made by PyO3's plain constructor (`nones`).
+const SHORT_LIST: u64 = 64;
+
 /// A Python error is set (`restore` put it there, `PyErr::fetch` takes it), or the input broke a
 /// bound. A unit enum, so a decode step's result stays two words.
 enum Fail {
@@ -385,10 +388,18 @@ impl<'a, 'py> Decoder<'a, 'py> {
         Ok(None)
     }
 
-    /// A list of `n` `None`s, which the decode replaces in order: `[None] * n`, which raises
-    /// MemoryError where PyO3's list constructors would abort. `n` is at most the input length.
+    /// A list of `n` `None`s, which the decode replaces in order. `n` is at most the input length,
+    /// so a long list is made as `[None] * n`, which raises MemoryError where PyO3's list
+    /// constructors would abort. A short one, no bigger than an int, comes from PyO3's: the
+    /// repeat costs most small documents about 1% of their decode.
     fn nones(&mut self, n: u64) -> PyResult<Bound<'py, PyList>> {
         let py = self.py;
+        if n <= SHORT_LIST {
+            return PyList::new(
+                py,
+                std::iter::repeat_n(py.None().into_bound(py), n as usize),
+            );
+        }
         let seed = match self.seed.take() {
             Some(seed) => seed,
             None => PyList::new(py, [py.None()])?.into_sequence(),
