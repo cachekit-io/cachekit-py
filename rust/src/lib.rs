@@ -30,6 +30,9 @@ pub mod hit_counter;
 #[cfg(feature = "python")]
 pub mod l1_hit;
 
+// The Memcached backend's node choice, byte-identical to pymemcache's (backends/memcached/hasher.py).
+pub mod rendezvous;
+
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
@@ -67,6 +70,9 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MEMO_MAX_LEN", l1_hit::MEMO_MAX_LEN)?;
     m.add("MEMO_MAX_ARGS", l1_hit::MEMO_MAX_ARGS)?;
     m.add("MEMO_MAX_ENTRIES", l1_hit::MEMO_MAX_ENTRIES)?;
+
+    // The Memcached backend's rendezvous node choice (backends/memcached/hasher.py)
+    m.add_function(wrap_pyfunction!(rendezvous::rendezvous_node, m)?)?;
 
     // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the

@@ -45,7 +45,7 @@ def custom_function():
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
 - **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, backpressure, monitoring)
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
-- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, integrity checking on
+- **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, integrity checking on, Prometheus cache-operation series off ([series that ignore `MonitoringConfig`](features/prometheus-metrics.md#series-that-ignore-monitoringconfig) still record)
 - **`@cache.test`** - SDK-local, Python-only testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
 - **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
 - **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
@@ -113,9 +113,9 @@ def your_function(args):
 #### Monitoring Parameters
 
 - **`monitoring`** (`MonitoringConfig`, default: `MonitoringConfig()`) - Observability configuration:
-  - `collect_stats` (`bool`, default: `True`) - Record the Prometheus cache-operation series ([which decorators](features/prometheus-metrics.md#which-decorators-record)). `cache_info()` counts either way
+  - `collect_stats` (`bool`, default: `True`) - Record the Prometheus cache-operation series ([which decorators](features/prometheus-metrics.md#which-decorators-record)). `False` stops them; `cache_info()` counts either way
   - `enable_structured_logging` (`bool`, default: `True`) - Log cache operations at INFO, with their fields on each record ([Structured Logging](#structured-logging))
-  - `enable_prometheus_metrics` (`bool`, default: `True`) - Not read at runtime: `False` stops no series. Use `collect_stats`
+  - `enable_prometheus_metrics` (`bool`, default: `True`) - Record the Prometheus cache-operation series. `False` stops them, as `collect_stats=False` does; `cache_info()` counts either way. [Some series](features/prometheus-metrics.md#series-that-ignore-monitoringconfig) ignore both flags
 
 #### Encryption Parameters
 
@@ -147,7 +147,7 @@ def analyze_dataset(dataset_id, filters=None):
 def critical_business_function():
     return important_computation()
 
-@cache.dev  # Development: verbose logging, integrity checks on
+@cache.dev  # Development: verbose logging, no cache-operation Prometheus series
 def debug_function():
     return process_data()
 

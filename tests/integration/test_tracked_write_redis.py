@@ -72,7 +72,9 @@ def _tracked(client: redis.Redis) -> set[bytes]:
 
 
 def _cache_keys(client: redis.Redis) -> set[bytes]:
-    return {k[len(b"t:default:") :] for k in client.keys("t:default:*") if b":ck:reg:" not in k}
+    # An async miss's fill lock is released in the background, so its :lock key can outlive the call briefly.
+    keys = client.keys("t:default:*")
+    return {k[len(b"t:default:") :] for k in keys if b":ck:reg:" not in k and not k.endswith(b":lock")}
 
 
 def _drain_writers(created: list[wb.WriteBehind]) -> None:
@@ -269,7 +271,8 @@ class TestDelegationWritesWhereItReads:
         await fn(1)
         await fn(1)
         assert calls == 1
-        assert client.keys("t:source:*") == []
+        # The fill lock is the facade's own (not delegated) and is released in the background: its key may linger.
+        assert [k for k in client.keys("t:source:*") if not k.endswith(b":lock")] == []
 
 
 class TestFuseDecision:

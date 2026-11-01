@@ -210,18 +210,19 @@ the backend failing the release leaves the lock, until the same 30 s timeout as
 the crash case above. One limit on `CachekitIOBackend`: its lock requests are drained
 as asyncio Tasks, and `asyncio.run()` teardown cancels every Task, so a request
 cut short there falls back on that same server-side timeout. The decorator's own
-release is the exception (see below): it is sent from a worker thread, which
+release, on either backend, is the exception (see below): it is sent from a worker thread, which
 `asyncio.run()` waits for, so it lands even when the decorated call is the last
 thing the process does, and even if `close_http_clients()` runs straight after. On CPython 3.11.0 only, a loop closed by hand
 (`loop.close()`, not `asyncio.run()`) before that release finishes logs one
 `concurrent.futures` "Event loop is closed" error; the release still lands.
 
-### Request Count on CachekitIO
+### Round Trips on an Async Miss
 
-On `CachekitIOBackend`, an uncontended async miss makes three requests the caller
-waits on: the read, the lock `POST`, and the write. With `distributed_lock=False`
-it makes two, the read and the write, and sends no lock request at all. With the
-lock on, two steps are trimmed:
+On `CachekitIOBackend` and the tenant-scoped Redis backend, an uncontended async
+miss makes three round trips the caller waits on: the read, the lock (`POST …/lock`,
+or `SET NX` on Redis), and the write. With `distributed_lock=False` it makes two,
+the read and the write, and takes no lock at all. With the lock on, two steps are
+trimmed:
 
 - **No re-read when nobody else held the lock.** The post-lock re-read only
   runs when the lock was granted after a wait, or when the first read failed
@@ -230,14 +231,18 @@ lock on, two steps are trimmed:
   holder, so the re-read would almost always miss again and be billed as a miss.
   A fill that completes between the read and the lock request is not seen: the
   value is recomputed and written again, and the last write wins.
-- **The release does not block the return.** The `DELETE …/lock` is sent in the
-  background once the value is stored, as cachekit-ts does. Waiters in other
-  processes see the lock released just as before. If the event loop's default
-  executor has already been shut down, the release is sent inline on the event
-  loop's thread instead, one blocking round trip, so the lock is still released.
+- **The release does not block the return.** The release (`DELETE …/lock`, or
+  the release script's `EVALSHA` on Redis) is sent in the background once the
+  value is stored, as cachekit-ts does. Waiters in other processes see the lock
+  released one round trip after the call returns, so a reader that inspects the
+  backend straight after the call can still find the lock key. If the event
+  loop's default executor has already been shut down, the release is sent inline
+  on the event loop's thread instead, one blocking round trip, so the lock is
+  still released.
 
-The Redis backend keeps both steps: its release is one Redis round trip once the
-release script is cached on the server.
+A contended grant, or a lock taken after a failed first read, still re-reads before
+computing. `acquire_lock` itself, called directly, is unchanged on both backends:
+its release completes before the `async with` exits.
 
 ### TTL Shorter Than Compute Time
 ```python
@@ -318,8 +323,9 @@ What changes on an async miss:
 | | `distributed_lock=True` (default) | `distributed_lock=False` |
 |---|---|---|
 | Lock requests (CachekitIO) | Uncontended: one `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
+| Lock round trips (tenant-scoped Redis) | Uncontended: one `SET NX` the caller waits on, one release `EVALSHA` in the background | None |
 | Concurrent misses on one event loop | One call ([single-flight](#in-process-single-flight-before-the-lock)) | Single-flight is unchanged: within a process, only callers on the event loop running the key's call share it. While it runs, every caller on another thread's loop runs its own call (ten such callers, ten calls) |
-| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CachekitIO, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#request-count-on-cachekitio)) | At least one call per process that misses, each computing and writing |
+| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CachekitIO and Redis, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#round-trips-on-an-async-miss)) | At least one call per process that misses, each computing and writing |
 | [Write-behind](write-behind.md) | Not applied on the lock path: the L2 write stays synchronous, including after a timed-out lock wait. Write-behind can defer it only when the miss falls through to the unlocked path: a backend error while acquiring the lock, or a backend that cannot lock | Applied when on: the L2 write leaves the caller's path |
 
 The trade-off is cross-process stampede protection. Turn it off when the function is cheap or idempotent and a

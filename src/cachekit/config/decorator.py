@@ -549,10 +549,12 @@ class DecoratorConfig:
 
     @classmethod
     def dev(cls, **kwargs: Any) -> DecoratorConfig:
-        """Development profile: Verbose logging, easy debugging, no Prometheus except circuit_breaker_state, integrity checking ON.
+        """Development profile: Verbose logging, easy debugging, no cache-operation Prometheus series, integrity checking ON.
 
         Use cases: Local development, debugging production issues
-        Trade-offs: Verbose logs, Prometheus metrics disabled for simplicity except circuit_breaker_state
+        Trade-offs: Verbose logs; records none of the three cache-operation Prometheus series
+            (enable_prometheus_metrics=False). The series that ignore MonitoringConfig, such as
+            circuit_breaker_state, still record.
 
         Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority", at
               first call; with nothing configured, L1-only.

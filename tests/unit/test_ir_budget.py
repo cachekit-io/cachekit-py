@@ -446,6 +446,51 @@ def test_batched_metrics_path_records_every_call_per_thread_and_queues_none(monk
     assert direct == {}
 
 
+def test_backed_l1_hit_path_is_a_plaintext_l1_hit_on_held_msgpack(monkeypatch) -> None:
+    """``l1_hit_backed`` budgets an L1 hit with a backend: after warmup, every call finds its key in L1, holding
+    the verified MessagePack, so it never reaches L2."""
+    pytest.importorskip("pandas")  # the workload builder makes the Arrow path's DataFrame too
+    import cachekit
+    from cachekit.l1_cache import L1Cache
+    from cachekit.serializers.standard_serializer import VerifiedMsgpack
+
+    entries: list[object] = []
+    real_get = L1Cache.get
+
+    def tracking_get(self, key):
+        found, entry = real_get(self, key)
+        entries.append(entry if found else None)
+        return found, entry
+
+    # build_workload imports cache at call time, so this wrapper sees the backend the path is built with.
+    backend_reads: list[str] = []
+    real_cache = cachekit.cache
+
+    def counting_cache(*args, backend, **kwargs):
+        real_backend_get = backend.get
+
+        def counting_get(key):
+            backend_reads.append(key)
+            return real_backend_get(key)
+
+        backend.get = counting_get
+        return real_cache(*args, backend=backend, **kwargs)
+
+    monkeypatch.setattr(L1Cache, "get", tracking_get)
+    monkeypatch.setattr(cachekit, "cache", counting_cache)
+    op = ir_workload.build_workload("l1_hit_backed")
+    for _ in range(3):  # warmup: the miss stores the envelope, the first hit swaps in the MessagePack
+        op()
+    assert backend_reads, "the warmup miss reads the backend, so the count reaches it"
+    entries.clear()
+    backend_reads.clear()
+    for _ in range(20):
+        assert op() == {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
+    assert len(entries) == 20
+    assert all(type(entry) is VerifiedMsgpack for entry in entries)
+    assert backend_reads == []
+
+
 def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> None:
     for name in ("time", "monotonic", "perf_counter"):
         monkeypatch.setattr(time, name, getattr(time, name))
