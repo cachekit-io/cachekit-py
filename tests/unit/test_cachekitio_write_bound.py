@@ -600,15 +600,28 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Striped(object()))  # nothing to find, but too wide to be sure
 
     def test_each_attribute_value_is_charged_once(self) -> None:
-        """A backend whose attributes fit the budget when each value is charged once answers a clean False:
-        charging a value both when read and when walked spends the budget and opens the list on every write."""
+        """A backend whose attributes or set slots fit the budget when each value is charged once answers a
+        clean False: charging a value both when read and when walked spends the budget and opens the list on
+        every write."""
 
         class _Wide:
             def __init__(self) -> None:
                 for i in range(_REACH_READS * 3 // 4):
                     setattr(self, f"a{i}", i)
 
+        class _Slotted:
+            __slots__ = tuple(f"s{i}" for i in range(50))
+
+            def __init__(self) -> None:
+                for i, name in enumerate(self.__slots__):
+                    setattr(self, name, i)
+
+        class _Pool:
+            def __init__(self) -> None:
+                self.entries = [_Slotted() for _ in range(_REACH_READS * 5 // 8 // 50)]
+
         assert _reaches_write_deadlines(_Wide()) is False
+        assert _reaches_write_deadlines(_Pool()) is False
 
     def test_unset_slots_spend_the_budget(self) -> None:
         """Reading an unset slot is still a read: many instances with many unset slots spend the budget and

@@ -403,7 +403,7 @@ def _fuses_tracked_write(backend: object) -> bool:
 _unreported_write_classes: set[type] = set()
 # Three wrapper levels covers a metrics wrapper around a router around a backend; deeper nesting is rare.
 _REACH_DEPTH = 3
-# Values read at most (attribute values, slot reads, container items and the type entries scanned to find them) before
+# Values read at most (attribute values, unset slots, container items and the type entries scanned to find them) before
 # the search gives up and answers True. The answer is cached per handler, so a large object graph costs the
 # deadline list, never a missed bound.
 _REACH_READS = 4096
@@ -464,9 +464,12 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
         spent = scan[4]
     _, members, instance_dict, flag, _ = scan
     values: list[object] = []
+    unset = 0
     for descriptor in members if want_values else ():
-        with contextlib.suppress(AttributeError):  # an unset slot
+        try:
             values.append(descriptor.__get__(obj, kind))
+        except AttributeError:  # an unset slot: a read the caller never walks, so it is charged here
+            unset += 1
     if type(instance_dict) is types.GetSetDescriptorType:
         held = instance_dict.__get__(obj, kind)  # type: ignore[attr-defined]
         if type(held) is dict:
@@ -474,8 +477,7 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
                 flag = held["_reports_write_deadline"]
             if want_values:
                 values += dict.values(held)
-    # Every slot read counts, an unset one too; the caller charges each value it walks, so values are not charged here.
-    return flag is True, values, spent + (len(members) if want_values else 0)
+    return flag is True, values, spent + unset  # the caller charges each value it walks
 
 
 def _reaches_write_deadlines(backend: object) -> bool:
