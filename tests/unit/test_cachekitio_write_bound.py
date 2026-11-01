@@ -567,7 +567,7 @@ class TestWriteBound:
     def test_a_search_that_raises_opens_the_list(self, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         """Opening the list is always safe, so a search that fails answers True."""
 
-        def broken(obj: object, types_read: object) -> tuple[bool, list[object], int]:
+        def broken(obj: object, types_read: object, want_values: bool) -> tuple[bool, list[object], int]:
             raise RuntimeError("unexpected")
 
         monkeypatch.setattr(cache_handler_module, "_read_object", broken)
