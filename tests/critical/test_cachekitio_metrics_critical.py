@@ -11,9 +11,11 @@ Performance target: < 1 second total.
 from __future__ import annotations
 
 import pytest
+from urllib3 import HTTPResponse
 
+from cachekit import cache
 from cachekit.backends.cachekitio.backend import CachekitIOBackend, _inject_metrics_headers
-from tests.utils.cachekitio_fakes import FakePool, fake_backend, response
+from tests.utils.cachekitio_fakes import FakePool, FakeRequest, fake_backend, response
 
 _TEST_API_KEY = "ck_test_critical_metrics"
 
@@ -93,3 +95,71 @@ class TestAsyncRequestHeaderInjection:
         headers = pool.requests[0].headers
         assert "X-CacheKit-TTL" in headers
         assert "X-CacheKit-L1-Status" in headers
+
+
+def _miss_backend() -> tuple[CachekitIOBackend, FakePool]:
+    """Every read misses; every lock and write succeeds."""
+
+    def respond(request: FakeRequest) -> HTTPResponse:
+        if request.method == "GET":
+            return response(404)
+        if request.path.endswith("/lock"):
+            return response(200, json={"lock_id": "lock-1"})
+        return response(200, json={"success": True})
+
+    return fake_backend(respond, api_key=_TEST_API_KEY)
+
+
+def _reads(pool: FakePool) -> list[FakeRequest]:
+    return [request for request in pool.requests if request.method == "GET"]
+
+
+def _assert_reads_carry_function_stats(
+    first_miss: list[FakeRequest], hit: list[FakeRequest], second_miss: list[FakeRequest]
+) -> None:
+    assert first_miss
+    assert not hit  # the L1 hit sent nothing
+    assert second_miss
+    for request in first_miss:
+        assert request.headers["X-CacheKit-L1-Status"] == "miss"  # "disabled" is the standalone default
+        assert request.headers["X-CacheKit-L1-Hits"] == "0"
+    for request in second_miss:
+        assert request.headers["X-CacheKit-L1-Hits"] == "1"  # the hit in between, on this function's stats
+
+
+@pytest.mark.critical
+class TestDecoratedRequestCarriesFunctionStats:
+    """A @cache call's L2 reads carry the decorated function's stats, not the standalone default.
+
+    The wrapper sets the stats context only past the backed L1 hit, which makes no request. A miss, a hit and
+    a second miss pin both sides: each miss's reads carry this function's stats, and the hit sends nothing.
+    """
+
+    def test_sync_miss_hit_miss(self) -> None:
+        backend, pool = _miss_backend()
+
+        @cache(backend=backend, ttl=60)
+        def double(x: int) -> int:
+            return x * 2
+
+        calls = []
+        for x in (1, 1, 2):
+            before = len(_reads(pool))
+            assert double(x) == x * 2
+            calls.append(_reads(pool)[before:])
+        _assert_reads_carry_function_stats(*calls)
+
+    @pytest.mark.asyncio
+    async def test_async_miss_hit_miss(self) -> None:
+        backend, pool = _miss_backend()
+
+        @cache(backend=backend, ttl=60)
+        async def double(x: int) -> int:
+            return x * 2
+
+        calls = []
+        for x in (1, 1, 2):
+            before = len(_reads(pool))
+            assert await double(x) == x * 2
+            calls.append(_reads(pool)[before:])
+        _assert_reads_carry_function_stats(*calls)
