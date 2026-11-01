@@ -806,3 +806,77 @@ def test_the_walk_finds_the_password_on_an_interrupt_through_redis_py(
         exc = _raised(lambda: redis.Redis.from_url(url.get_secret_value()).get("k"), KeyboardInterrupt)
 
     assert _cachekit_locals_holding(exc, password, below_caller=True) != []
+
+
+@contextmanager
+def _interrupting_reconnects(interrupt: type[BaseException]) -> Iterator[threading.Event]:
+    """Once the yielded event is set, redis-py raises ``interrupt`` as it sends a new connection's AUTH or HELLO, the
+    commands that carry the password, as a ``gevent.Timeout`` raised in the worker would."""
+    armed = threading.Event()
+    send = redis.connection.AbstractConnection.send_command
+
+    def interrupted(self: object, *args: object, **kwargs: object) -> None:
+        if armed.is_set() and args and str(args[0]).upper() in ("AUTH", "HELLO"):
+            raise interrupt
+        send(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redis.connection.AbstractConnection, "send_command", interrupted)
+        yield armed
+
+
+@pytest.mark.parametrize("interrupt", _INTERRUPTS)
+def test_an_interrupt_in_the_fill_locks_background_release_reaches_no_report(
+    fake_redis: Callable[..., _FakeRedis], password: str, interrupt: type[BaseException], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing awaits the fill lock's release, so an interrupt raised as it re-authenticates must not be left on its
+    future: asyncio would report it, traceback and redis-py's ``auth_args`` whole, as "exception was never retrieved"."""
+    client = redis.Redis.from_url(_url(fake_redis(refusing=False, serving={b"SET": b"+OK\r\n"}), password).get_secret_value())
+    backend = PerRequestRedisBackend(client, "t")
+    reports: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reports.append(context))
+        with _interrupting_reconnects(interrupt) as armed:
+            async with backend.acquire_fill_lock("k", timeout=5) as (acquired, _):
+                assert acquired
+                client.connection_pool.disconnect()  # so the release reconnects and authenticates
+                armed.set()
+            await loop.shutdown_default_executor()  # the background release has run
+        gc.collect()
+        await asyncio.sleep(0)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger=provider_module.__name__):
+            asyncio.run(run())
+    finally:
+        client.close()
+    assert reports == []
+    assert f"Redis lock release for {redact_cache_key('k')} failed" in caplog.text
+    assert password not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("interrupt", _INTERRUPTS)
+def test_an_interrupt_in_the_fill_locks_inline_release_reaches_no_frame_holding_the_password(
+    fake_redis: Callable[..., _FakeRedis], password: str, interrupt: type[BaseException]
+) -> None:
+    """With the default executor shut down the release runs inline on the loop's thread, where an interrupt propagates
+    as itself, its frames cleared as on every other operation."""
+    client = redis.Redis.from_url(_url(fake_redis(refusing=False, serving={b"SET": b"+OK\r\n"}), password).get_secret_value())
+    backend = PerRequestRedisBackend(client, "t")
+
+    async def run() -> None:
+        with _interrupting_reconnects(interrupt) as armed:
+            async with backend.acquire_fill_lock("k", timeout=5) as (acquired, _):
+                assert acquired
+                await asyncio.get_running_loop().shutdown_default_executor()
+                client.connection_pool.disconnect()
+                armed.set()
+
+    try:
+        exc = _raised(lambda: asyncio.run(run()), interrupt)
+    finally:
+        client.close()
+    _assert_cleared(exc, interrupt, password, through=exc)
