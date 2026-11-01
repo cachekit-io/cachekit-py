@@ -9,6 +9,7 @@ import doctest
 import importlib.metadata
 import json
 import re
+import site
 import subprocess
 import sys
 from collections.abc import Callable
@@ -181,14 +182,40 @@ def test_refuses_an_editable_source_outside_its_checkout(monkeypatch: pytest.Mon
         terrain_canary.cachekit_label()
 
 
-def test_reads_an_editable_installs_source_directories_as_site_does(tmp_path: Path) -> None:
-    site = tmp_path / "site-packages"
-    site.mkdir()
-    (site / "cachekit.pth").write_text("# a comment\nimport sys\n\n  /src/cachekit-py/src  \n../relative\n")
-    installed = Installed(EDITABLE, ("cachekit.pth", "cachekit-0.25.1.dist-info/RECORD"), site)
-    # Comments, blank lines and `import` lines name no directory; a relative line names one beside the .pth.
-    expected = {Path("/src/cachekit-py/src").resolve(), (tmp_path / "relative").resolve()}
-    assert terrain_canary.editable_sources(cast("importlib.metadata.Distribution", installed)) == expected
+def test_reads_pth_lines_as_site_does(tmp_path: Path) -> None:
+    # Differential against the real site.addpackage. Every directory any reading of a line could name
+    # exists, so only the line grammar decides what each adds.
+    sitedir = tmp_path / "site-packages"
+    lines = [
+        "# a comment",
+        "import sys",
+        "   ",
+        f"{tmp_path}/src  ",  # trailing whitespace is stripped
+        f"  {tmp_path}/alternate",  # leading whitespace stays: a path under site-packages
+        "relative",
+        "  # indented, so a path",
+        "  import os",  # indented, so a path
+    ]
+    for named in (
+        tmp_path / "src",
+        tmp_path / "alternate",
+        sitedir / "relative",
+        Path(f"{sitedir}/  {tmp_path}/alternate"),
+        Path(f"{sitedir}/  # indented, so a path"),
+        Path(f"{sitedir}/  import os"),
+    ):
+        named.mkdir(parents=True, exist_ok=True)
+    (sitedir / "cachekit.pth").write_text("\n".join(lines) + "\n")
+    before = list(sys.path)
+    try:
+        site.addpackage(str(sitedir), "cachekit.pth", set())
+        added = {Path(p).resolve() for p in sys.path if p not in before}
+    finally:
+        sys.path[:] = before
+    installed = Installed(EDITABLE, ("cachekit.pth", "cachekit-0.25.1.dist-info/RECORD"), sitedir)
+    assert terrain_canary.editable_sources(cast("importlib.metadata.Distribution", installed)) == added
+    assert (tmp_path / "alternate").resolve() not in added
+    assert len(added) == 5
 
 
 def test_refuses_a_package_that_shadows_the_install(tmp_path: Path) -> None:

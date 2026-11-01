@@ -243,7 +243,13 @@ def cpu_model() -> str:
 
 
 def editable_sources(installed: importlib.metadata.Distribution) -> set[Path]:
-    """The directories an editable install's ``.pth`` files put on ``sys.path``, read as ``site`` reads them.
+    """The directories an editable install's ``.pth`` files name, by the line grammar ``site`` uses.
+
+    ``site.addpackage`` skips a line that starts with ``#`` or is blank, runs one that starts with
+    ``import`` and a space or tab, and joins any other to the ``.pth`` file's directory after
+    stripping only its trailing whitespace. Leading whitespace stays, so ``"  /src"`` names a path
+    under site-packages, not ``/src``. A file that cannot be read or decoded names nothing, so the
+    check fails closed.
 
     >>> editable_sources(importlib.metadata.PathDistribution(Path("/nowhere")))
     set()
@@ -255,12 +261,13 @@ def editable_sources(installed: importlib.metadata.Distribution) -> set[Path]:
         pth = Path(installed.locate_file(recorded))
         try:
             lines = pth.read_text().splitlines()
-        except OSError:
-            continue  # listed but unreadable: it puts nothing on sys.path
-        # Blank lines and comments do nothing, and a line starting with `import` runs instead of naming a
-        # directory; any other line names one, relative to the .pth file's own directory.
-        names = (line.strip() for line in lines)
-        sources |= {(pth.parent / n).resolve() for n in names if n and not n.startswith(("#", "import ", "import\t"))}
+        except (OSError, ValueError):
+            continue  # unreadable or undecodable: it names nothing here
+        sources |= {
+            (pth.parent / line.rstrip()).resolve()
+            for line in lines
+            if line.strip() and not line.startswith(("#", "import ", "import\t"))
+        }
     return sources
 
 
