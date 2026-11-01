@@ -2,7 +2,7 @@
   "interpreters": {
     "cpython-3.12-x86_64": {
       "budgets": {
-        "byte_storage_store_40b": 2658,
+        "byte_storage_store_40b": 2688,
         "byte_storage_store_64k": 720631,
         "file_set": 76035,
         "l1_hit": 2596,
@@ -15,18 +15,18 @@
         "secure_l1_hit": 140428,
         "serializer_arrow": 1969626,
         "serializer_arrow_usgs": 61781406,
-        "serializer_auto": 65942,
+        "serializer_auto": 64722,
         "serializer_auto_usgs": 61793577,
-        "serializer_default": 58733,
+        "serializer_default": 57744,
         "serializer_default_records": 1420388,
-        "serializer_encrypted": 100097,
+        "serializer_encrypted": 99162,
         "serializer_orjson": 22135
       },
       "python": "3.12.12"
     },
     "cpython-3.14-x86_64": {
       "budgets": {
-        "byte_storage_store_40b": 2540,
+        "byte_storage_store_40b": 2558,
         "byte_storage_store_64k": 720751,
         "file_set": 74112,
         "l1_hit": 2482,
@@ -39,11 +39,11 @@
         "secure_l1_hit": 141391,
         "serializer_arrow": 1980777,
         "serializer_arrow_usgs": 61324948,
-        "serializer_auto": 66628,
+        "serializer_auto": 65653,
         "serializer_auto_usgs": 61344459,
-        "serializer_default": 59574,
+        "serializer_default": 58608,
         "serializer_default_records": 1424292,
-        "serializer_encrypted": 101938,
+        "serializer_encrypted": 100937,
         "serializer_orjson": 22825
       },
       "python": "3.14.3"
