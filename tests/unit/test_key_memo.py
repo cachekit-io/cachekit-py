@@ -482,7 +482,8 @@ class TestL1OnlyFastPath:
             fn(i)
         assert 0 < len(_memo(fn)) <= MEMO_MAX_ENTRIES
 
-    def test_a_miss_still_runs_inside_the_stats_context(self) -> None:
+    def test_a_miss_runs_outside_the_stats_context(self) -> None:
+        """Only a backed request reads the stats context, so an L1-only miss runs the function without one."""
         seen: list[Any] = []
 
         @cache(backend=None, encryption=False)
@@ -495,7 +496,7 @@ class TestL1OnlyFastPath:
         fn.invalidate_cache(1)
         fn(1)
         assert len(seen) == 2
-        assert all(stats is not None for stats in seen)
+        assert all(stats is None for stats in seen)
 
     def test_metaclass_arguments_run_uncached_as_before(self) -> None:
         calls = 0
@@ -660,10 +661,8 @@ class TestL1OnlyFastPath:
         assert calls == 3
 
     @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-    def test_a_memoised_hit_returns_before_the_stats_context_is_set(
-        self, is_async: bool, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Only _sync_call and _async_call set the stats context, so only the miss may reach one."""
+    def test_no_l1_only_call_sets_the_stats_context(self, is_async: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_sync_call and _async_call set the stats context only past the backed L1 hit, so an L1-only call never does."""
         sets = 0
         set_stats = wrapper_module.set_current_function_stats
 
@@ -678,4 +677,4 @@ class TestL1OnlyFastPath:
         for _ in range(5):
             assert call(3) == 3
         info = fn.cache_info()
-        assert (sets, info.l1_hits, info.misses) == (1, 4, 1)
+        assert (sets, info.l1_hits, info.misses) == (0, 4, 1)

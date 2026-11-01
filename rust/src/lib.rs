@@ -4,9 +4,10 @@
 //! Business logic lives in cachekit-core, including the untrusted msgpack decode bound
 //! (`cachekit_core::check_msgpack_structure`).
 //!
-//! The crate is safe Rust: unsafe code belongs in cachekit-core, whose CI verifies it, so a build
+//! Unsafe code belongs in cachekit-core, whose CI verifies it, so the crate denies it: a build
 //! rejects any here rather than leaving it to the post-merge cargo-geiger count (SECURITY.md).
-#![forbid(unsafe_code)]
+//! `msgpack_decode` is the one module exempt; it calls the CPython C API directly.
+#![deny(unsafe_code)]
 
 // Re-export core types for use in Python bindings
 pub use cachekit_core::{ByteStorage, StorageEnvelope};
@@ -21,6 +22,11 @@ pub use cachekit_core::{
 // Python bindings (gated behind python feature)
 #[cfg(feature = "python")]
 pub mod python_bindings;
+
+// StandardSerializer's one-pass bounded MessagePack decode
+#[cfg(feature = "python")]
+#[allow(unsafe_code)]
+pub mod msgpack_decode;
 
 // The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's
 // own tests run in the pure-Rust test build too.
@@ -92,6 +98,8 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_bindings::check_msgpack_structure_py,
         m
     )?)?;
+    // StandardSerializer's read decode: the walk above and msgpack.unpackb in one pass
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_standard_py, m)?)?;
     // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
     m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 

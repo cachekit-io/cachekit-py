@@ -230,7 +230,12 @@ set exactly one.
 | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
 | none of the above: `REDIS_URL` | Redis, as above |
-| nothing set at all | plaintext, non-interop decorators: [L1-only](#4-nothing-configured-l1-only), no backend; secure, `encryption=True` and `interop=` decorators: Redis at `redis://localhost:6379` |
+| nothing set at all | plaintext, non-interop decorators: [L1-only](#4-nothing-configured-l1-only), no backend; secure and `encryption=True` decorators: Redis at `redis://localhost:6379`, tenant-scoped as above; `interop=` decorators: the same Redis, which interop refuses (see below) |
+
+`interop=` cannot use any Redis row of this table: each one is the tenant-scoped wrapper, whose
+`t:{tenant}:` prefix no other SDK writes, so the first call raises `ConfigurationError`. Pass
+`backend=RedisBackend()` instead ([Interop Mode](../features/interop-mode.md)). A
+`CachekitIOBackend` from `CACHEKIT_API_KEY` prefixes nothing and serves interop as resolved.
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
@@ -377,7 +382,9 @@ kept: set a backend (any tier above) before any of them.
 This tier does not apply to `@cache.secure`, `encryption=True` or `interop=`. L1-only
 holds raw Python objects, which cannot be ciphertext or the shared interop format, so
 these still resolve a backend with nothing configured, and get Redis at
-`RedisBackendConfig`'s default URL, `redis://localhost:6379`.
+`RedisBackendConfig`'s default URL, `redis://localhost:6379`. That Redis is the
+tenant-scoped wrapper, so an `interop=` decorator raises `ConfigurationError` on it at the
+first call (and runs uncached if nothing listens there): give it `backend=RedisBackend()`.
 
 > [!WARNING]
 > Earlier releases connected to `redis://localhost:6379` when nothing was configured. If
@@ -392,7 +399,8 @@ these still resolve a backend with nothing configured, and get Redis at
 3. A backend provider of your own registered with the DI container, else environment
    auto-detection per the table above
 4. Nothing configured: L1-only for a plaintext, non-interop decorator; secure, `encryption=True` and
-   `interop=` decorators still resolve Redis at `redis://localhost:6379`
+   `interop=` decorators still resolve Redis at `redis://localhost:6379`, which `interop=` then
+   refuses for its tenant prefix (pass `backend=RedisBackend()`)
 
 ## Performance Considerations
 

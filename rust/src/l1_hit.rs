@@ -20,8 +20,8 @@
 //!
 //! Deadlines are read on one clock, [`now`] (`monotonic` in Python), which `ObjectCache` uses too.
 //!
-//! Like the rest of this crate, the module is safe Rust: every object it touches goes through PyO3's
-//! checked API.
+//! The module is safe Rust, as the crate requires (`deny(unsafe_code)`): every object it touches goes
+//! through PyO3's checked API.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -377,7 +377,7 @@ impl HitMemo {
     ///
     /// Two attribute reads, about a tenth of the hit's instructions, most of it the type lookup
     /// each read makes. Calling the names' descriptors directly would skip that lookup, but only
-    /// through unsafe code, which this crate forbids.
+    /// through unsafe code, which the crate denies.
     fn names_hold(&self, py: Python<'_>) -> bool {
         let func = self.func.bind(py);
         let holds = |name: &Py<PyString>, held: &Py<PyAny>| {

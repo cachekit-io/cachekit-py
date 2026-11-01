@@ -1005,11 +1005,11 @@ def test_sync_backed_recheck_decodes_a_verified_msgpack_l1_entry_without_a_trip(
 
 
 def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(
-    waiting: list[int], decoded: list[type], decoded_data: list[type], walks: list[str]
+    waiting: list[int], decoded: list[type], decoded_data: list[type], decodes: list[str]
 ) -> None:
     """Each joined caller decodes the trip's envelope once, for its own copy, as before. It goes to
-    deserialize_data: a joiner keeps nothing in L1, so it builds no kept entry (deserialize_l1). The envelope
-    came from the trip, not from a decode in this process, so each joiner's decode walks it."""
+    deserialize_data: a joiner keeps nothing in L1, so it builds no kept entry (deserialize_l1). Each joiner's
+    decode is a full bounded decode (unpackb_standard) of the envelope's MessagePack."""
 
     def compute(x: int) -> dict[str, int]:
         _until(lambda: waiting[0] == HERD - 1)
@@ -1023,7 +1023,7 @@ def test_sync_backed_joiners_each_decode_their_own_copy_of_the_trips_envelope(
     assert backend.requests == ["get", "set"]
     assert decoded == []
     assert decoded_data == [bytes] * (HERD - 1)
-    assert walks == ["ok"] * (HERD - 1)
+    assert decodes == ["ok"] * (HERD - 1)
 
 
 def test_sync_backed_recheck_hit_hands_its_half_open_probe_slot_back(

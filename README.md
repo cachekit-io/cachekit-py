@@ -103,9 +103,11 @@ def expensive_api_call(user_id: int):
 
 > [!WARNING]
 > Earlier releases connected to `redis://localhost:6379` when nothing was configured. To keep
-> that Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`). `@cache.secure`,
-> `encryption=True` and `interop=` still need a backend and still fall back to localhost Redis;
-> see [Backend Resolution Priority](docs/backends/README.md#backend-resolution-priority).
+> that Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`). `@cache.secure`
+> and `encryption=True` still need a backend and still fall back to localhost Redis; see
+> [Backend Resolution Priority](docs/backends/README.md#backend-resolution-priority). `interop=`
+> refuses that Redis, and any Redis resolved without `backend=`, because it prefixes keys with the
+> tenant: pass `backend=RedisBackend()` ([Interop Mode](docs/features/interop-mode.md)).
 
 ### More Backends
 
@@ -272,7 +274,7 @@ What a call costs inside your process, from the wall-clock guards in `tests/perf
 | Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 539 ± 3 µs |
 
 - With no backend, L1 keeps the returned object itself, whatever the payload's size, and a repeat call with a few short scalar arguments is answered by one call into the Rust extension that takes no lock ([which calls](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#decorator--l1-hit-hot-path)). Any other call builds its key every time, as does every call to a function with a backend.
-- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 910 times the L1-only hit. This run predates hits skipping the structure walk over bytes they already checked, which took about 20% off this hit. Encryption adds a decrypt to each such hit and keeps the walk a plaintext hit now skips; before that skip, this run measured the difference at 9.3 ± 1.0 µs.
+- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 910 times the L1-only hit. This run predates the Rust decode every such hit now runs, which bounds and decodes the MessagePack in one pass at about half the instructions. Encryption adds a decrypt to each such hit; this run measured the difference at 9.3 ± 1.0 µs.
 - An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
 
 Hosted runners come with other CPU models too: in a run of an earlier commit, an EPYC 9V45 runner took about half as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
@@ -516,7 +518,8 @@ info = expensive_func.cache_info()
 # CACHEKIT_MEMCACHED_SERVERS, CACHEKIT_FILE_CACHE_DIR. Two or more is a ConfigurationError at
 # first call, and decorators relying on env auto-detection run uncached (docs/backends/README.md).
 # REDIS_URL is only a fallback and never conflicts. With none of them set, decorators cache
-# L1-only, in process (encrypted and interop decorators still use localhost Redis).
+# L1-only, in process (encrypted decorators still use localhost Redis; interop decorators refuse
+# any Redis resolved here, which is tenant-prefixed, and need backend=RedisBackend()).
 
 # Redis Connection (priority: CACHEKIT_REDIS_URL > REDIS_URL)
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
