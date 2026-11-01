@@ -37,6 +37,7 @@ backend = CachekitIOBackend(
     api_key="ck_live_...",              # default: CACHEKIT_API_KEY
     api_url="https://api.cachekit.io",  # default: CACHEKIT_API_URL, then api.cachekit.io
     timeout=5.0,                        # default: CACHEKIT_TIMEOUT, then 5.0 seconds
+    telemetry=None,                     # False turns telemetry off; see Telemetry below
 )
 ```
 
@@ -181,7 +182,43 @@ The API URL is validated on construction — HTTPS required, credentials in the 
 CACHEKIT_API_KEY=ck_live_...          # API key — or pass api_key= to CachekitIOBackend / @cache.io
 CACHEKIT_API_URL=https://api.cachekit.io  # Optional — defaults to api.cachekit.io
 CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
+CACHEKIT_TELEMETRY=false              # Optional — turns telemetry off (see Telemetry)
 ```
+
+## Telemetry
+
+While cachekit.io is in closed beta, a `CachekitIOBackend` sends usage telemetry to cachekit.io by default. It
+becomes opt-in when the service launches. It goes only to the API URL the backend is configured with, as headers
+on the cache requests the backend already makes; nothing is sent on its own, and the Redis, Memcached and File
+backends and L1-only caches send none.
+
+| Headers | What they carry |
+|---------|-----------------|
+| `X-CacheKit-Session-ID`, `X-CacheKit-Session-Start` | A random per-process session id and its start time |
+| `X-CacheKit-L1-Hits`, `X-CacheKit-L2-Hits`, `X-CacheKit-Misses` | The calling function's hit and miss counts this session |
+| `X-CacheKit-L1-Hit-Rate` | L1 hits / (L1 hits + L2 hits + misses), three decimals |
+| `X-CacheKit-L1-Latency-Buckets`, `-Sum-Ns`, `-One-In` | How long the L1 hits timed since the previous request took (below) |
+
+**L1 hit latency.** Each `@cache` call through the backend is timed with probability 1/64, chosen at random before
+the call runs. A timed call that is an L1 hit adds its duration, from entering the wrapper to returning the value,
+to a report: sixteen duration buckets doubling from 128 ns, and their sum in nanoseconds. The next request to
+cachekit.io carries the report and empties it, so each hit is reported once. A call that waited on another call's
+miss for the same key, a miss, an L2 hit and a direct `backend.get()` are never timed, and the health check never
+carries a report. A forked child starts with an empty report. Hits timed after the last request are not sent.
+
+**Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` to `false`, `0`, `off` or `no` (any case).
+Off from either wins over on from the other; both unset is on. Any other value of the variable also turns telemetry
+off and logs one warning. Both are read once, when the backend is constructed: set the variable before creating it.
+`@cache.io()` builds its own backend, so use the variable there.
+
+```python notest
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+backend = CachekitIOBackend(telemetry=False)
+```
+
+With telemetry off, requests carry none of the headers above. They still carry `X-CacheKit-L1-Status`, which the
+API requires, and a `User-Agent` naming cachekit-py and its version.
 
 ## When to Use
 

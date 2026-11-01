@@ -9,6 +9,7 @@ import inspect
 import logging
 import math
 import os
+import random
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -66,6 +67,7 @@ from ..serializers.encryption_wrapper import (
 )
 
 # Config import removed - using direct DecoratorConfig integration
+from .l1_latency import ONE_IN, L1LatencyReport
 from .orchestrator import FeatureOrchestrator
 from .single_flight import AsyncFlights, ThreadFlights
 from .stats_context import reset_current_function_stats, set_current_function_stats
@@ -632,6 +634,23 @@ _MEMO_MAX_ARGS = 8
 # Slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a hit
 # writes nothing to it.
 _MEMO_MAX_ENTRIES = 1024
+# The L1 hit-latency timer's draw, chance and clock. Globals, not closure cells: a wrapper's every free variable
+# costs its every call, the memoised L1-only hit included, which never times anything. A test can replace them.
+# getrandbits(k) == 0 holds with probability 2**-k: one draw, and a cached small int rather than a new float.
+_getrandbits = random.getrandbits
+_perf_counter_ns = time.perf_counter_ns
+_L1_SAMPLE_BITS = ONE_IN.bit_length() - 1
+
+
+def _latency_report_of(backend: object) -> L1LatencyReport | None:
+    """The L1 hit-latency report a backend sends with its requests (a CachekitIO backend with telemetry on), or None.
+
+    Read statically: a Mock or ``__getattr__`` proxy answers any attribute, and must not be read as one.
+    """
+    report = inspect.getattr_static(backend, "l1_latency_report", None)
+    return report if isinstance(report, L1LatencyReport) else None
+
+
 # What HitMemo.get returns when it cannot answer a call.
 _MISS = object()
 
@@ -939,6 +958,9 @@ def create_cache_wrapper(
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
     _handler_backend = None  # the backend operation_handler's StandardCacheHandler was built for
+    # The report this wrapper times its backed-mode L1 hits into: a lazily resolved backend sets it once
+    # _install_cache_handler sees it, before any L1 hit can happen (the hit waits for the backend).
+    _l1_latency = None if backend is None else _latency_report_of(backend)
 
     def _install_cache_handler(resolved: BaseBackend) -> None:
         """Install a StandardCacheHandler for the resolved backend, building it only when that backend changed.
@@ -947,8 +969,9 @@ def create_cache_wrapper(
         function, so building one per call was throwaway work on every backed call. Keyed on the
         backend's identity, so a backend first resolved by invalidate_cache() still gets its handler.
         """
-        nonlocal _handler_backend
+        nonlocal _handler_backend, _l1_latency
         if _handler_backend is not resolved:
+            _l1_latency = _latency_report_of(resolved)
             operation_handler.set_cache_handler(
                 StandardCacheHandler(
                     resolved,
@@ -2065,8 +2088,8 @@ def create_cache_wrapper(
             # Last: a caller that reads it False without the lock then reads the state set above.
             _zero_config_pending = False
 
-    def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:  # noqa: PLR0912
-        """sync_wrapper's call past its lock-free hit."""
+    def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any], timed_from: int | None) -> Any:  # noqa: PLR0912
+        """sync_wrapper's call past its lock-free hit; ``timed_from`` is its clock start if it was drawn for timing."""
         # SET stats context before any backend operations
         token = set_current_function_stats(_stats)
 
@@ -2216,6 +2239,8 @@ def create_cache_wrapper(
 
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
+                        if timed_from is not None and _l1_latency is not None:
+                            _l1_latency.add(_perf_counter_ns() - timed_from)
                         return l1_value
                     except TenantResolutionError:
                         # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
@@ -2574,10 +2599,13 @@ def create_cache_wrapper(
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return func(*args, **kwargs)
-        return _sync_call(args, kwargs)
+        # The L1 hit-latency draw, before the call's outcome is known (spec API-81). Only a backed-mode L1 hit whose
+        # backend keeps a report adds its duration; any other outcome discards it. A memoised hit, above, is L1-only
+        # mode, which has no backend to report to.
+        return _sync_call(args, kwargs, _perf_counter_ns() if not _getrandbits(_L1_SAMPLE_BITS) else None)
 
-    async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        """async_wrapper's call past its lock-free hit."""
+    async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any], timed_from: int | None) -> Any:
+        """async_wrapper's call past its lock-free hit; ``timed_from`` as in ``_sync_call``."""
         # SET stats context before any backend operations
         token = set_current_function_stats(_stats)
 
@@ -2696,6 +2724,8 @@ def create_cache_wrapper(
 
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
+                        if timed_from is not None and _l1_latency is not None:
+                            _l1_latency.add(_perf_counter_ns() - timed_from)
 
                         return l1_value
                     except TenantResolutionError:
@@ -2818,7 +2848,8 @@ def create_cache_wrapper(
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return await func(*args, **kwargs)
-        return await _async_call(args, kwargs)
+        # As in sync_wrapper. This is the coroutine's first step, not its creation, so the clock starts here.
+        return await _async_call(args, kwargs, _perf_counter_ns() if not _getrandbits(_L1_SAMPLE_BITS) else None)
 
     def _log_breaker_rejection(cache_key: str) -> None:
         """Log a call the circuit breaker rejected. Never recorded as a failure: a rejection is not one."""

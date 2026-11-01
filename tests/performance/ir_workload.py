@@ -38,6 +38,7 @@ def build_workload(path: str) -> Callable[[], object]:
 
     import cachekit.decorators.orchestrator as orchestrator
     from cachekit import cache
+    from cachekit.decorators.l1_latency import L1LatencyReport
     from cachekit.serializers import EncryptionWrapper, get_serializer
 
     value = {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
@@ -69,6 +70,14 @@ def build_workload(path: str) -> Callable[[], object]:
 
         def health_check(self) -> tuple[bool, dict[str, Any]]:
             return True, {}
+
+    class ReportingBackend(DictBackend):
+        """DictBackend with an L1 hit-latency report, as a CachekitIO backend has with telemetry on (its default):
+        every call draws whether it is timed, and about one hit in ``ONE_IN`` is timed into the report."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.l1_latency_report = L1LatencyReport()
 
     class MissBackend(DictBackend):
         """Never holds a value, so every call takes the full miss path: get, compute, serialize, set."""
@@ -117,7 +126,7 @@ def build_workload(path: str) -> Callable[[], object]:
     # the stored object: after its first hit, this small value's entry is held as its verified MessagePack.
     decorated: dict[str, Callable[[], Callable[..., dict]]] = {
         "l1_hit": lambda: cache(backend=None, ttl=300)(body),
-        "l1_hit_backed": lambda: cache(backend=DictBackend(), ttl=300)(body),
+        "l1_hit_backed": lambda: cache(backend=ReportingBackend(), ttl=300)(body),
         "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
         "l2_hit": l2,
         "miss": lambda: cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body),

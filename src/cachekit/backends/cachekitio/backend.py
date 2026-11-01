@@ -24,10 +24,11 @@ from urllib3.exceptions import ClosedPoolError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted, _clear_interrupted, _raised_during_request
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
-from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
+from cachekit.backends.cachekitio.config import CachekitIOBackendConfig, resolve_telemetry
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.validation import ConfigurationError, hide_any_secret
+from cachekit.decorators.l1_latency import L1LatencyReport, clock_qualifies
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.logging import get_structured_logger
@@ -191,7 +192,7 @@ _API_KEY_HINT = (
 )
 
 
-def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
+def _inject_metrics_headers(stats: _FunctionStats | None, telemetry: bool = True) -> dict[str, str]:
     """Extract cache metrics and format as HTTP headers.
 
     Extracts L1 hits, L2 hits, and misses from the provided function statistics,
@@ -201,6 +202,8 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
 
     Args:
         stats: Function statistics tracker, or None for graceful degradation.
+        telemetry: False sends L1-Status alone, none of the optional metrics headers
+            (spec/saas-api.md#telemetry-switch).
 
     Returns:
         dict[str, str]: Headers dictionary containing:
@@ -227,8 +230,15 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
         '2'
         >>> headers["X-CacheKit-L2-Hits"]
         '1'
-        >>> float(headers["X-CacheKit-L1-Hit-Rate"])
-        0.667
+        >>> headers["X-CacheKit-L1-Hit-Rate"]  # L1 / (L1 + L2 + misses)
+        '0.667'
+        >>> stats.record_miss()
+        >>> _inject_metrics_headers(stats)["X-CacheKit-L1-Hit-Rate"]
+        '0.500'
+
+        >>> # Telemetry off: L1-Status alone
+        >>> _inject_metrics_headers(stats, telemetry=False)
+        {'X-CacheKit-L1-Status': 'miss'}
         >>> headers["X-CacheKit-L1-Status"]
         'miss'
 
@@ -256,22 +266,6 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
     if stats is None:
         return {"X-CacheKit-L1-Status": "disabled"}
 
-    # Extract metrics from stats
-    info = stats.get_info()
-    l1_hits = info.l1_hits
-    l2_hits = info.l2_hits
-    misses = info.misses
-
-    # Calculate L1 hit rate with zero-division guard
-    total_hits = l1_hits + l2_hits
-    if total_hits > 0:
-        l1_hit_rate = l1_hits / total_hits
-    else:
-        l1_hit_rate = 0.0
-
-    # Format L1 hit rate to 3 decimal places
-    l1_hit_rate_str = f"{l1_hit_rate:.3f}"
-
     # Determine L1 status for rate limit classification
     # Conservative approach: report "miss" for enabled (counts as backend op)
     # or "disabled" if L1 is not enabled
@@ -279,6 +273,18 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
         l1_status = "miss"  # Conservative: treat all as backend ops
     else:
         l1_status = "disabled"
+    if not telemetry:
+        return {"X-CacheKit-L1-Status": l1_status}
+
+    # Extract metrics from stats
+    info = stats.get_info()
+    l1_hits = info.l1_hits
+    l2_hits = info.l2_hits
+    misses = info.misses
+
+    # The share of counted operations L1 served, 0.000 with none counted (spec/saas-api.md#l1-hit-rate, API-78)
+    counted = l1_hits + l2_hits + misses
+    l1_hit_rate_str = f"{l1_hits / counted if counted else 0.0:.3f}"
 
     # Get session headers with exception safety
     try:
@@ -337,6 +343,7 @@ class CachekitIOBackend:
         api_url: str | None = None,
         api_key: str | SecretStr | None = None,
         timeout: float | None = None,
+        telemetry: bool | None = None,
     ) -> None:
         """Initialize cachekit.io backend.
 
@@ -344,6 +351,9 @@ class CachekitIOBackend:
             api_url: API endpoint URL. Default: ``CACHEKIT_API_URL``, then ``https://api.cachekit.io``.
             api_key: API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
             timeout: Request timeout in seconds. Default: ``CACHEKIT_TIMEOUT``, then 5.0.
+            telemetry: False turns telemetry off: no optional metrics header (session, counters, hit rate,
+                L1 hit latency) is sent. ``CACHEKIT_TELEMETRY=false`` does the same, and off from either wins;
+                both unset leaves it on. Both are read here, once.
 
         Each argument left as None is loaded from the environment via pydantic-settings,
         so ``CachekitIOBackend(api_key=...)`` alone is valid — an explicit argument wins,
@@ -354,7 +364,7 @@ class CachekitIOBackend:
                 validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
         api_key = hide_any_secret(api_key)  # a bytes key too: no local here holds it raw (CWE-532)
-        overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
+        overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout, "telemetry": telemetry}
         errors = None
         try:
             # The config takes a str key wrapped. A bytes key is unwrapped only here, inline, and its str field decodes it
@@ -380,6 +390,12 @@ class CachekitIOBackend:
         # on it through asyncio.to_thread. Holding the lease keeps the client open; dropping it closes the client.
         # Each request re-leases after a fork or a close_http_clients() (see _own_lease).
         self._lease = lease_http_client(self._config)
+
+        # spec/saas-api.md#telemetry-switch: resolved once, for this instance's lifetime.
+        self._telemetry = resolve_telemetry(self._config.telemetry, os.environ)
+        # The wrappers configured with this backend time a sample of their L1 hits into this report, which rides
+        # this backend's next request. None, and nothing timed, with telemetry off or no qualifying clock (API-82).
+        self.l1_latency_report: L1LatencyReport | None = L1LatencyReport() if self._telemetry and clock_qualifies() else None
 
     def _own_lease(self) -> ClientLease:
         """This process's open lease: re-leased after a fork, or once close_http_clients() closed its client.
@@ -527,11 +543,14 @@ class CachekitIOBackend:
 
             Automatically injects cache metrics headers (L1/L2 hits, session ID) when
             called from within a @cache decorated function; with no stats in context,
-            only ``X-CacheKit-L1-Status: disabled``.
+            only ``X-CacheKit-L1-Status: disabled``. With telemetry off, only L1-Status.
+
+            The L1 hit-latency report, if any, rides the first attempt alone: once sent it is
+            consumed, so the retry never carries it (spec API-86).
         """
         url = f"/v1/cache/{endpoint}"
-        headers = self._request_headers(headers)
-        response = self._send(method, url, body, headers)
+        headers, first = self._request_headers(endpoint, headers)
+        response = self._send(method, url, body, first)
         if (delay := _write_retry_delay(method, response)) is not None:
             _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
             time.sleep(delay)
@@ -553,20 +572,27 @@ class CachekitIOBackend:
         response, not the request: the attempt in flight still completes on its worker thread.
         """
         url = f"/v1/cache/{endpoint}"
-        headers = self._request_headers(headers)
-        response = await asyncio.to_thread(self._send, method, url, body, headers)
+        headers, first = self._request_headers(endpoint, headers)
+        response = await asyncio.to_thread(self._send, method, url, body, first)
         if (delay := _write_retry_delay(method, response)) is not None:
             _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
             await asyncio.sleep(delay)
             response = await asyncio.to_thread(self._send, method, url, body, headers)
         return self._checked(method, response, miss_on_404)
 
-    @staticmethod
-    def _request_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    def _request_headers(self, endpoint: str, headers: dict[str, str] | None) -> tuple[dict[str, str], dict[str, str]]:
+        """A request's headers for any attempt, and for its first: the same plus the L1 hit-latency report, if any.
+
+        Taking the report empties it, so call this once per request. The health endpoint never takes one: the
+        server does not record it (API-84).
+        """
         # Always — defaults to L1-Status: disabled when no stats. Built on the caller's thread: the stats
         # come from its context.
-        metrics_headers = _inject_metrics_headers(get_current_function_stats())
-        return {**headers, **metrics_headers} if headers else metrics_headers
+        metrics_headers = _inject_metrics_headers(get_current_function_stats(), self._telemetry)
+        merged = {**headers, **metrics_headers} if headers else metrics_headers
+        report = self.l1_latency_report
+        taken = None if report is None or endpoint == "health" else report.take()
+        return merged, {**merged, **taken} if taken else merged
 
     # ==================== BaseBackend Protocol (Sync) ====================
     # These sync methods send on the shared client on the calling thread (no event loop required)
@@ -1195,4 +1221,5 @@ class CachekitIOBackend:
             api_url=self._config.api_url,
             api_key=self._config.api_key,
             timeout=timeout,
+            telemetry=self._config.telemetry,
         )
