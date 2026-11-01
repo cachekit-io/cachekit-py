@@ -642,24 +642,24 @@ class CachekitIOBackend:
         response = self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
         seen = WRITE_FRESH_UNTIL.get()
         if seen is not None:
-            seen.append(self._write_fresh_until(response))
+            seen.append(self._write_freshness(response))
 
-    # set reports its write's freshness through WRITE_FRESH_UNTIL; see cache_handler._set_reporting_freshness.
+    # set reports its write's freshness through WRITE_FRESH_UNTIL; see cache_handler.open_write_report.
     reports_write_freshness = True
 
     @staticmethod
-    def _write_fresh_until(response: BaseHTTPResponse) -> float:
-        """When the server's freshness for a value this PUT stored runs out (spec/saas-api.md#remaining-freshness).
+    def _write_freshness(response: BaseHTTPResponse) -> tuple[float, float]:
+        """``(received, fresh_until)`` for a value this PUT stored (spec/saas-api.md#remaining-freshness).
 
-        The decorator bounds its L1 copy of the value by it (API-103): the server may have clamped
-        ``ttl`` to the plan's maximum. Timed from the 2xx's receipt, on the thread that received it, so
-        a later hop back to the event loop cannot restart the bound. ``X-CacheKit-Fresh-For`` is read
-        with the GET grammar (``_parse_fresh_for``): absent (the stated TTL was applied) gives
+        The decorator bounds its L1 copy of the value by them (API-103): the server may have clamped
+        ``ttl`` to the plan's maximum. Both are timed from the 2xx's receipt, on the thread that received
+        it, so a later hop back to the event loop cannot restart the bound. ``X-CacheKit-Fresh-For`` is
+        read with the GET grammar (``_parse_fresh_for``): absent (the stated TTL was applied) gives
         ``math.inf``, malformed gives the receipt itself.
         """
         received = time.time()
         fresh_for = CachekitIOBackend._fresh_for(response)
-        return math.inf if fresh_for is None else received + fresh_for
+        return received, math.inf if fresh_for is None else received + fresh_for
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
