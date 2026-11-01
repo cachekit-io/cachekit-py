@@ -22,6 +22,7 @@ trailing-byte paths are reached as well as the happy path.
 from __future__ import annotations
 
 import gc
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -302,6 +303,35 @@ def _measure_amplifier_peaks() -> dict[str, list[int]]:
 def test_an_amplifying_payload_costs_no_more_heap_than_before() -> None:
     for name, (before, now) in measure_in_subprocess(_measure_amplifier_peaks).items():
         assert now <= before, f"{name}: {now} bytes at peak, {before} before"
+
+
+_OUT_OF_MEMORY = """
+import resource, sys
+from cachekit._rust_serializer import unpackb_standard
+n = 1 << 27
+data = {shape}
+with open("/proc/self/statm") as f:
+    mapped = int(f.read().split()[0]) * resource.getpagesize()
+resource.setrlimit(resource.RLIMIT_AS, (mapped + (64 << 20), resource.RLIM_INFINITY))
+try:
+    unpackb_standard(data, 1024, None)
+except MemoryError:
+    sys.exit(0)
+sys.exit(3)
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS is enforced on Linux")
+@pytest.mark.parametrize(
+    "shape",
+    ['b"\\xc6" + n.to_bytes(4, "big") + bytes(n)', 'b"\\xdd" + (n >> 3).to_bytes(4, "big") + b"\\xc0" * (n >> 3)'],
+    ids=["128 MiB bin", "16M-item array"],
+)
+def test_an_allocation_the_input_sizes_raises_memory_error(shape: str) -> None:
+    """With panic = "abort", a PyO3 constructor that meets a NULL would kill the process, not raise."""
+    script = _OUT_OF_MEMORY.format(shape=shape)
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, check=False)  # noqa: S603 - this module's own script
+    assert run.returncode == 0, run.stderr.decode()[-2000:]
 
 
 def _measure_leaks() -> list[int]:

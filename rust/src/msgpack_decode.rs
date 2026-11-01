@@ -14,14 +14,15 @@
 //! return unchanged, because each marker test reads its key with `dict.get`.
 //!
 //! Safe Rust only (`SECURITY.md`): every object is a PyO3 `Bound`, so each reference is released
-//! by its owner on any exit, and an array's items wait on a stack until it closes, so no
-//! partly-filled list is ever built.
+//! by its owner on any exit. PyO3's plain constructors abort the process when CPython is out of
+//! memory (the release profile sets `panic = "abort"`), so the two allocations the input sizes, an
+//! array's list and a bin's bytes, go through ones that raise MemoryError, as the old decode did.
 
 use cachekit_core::check_msgpack_structure;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PySequence, PyString};
 
 /// The keys `_standard_object_hook` tests (`standard_serializer.py`).
 const MARKER_KEYS: [&[u8]; 3] = [b"__datetime__", b"__date__", b"__time__"];
@@ -40,14 +41,17 @@ enum Fail {
     Bound,
 }
 
+/// An open container, filled as each element arrives.
+enum Open<'py> {
+    /// An array: its list, made with `None` in every slot, and the next index to fill.
+    List(Bound<'py, PyList>, usize),
+    /// A map: its dict, and the key read, awaiting its value.
+    Map(Bound<'py, PyDict>, Option<Bound<'py, PyAny>>),
+}
+
 /// An open array or map.
 struct Frame<'py> {
-    /// Map: the dict, filled as each value arrives. Array: None.
-    dict: Option<Bound<'py, PyDict>>,
-    /// Map: the key read, awaiting its value.
-    key: Option<Bound<'py, PyAny>>,
-    /// Array: where its items start on the decoder's `items` stack.
-    base: usize,
+    open: Open<'py>,
     /// Elements still to read: items for an array, keys plus values for a map.
     owed: u64,
     /// Map: a `str` key equal to a marker key was read.
@@ -69,9 +73,8 @@ struct Decoder<'a, 'py> {
     /// Elements owed across every open container, the root included (the walk's `pending`).
     pending: u64,
     stack: Vec<Frame<'py>>,
-    /// The items of every open array, innermost last; an array's become its list when it closes.
-    /// Only decoded elements land here, so it never outgrows the input.
-    items: Vec<Bound<'py, PyAny>>,
+    /// `[None]`, made at the first non-empty array, for `nones`.
+    seed: Option<Bound<'py, PySequence>>,
     /// Cached strings; a table slot holds an index into it plus one, or 0 when empty. A slot holds
     /// one string at a time, a colliding one replacing it, so this never exceeds `2 * CACHE_SLOTS`.
     cached: Vec<StrSlot<'py>>,
@@ -103,7 +106,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
             max_depth,
             pending: 1,
             stack: Vec::new(),
-            items: Vec::new(),
+            seed: None,
             cached: Vec::new(),
             keys: [0; CACHE_SLOTS],
             values: [0; CACHE_SLOTS],
@@ -137,7 +140,13 @@ impl<'a, 'py> Decoder<'a, 'py> {
     /// Whether the next element read is a map key.
     #[inline]
     fn at_key(&self) -> bool {
-        matches!(self.stack.last(), Some(f) if f.dict.is_some() && f.key.is_none())
+        matches!(
+            self.stack.last(),
+            Some(Frame {
+                open: Open::Map(_, None),
+                ..
+            })
+        )
     }
 
     fn decode(&mut self, hook: &Bound<'py, PyAny>) -> Result<Bound<'py, PyAny>, Fail> {
@@ -184,11 +193,14 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 let Some(f) = self.stack.last_mut() else {
                     return Ok(value);
                 };
-                match &f.dict {
-                    None => self.items.push(value),
-                    Some(dict) => match f.key.take() {
+                match &mut f.open {
+                    Open::List(list, index) => {
+                        list.set_item(*index, value).map_err(|e| restore(py, e))?;
+                        *index += 1;
+                    }
+                    Open::Map(dict, pending) => match pending.take() {
                         None => {
-                            f.key = Some(value);
+                            *pending = Some(value);
                             break;
                         }
                         Some(key) => {
@@ -206,11 +218,9 @@ impl<'a, 'py> Decoder<'a, 'py> {
                     break;
                 }
                 let done = self.stack.pop().expect("a frame was just read");
-                value = match done.dict {
-                    Some(dict) => dict.into_any(),
-                    None => PyList::new(py, self.items.drain(done.base..))
-                        .map_err(|e| restore(py, e))?
-                        .into_any(),
+                value = match done.open {
+                    Open::List(list, _) => list.into_any(),
+                    Open::Map(dict, _) => dict.into_any(),
                 };
                 if done.marker {
                     value = hook.call1((value,)).map_err(|e| restore(py, e))?;
@@ -297,7 +307,13 @@ impl<'a, 'py> Decoder<'a, 'py> {
     fn binary(&mut self, len: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
         self.account(len, 0)?;
         let bytes = self.take(len);
-        Ok(Some(PyBytes::new(self.py, bytes).into_any()))
+        // new_with, not new: an input-sized allocation that fails raises MemoryError, not abort.
+        PyBytes::new_with(self.py, bytes.len(), |b| {
+            b.copy_from_slice(bytes);
+            Ok(())
+        })
+        .map(|b| Some(b.into_any()))
+        .map_err(|e| restore(self.py, e))
     }
 
     fn number(&mut self, marker: u8) -> Result<Option<Bound<'py, PyAny>>, Fail> {
@@ -353,14 +369,30 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 PyList::empty(self.py).into_any()
             }));
         }
+        let open = if is_map {
+            Open::Map(PyDict::new(self.py), None)
+        } else {
+            Open::List(self.nones(n).map_err(|e| restore(self.py, e))?, 0)
+        };
         self.stack.push(Frame {
-            dict: is_map.then(|| PyDict::new(self.py)),
-            key: None,
-            base: self.items.len(),
+            open,
             owed,
             marker: false,
         });
         Ok(None)
+    }
+
+    /// A list of `n` `None`s, which the decode replaces in order: `[None] * n`, which raises
+    /// MemoryError where PyO3's list constructors would abort. `n` is at most the input length.
+    fn nones(&mut self, n: u64) -> PyResult<Bound<'py, PyList>> {
+        let py = self.py;
+        let seed = match self.seed.take() {
+            Some(seed) => seed,
+            None => PyList::new(py, [py.None()])?.into_sequence(),
+        };
+        let list = seed.repeat(n as usize);
+        self.seed = Some(seed);
+        Ok(list?.cast_into::<PyList>()?)
     }
 }
 
