@@ -205,7 +205,7 @@ to a report: sixteen duration buckets doubling from 128 ns, and their sum in nan
 cachekit.io carries the report and empties it, so each hit is reported once. A call that waited on another call's
 miss for the same key, a miss, an L2 hit and a direct `backend.get()` are never timed, and the health check never
 carries a report. A forked child starts with an empty report and its own random draws. Under uWSGI without
-`--py-call-uwsgi-fork-hooks`, a worker replays its master's draws until its first request or first timed hit, so its
+`--py-call-uwsgi-fork-hooks`, a worker that inherits its backend replays its master's draws until its first request or first timed hit, so its
 first timed call can fall at the same position in every worker. Hits timed after the last request are not sent.
 
 **Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` (name and value in any case) to `false`, `0`, `off` or `no`.

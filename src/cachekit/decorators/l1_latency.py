@@ -72,8 +72,8 @@ def _replacement_lock(pid: int) -> threading.Lock:
 # job would time the same call positions in every job. A forked child must not replay its parent's sequence, or
 # sibling workers, and every job a prefork master forks from one state, would time the same call positions. The
 # at-fork hook reseeds it; a fork made from C runs no hook (uWSGI without --py-call-uwsgi-fork-hooks), so the
-# child's first report use reseeds it too: its first request or first timed hit, whichever comes first. Until then
-# such a child replays its parent's draws. A PID check on every draw would close that gap, but os.getpid() is a
+# child's first report construction or use reseeds it too: a backend it builds, or its first request or first timed
+# hit on one it inherited, whichever comes first. Until then such a child replays its parent's draws. A PID check on every draw would close that gap, but os.getpid() is a
 # system call, several times the cost of the draw on the hit path.
 sampling_rng = random.Random()  # noqa: S311 (a sampling draw, not a secret)
 _sampling_pid = os.getpid()
@@ -85,6 +85,14 @@ def _reseed_sampling(pid: int) -> None:
     if _sampling_pid != pid:
         sampling_rng.seed()
         _sampling_pid = pid
+
+
+def _reseed_if_forked(pid: int) -> None:
+    """Reseed the draw if this process has not yet: the check every report construction and use makes, so a
+    report built inside a child forked from C, whose state never carries the parent's PID, reseeds it too."""
+    if _sampling_pid != pid:
+        with _replacement_lock(pid):
+            _reseed_sampling(pid)
 
 
 if hasattr(os, "register_at_fork"):
@@ -115,16 +123,17 @@ class L1LatencyReport:
 
     def __init__(self) -> None:
         self._state = _State()
+        _reseed_if_forked(self._state.pid)
 
     def _current(self) -> _State:
         state = self._state
         pid = os.getpid()
+        _reseed_if_forked(pid)  # a fork no hook reached: see sampling_rng
         if state.pid != pid:
             # A forked child's first use: threads racing their first use agree on one new state, so none
             # discards hits another already counted into its own. The lock is this process's own, never one
             # inherited from the parent, which a parent thread may have held at the fork.
             with _replacement_lock(pid):
-                _reseed_sampling(pid)  # a fork no hook reached: see sampling_rng
                 state = self._state
                 if state.pid != pid:
                     state = _State()

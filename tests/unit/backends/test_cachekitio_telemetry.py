@@ -371,6 +371,37 @@ class TestSampling:
         assert first[0] == second[0] == parent  # before the first report use: replayed, as documented
         assert first[1] != second[1]  # after it: each child draws its own sequence
 
+    def test_api81_a_report_built_in_a_child_forked_from_c_reseeds(self) -> None:
+        """A worker that builds its backend after a fork made from C never takes over an inherited state, so its
+        report's construction must reseed the draw itself. Two such children of one parent state diverge at once."""
+        import ctypes
+
+        libc_fork = ctypes.PyDLL(None).fork
+
+        def child() -> list[int]:
+            r, w = os.pipe()
+            pid = libc_fork()
+            if pid == 0:  # pragma: no cover - child
+                os.close(r)
+                try:
+                    L1LatencyReport()  # the worker builds its backend, and so its report
+                    outcome: object = [wrapper._getrandbits(32) for _ in range(4)]
+                except BaseException as exc:  # never return into pytest from the child
+                    outcome = f"child raised {exc!r}"
+                report_to_parent(w, outcome)
+            os.close(w)
+            return child_outcome(pid, r)  # type: ignore[return-value]
+
+        state = l1_latency.sampling_rng.getstate()
+        first = child()
+        l1_latency.sampling_rng.setstate(state)
+        second = child()
+        l1_latency.sampling_rng.setstate(state)
+        parent = [wrapper._getrandbits(32) for _ in range(4)]
+        assert isinstance(first, list) and isinstance(second, list)
+        assert first != second and first != parent and second != parent
+
+    def test_api81_a_forked_child_draws_its_own_sequence(self) -> None:
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - child
