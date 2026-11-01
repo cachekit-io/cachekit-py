@@ -20,7 +20,7 @@ MAX_DURATION_NS = 60_000_000_000
 _MAX_WIRE_INT = 2**53 - 1
 # Each call is timed with probability 1/N, the same N for every backend: the wrapper's draw is SAMPLE_BITS random
 # bits all zero, so N is derived from it and is always the probability the draw has.
-SAMPLE_BITS = 6
+SAMPLE_BITS = 8
 ONE_IN = 1 << SAMPLE_BITS
 _ONE_IN_VALUE = str(ONE_IN)
 # perf_counter qualifies only at 100 ns or finer (spec: Clock).
@@ -117,7 +117,7 @@ class L1LatencyReport:
         >>> for d in (90, 300, 300, 40_000):
         ...     report.add(d)
         >>> report.take()
-        {'X-CacheKit-L1-Latency-Buckets': '1,0,2,0,0,0,0,0,0,1,0,0,0,0,0,0', 'X-CacheKit-L1-Latency-Sum-Ns': '40690', 'X-CacheKit-L1-Latency-One-In': '64'}
+        {'X-CacheKit-L1-Latency-Buckets': '1,0,2,0,0,0,0,0,0,1,0,0,0,0,0,0', 'X-CacheKit-L1-Latency-Sum-Ns': '40690', 'X-CacheKit-L1-Latency-One-In': '256'}
         >>> report.take() is None
         True
     """
@@ -131,7 +131,8 @@ class L1LatencyReport:
     def _current(self) -> _State:
         state = self._state
         pid = os.getpid()
-        _reseed_if_forked(pid)  # a fork no hook reached: see sampling_rng
+        if _sampling_pid != pid:  # tested here, not in a call: this runs on every timed hit
+            _reseed_if_forked(pid)  # a fork no hook reached: see sampling_rng
         if state.pid != pid:
             # A forked child's first use: threads racing their first use agree on one new state, so none
             # discards hits another already counted into its own. The lock is this process's own, never one
@@ -148,14 +149,19 @@ class L1LatencyReport:
 
     @staticmethod
     def _count(state: _State, duration_ns: int) -> None:
-        """Count one duration into ``state``; the caller holds its lock. Above 60 s it is discarded (API-87)."""
+        """Count one duration into ``state``; the caller holds its lock. Above 60 s it is discarded (API-87).
+
+        bucket_index, inlined without min and max: each timed hit runs this, and on CPython 3.12 the builtin calls
+        cost more than the rest of the count.
+        """
         if not 0 <= duration_ns <= MAX_DURATION_NS:
             return
         total = state.sum + duration_ns
         if total > _MAX_WIRE_INT:  # never reached in practice: about 150,000 hits of 60 s in one report
             return
         state.sum = total
-        state.buckets[bucket_index(duration_ns)] += 1
+        i = (duration_ns - 1).bit_length() - 7
+        state.buckets[0 if i < 0 else BUCKETS - 1 if i >= BUCKETS else i] += 1
 
     def add(self, duration_ns: int) -> None:
         """Count one timed L1 hit of ``duration_ns``."""

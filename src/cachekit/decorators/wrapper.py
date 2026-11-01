@@ -11,7 +11,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
@@ -649,30 +649,6 @@ def _latency_report_of(backend: object) -> L1LatencyReport | None:
     """
     report = inspect.getattr_static(backend, "l1_latency_report", None)
     return report if isinstance(report, L1LatencyReport) else None
-
-
-def _timed_call(call: Callable[..., _T], args: tuple[Any, ...], kwargs: dict[str, Any]) -> _T:
-    """Run a wrapper's ``_sync_call`` timed: an L1 hit's duration, from here until its value is handed back, goes to
-    the report it names (spec/saas-api.md#l1-hit-latency). The duration includes the call's context cleanup and
-    the wait for the report's lock, which the caller pays before it gets the value. A module function, so the
-    wrappers it serves gain no free variable."""
-    start = _perf_counter_ns()
-    served: list[L1LatencyReport | None] = []
-    value = call(args, kwargs, served)
-    if served and (report := served[0]) is not None:
-        report.record(start, _perf_counter_ns)
-    return value
-
-
-async def _timed_call_async(call: Callable[..., Awaitable[_T]], args: tuple[Any, ...], kwargs: dict[str, Any]) -> _T:
-    """``_timed_call`` for ``_async_call``. An L1 hit awaits nothing, so the record runs in the step that produced
-    the value."""
-    start = _perf_counter_ns()
-    served: list[L1LatencyReport | None] = []
-    value = await call(args, kwargs, served)
-    if served and (report := served[0]) is not None:
-        report.record(start, _perf_counter_ns)
-    return value
 
 
 # What HitMemo.get returns when it cannot answer a call.
@@ -2112,9 +2088,10 @@ def create_cache_wrapper(
             # Last: a caller that reads it False without the lock then reads the state set above.
             _zero_config_pending = False
 
-    def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any], served: list[L1LatencyReport | None] | None) -> Any:  # noqa: PLR0912
-        """sync_wrapper's call past its lock-free hit. ``served`` is given when the call is timed (_timed_call):
-        a backed-mode L1 hit appends the report its duration goes to."""
+    def _sync_call(args: tuple[Any, ...], kwargs: dict[str, Any], timed_from: int | None) -> Any:  # noqa: PLR0912
+        """sync_wrapper's call past its lock-free hit. ``timed_from`` is the clock reading the call started at when
+        it is timed, else None: a backed-mode L1 hit records its duration in the step that produces its value
+        (spec/saas-api.md#l1-hit-latency), so a timed hit allocates nothing and adds no frame."""
         # The stats context is set below the backed L1 hit: its only reader is the CachekitIO request, and
         # nothing above it reaches the backend. None until then, so a call that ends earlier resets nothing.
         token = None
@@ -2268,8 +2245,8 @@ def create_cache_wrapper(
 
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
-                        if served is not None:
-                            served.append(_l1_latency)
+                        if timed_from is not None and _l1_latency is not None:
+                            _l1_latency.record(timed_from, _perf_counter_ns)
                         return l1_value
                     except TenantResolutionError:
                         # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
@@ -2634,10 +2611,10 @@ def create_cache_wrapper(
         # The L1 hit-latency draw, before the call's outcome is known (spec API-81). Only a backed-mode L1 hit whose
         # backend keeps a report adds its duration; any other outcome discards it. A memoised hit, above, is L1-only
         # mode, which has no backend to report to.
-        return _sync_call(args, kwargs, None) if _getrandbits(SAMPLE_BITS) else _timed_call(_sync_call, args, kwargs)
+        return _sync_call(args, kwargs, None if _getrandbits(SAMPLE_BITS) else _perf_counter_ns())
 
-    async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any], served: list[L1LatencyReport | None] | None) -> Any:
-        """async_wrapper's call past its lock-free hit; ``served`` as in ``_sync_call``."""
+    async def _async_call(args: tuple[Any, ...], kwargs: dict[str, Any], timed_from: int | None) -> Any:
+        """async_wrapper's call past its lock-free hit; ``timed_from`` as in ``_sync_call``."""
         token = None  # the stats context is set below the backed L1 hit, as in _sync_call
 
         try:
@@ -2755,8 +2732,8 @@ def create_cache_wrapper(
 
                         # Record L1 hit for cache_info()
                         _stats.record_l1_hit()
-                        if served is not None:
-                            served.append(_l1_latency)
+                        if timed_from is not None and _l1_latency is not None:
+                            _l1_latency.record(timed_from, _perf_counter_ns)
 
                         return l1_value
                     except TenantResolutionError:
@@ -2881,10 +2858,8 @@ def create_cache_wrapper(
         if kwargs and "_bypass_cache" in kwargs:
             del kwargs["_bypass_cache"]
             return await func(*args, **kwargs)
-        # As in sync_wrapper. The timed coroutine reads its clock at its first step, not at its creation.
-        if _getrandbits(SAMPLE_BITS):
-            return await _async_call(args, kwargs, None)
-        return await _timed_call_async(_async_call, args, kwargs)
+        # As in sync_wrapper. The clock is read here, in this coroutine's first step, not at its creation.
+        return await _async_call(args, kwargs, None if _getrandbits(SAMPLE_BITS) else _perf_counter_ns())
 
     def _log_breaker_rejection(cache_key: str) -> None:
         """Log a call the circuit breaker rejected. Never recorded as a failure: a rejection is not one."""

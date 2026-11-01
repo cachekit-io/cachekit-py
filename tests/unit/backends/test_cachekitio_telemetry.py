@@ -25,6 +25,7 @@ from cachekit.decorators.l1_latency import (
     MAX_DURATION_NS,
     ONE_IN,
     ONE_IN_HEADER,
+    SAMPLE_BITS,
     SUM_HEADER,
     L1LatencyReport,
 )
@@ -431,7 +432,7 @@ class TestSampling:
         f(1)  # hit
         f(2)  # miss
         assert len(draws) == 3
-        assert set(draws) == {6}  # 2**-6 = 1/64
+        assert set(draws) == {SAMPLE_BITS}  # 2**-SAMPLE_BITS = 1/ONE_IN
         assert all(not sent for sent in _sent(pool))  # a non-zero draw times nothing
 
     def test_api81_probability_is_one_in_n_and_n_is_sent(self) -> None:
