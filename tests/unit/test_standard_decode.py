@@ -313,13 +313,20 @@ n = 1 << 27
 data = {shape}
 with open("/proc/self/statm") as f:
     mapped = int(f.read().split()[0]) * resource.getpagesize()
-resource.setrlimit(resource.RLIMIT_AS, (mapped + (64 << 20), resource.RLIM_INFINITY))
+resource.setrlimit(resource.RLIMIT_AS, (mapped + (64 << 20), resource.getrlimit(resource.RLIMIT_AS)[1]))
 try:
     unpackb_standard(data, 1024, None)
 except MemoryError:
     sys.exit(0)
 sys.exit(3)
 """
+# Every allocation the input sizes (n is 128 MiB), as the `data` expression the script decodes.
+_OUT_OF_MEMORY_SHAPES = {
+    "bin": 'b"\\xc6" + n.to_bytes(4, "big") + bytes(n)',
+    "ext": 'b"\\xc9" + n.to_bytes(4, "big") + b"\\x05" + bytes(n)',
+    "trailing bytes": 'b"\\xc0" + bytes(n)',
+    "array of n / 8 items": 'b"\\xdd" + (n >> 3).to_bytes(4, "big") + b"\\xc0" * (n >> 3)',
+}
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS is enforced on Linux")
@@ -327,11 +334,7 @@ sys.exit(3)
     bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
     reason="mimalloc's reserved arenas hold the allocation, so RLIMIT_AS never refuses it; the GIL legs run the same Rust",
 )
-@pytest.mark.parametrize(
-    "shape",
-    ['b"\\xc6" + n.to_bytes(4, "big") + bytes(n)', 'b"\\xdd" + (n >> 3).to_bytes(4, "big") + b"\\xc0" * (n >> 3)'],
-    ids=["128 MiB bin", "16M-item array"],
-)
+@pytest.mark.parametrize("shape", _OUT_OF_MEMORY_SHAPES.values(), ids=_OUT_OF_MEMORY_SHAPES.keys())
 def test_an_allocation_the_input_sizes_raises_memory_error(shape: str) -> None:
     """With panic = "abort", a PyO3 constructor that meets a NULL would kill the process, not raise."""
     script = _OUT_OF_MEMORY.format(shape=shape)
@@ -366,28 +369,29 @@ def _measure_leaks() -> list[int]:
 # This gate catches per-call allocations only: a path that keeps an object it allocated keeps at least one per call,
 # and the smallest object (an int) is 28 bytes, so it adds at least 500 * 28 = 13.7 KiB to EVERY round. A leaked
 # reference to an object that already exists (the input, its buffer, the hook) allocates nothing, so tracemalloc
-# cannot see it: test_no_decode_keeps_a_reference_to_its_input counts those. The interpreter's own growth (caches, free lists, a dict resizing) comes
-# in a few one-off steps, and one such step can exceed any fixed budget on the total. So the gate bounds the quietest
-# of five rounds, which grows by under 1 KiB when nothing leaks.
+# cannot see it: test_no_decode_keeps_a_reference_to_its_input counts those. The interpreter's own growth (caches,
+# free lists, a dict resizing) comes in a few one-off steps, and one such step can exceed any fixed budget on the
+# total. So the gate bounds the quietest of five rounds, which grows by under 1 KiB when nothing leaks.
 LEAK_ROUNDS = 5
 LEAK_CALLS_PER_ROUND = 500
 LEAK_ROUND_BUDGET = 8 * 1024
 
 
-def test_no_path_leaks_a_reference() -> None:
+def test_no_path_leaks_an_object() -> None:
     """An object a decode allocates and never frees climbs traced memory every round (per-call allocations only)."""
     sizes = measure_in_subprocess(_measure_leaks)
     rounds = [after - before for before, after in zip(sizes, sizes[1:], strict=False)]
     assert min(rounds) < LEAK_ROUND_BUDGET, sizes
 
 
+# Empty and one-byte bytes are immortal singletons, whose count never moves.
 _MULTI_BYTE = {name: data for name, data in CASES.items() if len(data) > 1}
 
 
 @pytest.mark.parametrize("data", _MULTI_BYTE.values(), ids=_MULTI_BYTE.keys())
 def test_no_decode_keeps_a_reference_to_its_input(data: bytes) -> None:
     """Every path, from every buffer type, gives back each reference it took to the input, its buffer and the hook."""
-    owned = bytes(bytearray(data))  # a fresh object: a code constant may be immortal, and its count never moves
+    owned = bytes(bytearray(data))  # a fresh object: a code constant may be immortal too
     view, buffer = memoryview(owned), bytearray(data)
     assert view.obj is owned
     watched = (owned, view, buffer, _standard_object_hook)

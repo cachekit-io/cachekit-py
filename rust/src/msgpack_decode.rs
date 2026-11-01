@@ -15,17 +15,20 @@
 //!
 //! Safe Rust only (`SECURITY.md`): every object is a PyO3 `Bound`, so each reference is released
 //! by its owner on any exit. PyO3's plain constructors abort the process when CPython is out of
-//! memory (the release profile sets `panic = "abort"`), so the two allocations the input sizes, an
-//! array's list and a bin's bytes, go through ones that raise MemoryError, as the old decode did.
+//! memory (the release profile sets `panic = "abort"`), so every allocation the input sizes, a
+//! long array's list and the bytes of a bin, an ext or `ExtraData`, goes through a constructor
+//! that raises MemoryError instead (`nones`, `bytes_of`).
 
 // cargo-geiger checks the crate only after a merge; this fails any build, a PR's included.
 #![forbid(unsafe_code)]
+
+use std::convert::Infallible;
 
 use cachekit_core::check_msgpack_structure;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PySequence, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 
 /// The keys `_standard_object_hook` tests (`standard_serializer.py`).
 const MARKER_KEYS: [&[u8]; 3] = [b"__datetime__", b"__date__", b"__time__"];
@@ -41,7 +44,7 @@ const CACHE_SLOTS: usize = 1 << CACHE_BITS;
 const SHORT_LIST: u64 = 64;
 
 /// A Python error is set (`restore` put it there, `PyErr::fetch` takes it), or the input broke a
-/// bound. A unit enum, so a decode step's result stays two words.
+/// bound. A fieldless enum, so a decode step's result stays two words.
 enum Fail {
     Py,
     Bound,
@@ -79,8 +82,6 @@ struct Decoder<'a, 'py> {
     /// Elements owed across every open container, the root included (the walk's `pending`).
     pending: u64,
     stack: Vec<Frame<'py>>,
-    /// `[None]`, made at the first non-empty array, for `nones`.
-    seed: Option<Bound<'py, PySequence>>,
     /// Cached strings; a table slot holds an index into it plus one, or 0 when empty. A slot holds
     /// one string at a time, a colliding one replacing it, so this never exceeds `2 * CACHE_SLOTS`.
     cached: Vec<StrSlot<'py>>,
@@ -112,7 +113,6 @@ impl<'a, 'py> Decoder<'a, 'py> {
             max_depth,
             pending: 1,
             stack: Vec::new(),
-            seed: None,
             cached: Vec::new(),
             keys: [0; CACHE_SLOTS],
             values: [0; CACHE_SLOTS],
@@ -313,13 +313,9 @@ impl<'a, 'py> Decoder<'a, 'py> {
     fn binary(&mut self, len: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
         self.account(len, 0)?;
         let bytes = self.take(len);
-        // new_with, not new: an input-sized allocation that fails raises MemoryError, not abort.
-        PyBytes::new_with(self.py, bytes.len(), |b| {
-            b.copy_from_slice(bytes);
-            Ok(())
-        })
-        .map(|b| Some(b.into_any()))
-        .map_err(|e| restore(self.py, e))
+        bytes_of(self.py, bytes)
+            .map(|b| Some(b.into_any()))
+            .map_err(|e| restore(self.py, e))
     }
 
     fn number(&mut self, marker: u8) -> Result<Option<Bound<'py, PyAny>>, Fail> {
@@ -330,10 +326,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         Ok(Some(match marker {
             0xca => PyFloat::new(py, f64::from(f32::from_bits(raw as u32))).into_any(),
             0xcb => PyFloat::new(py, f64::from_bits(raw)).into_any(),
-            0xcf => match raw.into_pyobject(py) {
-                Ok(n) => n.into_any(),
-                Err(never) => match never {},
-            },
+            0xcf => int(py, raw),
             0xd0 => int(py, i64::from(raw as u8 as i8)),
             0xd1 => int(py, i64::from(raw as u16 as i16)),
             0xd2 => int(py, i64::from(raw as u32 as i32)),
@@ -350,12 +343,13 @@ impl<'a, 'py> Decoder<'a, 'py> {
         self.account(len + 1, 0)?;
         let code = self.take(1)[0] as i8;
         let data = self.take(len);
-        let made = if code == -1 {
-            msgpack_attr(py, "Timestamp")
-                .and_then(|t| t.call_method1("from_bytes", (PyBytes::new(py, data),)))
-        } else {
-            msgpack_attr(py, "ExtType").and_then(|t| t.call1((code, PyBytes::new(py, data))))
-        };
+        let made = bytes_of(py, data).and_then(|data| {
+            if code == -1 {
+                msgpack_attr(py, "Timestamp").and_then(|t| t.call_method1("from_bytes", (data,)))
+            } else {
+                msgpack_attr(py, "ExtType").and_then(|t| t.call1((code, data)))
+            }
+        });
         made.map(Some).map_err(|e| restore(py, e))
     }
 
@@ -389,34 +383,40 @@ impl<'a, 'py> Decoder<'a, 'py> {
     }
 
     /// A list of `n` `None`s, which the decode replaces in order. `n` is at most the input length,
-    /// so a long list is made as `[None] * n`, which raises MemoryError where PyO3's list
-    /// constructors would abort. A short one, no bigger than an int, comes from PyO3's: the
-    /// repeat costs most small documents about 1% of their decode.
-    fn nones(&mut self, n: u64) -> PyResult<Bound<'py, PyList>> {
+    /// so a list longer than `SHORT_LIST` is made as `[None] * n`, which raises MemoryError where
+    /// PyO3's list constructor would abort. A shorter one, at most 512 bytes of slots, comes from
+    /// that constructor: making it by repeat would add about 1% to a small document's decode.
+    fn nones(&self, n: u64) -> PyResult<Bound<'py, PyList>> {
         let py = self.py;
+        let none = py.None().into_bound(py);
         if n <= SHORT_LIST {
-            return PyList::new(
-                py,
-                std::iter::repeat_n(py.None().into_bound(py), n as usize),
-            );
+            return PyList::new(py, std::iter::repeat_n(none, n as usize));
         }
-        let seed = match self.seed.take() {
-            Some(seed) => seed,
-            None => PyList::new(py, [py.None()])?.into_sequence(),
-        };
-        let list = seed.repeat(n as usize);
-        self.seed = Some(seed);
-        Ok(list?.cast_into::<PyList>()?)
+        let seed = PyList::new(py, [none])?;
+        Ok(seed
+            .as_sequence()
+            .repeat(n as usize)?
+            .cast_into::<PyList>()?)
     }
 }
 
 /// A Python `int`.
 #[inline]
-fn int(py: Python<'_>, n: i64) -> Bound<'_, PyAny> {
-    match n.into_pyobject(py) {
-        Ok(n) => n.into_any(),
-        Err(never) => match never {},
-    }
+fn int<'py>(
+    py: Python<'py>,
+    n: impl IntoPyObject<'py, Output = Bound<'py, PyInt>, Error = Infallible>,
+) -> Bound<'py, PyAny> {
+    let Ok(n) = n.into_pyobject(py);
+    n.into_any()
+}
+
+/// `bytes` holding `data`. `new_with`, not `new`: it raises MemoryError where `new` would abort,
+/// at the cost of zeroing the buffer before the copy.
+fn bytes_of<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, data.len(), |b| {
+        b.copy_from_slice(data);
+        Ok(())
+    })
 }
 
 #[inline]
@@ -469,7 +469,7 @@ pub fn unpackb_standard(
             }
             let extra = msgpack_attr(py, "ExtraData")?;
             return Err(PyErr::from_value(
-                extra.call1((value, PyBytes::new(py, &data[consumed..])))?,
+                extra.call1((value, bytes_of(py, &data[consumed..])?))?,
             ));
         }
         Err(Fail::Py) => PyErr::fetch(py),
