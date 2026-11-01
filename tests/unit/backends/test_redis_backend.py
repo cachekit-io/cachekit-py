@@ -479,6 +479,12 @@ class _FakeRedis:
     def pipeline(self, transaction: bool = True) -> _FakePipeline:
         return _FakePipeline(self)
 
+    def stored_keys(self) -> list[str]:
+        """The keys, read under the mutex: an async miss releases its fill lock on an executor thread after the
+        call returns, and on a free-threaded build that delete can land while a test iterates ``_store``."""
+        with self._mutex:
+            return list(self._store)
+
 
 class _FakePipeline:
     """The fused tracked write's pipeline over ``_FakeRedis``: SET runs, and the key registry's commands,
@@ -792,7 +798,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         assert runs == [1, 2]
         assert any("Lock operation failed" in r.getMessage() for r in caplog.records)
-        cache_keys = [k for k in fake._store if not k.endswith(":lock")]
+        cache_keys = [k for k in fake.stored_keys() if not k.endswith(":lock")]
         formatter = logging.Formatter()
         for record in caplog.records:
             text = formatter.format(record)
@@ -895,7 +901,7 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
 
     @staticmethod
     def _tenants(fake: _FakeRedis) -> set[str]:
-        return {key.split(":", 2)[1] for key in fake._store}
+        return {key.split(":", 2)[1] for key in fake.stored_keys()}
 
     @pytest.mark.parametrize(
         ("tenant", "wire"),
@@ -1137,7 +1143,7 @@ class TestUnsupportedTenantIdRaisesThroughTheDecorator:
         with as_tenant("tenant-b"):
             assert await _call(lookup, 1) == 1
         assert calls == [1]
-        assert {key.split(":", 2)[1] for key in fake._store} == {"tenant-b"}
+        assert {key.split(":", 2)[1] for key in fake.stored_keys()} == {"tenant-b"}
 
     @_BOTH_PATHS
     async def test_raises_while_the_breaker_is_open(self, tenant_backend, live_breakers, is_async):
