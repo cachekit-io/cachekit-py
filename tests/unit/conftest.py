@@ -11,7 +11,10 @@ import pytest
 
 from cachekit.decorators import orchestrator as orchestrator_module
 from cachekit.reliability.circuit_breaker import CircuitBreaker
-from cachekit.serializers import base as serializers_base
+from cachekit.serializers import standard_serializer
+
+# check_msgpack_structure's error for a document outside its bounds, which unpackb_standard raises as its own.
+_GUARD_ERROR_PREFIX = "Unpack failed: MessagePack document "
 
 
 @pytest.fixture(autouse=True)
@@ -52,18 +55,20 @@ def backend_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def walks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Each structure walk (check_msgpack_structure) a decode runs: "ok", or "refused" when the walk raised."""
+def decodes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Each StandardSerializer decode (unpackb_standard, which enforces the structure bounds in the same pass): "ok",
+    "refused" when the bounds refused the document (the guard's own error), or the type of anything else it raised."""
     seen: list[str] = []
-    real = serializers_base.check_msgpack_structure
+    real = standard_serializer.unpackb_standard
 
-    def recording(data: Any, limit: int) -> None:
+    def recording(data: Any, limit: int, object_hook: Any) -> Any:
         try:
-            real(data, limit)
-        except ValueError:
-            seen.append("refused")
+            value = real(data, limit, object_hook)
+        except Exception as e:
+            seen.append("refused" if isinstance(e, ValueError) and str(e).startswith(_GUARD_ERROR_PREFIX) else type(e).__name__)
             raise
         seen.append("ok")
+        return value
 
-    monkeypatch.setattr(serializers_base, "check_msgpack_structure", recording)
+    monkeypatch.setattr(standard_serializer, "unpackb_standard", recording)
     return seen
