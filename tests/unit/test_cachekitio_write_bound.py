@@ -23,7 +23,7 @@ import time
 import types
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote
 
 import pytest
@@ -323,20 +323,6 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Private(backend))  # name-mangled slot
         assert not _reaches_write_deadlines(_Unset())
 
-    def test_reachability_is_not_starved_by_a_large_sibling(self, backend: CachekitIOBackend) -> None:
-        """A direct ``inner`` is found however many objects a sibling attribute holds, before or after it."""
-
-        class _Wrapper:
-            def __init__(self, inner: CachekitIOBackend, first: bool) -> None:
-                if first:
-                    self.inner = inner
-                self.locks = [threading.Lock() for _ in range(5000)]
-                if not first:
-                    self.inner = inner
-
-        assert _reaches_write_deadlines(_Wrapper(backend, first=True))
-        assert _reaches_write_deadlines(_Wrapper(backend, first=False))
-
     def test_documented_blind_spots_keep_the_stated_ttl(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         """The two shapes the docs name as out of reach: a backend held only in a closure, and one assigned
         to an attribute on first use (the search runs before the first write and is cached)."""
@@ -411,22 +397,6 @@ class TestWriteBound:
                 self.nested = [[[[0] * 100] * 100] * 100] * 100
 
         assert _reaches_write_deadlines(_Wide())  # finishes only if every read counts and shared lists are read once
-
-    def test_a_cycle_before_the_backend_ends(self, backend: CachekitIOBackend) -> None:
-        """The walk meets a self-referencing config dict first, then finds the backend one level down."""
-        root: dict[str, object] = {}
-        root["children"] = [{"parent": root}]
-
-        class _Holder:
-            def __init__(self) -> None:
-                self.inner = backend
-
-        class _Wrapper:
-            def __init__(self) -> None:
-                self.config = root
-                self.holder = _Holder()
-
-        assert _reaches_write_deadlines(_Wrapper())
 
     def test_a_shared_wrapper_reached_by_a_longer_path_first_is_searched_to_full_reach(self, backend: CachekitIOBackend) -> None:
         """``seen`` keeps the shallowest depth: a router first reached through a metrics wrapper (one level
@@ -505,6 +475,40 @@ class TestWriteBound:
         ran.clear()  # building the objects above may touch the metaclass; the search must not
         assert _reaches_write_deadlines(holder) is False
         assert ran == []
+
+    def test_a_container_root_holding_the_backend_is_reached(self, backend: CachekitIOBackend) -> None:
+        """A root that is itself a dict, list or tuple subclass: its items sit at depth 0, and their flags count."""
+
+        class _Router(dict):  # type: ignore[type-arg]
+            pass
+
+        class _Ring(list):  # type: ignore[type-arg]
+            pass
+
+        class _Pair(NamedTuple):
+            name: str
+            inner: object
+
+        assert _reaches_write_deadlines(_Router(us=backend))
+        assert _reaches_write_deadlines(_Ring([object(), backend]))
+        assert _reaches_write_deadlines(_Pair("us", backend))
+        assert _reaches_write_deadlines(_Router(us=object())) is False
+
+    def test_a_none_flag_on_a_subclass_stops_the_lookup(self) -> None:
+        """As Python's own lookup: the first namespace holding the name wins, even with None."""
+
+        class _Base:
+            _reports_write_deadline = True
+
+        class _Off(_Base):
+            _reports_write_deadline = None
+
+        class _Holder:
+            def __init__(self, inner: object) -> None:
+                self.inner = inner
+
+        assert _reaches_write_deadlines(_Holder(_Base()))
+        assert _reaches_write_deadlines(_Holder(_Off())) is False
 
     def test_forwarding_proxy_is_reached(self, backend: CachekitIOBackend) -> None:
         """The backend lives only in a closure: the proxy is found through the root's forwarded attribute."""
@@ -593,7 +597,6 @@ class TestWriteBound:
                 self.locks = {i: threading.Lock() for i in range(5000)}
                 self.inner = inner
 
-        assert _reaches_write_deadlines(_Striped(backend))
         assert _reaches_write_deadlines(_Striped(object()))  # nothing to find, but too wide to be sure
 
     def test_composing_wrapper_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:

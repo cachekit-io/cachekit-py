@@ -14,7 +14,7 @@ import sys
 import threading
 import types
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
 from pydantic import SecretBytes, SecretStr
@@ -409,7 +409,7 @@ _REACH_DEPTH = 3
 _REACH_READS = 4096
 _REACH_LEAVES = (str, bytes, bytearray, memoryview, int, float, complex, bool, type(None), type)
 # Containers are walked with the base type's own iterator, so a subclass's __iter__ never runs.
-_REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
+_REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Iterator[object]]], ...] = (
     (dict, lambda d: iter(dict.values(d))),  # a C view; iter() on it runs no user code
     (list, list.__iter__),
     (tuple, tuple.__iter__),
@@ -422,27 +422,31 @@ _TYPE_DICT: Any = vars(type)["__dict__"]
 _TYPE_MODULE: Any = vars(type)["__module__"]
 _TYPE_QUALNAME: Any = vars(type)["__qualname__"]
 _unreachable_wrapper_classes: set[tuple[str, str]] = set()  # names, not classes: a class per mock is not kept
+_MISSING = object()  # not found yet: None is a value a namespace can hold
+# A type's scan: (the type, kept alive so its id is not reused; member descriptors; getset __dict__;
+# class-level flag; entries scanned).
+_TypeScan = tuple[type, list[Any], object, object, int]
 
 
-def _scan_type(kind: type) -> tuple[list[Any], object, object, int]:
+def _scan_type(kind: type) -> _TypeScan:
     """What reading an instance of ``kind`` needs, from one scan of its MRO: its member descriptors, its getset
     ``__dict__`` descriptor, its class-level ``_reports_write_deadline`` value, and the entries scanned."""
     members: list[Any] = []
     scanned = 0
-    instance_dict: object = None
-    flag: object = None
+    instance_dict: object = _MISSING
+    flag: object = _MISSING
     for klass in _TYPE_MRO.__get__(kind):
         namespace = _TYPE_DICT.__get__(klass)
         scanned += 1 + len(namespace)
         members += [d for d in namespace.values() if type(d) is types.MemberDescriptorType]
-        if instance_dict is None and "__dict__" in namespace:
+        if instance_dict is _MISSING and "__dict__" in namespace:
             instance_dict = namespace["__dict__"]
-        if flag is None and "_reports_write_deadline" in namespace:
+        if flag is _MISSING and "_reports_write_deadline" in namespace:
             flag = namespace["_reports_write_deadline"]
-    return members, instance_dict, flag, scanned
+    return kind, members, instance_dict, flag, scanned
 
 
-def _read_object(obj: object, types_read: dict[type, Any]) -> tuple[bool, list[object], int]:
+def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: bool) -> tuple[bool, list[object], int]:
     """One read of ``obj``: (it says it reports a write deadline, its attribute values, reads spent). A type is
     scanned once per search (``types_read``), and charged then.
 
@@ -454,13 +458,13 @@ def _read_object(obj: object, types_read: dict[type, Any]) -> tuple[bool, list[o
     """
     kind = type(obj)
     spent = 0
-    scan = types_read.get(kind)
+    scan = types_read.get(id(kind))  # by id: hashing the type could run a metaclass __hash__
     if scan is None:
-        scan = types_read[kind] = _scan_type(kind)
-        spent = scan[3]
-    members, instance_dict, flag, _ = scan
+        scan = types_read[id(kind)] = _scan_type(kind)
+        spent = scan[4]
+    _, members, instance_dict, flag, _ = scan
     values: list[object] = []
-    for descriptor in members:
+    for descriptor in members if want_values else ():
         with contextlib.suppress(AttributeError):  # an unset slot
             values.append(descriptor.__get__(obj, kind))
     if type(instance_dict) is types.GetSetDescriptorType:
@@ -468,8 +472,9 @@ def _read_object(obj: object, types_read: dict[type, Any]) -> tuple[bool, list[o
         if type(held) is dict:
             if "_reports_write_deadline" in held:  # an instance value shadows the class's
                 flag = held["_reports_write_deadline"]
-            values += dict.values(held)
-    return flag is True, values, spent + len(members)
+            if want_values:
+                values += dict.values(held)
+    return flag is True, values, spent + len(values)
 
 
 def _reaches_write_deadlines(backend: object) -> bool:
@@ -495,16 +500,16 @@ def _reaches_write_deadlines(backend: object) -> bool:
             return True
         queue: collections.deque[tuple[object, int]] = collections.deque([(backend, 0)])
         seen = {id(backend): 0}  # id -> the shallowest depth it was reached at
-        types_read: dict[type, Any] = {}  # each type's MRO is scanned once per search
+        types_read: dict[int, _TypeScan] = {}  # each type's MRO is scanned once per search
         reads = 0
         while queue:
             obj, depth = queue.popleft()
             walk = next((it for base, it in _REACH_CONTAINERS if issubclass(type(obj), base)), None)
             if walk is not None:
-                children: Any = walk(obj)  # a container: its items stay at the holder's depth
+                children: Iterable[object] = walk(obj)  # a container: its items stay at the holder's depth
             else:
-                reports, children, scanned = _read_object(obj, types_read)
-                if reports and depth:  # the root's own flag was read with getattr above
+                reports, children, scanned = _read_object(obj, types_read, depth < _REACH_DEPTH)
+                if reports and obj is not backend:  # the root's own flag was read with getattr above
                     return True
                 reads += scanned
                 if reads > _REACH_READS:
