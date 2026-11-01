@@ -44,6 +44,7 @@ from ..cache_handler import (
     supports_swr,
     supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
+    write_deadlines_reachable,
 )
 from ..config.validation import ConfigurationError, hide_secret
 from ..interop import (
@@ -1317,17 +1318,17 @@ def create_cache_wrapper(
             stored = await set_tracked_async(cache_key, serialized_data, ttl, _registry_id, _warn_track_failure)
             if stored is not None:
                 return stored, True, None
-        # As _set_l2: around every write, and the handler's own set_async. to_thread copies the context.
+        reachable = getattr(handler, "_write_deadlines_reachable", None)  # inline, as in _set_l2
+        if not (write_deadlines_reachable(handler) if reachable is None else reachable):
+            return await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl), False, None  # type: ignore[union-attr]
+        # As _set_l2: around the handler's own set_async. to_thread copies the context.
         seen: list[tuple[float, float]] = []
         token = _WRITE_DEADLINES.set(seen)
         try:
             stored = await handler.set_async(cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl)  # type: ignore[union-attr]
         finally:
             _WRITE_DEADLINES.reset(token)
-        backend = getattr(handler, "backend", None)  # nothing reported: inline, as in _set_l2
-        if not seen and (not stored or getattr(backend, "_reports_write_deadline", False) is not True):
-            return stored, False, None
-        return stored, False, _written_copy_expiry(backend, seen, stored, ttl)
+        return stored, False, _written_copy_expiry(getattr(handler, "backend", None), seen, stored, ttl)
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining

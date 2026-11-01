@@ -400,6 +400,49 @@ def _fuses_tracked_write(backend: object) -> bool:
 
 
 _unreported_write_classes: set[type] = set()
+_REACH_DEPTH = 3  # wrapper levels searched for a reporting backend
+_REACH_NODES = 256  # objects searched at most, so a backend holding a large object graph stays cheap
+_REACH_LEAVES = (str, bytes, int, float, bool, type(None), type)
+
+
+def _reaches_write_deadlines(backend: object) -> bool:
+    """Whether a write through ``backend`` can report a write deadline (API-103): the backend says it reports,
+    attribute-forwarding proxies included, or it holds such a backend in an attribute, a list or a tuple, up
+    to ``_REACH_DEPTH`` wrappers down (a metrics or timeout wrapper that composes a CachekitIOBackend).
+
+    Asked once per handler (``write_deadlines_reachable``): a backend that cannot report never pays for the
+    deadline list on its writes, which costs the instruction-gated miss path about 2%. A wrapper that builds
+    its CachekitIOBackend on first use, or holds it out of reach, keeps L1 copies at the stated ttl.
+    """
+    stack = [(backend, 0)]
+    visited: set[int] = set()
+    while stack and len(visited) < _REACH_NODES:
+        obj, depth = stack.pop()
+        if id(obj) in visited:
+            continue
+        visited.add(id(obj))
+        try:
+            if getattr(obj, "_reports_write_deadline", False) is True:
+                return True
+            attrs = vars(obj) if depth < _REACH_DEPTH else {}
+        except Exception as exc:  # noqa: BLE001 - an object that cannot be inspected holds no reachable backend
+            get_logger().debug(f"write-deadline search skipped a {type(obj).__name__}: {type(exc).__name__}")
+            continue
+        for value in attrs.values():
+            for item in value if isinstance(value, (list, tuple)) else (value,):
+                if not isinstance(item, _REACH_LEAVES):
+                    stack.append((item, depth + 1))
+    return False
+
+
+def write_deadlines_reachable(handler: Any) -> bool:
+    """``_reaches_write_deadlines`` for the handler's backend, cached on the handler."""
+    reachable = getattr(handler, "_write_deadlines_reachable", None)
+    if reachable is None:
+        reachable = _reaches_write_deadlines(getattr(handler, "backend", None))
+        with contextlib.suppress(AttributeError):  # a custom strategy with __slots__: asked again next time
+            handler._write_deadlines_reachable = reachable
+    return reachable
 
 
 def _written_copy_expiry(
@@ -453,9 +496,15 @@ def _set_l2(
         stored = set_tracked(key, value, ttl, registry_id, on_track_error)
         if stored is not None:
             return stored, True, None
-    # Opened around every write, not only a reporting backend's: a wrapper that composes one (metrics,
-    # wrapt.ObjectProxy) reaches its set without forwarding the capability. Around the handler's own set,
-    # so an override of it still runs.
+    # The cached answer read inline: a call here costs the gated miss path 0.4%.
+    reachable = getattr(handler, "_write_deadlines_reachable", None)
+    if not (write_deadlines_reachable(handler) if reachable is None else reachable):
+        # Only thread the SWR kwarg when set: strategy implementations without
+        # **metadata (tests, custom handlers) must keep working unchanged.
+        if stale_ttl is not None:
+            return bool(handler.set(key, value, ttl, stale_ttl=stale_ttl)), False, None
+        return bool(handler.set(key, value, ttl)), False, None
+    # Around the handler's own set, so an override of it still runs.
     seen: list[tuple[float, float]] = []
     token = _WRITE_DEADLINES.set(seen)
     try:
@@ -467,12 +516,7 @@ def _set_l2(
             stored = bool(handler.set(key, value, ttl))
     finally:
         _WRITE_DEADLINES.reset(token)
-    # Nothing reported, the case for every backend but CachekitIO: answered inline, so the gated miss
-    # path pays no extra call (_written_copy_expiry gives None here too).
-    backend = getattr(handler, "backend", None)
-    if not seen and (not stored or getattr(backend, "_reports_write_deadline", False) is not True):
-        return stored, False, None
-    return stored, False, _written_copy_expiry(backend, seen, stored, ttl)
+    return stored, False, _written_copy_expiry(getattr(handler, "backend", None), seen, stored, ttl)
 
 
 class _MultiDeleteBackend(Protocol):
@@ -2443,6 +2487,7 @@ class StandardCacheHandler:
             ttl_refresh_threshold: Threshold for TTL refresh (0.0-1.0, default 0.5 = 50%)
         """
         self.backend = backend
+        self._write_deadlines_reachable: Optional[bool] = None  # see write_deadlines_reachable
         self.backpressure_controller = backpressure_controller
         self.ttl_refresh_threshold = ttl_refresh_threshold
 

@@ -33,7 +33,7 @@ from cachekit import l1_cache as l1_module
 from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
-from cachekit.cache_handler import StandardCacheHandler, _set_l2
+from cachekit.cache_handler import StandardCacheHandler, _reaches_write_deadlines, _set_l2
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators import write_behind as wb
 from cachekit.l1_cache import DEFAULT_L1_TTL_SECONDS
@@ -276,6 +276,41 @@ class TestWriteBound:
         assert _write(StandardCacheHandler(outer)) == (True, False, clock.now)
         assert nested == [(True, False, clock.now + 60)]
         assert _WRITE_DEADLINES.get() is None
+
+    def test_reachability_is_decided_once_per_handler(self, backend: CachekitIOBackend) -> None:
+        """A backend that cannot report never opens the deadline list (the miss path's instruction gate); the
+        answer is cached on the handler, and found through wrappers, lists and forwarded attributes."""
+
+        class _Holder:
+            def __init__(self, *inner: object) -> None:
+                self.inner = list(inner)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                pass
+
+        class _Plain:
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                pass
+
+        assert _reaches_write_deadlines(backend)
+        assert _reaches_write_deadlines(_Holder(_Plain(), backend))  # a tiered wrapper's list
+        assert _reaches_write_deadlines(_Holder(_Holder(_Holder(backend))))  # three wrappers down
+        assert not _reaches_write_deadlines(_Holder(_Holder(_Holder(_Holder(backend)))))  # past the depth limit
+        assert not _reaches_write_deadlines(_Plain())
+        handler = StandardCacheHandler(_Plain())  # type: ignore[arg-type]
+        assert _write(handler) == (True, False, None)
+        assert handler._write_deadlines_reachable is False
+
+    def test_lazily_built_backend_keeps_the_stated_ttl(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
+        """A wrapper that builds its CachekitIOBackend on first use is out of reach when the handler first
+        asks, so its writes keep the stated ttl, as before API-103 (documented)."""
+
+        class _Lazy:
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                backend.set(key, value, ttl)
+
+        saas.put_fresh_for = "0"
+        assert _write(StandardCacheHandler(_Lazy())) == (True, False, None)  # type: ignore[arg-type]
 
     def test_composing_wrapper_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         """A wrapper that composes a CachekitIO backend without forwarding its attributes (a metrics class)
