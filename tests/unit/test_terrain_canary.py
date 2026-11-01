@@ -5,6 +5,7 @@ CI runs no doctests under tests/performance, so its doctests and its argument ch
 
 from __future__ import annotations
 
+import argparse
 import doctest
 import importlib.metadata
 import json
@@ -14,7 +15,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import pytest
 
@@ -288,3 +289,21 @@ def test_names_the_apple_chip_on_macos(monkeypatch: pytest.MonkeyPatch, sysctl: 
     monkeypatch.setattr(terrain_canary.platform, "processor", lambda: "arm")
     monkeypatch.setattr(terrain_canary.subprocess, "run", run)
     assert terrain_canary.cpu_model() == expected
+
+
+def test_records_the_l2_label_without_its_padding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The label prints beside the figures as given, so padding from a shell quote must not reach it.
+    seen: list[str] = []
+
+    class StoppedBeforeRunError(Exception):
+        pass
+
+    def stop(args: argparse.Namespace) -> NoReturn:
+        seen.append(args.l2_where)
+        raise StoppedBeforeRunError
+
+    monkeypatch.setattr(terrain_canary, "run", stop)
+    argv = ["--redis", "redis://127.0.0.1:6379/0", "--harness", HARNESS, "--out", str(tmp_path / "terrain.json")]
+    with pytest.raises(StoppedBeforeRunError):
+        terrain_canary.main([*argv, "--l2-where", "  same host, loopback TCP "])
+    assert seen == ["same host, loopback TCP"]
