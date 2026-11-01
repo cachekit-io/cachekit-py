@@ -135,6 +135,31 @@ async with backend.acquire_lock("my-key", timeout=30.0, blocking_timeout=5.0) as
 The `@cache` decorators use this automatically on cache miss for **async**
 functions — see [Distributed Locking](../features/distributed-locking.md).
 
+## TTL Range and Plan Maximum
+
+A TTL is 1 to 7,776,000 seconds (90 days), and `ttl + stale_ttl` stays within the same 7,776,000.
+The decorator rejects a larger `ttl + stale_ttl` at decoration time. Your plan then sets the
+longest an entry is kept, its stale window included:
+
+| Plan | Maximum TTL |
+| :--- | :--- |
+| Free | 86,400 s (24 hours) |
+| Startup | 2,592,000 s (30 days) |
+| Professional | 7,776,000 s (90 days) |
+| Enterprise | None |
+
+A longer TTL is clamped to the maximum, not rejected, and the stale window gets only what the
+maximum leaves after the fresh TTL. A write without a TTL (`ttl=None`) is stored for the plan
+maximum; only a plan without one stores an entry that never expires. `refresh_ttl` is clamped
+the same way.
+
+The server reports the result in the `PUT` response's `X-CacheKit-Fresh-For`, and the decorator
+bounds its in-process (L1) copy of the value it wrote by it: the copy lives at most
+`min(ttl, fresh_for)` from the response, so a clamped write is never served from L1 past the
+plan maximum. A malformed or `0` value keeps no L1 copy; a server that sends no header leaves the
+copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied TTL, so it never
+lengthens an L1 copy.
+
 ## TTL Inspection (async only)
 
 ```python notest

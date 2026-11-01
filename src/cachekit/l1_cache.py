@@ -339,7 +339,10 @@ class L1Cache:
 
         # Skip caching if the effective TTL is non-finite (NaN/inf would create an
         # immortal entry that never expires) or too short (would expire immediately).
+        # Any older entry under the key is dropped, as for an oversized value below: a put that
+        # declines to store a newer value must not leave the previous one serving.
         if not math.isfinite(expiry) or expiry <= current_time:
+            self._on_current_state(_L1State.remove, key)
             logger.debug(
                 "Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)",
                 redact_key_for_log(key),

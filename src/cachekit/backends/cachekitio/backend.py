@@ -81,7 +81,8 @@ TTL_HEADER = "X-CacheKit-TTL"
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
-# A Fresh-For value never exceeds the 30-day TTL cap, which is seven digits.
+# The Fresh-For header's own 30-day cap (seven digits), set by the spec independently of the
+# 90-day TTL range: it only ever shortens a local copy's bound. Never derive one from the other.
 _FRESH_FOR_MAX_S = 2_592_000
 _FRESH_FOR_MAX_DIGITS = 7
 
@@ -160,7 +161,7 @@ def _parse_fresh_for(value: str | None) -> int | None:
     """Map an ``X-CacheKit-Fresh-For`` value to seconds (spec/saas-api.md#remaining-freshness).
 
     Absent = pre-signal server → None (legacy behavior: no bound). Anything but 1-7 ASCII
-    digits at most the 30-day TTL cap = drift → 0 (do not extend local service — the
+    digits at most the header's 30-day cap = drift → 0 (do not extend local service — the
     conservative action, mirroring the unrecognized-freshness → stale rule). The shape check
     runs before ``int()``, which accepts ``+5``, ``1_0``, whitespace and non-ASCII digits.
     Takes the header string, not a response, so it outlives the HTTP client.
@@ -627,7 +628,8 @@ class CachekitIOBackend:
         Args:
             key: Cache key
             value: Bytes to cache
-            ttl: Time-to-live in seconds (optional)
+            ttl: Time-to-live in seconds (optional). Omitted, the entry gets the plan's
+                maximum TTL, and never expires only on a plan without one.
             stale_ttl: Stale-grace window in seconds past the fresh TTL
                 (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
@@ -635,7 +637,19 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
+        self._set_with_freshness(key, value, ttl, stale_ttl)
+
+    def _set_with_freshness(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> int | None:
+        """``set``, returning the ``X-CacheKit-Fresh-For`` of the PUT's 2xx (spec/saas-api.md#remaining-freshness).
+
+        The decorator bounds its L1 copy of the value by it (API-103): the server may have clamped
+        ``ttl`` to the plan's maximum. Read with the GET grammar (``_parse_fresh_for``): None when the
+        header is absent (the stated TTL was applied), 0 when it is malformed. Private, like
+        ``_set_tracked``: the handler calls it only while ``set`` is this class's own (see
+        ``cache_handler._reports_write_freshness``), so an override or patch of ``set`` still runs.
+        """
+        response = self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
+        return self._fresh_for(response)
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
@@ -646,6 +660,10 @@ class CachekitIOBackend:
         if stale_ttl is not None and stale_ttl > 0 and ttl is not None:
             headers[STALE_TTL_HEADER] = str(_wire_seconds(stale_ttl))
         return headers
+
+    # The set that _set_with_freshness stands in for, captured at class creation; see
+    # cache_handler._reports_write_freshness.
+    _set_with_freshness_replaces = set
 
     def delete(self, key: str) -> bool:
         """Delete key from cache (sync).
@@ -819,7 +837,8 @@ class CachekitIOBackend:
         Args:
             key: Cache key
             value: Bytes to cache
-            ttl: Time-to-live in seconds (optional)
+            ttl: Time-to-live in seconds (optional). Omitted, the entry gets the plan's
+                maximum TTL, and never expires only on a plan without one.
             stale_ttl: Stale-grace window in seconds past the fresh TTL
                 (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
@@ -1136,7 +1155,9 @@ class CachekitIOBackend:
             key: Cache key
 
         Returns:
-            TTL in seconds, None if key doesn't exist or has no expiry
+            Seconds until the entry is evicted, its stale window included; None if the key
+            doesn't exist, the request failed, or the entry has no expiry (stored without a TTL
+            on a plan with no maximum TTL; on any other plan an omitted TTL gets the plan maximum)
 
         Raises:
             BackendError: If the key is reserved (see ``_encode_key``); encoded outside the
@@ -1152,6 +1173,9 @@ class CachekitIOBackend:
 
     async def refresh_ttl(self, key: str, ttl: int) -> bool:
         """Refresh/update TTL for existing key.
+
+        The ``PATCH`` response says nothing about the applied TTL (the server may clamp it to the
+        plan maximum), so the decorator never derives a local (L1) bound from it (API-104).
 
         Args:
             key: Cache key

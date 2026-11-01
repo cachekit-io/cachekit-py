@@ -107,7 +107,9 @@ def cache(
             entry is served immediately and the function re-runs in the background,
             so no request pays the recompute at a TTL boundary. Requires a positive
             ``ttl`` and an SWR-capable backend (CachekitIO); ``ttl + stale_ttl``
-            is capped at 2,592,000 s (30 days). ``@cache.io`` defaults it to
+            is capped at 7,776,000 s (90 days, the protocol's TTL range; a plan
+            with a lower maximum TTL shortens the stale window first, server-side).
+            ``@cache.io`` defaults it to
             ``ttl`` — pass ``stale_ttl=0`` to opt out. The background recompute
             sees a snapshot of the caller's ``contextvars`` (so contextvar-based
             tenant extraction works), but no other request-scoped resources —

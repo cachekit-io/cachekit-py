@@ -182,7 +182,7 @@ class DecoratorConfig:
     # positive ttl and an SWR-capable backend (CachekitIO). None = preset
     # decides (io() defaults it to ttl via swr_by_default); 0 = explicitly off.
     stale_ttl: int | None = None
-    # Preset flag: default stale_ttl to ttl (capped to the shared 30-day bound)
+    # Preset flag: default stale_ttl to ttl (capped to the shared 90-day TTL range)
     # when the backend supports SWR and the user didn't say otherwise.
     swr_by_default: bool = False
     namespace: str | None = None

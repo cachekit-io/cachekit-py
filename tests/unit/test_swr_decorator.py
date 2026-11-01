@@ -30,7 +30,7 @@ from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.validation import ConfigurationError
 from tests.utils.fork_helpers import child_outcome, report, run_fresh
 
-_CAP = 2_592_000  # 30-day storage cap shared by ttl + stale_ttl
+_CAP = 7_776_000  # 90-day TTL range shared by ttl + stale_ttl
 
 
 class FakeSWRBackend:
@@ -240,7 +240,7 @@ class TestSWRConfig:
         assert compute() == "v"
         assert backend.set_calls == [(60, None)]  # no window: explicit opt-out
 
-    def test_preset_default_caps_window_to_30_day_total(self) -> None:
+    def test_preset_default_caps_window_to_90_day_total(self) -> None:
         backend = FakeSWRBackend()
         ttl = _CAP - 100  # leaves only 100s of window headroom
         config = DecoratorConfig(backend=backend, ttl=ttl, swr_by_default=True)
@@ -273,10 +273,31 @@ class TestSWRConfig:
             def f() -> None: ...
 
     def test_total_over_cap_raises(self) -> None:
-        with pytest.raises(ConfigurationError, match="30-day"):
+        with pytest.raises(ConfigurationError, match="90-day"):
 
-            @cache(backend=FakeSWRBackend(), ttl=2_000_000, stale_ttl=1_000_000, l1_enabled=False)
+            @cache(backend=FakeSWRBackend(), ttl=_CAP - 1_000_000, stale_ttl=1_000_001, l1_enabled=False)
             def f() -> None: ...
+
+    def test_total_at_cap_accepted(self) -> None:
+        """ttl + stale_ttl == 7,776,000 is the largest valid write; the old 30-day cap no longer applies."""
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=_CAP - 1_000_000, stale_ttl=1_000_000, l1_enabled=False)
+        def f() -> str:
+            return "v"
+
+        assert f() == "v"
+        assert backend.set_calls == [(_CAP - 1_000_000, 1_000_000)]
+
+    def test_total_past_old_30_day_cap_accepted(self) -> None:
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=2_000_000, stale_ttl=1_000_000, l1_enabled=False)
+        def f() -> str:
+            return "v"
+
+        assert f() == "v"
+        assert backend.set_calls == [(2_000_000, 1_000_000)]
 
     def test_non_swr_backend_raises(self) -> None:
         class PlainBackend:
@@ -743,7 +764,7 @@ class TestSWRSchedulingHardening:
     slot release when scheduling fails."""
 
     def test_default_window_off_when_ttl_at_or_above_cap(self) -> None:
-        """ttl ≥ the 30-day cap leaves no window headroom: SWR silently off,
+        """ttl ≥ the 90-day cap leaves no window headroom: SWR silently off,
         never a negative stale_ttl."""
         backend = FakeSWRBackend()
         config = DecoratorConfig(backend=backend, ttl=_CAP + 100, swr_by_default=True)
