@@ -144,9 +144,7 @@ def test_a_report_ir_budget_did_not_write_is_no_report(tmp_path, text: str) -> N
 
 def test_the_footnote_states_the_gate_thresholds() -> None:
     body = render(_all_ok(), 4, JOBS, "aaa", "bbb", RUN)
-    assert f"+{ir_budget.FAIL_PCT:g}% or more" in body
-    assert set(ir_budget.TOLERANCE_PCT) == {"serializer_orjson"}  # the footnote names no other exception
-    assert f"(+{ir_budget.TOLERANCE_PCT['serializer_orjson'][0]:g}% for `serializer_orjson`)" in body
+    assert f"+{ir_budget.FAIL_PCT:g}% or more against the base." in body  # one threshold, no per-path exception
 
 
 def test_ci_names_the_marker_and_the_shard_jobs() -> None:

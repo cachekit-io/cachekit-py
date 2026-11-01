@@ -51,18 +51,9 @@ def test_main_thread_ir_without_totals_raises(tmp_path) -> None:
         (99_000, "LOWER", True),
     ],
 )
-def test_compare_thresholds(measured: int, verdict: str, ok: bool) -> None:
-    lines, passed = compare({"l1_hit": 100_000}, {"l1_hit": measured})
-    assert lines[0].split()[0] == verdict
-    assert passed is ok
-
-
-@pytest.mark.parametrize(
-    ("measured", "verdict", "ok"),
-    [(100_999, "ok", True), (101_000, "WARN", True), (101_999, "WARN", True), (102_000, "FAIL", False), (98_000, "LOWER", True)],
-)
-def test_compare_gates_orjson_at_its_own_tolerance(measured: int, verdict: str, ok: bool) -> None:
-    lines, passed = compare({"serializer_orjson": 100_000}, {"serializer_orjson": measured})
+@pytest.mark.parametrize("path", ["l1_hit", "serializer_orjson"])  # orjson had a 2% exception until its noise was fixed
+def test_compare_thresholds(path: str, measured: int, verdict: str, ok: bool) -> None:
+    lines, passed = compare({path: 100_000}, {path: measured})
     assert lines[0].split()[0] == verdict
     assert passed is ok
 
