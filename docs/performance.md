@@ -320,7 +320,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 |------|--------------------|-------------:|-------------:|
 | `l1_hit` | `@cache(backend=None)` L1 hit | 2,596 | 2,482 |
 | `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit) | 83,015 | 83,882 |
-| `l1_hit_backed_auto` | `l1_hit_backed` with `serializer="auto"` (decodes the verified MessagePack the auto serializer keeps; recorded on a different machine from the other rows, where `l1_hit_backed` read 3.4% below its budget) | 91,986 | 92,950 |
+| `l1_hit_backed_auto` | `l1_hit_backed` with `serializer="auto"` (decodes the verified MessagePack the auto serializer keeps) | 91,986 | 92,950 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,596 | 2,488 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 172,539 | 167,686 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,364 | 204,897 |

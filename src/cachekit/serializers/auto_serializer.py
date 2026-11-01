@@ -987,8 +987,9 @@ class AutoSerializer:
         without retrieve() (:meth:`_deserialize_verified`). Call it only for an integrity-on serializer.
 
         None, decoding nothing, for every other entry: a header that claims another format (NumPy, Arrow,
-        DataFrame, Series), and bytes :meth:`deserialize` would test as NumPy before the envelope, which it
-        refuses under a ``"msgpack"`` header. The caller decodes those as any other entry, so only the route
+        DataFrame, Series), and any bytes with the ``NUMPY_RAW`` magic at offset 0 or 8. That magic test is
+        deliberately broader than :meth:`deserialize`'s checksum-gated NumPy route, which refuses such bytes
+        under a ``"msgpack"`` header: a broader test only declines to keep. The caller decodes those as any other entry, so only the route
         :meth:`deserialize` takes for this header to ``retrieve()`` runs here, and it fails as that route does.
 
         Examples:
