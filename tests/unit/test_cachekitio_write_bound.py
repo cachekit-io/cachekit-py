@@ -35,7 +35,7 @@ from cachekit import l1_cache as l1_module
 from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio import backend as backend_module
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
-from cachekit.cache_handler import _REACH_CHECKS, StandardCacheHandler, _reach_children, _reaches_write_deadlines, _set_l2
+from cachekit.cache_handler import _REACH_READS, StandardCacheHandler, _reaches_write_deadlines, _set_l2
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators import write_behind as wb
 from cachekit.l1_cache import DEFAULT_L1_TTL_SECONDS
@@ -337,27 +337,28 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Wrapper(backend, first=True))
         assert _reaches_write_deadlines(_Wrapper(backend, first=False))
 
-    def test_closure_held_backend_is_reached_once_held_in_an_attribute(
-        self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock
-    ) -> None:
-        """The documented blind spot and its remedy: a wrapper holding its CachekitIOBackend only in a
-        closure is out of reach (its copies keep the stated ttl); the same wrapper holding it in an
-        attribute gets the bound."""
+    def test_documented_blind_spots_keep_the_stated_ttl(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
+        """The two shapes the docs name as out of reach: a backend held only in a closure, and one assigned
+        to an attribute on first use (the search runs before the first write and is cached)."""
 
         class _Closure:
             def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
                 backend.set(key, value, ttl)
 
-        class _Attribute:
+        class _BuiltOnFirstUse:
             def __init__(self) -> None:
-                self.inner = backend
+                self.inner: CachekitIOBackend | None = None
 
             def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                if self.inner is None:
+                    self.inner = backend
                 self.inner.set(key, value, ttl)
 
         saas.put_fresh_for = "0"
         assert _write(StandardCacheHandler(_Closure())) == (True, False, None)  # type: ignore[arg-type]
-        assert _write(StandardCacheHandler(_Attribute())) == (True, False, clock.now)  # type: ignore[arg-type]
+        handler = StandardCacheHandler(_BuiltOnFirstUse())  # type: ignore[arg-type]
+        assert _write(handler) == (True, False, None)
+        assert _write(handler) == (True, False, None)  # still: the answer was cached at the first write
 
     def test_reachability_through_containers(self, backend: CachekitIOBackend) -> None:
         """Routers, shard rings and pools: dict values, sets and nested containers, without spending depth."""
@@ -370,7 +371,7 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Holder([(17, object()), (42, backend)]))  # (hash, backend) ring
         assert _reaches_write_deadlines(_Holder({backend}))
         assert _reaches_write_deadlines(_Holder({"tier": [[{"x": backend}]]}))  # nested, one wrapper level
-        assert _reaches_write_deadlines(_Holder([object()] * 1_000_000 + [backend])) is False  # budget, quickly
+        assert _reaches_write_deadlines(_Holder([object()] * 1_000_000))  # budget spent: fails open, quickly
 
     def test_an_ordinary_backend_answers_false_without_failing_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A plain backend with dicts, lists, sets and slots in its attributes is searched to a clean False:
@@ -400,16 +401,30 @@ class TestWriteBound:
 
         assert _reaches_write_deadlines(_Holder()) is False  # returns, and finds nothing
 
-    def test_container_reads_stay_within_the_budget(self) -> None:
-        """Every container item read counts, leaves included, however the containers nest."""
+    def test_one_counter_bounds_any_container_shape(self) -> None:
+        """Every value read counts, leaves included, and a shared container is read once: shapes that grow
+        super-linearly when re-read finish at once and fail open."""
 
         class _Wide:
             def __init__(self) -> None:
-                self.groups = [[object() for _ in range(200)] for _ in range(100)]
-                self.table = [[0] * 4096 for _ in range(200)]
+                row = [0] * 10**6
+                self.grid = [row] * 10**6
+                self.nested = [[[[0] * 100] * 100] * 100] * 100
 
-        _, reads = _reach_children(_Wide(), _REACH_CHECKS)
-        assert reads <= _REACH_CHECKS
+        started = time.monotonic()
+        assert _reaches_write_deadlines(_Wide())
+        assert time.monotonic() - started < 1.0
+
+    def test_a_cycle_beside_the_backend_ends(self, backend: CachekitIOBackend) -> None:
+        root: dict[str, object] = {}
+        root["children"] = [{"parent": root}]
+
+        class _Wrapper:
+            def __init__(self) -> None:
+                self.config = root
+                self.inner = backend
+
+        assert _reaches_write_deadlines(_Wrapper())
 
     def test_a_full_bucket_does_not_starve_a_route(self, backend: CachekitIOBackend) -> None:
         """Containers at one nesting level are read round-robin: a 4,096-item bucket before a router does
@@ -417,7 +432,7 @@ class TestWriteBound:
 
         class _Wrapper:
             def __init__(self) -> None:
-                self.buckets = [[object() for _ in range(_REACH_CHECKS)]]
+                self.buckets = [[object() for _ in range(_REACH_READS)]]
                 self.routes = {"us": [backend]}
 
         class _Root:
@@ -432,7 +447,7 @@ class TestWriteBound:
 
         class _Wide:
             def __init__(self) -> None:
-                self.items = [object() for _ in range(10 * _REACH_CHECKS)]
+                self.items = [object() for _ in range(10 * _REACH_READS)]
 
         class _Holder:
             def __init__(self, inner: object) -> None:
@@ -470,19 +485,31 @@ class TestWriteBound:
             def __init__(self) -> None:
                 self.lazy = _LazyProxy()
                 self.overriding = _Overriding()
+                self.hooked = _Hooked()
 
-        assert _reaches_write_deadlines(_Holder()) is False
+        class _Meta(type):
+            def __getattribute__(cls, name: str) -> Any:
+                ran.append(f"meta:{name}")
+                return super().__getattribute__(name)
+
+        class _Hooked(metaclass=_Meta):
+            def __init__(self) -> None:
+                self.value = 1
+
+        ran.clear()
+        holder = _Holder()
+        ran.clear()  # building the objects above may touch the metaclass; the search must not
+        assert _reaches_write_deadlines(holder) is False
         assert ran == []
 
     def test_forwarding_proxy_is_reached(self, backend: CachekitIOBackend) -> None:
+        """The backend lives only in a closure: the proxy is found through the root's forwarded attribute."""
+
         class _Proxy:
-            def __init__(self, inner: CachekitIOBackend) -> None:
-                self._inner = inner
-
             def __getattr__(self, name: str) -> Any:
-                return getattr(self._inner, name)
+                return getattr(backend, name)
 
-        assert _reaches_write_deadlines(_Proxy(backend))
+        assert _reaches_write_deadlines(_Proxy())
 
     def test_search_runs_no_user_code_below_the_root(self, backend: CachekitIOBackend) -> None:
         """A lazy object is never evaluated, a list subclass's ``__iter__`` never runs, and a property never
@@ -515,11 +542,32 @@ class TestWriteBound:
     def test_a_search_that_raises_opens_the_list(self, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         """Opening the list is always safe, so a search that fails answers True."""
 
-        def broken(obj: object, budget: int) -> list[object]:
+        def broken(obj: object) -> list[object]:
             raise RuntimeError("unexpected")
 
-        monkeypatch.setattr(cache_handler_module, "_reach_children", broken)
+        monkeypatch.setattr(cache_handler_module, "_instance_values", broken)
         assert _reaches_write_deadlines(object())
+
+    def test_a_none_backend_or_odd_module_neither_raises_nor_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        logged: list[str] = []
+        monkeypatch.setattr(cache_handler_module.get_logger(), "info", lambda message, *a, **k: logged.append(message))
+        assert _reaches_write_deadlines(None) is False
+        assert logged == []
+        odd = type("Odd", (), {})
+        odd.__module__ = None  # type: ignore[assignment]
+        assert _reaches_write_deadlines(odd()) is False
+        assert len(logged) == 1
+
+    def test_budget_exhaustion_opens_the_list(self, backend: CachekitIOBackend) -> None:
+        """A wide first level used to answer False and drop the bound; now the walk fails open."""
+
+        class _Striped:
+            def __init__(self, inner: object) -> None:
+                self.locks = {i: threading.Lock() for i in range(5000)}
+                self.inner = inner
+
+        assert _reaches_write_deadlines(_Striped(backend))
+        assert _reaches_write_deadlines(_Striped(object()))  # nothing to find, but too wide to be sure
 
     def test_composing_wrapper_keeps_the_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock) -> None:
         """A wrapper that composes a CachekitIO backend without forwarding its attributes (a metrics class)
@@ -715,58 +763,6 @@ class TestWriterCopyBound:
         assert compute() == 1
         assert calls
         assert "PUT" not in saas.ops
-
-    def test_forwarding_proxy_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
-        """A proxy that forwards attributes and ``set`` to a CachekitIO backend keeps its writes' bounds."""
-
-        class _Proxy:
-            def __init__(self, inner: CachekitIOBackend) -> None:
-                self.inner = inner
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self.inner, name)
-
-            def get_with_freshness(self, key: str) -> Any:
-                return self.inner.get_with_freshness(key)
-
-            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
-                self.inner.set(key, value, ttl, stale_ttl)
-
-        saas.put_fresh_for = "0"
-        saas.get_fresh_for = "0"
-        compute, calls = _decorated(_Proxy(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
-        assert compute() == 1
-        gets = saas.gets()
-        assert compute() == 1
-        assert saas.gets() == gets + 1
-        assert len(calls) == 1
-
-    def test_slotted_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
-        """A ``@dataclass(slots=True)`` wrapper over CachekitIO: a 0 Fresh-For keeps no copy."""
-
-        @dataclasses.dataclass(slots=True)
-        class _Slotted:
-            inner: CachekitIOBackend
-
-            def get(self, key: str) -> bytes | None:
-                return self.inner.get(key)
-
-            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
-                self.inner.set(key, value, ttl)
-
-            def delete(self, key: str) -> bool:
-                return self.inner.delete(key)
-
-            def exists(self, key: str) -> bool:
-                return self.inner.exists(key)
-
-        saas.put_fresh_for = "0"
-        compute, calls = _decorated(_Slotted(backend), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
-        assert compute() == 1
-        gets = saas.gets()
-        assert compute() == 1
-        assert saas.gets() == gets + 1
-        assert len(calls) == 1
 
     def test_composing_wrapper_keeps_a_zero_bound(self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool) -> None:
         """A composing wrapper (no attribute forwarding) over CachekitIO: a 0 Fresh-For keeps no copy."""

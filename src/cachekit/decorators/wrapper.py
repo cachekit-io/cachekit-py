@@ -1318,7 +1318,7 @@ def create_cache_wrapper(
             stored = await set_tracked_async(cache_key, serialized_data, ttl, _registry_id, _warn_track_failure)
             if stored is not None:
                 return stored, True, None
-        reachable = getattr(handler, "_write_deadlines_reachable", None)  # inline, as in _set_l2
+        reachable = getattr(handler, "_write_deadlines_reachable", None)  # the async path is not gated: one branch
         seen: list[tuple[float, float]] | None = (
             [] if (write_deadlines_reachable(handler) if reachable is None else reachable) else None
         )

@@ -164,10 +164,11 @@ lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps 
 as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
 backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread, provided the decorator
 can find that backend at its first L2 write: in an attribute (`__slots__` included), or in a dict,
-list, tuple or set there (a router or a shard ring), at most three wrappers down. A wrapper that
-holds its backend only in a closure, or creates it inside `set`, is not found: its L1 copies keep
-`ttl`, and the decorator logs this once per wrapper class. Hold the backend in an attribute to get
-the bound. A wrapper that delegates on another thread (a timeout wrapper with its own executor) must
+list, tuple or set there (a router or a shard ring), at most three wrappers down. A backend too
+large to search is treated as one that reports. A wrapper that holds its backend only in a closure,
+or creates it on first use (even into an attribute: the search runs before the first write and its
+answer is kept), is not found: its L1 copies keep `ttl`, and the decorator logs this once per
+wrapper class. Hold the backend in an attribute from construction to get the bound. A wrapper that delegates on another thread (a timeout wrapper with its own executor) must
 run the call under `contextvars.copy_context().run`; otherwise its L1 copies keep `ttl` and ignore
 Fresh-For. A subclass that writes any other way gives the decorator no response to read, so it
 keeps no L1 copy of that write.
