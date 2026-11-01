@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Callable
 
 # Bucket i (0-based) holds the durations up to 2**(i + 7) ns, the last up to the 60 s ceiling (spec table).
 BUCKETS = 16
@@ -43,13 +44,28 @@ def bucket_index(duration_ns: int) -> int:
     return min(max((duration_ns - 1).bit_length() - 7, 0), BUCKETS - 1)
 
 
+class _State:
+    """One process's accumulator. Its ``pid`` never changes: a forked child gets a new ``_State``, never a reset one."""
+
+    __slots__ = ("buckets", "lock", "pid", "sum")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pid = os.getpid()
+        self.buckets = [0] * BUCKETS
+        self.sum = 0
+
+
 class L1LatencyReport:
     """One CachekitIO backend's accumulator of timed L1 hits since its last report.
 
-    ``add`` and ``take`` hold one lock, so a report's buckets and sum always describe the same hits and no two
-    requests carry the same hit (API-85). A forked child starts empty (API-83): checked against the PID rather
-    than by an at-fork hook, because uWSGI forks without running Python's hooks. The lock is replaced with the
-    state, as a thread of the parent may have held it at the fork.
+    ``add``, ``record`` and ``take`` hold one lock, so a report's buckets and sum always describe the same hits and
+    no two requests carry the same hit (API-85). A forked child starts empty (API-83): checked against the PID
+    rather than by an at-fork hook, because uWSGI forks without running Python's hooks. The child never touches
+    the parent's state, whose lock a parent thread may have held at the fork: it builds a complete new state and
+    publishes it with one assignment, so a thread sees either the inherited state, whose PID sends it to build its
+    own, or a new empty one. Two child threads racing their first use may each build one; the hits counted into the
+    one overwritten are lost, never the parent's sent.
 
     Examples:
         >>> report = L1LatencyReport()
@@ -61,44 +77,57 @@ class L1LatencyReport:
         True
     """
 
-    __slots__ = ("_buckets", "_lock", "_pid", "_sum")
+    __slots__ = ("_state",)
 
     def __init__(self) -> None:
-        self._reset()
+        self._state = _State()
 
-    def _reset(self) -> None:
-        self._lock = threading.Lock()
-        self._pid = os.getpid()
-        self._buckets = [0] * BUCKETS
-        self._sum = 0
+    def _current(self) -> _State:
+        state = self._state
+        if state.pid != os.getpid():
+            state = _State()
+            self._state = state
+        return state
+
+    @staticmethod
+    def _count(state: _State, duration_ns: int) -> None:
+        """Count one duration into ``state``; the caller holds its lock. Above 60 s it is discarded (API-87)."""
+        if not 0 <= duration_ns <= MAX_DURATION_NS:
+            return
+        total = state.sum + duration_ns
+        if total > _MAX_WIRE_INT:  # never reached in practice: about 150,000 hits of 60 s in one report
+            return
+        state.sum = total
+        state.buckets[bucket_index(duration_ns)] += 1
 
     def add(self, duration_ns: int) -> None:
-        """Count one timed L1 hit. A duration above 60 s is discarded (API-87)."""
-        if duration_ns > MAX_DURATION_NS or duration_ns < 0:
-            return
-        if self._pid != os.getpid():
-            self._reset()
-        index = bucket_index(duration_ns)
-        with self._lock:
-            total = self._sum + duration_ns
-            if total > _MAX_WIRE_INT:  # never reached in practice: about 150,000 hits of 60 s in one report
-                return
-            self._sum = total
-            self._buckets[index] += 1
+        """Count one timed L1 hit of ``duration_ns``."""
+        state = self._current()
+        with state.lock:
+            self._count(state, duration_ns)
+
+    def record(self, start_ns: int, clock: Callable[[], int]) -> None:
+        """Count one timed L1 hit that started at ``start_ns`` on ``clock`` and ends now.
+
+        The clock is read once the lock is held, so the time spent waiting for it, which the caller pays before it
+        gets its value, is in the duration.
+        """
+        state = self._current()
+        with state.lock:
+            self._count(state, clock() - start_ns)
 
     def take(self) -> dict[str, str] | None:
         """The report's headers, emptying it in the same step; None while its duration sum is 0.
 
         A report whose sum is 0 stays: all-zero buckets are never attached.
         """
-        if self._pid != os.getpid():
-            self._reset()
-        with self._lock:
-            if self._sum < 1:
+        state = self._current()
+        with state.lock:
+            if state.sum < 1:
                 return None
-            buckets, total = self._buckets, self._sum
-            self._buckets = [0] * BUCKETS
-            self._sum = 0
+            buckets, total = state.buckets, state.sum
+            state.buckets = [0] * BUCKETS
+            state.sum = 0
         return {
             BUCKETS_HEADER: ",".join(map(str, buckets)),
             SUM_HEADER: str(total),

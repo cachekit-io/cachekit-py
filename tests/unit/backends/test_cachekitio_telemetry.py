@@ -20,7 +20,7 @@ from cachekit.backends.cachekitio.backend import CachekitIOBackend, _inject_metr
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig, resolve_telemetry
 from cachekit.backends.errors import BackendError
 from cachekit.decorators import l1_latency, wrapper
-from cachekit.decorators.l1_latency import HEADERS, MAX_DURATION_NS, ONE_IN, L1LatencyReport
+from cachekit.decorators.l1_latency import HEADERS, MAX_DURATION_NS, ONE_IN, L1LatencyReport, bucket_index
 from cachekit.decorators.wrapper import _FunctionStats, _latency_report_of
 from tests.utils.cachekitio_fakes import TEST_API_KEY, FakePool, FakeRequest, fake_backend, response
 
@@ -141,13 +141,18 @@ class TestWhatIsTimed:
         assert [sent for sent in _sent(pool) if sent] == [ONE_HIT_300]
         assert _sent(pool)[before] == ONE_HIT_300
 
-    def test_api79_the_clock_starts_before_the_key_is_built(self, store: _Store, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The first clock read comes before the call's first step past the wrapper (its stats context, then its key)."""
+    def test_api79_the_clock_spans_key_building_and_context_cleanup(
+        self, store: _Store, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The first clock read comes before the call's first step past the wrapper (its stats context, then its key);
+        the last after the context is restored, the call's last step before its value is handed back."""
         events: list[str] = []
         monkeypatch.setattr(wrapper, "_getrandbits", lambda k: 0)
         monkeypatch.setattr(wrapper, "_perf_counter_ns", lambda: events.append("clock") or 1_000 * len(events))
         real = wrapper.set_current_function_stats
         monkeypatch.setattr(wrapper, "set_current_function_stats", lambda stats: events.append("call") or real(stats))
+        real_reset = wrapper.reset_current_function_stats
+        monkeypatch.setattr(wrapper, "reset_current_function_stats", lambda token: events.append("reset") or real_reset(token))
         backend, _ = _backend(store)
 
         @cache(backend=backend, ttl=60, namespace=_ns())
@@ -157,7 +162,48 @@ class TestWhatIsTimed:
         f(1)
         events.clear()
         f(1)  # hit
-        assert events == ["clock", "call", "clock"]
+        assert events == ["clock", "call", "reset", "clock"]
+
+    @pytest.mark.parametrize("mode", ["sync", "async"])
+    def test_api79_the_wait_for_the_reports_lock_is_in_the_duration(
+        self, mode: str, store: _Store, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The caller pays for a contended report lock before it gets its value, so that wait is part of the hit."""
+        monkeypatch.setattr(wrapper, "_getrandbits", lambda k: 0)
+        backend, _ = _backend(store)
+        report = backend.l1_latency_report
+        assert report is not None
+
+        if mode == "sync":
+
+            @cache(backend=backend, ttl=60, namespace=_ns())
+            def f(x: int) -> int:
+                return x
+
+            call = lambda: f(1)  # noqa: E731
+        else:
+
+            @cache(backend=backend, ttl=60, namespace=_ns())
+            async def g(x: int) -> int:
+                return x
+
+            call = lambda: asyncio.run(g(1))  # noqa: E731
+
+        call()  # miss
+        report.take()
+        hold_ns = 50_000_000
+        state = report._state
+        state.lock.acquire()  # another thread mid-record
+        releaser = threading.Timer(hold_ns / 1e9, state.lock.release)
+        releaser.start()
+        try:
+            call()  # hit, blocked on the lock
+        finally:
+            releaser.join()
+        taken = report.take()
+        # The hold starts before the call (asyncio.run's setup eats into it), so not all of it is waited; without
+        # the wait in the interval the hit reads well under a millisecond.
+        assert taken is not None and int(taken["X-CacheKit-L1-Latency-Sum-Ns"]) >= hold_ns // 2
 
     def test_api80_a_miss_and_an_l2_hit_are_never_timed(self, store: _Store, timed: _Clock) -> None:
         backend, pool = _backend(store)
@@ -310,10 +356,35 @@ class TestReports:
 
     def test_api83_a_lock_held_at_the_fork_does_not_hang_the_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
         report = L1LatencyReport()
-        report._lock.acquire()  # a parent thread mid-add when the process forked
+        report._state.lock.acquire()  # a parent thread mid-add when the process forked
         monkeypatch.setattr(l1_latency.os, "getpid", lambda: -1)
         report.add(200)
         assert report.take() is not None
+
+    def test_api83_racing_first_uses_in_a_child_never_take_the_parents_hits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Child threads that all reach the inherited state at once each see its PID and build their own; none
+        reads or empties the parent's state, which keeps its hit untouched."""
+        report = L1LatencyReport()
+        report.add(12_345)
+        inherited = report._state
+        monkeypatch.setattr(l1_latency.os, "getpid", lambda: -1)
+        barrier = threading.Barrier(8)
+        taken: list[dict[str, str] | None] = []
+
+        def first_use() -> None:
+            barrier.wait()
+            report.add(700)
+            taken.append(report.take())
+
+        threads = [threading.Thread(target=first_use) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert all(t is None or t["X-CacheKit-L1-Latency-Sum-Ns"] != "12345" for t in taken)
+        sums = [int(t["X-CacheKit-L1-Latency-Sum-Ns"]) for t in taken if t is not None]
+        assert all(s % 700 == 0 for s in sums)  # only child hits, never the parent's 12,345 ns
+        assert inherited.sum == 12_345 and inherited.buckets[bucket_index(12_345)] == 1
 
     def test_a_zero_sum_report_is_not_attached_and_stays(self) -> None:
         report = L1LatencyReport()
@@ -432,7 +503,7 @@ class TestEncoding:
 
     def test_api87_the_sum_never_passes_2_pow_53(self) -> None:
         report = L1LatencyReport()
-        report._sum = 2**53 - 10
+        report._state.sum = 2**53 - 10
         report.add(100)  # would pass the limit: dropped
         report.add(9)
         taken = report.take()
