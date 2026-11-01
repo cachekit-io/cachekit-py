@@ -264,7 +264,7 @@ def test_cached_function():
 
 ## Performance
 
-What a call costs inside your process, from the wall-clock guards in `tests/performance/` run on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with CPython 3.14.7. Each figure is the mean of five run medians with its 95% band. The two L1-only rows come from [a later run](https://github.com/cachekit-io/cachekit-py/actions/runs/41210621694) on the same CPU model and Python than the other two.
+What a call costs inside your process, from the wall-clock guards in `tests/performance/` run on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with CPython 3.14.7. Each figure is the mean of five run medians with its 95% band. The two L1-only rows come from [a later run](https://github.com/cachekit-io/cachekit-py/actions/runs/41210621694) on the same CPU model and Python as the other two.
 
 | Path | Time per call |
 |:-----|--------------:|
