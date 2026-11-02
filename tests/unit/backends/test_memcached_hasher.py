@@ -22,6 +22,7 @@ from cachekit._rust_serializer import rendezvous_node
 from cachekit.backends.memcached.backend import MemcachedBackend, _parse_server
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.memcached.hasher import NativeRendezvousHash
+from tests.utils.hypothesis_settings import slow_first_draw
 
 server = st.builds("{}:{}".format, st.from_regex(r"[a-z0-9.\-]{1,40}", fullmatch=True), st.integers(1, 65535))
 servers = st.lists(server, min_size=1, max_size=5, unique=True)
@@ -35,6 +36,7 @@ def both(nodes: list[str]) -> tuple[RendezvousHash, NativeRendezvousHash]:
     return reference, native
 
 
+@slow_first_draw
 @given(nodes=servers, key=st.text(max_size=300))
 def test_same_server_as_pymemcache_for_any_str_key(nodes: list[str], key: str) -> None:
     # Any text, non-ASCII included: pymemcache hashes each character's low 8 bits.
@@ -42,6 +44,7 @@ def test_same_server_as_pymemcache_for_any_str_key(nodes: list[str], key: str) -
     assert native.get_node(key) == reference.get_node(key)
 
 
+@slow_first_draw
 @given(nodes=servers, key=st.from_regex(r"[!-~]{1,250}", fullmatch=True))
 def test_same_server_as_pymemcache_for_memcached_keys(nodes: list[str], key: str) -> None:
     # The keys HashClient actually routes: printable ASCII, no spaces, at most 250 characters.
@@ -49,12 +52,14 @@ def test_same_server_as_pymemcache_for_memcached_keys(nodes: list[str], key: str
     assert native.get_node(key) == reference.get_node(key)
 
 
+@slow_first_draw
 @given(nodes=servers, key=st.binary(max_size=64))
 def test_bytes_key_falls_back_to_pymemcache(nodes: list[str], key: bytes) -> None:
     reference, native = both(nodes)
     assert native.get_node(key) == reference.get_node(key)
 
 
+@slow_first_draw
 @given(data=st.text(max_size=300), seed=st.integers(0, 2**32 - 1))
 def test_native_murmur3_is_pymemcache_murmur3(data: str, seed: int) -> None:
     # One node "" scores f"-{data}", so compare rendezvous_node's pick against a hand scoring.
@@ -148,6 +153,7 @@ def test_non_str_node_falls_back_to_pymemcache() -> None:
     assert native.get_node("k") == reference.get_node("k")
 
 
+@slow_first_draw
 @given(nodes=servers, keys=st.lists(st.from_regex(r"[!-~]{1,250}", fullmatch=True), max_size=20))
 def test_backend_routes_like_a_default_hash_client(nodes: list[str], keys: list[str]) -> None:
     backend = MemcachedBackend(MemcachedBackendConfig(servers=nodes))
