@@ -163,7 +163,7 @@ copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied
 lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
 as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
 backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread, provided the decorator
-can find that backend at its first L2 write: in an attribute (`__slots__` included), or in a dict,
+can find that backend at its first L2 write: in an instance or class attribute (`__slots__` included), or in a dict,
 list, tuple or set there (a router or a shard ring), at most three wrappers down. A wrapper too
 large to search is assumed to hold one. A wrapper that holds its backend only in a closure,
 or creates it on first use (even into an attribute: the search runs before the first write and its

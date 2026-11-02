@@ -427,13 +427,29 @@ _unreachable_wrapper_classes: set[tuple[str, str]] = set()  # names, not classes
 _MISSING = object()  # not found yet: None is a value a namespace can hold
 # A type's scan: (the type, kept alive so its id is not reused; member descriptors; getset __dict__;
 # class-level flag; entries scanned).
-_TypeScan = tuple[type, list[Any], object, object, int]
+_TypeScan = tuple[type, list[Any], object, object, int, list[object]]
+# Class-namespace values that are code or descriptors, not held objects: skipped by type identity, so no
+# metaclass __hash__ runs, and never called.
+_CLASS_CODE = (
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.MemberDescriptorType,
+    types.GetSetDescriptorType,
+    types.WrapperDescriptorType,
+    types.MethodDescriptorType,
+    classmethod,
+    staticmethod,
+    property,
+)
 
 
 def _scan_type(kind: type) -> _TypeScan:
     """What reading an instance of ``kind`` needs, from one scan of its MRO: its member descriptors, its getset
-    ``__dict__`` descriptor, its class-level ``_reports_write_deadline`` value, and the entries scanned."""
+    ``__dict__`` descriptor, its class-level ``_reports_write_deadline`` value, the entries scanned, and the
+    objects its classes hold (``inner = backend`` on a wrapper class), read from the namespaces as stored, so no
+    descriptor runs; dunders, functions and descriptors are skipped."""
     members: list[Any] = []
+    class_values: list[object] = []
     scanned = 0
     instance_dict: object = _MISSING
     flag: object = _MISSING
@@ -441,11 +457,16 @@ def _scan_type(kind: type) -> _TypeScan:
         namespace = _TYPE_DICT.__get__(klass)
         scanned += 1 + len(namespace)
         members += [d for d in namespace.values() if type(d) is types.MemberDescriptorType]
+        class_values += [
+            value
+            for name, value in namespace.items()
+            if not name.startswith("__") and not any(type(value) is code for code in _CLASS_CODE)
+        ]
         if instance_dict is _MISSING and "__dict__" in namespace:
             instance_dict = namespace["__dict__"]
         if flag is _MISSING and "_reports_write_deadline" in namespace:
             flag = namespace["_reports_write_deadline"]
-    return kind, members, instance_dict, flag, scanned
+    return kind, members, instance_dict, flag, scanned, class_values
 
 
 def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: bool) -> tuple[bool, list[object], int]:
@@ -464,7 +485,7 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
     if scan is None:
         scan = types_read[id(kind)] = _scan_type(kind)
         spent = scan[4]
-    _, members, instance_dict, flag, _ = scan
+    _, members, instance_dict, flag, _, class_values = scan
     values: list[object] = []
     unset = 0
     for descriptor in members if want_values else ():
@@ -479,6 +500,8 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
                 flag = held["_reports_write_deadline"]
             if want_values:
                 values += dict.values(held)
+    if want_values:
+        values += class_values
     return flag is True, values, spent + unset  # the caller charges each value it walks
 
 
@@ -596,8 +619,10 @@ def _set_l2(
     stale_ttl: int | None,
     registry_id: str | None,
     on_track_error: Callable[[str, Exception], None],
+    on_report: Optional[Callable[[tuple[float, float]], None]] = None,
 ) -> tuple[bool, bool, Optional[float]]:
-    """A buffered L2 write through ``handler``: (stored, tracked, l1_until).
+    """A buffered L2 write through ``handler``: (stored, tracked, l1_until). ``on_report`` is called with each
+    ``(received, fresh_until)`` the backend reports, as it reports it (``_ReportedDeadlines``).
 
     With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
     (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
@@ -624,7 +649,7 @@ def _set_l2(
             return bool(handler.set(key, value, ttl, stale_ttl=stale_ttl)), False, None
         return bool(handler.set(key, value, ttl)), False, None
     # Around the handler's own set, so an override of it still runs.
-    seen: list[tuple[float, float]] = []
+    seen: list[tuple[float, float]] = [] if on_report is None else _ReportedDeadlines(on_report)
     token = _WRITE_DEADLINES.set(seen)
     try:
         if stale_ttl is not None:
@@ -634,6 +659,22 @@ def _set_l2(
     finally:
         _WRITE_DEADLINES.reset(token)
     return stored, False, _written_copy_expiry(getattr(handler, "backend", None), seen, stored, ttl)
+
+
+class _ReportedDeadlines(list[tuple[float, float]]):
+    """A ``_WRITE_DEADLINES`` list that applies each report the moment the backend appends it, from inside the
+    backend's ``set``: a write-behind copy is bounded at the 2xx's receipt, not when a ``set`` override's
+    post-response work (an audit hook) returns."""
+
+    __slots__ = ("_on_report",)
+
+    def __init__(self, on_report: Callable[[tuple[float, float]], None]) -> None:
+        super().__init__()
+        self._on_report = on_report
+
+    def append(self, entry: tuple[float, float]) -> None:
+        super().append(entry)
+        self._on_report(entry)
 
 
 class _MultiDeleteBackend(Protocol):

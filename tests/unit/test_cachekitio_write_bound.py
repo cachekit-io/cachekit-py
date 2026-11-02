@@ -1203,3 +1203,73 @@ class TestL1DeclinedPutDropsOlderEntry:
         l1._on_current_state = recording  # type: ignore[method-assign]
         l1.put("k", b"new", redis_ttl=0)
         assert order == ["take-over", "state"]
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_class_attribute_backend_is_bounded(saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool) -> None:
+    """Cobel's probe: a wrapper holding its backend as a class attribute (``inner = backend``) is found, so a
+    0 Fresh-For keeps no copy."""
+
+    class _Wrapper:
+        inner = backend
+
+        def get(self, key: str) -> bytes | None:
+            return self.inner.get(key)
+
+        def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+            self.inner.set(key, value, ttl)
+
+        def delete(self, key: str) -> bool:
+            return self.inner.delete(key)
+
+        def exists(self, key: str) -> bool:
+            return self.inner.exists(key)
+
+    saas.put_fresh_for = "0"
+    compute, _ = _decorated(_Wrapper(), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
+    assert compute() == 1
+    gets = saas.gets()
+    assert compute() == 1
+    assert saas.gets() == gets + 1
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_deferred_copy_is_bounded_at_receipt_not_after_post_response_work(
+    saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
+) -> None:
+    """Cobel's probe: a ``set`` override that blocks in post-response work after ``super().set`` returns. The
+    write-behind copy is bounded when the 2xx is read, so at receipt + 6 with Fresh-For 5 the call reaches L2.
+    The server also sends Fresh-For on reads, so a read's backfill cannot stand in for the writer's copy."""
+    received = threading.Event()
+    release = threading.Event()
+    writers: list[wb.WriteBehind] = []
+    init = wb.WriteBehind.__init__
+
+    def record(self: wb.WriteBehind, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        writers.append(self)
+
+    monkeypatch.setattr(wb.WriteBehind, "__init__", record)
+
+    class _Delayed(CachekitIOBackend):
+        def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+            super().set(key, value, ttl, stale_ttl)
+            received.set()
+            assert release.wait(_GUARD_SECONDS)
+
+    backend.__class__ = _Delayed
+    saas.put_fresh_for = "5"
+    saas.get_fresh_for = "5"
+    compute, _ = _decorated(backend, is_async=is_async, write_behind=True, distributed_lock=False)
+    try:
+        assert compute() == 1
+        assert received.wait(_GUARD_SECONDS)
+        assert compute() == 1  # the copy was dropped at receipt: this reaches L2 and backfills under its own bound
+        clock.advance(6)
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+    finally:
+        release.set()
+        for writer in writers:
+            assert writer.close(time.monotonic() + _GUARD_SECONDS) == []

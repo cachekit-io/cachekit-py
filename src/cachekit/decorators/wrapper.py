@@ -1821,8 +1821,18 @@ def create_cache_wrapper(
         start = time.perf_counter()
         # Trackable first: a backend without a registry never pays for set_tracked's probe.
         registry_id = _registry_id if _is_trackable() else None
+        local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
+
+        def bound_at_receipt(report: tuple[float, float]) -> None:
+            # Called from inside the backend's set as the 2xx is read: the copy is bounded before any post-response
+            # work in a set override runs, not when the handler call returns.
+            received, fresh_until = report
+            _drop_copy_outliving_write(cache_key, min(received + local_ttl, fresh_until), copy)
+
         try:
-            stored, tracked, l1_until = _set_l2(handler, cache_key, envelope, ttl, _stale_ttl, registry_id, _warn_track_failure)
+            stored, tracked, l1_until = _set_l2(
+                handler, cache_key, envelope, ttl, _stale_ttl, registry_id, _warn_track_failure, on_report=bound_at_receipt
+            )
         except BaseException:
             # The write may have had its 2xx before it raised, and its bound is lost with the return: no copy.
             _drop_copy_outliving_write(cache_key, 0.0, copy)
@@ -1857,6 +1867,8 @@ def create_cache_wrapper(
         if l1_until is None or _l1_cache is None:
             return
         with copy.lock:
+            # The smallest bound reported so far: a later report (or the final one) can only shorten it.
+            l1_until = l1_until if copy.l1_until is None else min(copy.l1_until, l1_until)
             copy.l1_until = l1_until
             put_until = copy.put_until
         # L1 stops serving a copy ttl_buffer_seconds before the expiry it was put with.
