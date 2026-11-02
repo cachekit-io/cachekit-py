@@ -340,7 +340,7 @@ make build  # Standard build
 ```bash
 make perf               # Full battery: env fingerprint + timer calibration, serializer benchmarks, GIL scaling
 make perf-compare       # Regression gate: fail on >10% median serializer regression vs baseline
-make perf-ir            # Instruction-count gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind)
+make perf-ir            # Instruction-count gate: fail on a >=1% per-call regression (needs valgrind)
 make perf-ir-update     # Ratchet the committed instruction budgets down to the measured figures
 
 make benchmark          # Serializer benchmarks only + save a local baseline
