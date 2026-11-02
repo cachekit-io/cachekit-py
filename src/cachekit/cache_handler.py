@@ -7,18 +7,20 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import contextvars
 import sys
 import threading
 import types
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
 from pydantic import SecretBytes, SecretStr
 
 from cachekit.backends.base import (
+    _WRITE_DEADLINES,
     BackendError,
     BaseBackend,
     BufferHandle,
@@ -50,6 +52,7 @@ from cachekit.di import DIContainer
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
+from cachekit.l1_cache import DEFAULT_L1_TTL_SECONDS
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import (
     EnvelopeShapeError,
@@ -399,6 +402,228 @@ def _fuses_tracked_write(backend: object) -> bool:
     return True
 
 
+_unreported_write_classes: set[type] = set()
+# Three wrapper levels covers a metrics wrapper around a router around a backend; deeper nesting is rare.
+_REACH_DEPTH = 3
+# Values read at most (attribute values, unset slots, container items and the type entries scanned to find them) before
+# the search gives up and answers True. The answer is cached per handler, so a large object graph costs the
+# deadline list, never a missed bound.
+_REACH_READS = 4096
+_REACH_LEAVES = (str, bytes, bytearray, memoryview, int, float, complex, bool, type(None), type)
+# Containers are walked with the base type's own iterator, so a subclass's __iter__ never runs.
+_REACH_CONTAINERS: tuple[tuple[type, Callable[[Any], Iterator[object]]], ...] = (
+    (dict, lambda d: iter(dict.values(d))),  # a C view; iter() on it runs no user code
+    (list, list.__iter__),
+    (tuple, tuple.__iter__),
+    (set, set.__iter__),
+    (frozenset, frozenset.__iter__),
+)
+# Type internals read through type's own descriptors, so a metaclass property or __getattribute__ never runs.
+_TYPE_MRO: Any = vars(type)["__mro__"]
+_TYPE_DICT: Any = vars(type)["__dict__"]
+_TYPE_MODULE: Any = vars(type)["__module__"]
+_TYPE_QUALNAME: Any = vars(type)["__qualname__"]
+_unreachable_wrapper_classes: set[tuple[str, str]] = set()  # names, not classes: a class per mock is not kept
+_MISSING = object()  # not found yet: None is a value a namespace can hold
+# A type's scan: (the type, kept alive so its id is not reused; member descriptors; getset __dict__;
+# class-level flag; entries scanned).
+_TypeScan = tuple[type, list[Any], object, object, int, list[object]]
+# Class-namespace values that are code or descriptors, not held objects: skipped by type identity, so no
+# metaclass __hash__ runs, and never called.
+_CLASS_CODE = (
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.MemberDescriptorType,
+    types.GetSetDescriptorType,
+    types.WrapperDescriptorType,
+    types.MethodDescriptorType,
+    types.ClassMethodDescriptorType,
+    types.MethodWrapperType,
+    classmethod,
+    staticmethod,
+    property,
+)
+
+
+def _scan_type(kind: type) -> _TypeScan:
+    """What reading an instance of ``kind`` needs, from one scan of its MRO: its member descriptors, its getset
+    ``__dict__`` descriptor, its class-level ``_reports_write_deadline`` value, the entries scanned, and the
+    objects its classes hold (``inner = backend`` on a wrapper class), read from the namespaces as stored, so no
+    descriptor runs; functions and descriptors are skipped."""
+    members: list[Any] = []
+    class_values: list[object] = []
+    scanned = 0
+    instance_dict: object = _MISSING
+    flag: object = _MISSING
+    for klass in _TYPE_MRO.__get__(kind):
+        namespace = _TYPE_DICT.__get__(klass)
+        scanned += 1 + len(namespace)
+        members += [d for d in namespace.values() if type(d) is types.MemberDescriptorType]
+        # Every name, dunders included (``__wrapped__ = backend``): interpreter metadata is strings, ints, types
+        # and tuples of them, which the walk treats as leaves, or code and descriptors, skipped here.
+        class_values += [
+            value
+            for value in namespace.values()
+            if not any(type(value) is code for code in _CLASS_CODE) and not issubclass(type(value), _REACH_LEAVES)
+        ]
+        if instance_dict is _MISSING and "__dict__" in namespace:
+            instance_dict = namespace["__dict__"]
+        if flag is _MISSING and "_reports_write_deadline" in namespace:
+            flag = namespace["_reports_write_deadline"]
+    return kind, members, instance_dict, flag, scanned, class_values
+
+
+def _read_object(
+    obj: object, types_read: dict[int, _TypeScan], class_depths: dict[int, int], depth: int
+) -> tuple[bool, list[object], int]:
+    """One read of ``obj`` at ``depth``: (it says it reports a write deadline, its attribute values, reads spent).
+    A type is scanned once per search (``types_read``), and charged then. Values are read only below
+    ``_REACH_DEPTH``. A type's class values are yielded whenever one of its instances is read shallower than any
+    earlier yield of them (``class_depths``), so a type first met at the depth limit, or first met by a longer
+    path, still has its class-held backend searched from the shallowest route: at most ``_REACH_DEPTH`` yields
+    per type.
+
+    Storage is read only through the C descriptors Python makes for it: the getset ``__dict__`` and every
+    member descriptor along the MRO, so a property named ``__dict__`` or shadowing a slot is skipped, never
+    called. Member descriptors are deliberately every C member field, not only ``__slots__``: that is how a
+    bound method's ``__self__`` is found (``self.write = backend.set``), and a function's ``__globals__``
+    only spends the budget, which fails open. Do not make functions leaves: that turns a True into a False.
+    """
+    kind = type(obj)
+    spent = 0
+    scan = types_read.get(id(kind))  # by id: hashing the type could run a metaclass __hash__
+    if scan is None:
+        scan = types_read[id(kind)] = _scan_type(kind)
+        spent = scan[4]
+    _, members, instance_dict, flag, _, class_values = scan
+    want_values = depth < _REACH_DEPTH  # at the limit only the flag is read
+    values: list[object] = []
+    unset = 0
+    for descriptor in members if want_values else ():
+        try:
+            values.append(descriptor.__get__(obj, kind))
+        except AttributeError:  # an unset slot: a read the caller never walks, so it is charged here
+            unset += 1
+    if type(instance_dict) is types.GetSetDescriptorType:
+        held = instance_dict.__get__(obj, kind)  # type: ignore[attr-defined]
+        if type(held) is dict:
+            if "_reports_write_deadline" in held:  # an instance value shadows the class's
+                flag = held["_reports_write_deadline"]
+            if want_values:
+                values += dict.values(held)
+    if want_values and depth < class_depths.get(id(kind), _REACH_DEPTH):
+        class_depths[id(kind)] = depth
+        values += class_values
+    return flag is True, values, spent + unset  # the caller charges each value it walks
+
+
+def _reaches_write_deadlines(backend: object) -> bool:
+    """Whether a write through ``backend`` can report a write deadline (API-103): the backend says it reports
+    (read with ``getattr``, so an attribute-forwarding proxy forwards it), or it holds a backend that says so,
+    up to ``_REACH_DEPTH`` wrappers down, in an attribute (``__dict__`` or ``__slots__``) or in a dict, list,
+    tuple or set there (a metrics, timeout, router or shard-ring wrapper over a CachekitIOBackend).
+
+    One breadth-first walk with one counter: every value read counts, container items and the type entries
+    scanned included. An object is expanded again only when reached by a shorter path (``seen`` keeps the
+    shallowest depth), so a cycle ends and a wrapper shared by a long and a short path is searched to its
+    full reach. Below the root everything is read through Python's own descriptors (``_read_object``), so a
+    lazy object is not evaluated and no property, ``__getattr__``, ``__iter__`` override or metaclass hook
+    runs. If the walk raises, or spends ``_REACH_READS`` reads without an answer, the answer is True: opening
+    the deadline list is always safe, skipping it is not. A wrapper holding its backend only in a closure, or
+    creating it on first use (even into an attribute: the search runs before the first write), is out of
+    reach: logged once per class, and its L1 copies keep the stated ttl.
+    """
+    if backend is None:
+        return False
+    try:
+        if getattr(backend, "_reports_write_deadline", False) is True:
+            return True
+        queue: collections.deque[tuple[object, int]] = collections.deque([(backend, 0)])
+        seen = {id(backend): 0}  # id -> the shallowest depth it was reached at
+        types_read: dict[int, _TypeScan] = {}  # each type's MRO is scanned once per search
+        class_depths: dict[int, int] = {}  # type id -> the shallowest depth its class values were yielded at
+        reads = 0
+        while queue:
+            obj, depth = queue.popleft()
+            kind = type(obj)
+            walk = next((it for base, it in _REACH_CONTAINERS if issubclass(kind, base)), None)
+            batches: list[tuple[Iterable[object], int]] = []
+            if walk is not None:
+                batches.append((walk(obj), depth))  # a container: its items stay at the holder's depth
+            # An object, or a container subclass (a dict router with self.inner): read its own storage too.
+            # Identity, not `in`: hashing the type could run a metaclass __hash__.
+            if walk is None or not any(kind is base for base, _ in _REACH_CONTAINERS):
+                reports, values, scanned = _read_object(obj, types_read, class_depths, depth)
+                if reports and obj is not backend:  # the root's own flag was read with getattr above
+                    return True
+                reads += scanned
+                if reads > _REACH_READS:
+                    return True
+                if depth < _REACH_DEPTH:  # at the limit its flag is read; its own attributes are past the reach
+                    batches.append((values, depth + 1))
+            for children, child_depth in batches:
+                for child in children:
+                    reads += 1
+                    if reads > _REACH_READS:
+                        return True
+                    if issubclass(type(child), _REACH_LEAVES) or seen.get(id(child), _REACH_DEPTH + 1) <= child_depth:
+                        continue
+                    seen[id(child)] = child_depth
+                    queue.append((child, child_depth))
+        kind = type(backend)
+        module = _TYPE_MODULE.__get__(kind)
+        name = (module if isinstance(module, str) else "", _TYPE_QUALNAME.__get__(kind))
+        if name not in _unreachable_wrapper_classes and not name[0].startswith("cachekit."):
+            _unreachable_wrapper_classes.add(name)
+            get_logger().info(
+                f"{name[1]} holds no CachekitIOBackend in its attributes: its writes keep L1 copies for their "
+                "ttl. If it wraps one, hold it in an attribute before the first write."
+            )
+    except Exception as exc:  # noqa: BLE001 - the safe answer: open the list
+        get_logger().debug(f"write-deadline search failed: {type(exc).__name__}")
+        return True
+    return False
+
+
+def write_deadlines_reachable(handler: Any) -> bool:
+    """``_reaches_write_deadlines`` for the handler's backend, cached on the handler. The decorator always
+    installs a ``StandardCacheHandler``; a custom ``CacheHandlerStrategy`` (a public extension point) that
+    cannot take the attribute (``__slots__``) is searched again on each write, bounded by ``_REACH_READS``."""
+    reachable = _reaches_write_deadlines(getattr(handler, "backend", None))
+    with contextlib.suppress(AttributeError):
+        handler._write_deadlines_reachable = reachable
+    return reachable
+
+
+def _written_copy_expiry(
+    backend: object, seen: list[tuple[float, float]], stored: bool, ttl: Optional[float]
+) -> Optional[float]:
+    """When the writer's L1 copy of a value it wrote expires (API-103), from what the write reported into
+    ``seen`` (``_WRITE_DEADLINES``); None keeps the stated ttl from the put.
+
+    ``min(local_ttl, effective_ttl, fresh_for)``, every term timed from the 2xx's receipt: ttl stands for
+    local_ttl and effective_ttl (the L1 default for ttl=None), Fresh-For for the last, unbounded when
+    absent. A report wins even when the write then failed (an override that raised after its 2xx). With
+    none: None for a failed write (API-36/37 bound the copy) or a backend that never reports, and 0.0, no
+    copy, when the backend says it reports but the write never reached its own ``set`` (an override that
+    does not delegate, or delegates on another thread without the context), so the bound is unknown: that
+    turns L1 off for the backend's writes, logged once per class. A nested write that reports into the
+    same list can only shorten the bound.
+    """
+    if seen:
+        local_ttl = DEFAULT_L1_TTL_SECONDS if ttl is None else ttl
+        return min(min(received + local_ttl, fresh_until) for received, fresh_until in seen)
+    if not stored or getattr(backend, "_reports_write_deadline", False) is not True:
+        return None
+    if type(backend) not in _unreported_write_classes:
+        _unreported_write_classes.add(type(backend))
+        get_logger().warning(
+            f"{type(backend).__name__}.set reported no write deadline: its writes keep no L1 copy. "
+            "Delegate to the base set on the same thread, or under contextvars.copy_context().run."
+        )
+    return 0.0
+
+
 def _set_l2(
     handler: Any,
     key: str,
@@ -407,24 +632,62 @@ def _set_l2(
     stale_ttl: int | None,
     registry_id: str | None,
     on_track_error: Callable[[str, Exception], None],
-) -> tuple[bool, bool]:
-    """A buffered L2 write through ``handler``: (stored, tracked).
+    on_report: Optional[Callable[[tuple[float, float]], None]] = None,
+) -> tuple[bool, bool, Optional[float]]:
+    """A buffered L2 write through ``handler``: (stored, tracked, l1_until). ``on_report`` is called with each
+    ``(received, fresh_until)`` the backend reports, as it reports it (``_ReportedDeadlines``).
 
     With a ``registry_id``, the key-registry write rides in the same round trip where the handler can
     (``set_tracked``), and tracked is True: its failure has gone to ``on_track_error``. Otherwise tracked is
-    False and the caller tracks a stored key itself. getattr: custom CacheHandlerStrategy impls predate
-    set_tracked, as they predate set_streaming.
+    False and the caller tracks a stored key itself. l1_until bounds the writer's L1 copy
+    (``_written_copy_expiry``), None where the backend reports no freshness. getattr: custom CacheHandlerStrategy
+    impls predate set_tracked, as they predate set_streaming.
     """
     set_tracked = None if registry_id is None else getattr(handler, "set_tracked", None)
     if set_tracked is not None:
         stored = set_tracked(key, value, ttl, registry_id, on_track_error)
         if stored is not None:
-            return stored, True
-    # Only thread the SWR kwarg when set: strategy implementations without
-    # **metadata (tests, custom handlers) must keep working unchanged.
-    if stale_ttl is not None:
-        return bool(handler.set(key, value, ttl, stale_ttl=stale_ttl)), False
-    return bool(handler.set(key, value, ttl)), False
+            return stored, True, None
+    # The instruction-gated miss path: the cached answer is a plain attribute load (getattr's call costs the
+    # gate measurably; try is free until it raises), and a backend that cannot report takes its own early return
+    # (one set call under a conditional token measured +1.02% on `miss`, this +0.79%).
+    try:
+        reachable = handler._write_deadlines_reachable
+    except AttributeError:  # a custom strategy that does not carry the cache
+        reachable = None
+    if not (write_deadlines_reachable(handler) if reachable is None else reachable):
+        # Only thread the SWR kwarg when set: strategy implementations without
+        # **metadata (tests, custom handlers) must keep working unchanged.
+        if stale_ttl is not None:
+            return bool(handler.set(key, value, ttl, stale_ttl=stale_ttl)), False, None
+        return bool(handler.set(key, value, ttl)), False, None
+    # Around the handler's own set, so an override of it still runs.
+    seen: list[tuple[float, float]] = [] if on_report is None else _ReportedDeadlines(on_report)
+    token = _WRITE_DEADLINES.set(seen)
+    try:
+        if stale_ttl is not None:
+            stored = bool(handler.set(key, value, ttl, stale_ttl=stale_ttl))
+        else:
+            stored = bool(handler.set(key, value, ttl))
+    finally:
+        _WRITE_DEADLINES.reset(token)
+    return stored, False, _written_copy_expiry(getattr(handler, "backend", None), seen, stored, ttl)
+
+
+class _ReportedDeadlines(list[tuple[float, float]]):
+    """A ``_WRITE_DEADLINES`` list that applies each report the moment the backend appends it, from inside the
+    backend's ``set``: a write-behind copy is bounded at the 2xx's receipt, not when a ``set`` override's
+    post-response work (an audit hook) returns."""
+
+    __slots__ = ("_on_report",)
+
+    def __init__(self, on_report: Callable[[tuple[float, float]], None]) -> None:
+        super().__init__()
+        self._on_report = on_report
+
+    def append(self, entry: tuple[float, float]) -> None:
+        super().append(entry)
+        self._on_report(entry)
 
 
 class _MultiDeleteBackend(Protocol):
@@ -1707,13 +1970,15 @@ class StoreOutcome(NamedTuple):
     a successful stream has none. Key tracking follows stored, L1 follows envelope. deferred says the
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
-    already reported: the caller must not track the key again.
+    already reported: the caller must not track the key again. l1_until is the instant the
+    caller's L1 copy must stop serving by (``_written_copy_expiry``; None keeps the stated ttl).
     """
 
     envelope: Optional[bytes]
     stored: bool
     deferred: bool = False
     tracked: bool = False
+    l1_until: Optional[float] = None
 
 
 class CacheOperationHandler:
@@ -2198,14 +2463,14 @@ class CacheOperationHandler:
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
-            stored, tracked = _set_l2(
+            stored, tracked, l1_until = _set_l2(
                 self._cache_handler, cache_key, serialized_data, ttl, stale_ttl, registry_id, on_track_error
             )
             if stored:
                 get_logger().cache_stored(cache_key, ttl)
 
             # The envelope goes to L1 even when the backend write failed (L1 serves it only within the per-entry share)
-            return StoreOutcome(envelope=serialized_data, stored=bool(stored), tracked=tracked)
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored), tracked=tracked, l1_until=l1_until)
         except (InteropError, KeyringConfigurationError):
             # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts), or
             # a LOCAL keyring config fault, which a cold key first hits here, on the
@@ -2408,6 +2673,7 @@ class StandardCacheHandler:
             ttl_refresh_threshold: Threshold for TTL refresh (0.0-1.0, default 0.5 = 50%)
         """
         self.backend = backend
+        self._write_deadlines_reachable: Optional[bool] = None  # see write_deadlines_reachable
         self.backpressure_controller = backpressure_controller
         self.ttl_refresh_threshold = ttl_refresh_threshold
 

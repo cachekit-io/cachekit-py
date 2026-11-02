@@ -82,7 +82,7 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
+- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no TTL: no expiration on Redis, Memcached and File; one year in L1-only mode (`backend=None`); on CachekitIO the server stores the entry for your plan's maximum TTL ([plan maximums](backends/cachekitio.md#ttl-range-and-plan-maximum)). On a preset it is an explicit opt-in.
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
 - **`integrity_checking`** (`bool`, default: `True`; any non-bool raises `ConfigurationError`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Behaviour when a writer and reader disagree on this flag: [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
@@ -223,7 +223,7 @@ def get_exchange_rates():
 
 - Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
 - L1 in-memory cache is enabled — hot data is served from process memory without an HTTP round-trip (each L1 hit deserializes the stored bytes)
-- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` disables both expiry and SWR.
+- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` sends no TTL and disables SWR: the server stores the entry for your plan's maximum TTL, and never expires it only on a plan without a maximum, or where none applied when the entry was written ([plan maximums](backends/cachekitio.md#ttl-range-and-plan-maximum)).
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
 ### Health Check Methods

@@ -23,6 +23,7 @@ from pydantic import SecretBytes, SecretStr, ValidationError
 from urllib3.exceptions import ClosedPoolError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted, _clear_interrupted, _raised_during_request
+from cachekit.backends.base import _WRITE_DEADLINES
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig, resolve_telemetry
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
@@ -82,7 +83,8 @@ TTL_HEADER = "X-CacheKit-TTL"
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
-# A Fresh-For value never exceeds the 30-day TTL cap, which is seven digits.
+# The Fresh-For header's own 30-day cap (seven digits), set by the spec independently of the
+# 90-day TTL range: it only ever shortens a local copy's bound. Never derive one from the other.
 _FRESH_FOR_MAX_S = 2_592_000
 _FRESH_FOR_MAX_DIGITS = 7
 
@@ -161,7 +163,7 @@ def _parse_fresh_for(value: str | None) -> int | None:
     """Map an ``X-CacheKit-Fresh-For`` value to seconds (spec/saas-api.md#remaining-freshness).
 
     Absent = pre-signal server → None (legacy behavior: no bound). Anything but 1-7 ASCII
-    digits at most the 30-day TTL cap = drift → 0 (do not extend local service — the
+    digits at most the header's 30-day cap = drift → 0 (do not extend local service — the
     conservative action, mirroring the unrecognized-freshness → stale rule). The shape check
     runs before ``int()``, which accepts ``+5``, ``1_0``, whitespace and non-ASCII digits.
     Takes the header string, not a response, so it outlives the HTTP client.
@@ -653,7 +655,9 @@ class CachekitIOBackend:
         Args:
             key: Cache key
             value: Bytes to cache
-            ttl: Time-to-live in seconds (optional)
+            ttl: Time-to-live in seconds (optional). Omitted, the entry gets the plan's
+                maximum TTL, and never expires only on a plan without a maximum, or where
+                none applied when the entry was written.
             stale_ttl: Stale-grace window in seconds past the fresh TTL
                 (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
@@ -661,7 +665,27 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
+        response = self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
+        seen = _WRITE_DEADLINES.get()
+        if seen is not None:
+            seen.append(self._write_freshness(response))
+
+    # set reports its write's freshness through _WRITE_DEADLINES; see cache_handler._written_copy_expiry.
+    _reports_write_deadline = True
+
+    @staticmethod
+    def _write_freshness(response: BaseHTTPResponse) -> tuple[float, float]:
+        """``(received, fresh_until)`` for a value this PUT stored (spec/saas-api.md#remaining-freshness).
+
+        The decorator bounds its L1 copy of the value by them (API-103): the server may have clamped
+        ``ttl`` to the plan's maximum. Both are timed from the 2xx's receipt, on the thread that received
+        it, so a later hop back to the event loop cannot restart the bound. ``X-CacheKit-Fresh-For`` is
+        read with the GET grammar (``_parse_fresh_for``): absent (the stated TTL was applied) gives
+        ``math.inf``, malformed gives the receipt itself.
+        """
+        received = time.time()
+        fresh_for = CachekitIOBackend._fresh_for(response)
+        return received, math.inf if fresh_for is None else received + fresh_for
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
@@ -845,7 +869,9 @@ class CachekitIOBackend:
         Args:
             key: Cache key
             value: Bytes to cache
-            ttl: Time-to-live in seconds (optional)
+            ttl: Time-to-live in seconds (optional). Omitted, the entry gets the plan's
+                maximum TTL, and never expires only on a plan without a maximum, or where
+                none applied when the entry was written.
             stale_ttl: Stale-grace window in seconds past the fresh TTL
                 (SWR). Only honoured alongside an explicit ``ttl``;
                 pre-SWR servers ignore it.
@@ -1162,7 +1188,10 @@ class CachekitIOBackend:
             key: Cache key
 
         Returns:
-            TTL in seconds, None if key doesn't exist or has no expiry
+            Seconds until the entry is evicted, its stale window included; None if the key
+            doesn't exist, the request failed, or the entry has no expiry (stored without a TTL
+            on a plan without a maximum, or where none applied when it was written, which can
+            happen on any plan)
 
         Raises:
             BackendError: If the key is reserved (see ``_encode_key``); encoded outside the
@@ -1178,6 +1207,9 @@ class CachekitIOBackend:
 
     async def refresh_ttl(self, key: str, ttl: int) -> bool:
         """Refresh/update TTL for existing key.
+
+        The ``PATCH`` response says nothing about the applied TTL (the server may clamp it to the
+        plan maximum), so the decorator never derives a local (L1) bound from it (API-104).
 
         Args:
             key: Cache key

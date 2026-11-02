@@ -182,7 +182,7 @@ class DecoratorConfig:
     # positive ttl and an SWR-capable backend (CachekitIO). None = preset
     # decides (io() defaults it to ttl via swr_by_default); 0 = explicitly off.
     stale_ttl: int | None = None
-    # Preset flag: default stale_ttl to ttl (capped to the shared 30-day bound)
+    # Preset flag: default stale_ttl to ttl (capped to the shared 90-day TTL range)
     # when the backend supports SWR and the user didn't say otherwise.
     swr_by_default: bool = False
     namespace: str | None = None
@@ -364,7 +364,8 @@ class DecoratorConfig:
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
                 integrity_checking=True to opt-in, l1, circuit_breaker, backpressure, monitoring, etc.)
-                Default ttl=300 (protocol/spec/intent-presets.md); ttl=None = never expire.
+                Default ttl=300 (protocol/spec/intent-presets.md); ttl=None sends no TTL:
+                never expiring on Redis, Memcached and File; CachekitIO stores it for the plan maximum.
 
         Returns:
             DecoratorConfig with minimal protections preset
@@ -411,7 +412,8 @@ class DecoratorConfig:
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
                 integrity_checking, l1, circuit_breaker, backpressure, monitoring, etc.)
-                Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
+                Default ttl=600 (protocol/spec/intent-presets.md); ttl=None sends no TTL:
+                never expiring on Redis, Memcached and File; CachekitIO stores it for the plan maximum.
 
         Returns:
             DecoratorConfig with production-grade protections
@@ -469,7 +471,8 @@ class DecoratorConfig:
                 per-tenant key derivation. Not a tenancy boundary: see docs/features/zero-knowledge-encryption.md
             **kwargs: Overrides (ttl, namespace, backend, l1, circuit_breaker, backpressure, monitoring, etc.)
                      - integrity_checking other than True is rejected, and encryption= is not an override.
-                     Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
+                     Default ttl=600 (protocol/spec/intent-presets.md); ttl=None sends no TTL:
+                     never expiring on Redis, Memcached and File; CachekitIO stores it for the plan maximum.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
                      auth failure / key-fingerprint mismatch instead of silently recomputing
                      (default None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED, which defaults to False)
@@ -562,7 +565,8 @@ class DecoratorConfig:
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
                 integrity_checking, l1, circuit_breaker, backpressure, monitoring, etc.)
-                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
+                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None sends no TTL:
+                never expiring on Redis, Memcached and File; CachekitIO stores it for the plan maximum.
 
         Returns:
             DecoratorConfig optimized for development
@@ -607,7 +611,8 @@ class DecoratorConfig:
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
                 integrity_checking, l1, circuit_breaker, backpressure, monitoring, etc.)
-                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
+                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None sends no TTL:
+                never expiring on Redis, Memcached and File; CachekitIO stores it for the plan maximum.
 
         Returns:
             DecoratorConfig optimized for testing
@@ -662,8 +667,9 @@ class DecoratorConfig:
             **kwargs: Overrides (ttl, namespace, integrity_checking, swr_by_default, l1, circuit_breaker,
                 backpressure, monitoring, etc.). ``backend`` is not one — io always
                 caches through its own CachekitIOBackend and rejects ``backend=``.
-                Default ttl=3600 (protocol/spec/intent-presets.md); ttl=None = never expire
-                (and disables the stale_ttl SWR window, which needs a positive ttl).
+                Default ttl=3600 (protocol/spec/intent-presets.md); ttl=None sends no TTL, so the
+                server stores the entry for the plan's maximum TTL (never expiring only on a plan
+                without a maximum, or where none applied when the entry was written), and disables the stale_ttl SWR window, which needs a positive ttl.
 
         Returns:
             DecoratorConfig with CachekitIOBackend
