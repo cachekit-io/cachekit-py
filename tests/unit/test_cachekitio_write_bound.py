@@ -183,6 +183,7 @@ class TestBackendReportsPutFreshFor:
         saas.put_fresh_for = "5"
         received = clock.now
         assert _reported(backend) == [(received, received + 5)]
+        assert clock.now == received + 3  # the slow parse ran: time did pass after receipt
 
     def test_set_keeps_its_none_return(self, saas: _FakeSaaS, backend: CachekitIOBackend) -> None:
         saas.put_fresh_for = "5"
@@ -1055,11 +1056,13 @@ class TestWriteBehindCopyBound:
         """A deferred write whose PUT got Fresh-For 0 and which then raised: in the backend's ``set`` (the
         handler catches it, so the write is not stored but its bound was reported), or in a patched handler
         ``set`` (so ``_set_l2`` raises and the bound is lost). Either way no copy serves."""
+        raised: list[str] = []
         if raiser == "backend":
 
             class _Raising(CachekitIOBackend):
                 def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
                     super().set(key, value, ttl, stale_ttl)
+                    raised.append("backend")
                     raise RuntimeError("audit hook failed")
 
             backend.__class__ = _Raising
@@ -1068,6 +1071,7 @@ class TestWriteBehindCopyBound:
 
             def raising(self_: StandardCacheHandler, *args: Any, **kwargs: Any) -> bool:
                 original(self_, *args, **kwargs)
+                raised.append("handler")
                 raise RuntimeError("audit hook failed")
 
             monkeypatch.setattr(StandardCacheHandler, "set", raising)
@@ -1078,6 +1082,7 @@ class TestWriteBehindCopyBound:
         assert compute() == 1
         self._drain()
         assert saas.ops.count("PUT") == 1
+        assert raised == [raiser]  # the write really failed after its 2xx
         gets = saas.gets()
         clock.advance(30)
         assert compute() == 1
