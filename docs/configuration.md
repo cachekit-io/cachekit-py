@@ -140,6 +140,10 @@ CACHEKIT_TIMEOUT=5.0
 # The same variable sizes the Redis pool, whose default is 50
 CACHEKIT_CONNECTION_POOL_SIZE=32
 
+# Optional: Turn telemetry off: false, 0, off or no (default: unset, which is on during the closed beta)
+# Off here wins over CachekitIOBackend(telemetry=True). Read once, when the backend is constructed
+CACHEKIT_TELEMETRY=false
+
 # Optional: Allow custom API hostname - disables SSRF hostname allowlist (default: false)
 # Only set to true when pointing at a private test server
 CACHEKIT_ALLOW_CUSTOM_HOST=false
@@ -154,6 +158,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
 | `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `32` | No | HTTP connections the backend's one pool keeps, shared by every thread and by async calls. Each concurrent request uses one (HTTP/1.1); a request that finds all in use opens a short-lived extra connection, and urllib3 logs a pool-full warning. The same variable sizes the Redis pool, whose default is 50 |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
+| `CACHEKIT_TELEMETRY` | on/off | unset (on) | No | `false`, `0`, `off` or `no` turns off the usage telemetry headers; `true`, `1`, `on` or `yes` leaves them on; an empty or blank value counts as unset (on); any other value is off. Off from this or from `CachekitIOBackend(telemetry=False)` wins. `CACHEKIT_TELEMETRY` is not bound to the `telemetry` field; the backend combines the two when it is constructed. The name matches in any case, like the other `CACHEKIT_*` variables. See [Telemetry](backends/cachekitio.md#telemetry) |
 
 **Security notes:**
 - `CACHEKIT_API_URL` must use HTTPS. HTTP is rejected at startup.

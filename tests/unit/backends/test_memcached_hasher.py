@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("pymemcache")
 
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 from pymemcache.client.hash import HashClient
 from pymemcache.client.murmur3 import murmur3_32
@@ -22,12 +22,10 @@ from cachekit._rust_serializer import rendezvous_node
 from cachekit.backends.memcached.backend import MemcachedBackend, _parse_server
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.memcached.hasher import NativeRendezvousHash
+from tests.utils.hypothesis_settings import slow_first_draw
 
 server = st.builds("{}:{}".format, st.from_regex(r"[a-z0-9.\-]{1,40}", fullmatch=True), st.integers(1, 65535))
 servers = st.lists(server, min_size=1, max_size=5, unique=True)
-
-# A process's first draw mines every imported module for constants; with the suite imported that can exceed too_slow's 1 s.
-slow_first_draw = settings(suppress_health_check=[HealthCheck.too_slow])
 
 
 def both(nodes: list[str]) -> tuple[RendezvousHash, NativeRendezvousHash]:

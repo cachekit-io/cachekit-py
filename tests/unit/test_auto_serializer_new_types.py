@@ -22,6 +22,7 @@ from hypothesis import strategies as st
 from cachekit._rust_serializer import ByteStorage
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import SerializationError
+from tests.utils.hypothesis_settings import slow_first_draw
 
 # Well-formed msgpack documents whose ndarray marker makes numpy raise something that is neither
 # a decode-bound rejection nor a ValueError, pinning the serializer's exception contract:
@@ -444,6 +445,7 @@ class TestAutoSerializerPropertyBased:
     - Type preservation: type(deserialize(serialize(x))) == type(x)
     """
 
+    @slow_first_draw
     @given(st.uuids())
     def test_uuid_roundtrip_property(self, test_uuid: UUID):
         """Property: UUID roundtrips through serialization unchanged."""
@@ -456,6 +458,7 @@ class TestAutoSerializerPropertyBased:
         assert deserialized["id"] == test_uuid
         assert isinstance(deserialized["id"], UUID)
 
+    @slow_first_draw
     @given(st.lists(st.integers(min_value=-(2**63), max_value=2**63 - 1), min_size=0, max_size=100).map(set))
     def test_set_roundtrip_property(self, test_set: set):
         """Property: Sets roundtrip through serialization unchanged."""
@@ -469,6 +472,7 @@ class TestAutoSerializerPropertyBased:
         assert isinstance(deserialized["items"], set)
         assert not isinstance(deserialized["items"], frozenset)
 
+    @slow_first_draw
     @given(st.lists(st.integers(min_value=-(2**63), max_value=2**63 - 1), min_size=0, max_size=100).map(frozenset))
     def test_frozenset_roundtrip_property(self, test_frozenset: frozenset):
         """Property: Frozensets roundtrip through serialization unchanged."""
@@ -481,6 +485,7 @@ class TestAutoSerializerPropertyBased:
         assert deserialized["items"] == test_frozenset
         assert isinstance(deserialized["items"], frozenset)
 
+    @slow_first_draw
     @given(
         st.dictionaries(
             st.text(min_size=1),
@@ -499,6 +504,7 @@ class TestAutoSerializerPropertyBased:
         assert deserialized == uuid_dict
         assert all(isinstance(v, UUID) for v in deserialized.values())
 
+    @slow_first_draw
     @given(st.lists(st.uuids(), min_size=1, max_size=100))
     def test_uuid_list_roundtrip_property(self, uuid_list: list[UUID]):
         """Property: Lists of UUIDs roundtrip correctly."""
@@ -510,6 +516,7 @@ class TestAutoSerializerPropertyBased:
         assert deserialized == uuid_list
         assert all(isinstance(u, UUID) for u in deserialized)
 
+    @slow_first_draw
     @given(
         st.lists(st.integers(min_value=-(2**31), max_value=2**31 - 1), min_size=0, max_size=50).map(set),
         st.lists(st.integers(min_value=-(2**31), max_value=2**31 - 1), min_size=0, max_size=50).map(set),
@@ -526,6 +533,7 @@ class TestAutoSerializerPropertyBased:
         assert isinstance(deserialized["group_a"], set)
         assert isinstance(deserialized["group_b"], set)
 
+    @slow_first_draw
     @given(
         st.lists(st.text(), min_size=0, max_size=50).map(frozenset),
         st.lists(st.integers(min_value=-(2**31), max_value=2**31 - 1), min_size=0, max_size=50).map(frozenset),
@@ -542,6 +550,7 @@ class TestAutoSerializerPropertyBased:
         assert isinstance(deserialized["immutable_a"], frozenset)
         assert isinstance(deserialized["immutable_b"], frozenset)
 
+    @slow_first_draw
     @given(
         st.dictionaries(
             st.text(min_size=1, max_size=10),
@@ -563,6 +572,7 @@ class TestAutoSerializerPropertyBased:
 
         assert deserialized == mixed_data
 
+    @slow_first_draw
     @given(st.integers(min_value=0, max_value=100))
     def test_set_size_property(self, size: int):
         """Property: Sets of any size roundtrip with correct cardinality."""
@@ -576,6 +586,7 @@ class TestAutoSerializerPropertyBased:
         assert isinstance(deserialized, set)
         assert deserialized == test_set
 
+    @slow_first_draw
     @given(st.integers(min_value=0, max_value=100))
     def test_frozenset_immutability_property(self, size: int):
         """Property: Frozensets remain hashable after roundtrip."""
@@ -589,6 +600,7 @@ class TestAutoSerializerPropertyBased:
         hash(deserialized)  # Should not raise
         assert deserialized == test_frozenset
 
+    @slow_first_draw
     @given(st.lists(st.uuids(), min_size=1, max_size=10))
     def test_uuid_deterministic_serialization_property(self, uuid_list: list[UUID]):
         """Property: Serializing same data produces consistent bytes."""

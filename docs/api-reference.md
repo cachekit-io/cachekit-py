@@ -193,6 +193,7 @@ def critical_business_logic():
 | `CACHEKIT_API_KEY` | **Yes** | — | API key (`ck_live_...`) for authentication |
 | `CACHEKIT_API_URL` | No | `https://api.cachekit.io` | API endpoint override |
 | `CACHEKIT_TIMEOUT` | No | `5.0` | HTTP request timeout in seconds |
+| `CACHEKIT_TELEMETRY` | No | unset (on) | `false` turns off the usage telemetry headers ([Telemetry](backends/cachekitio.md#telemetry)) |
 
 #### Usage
 
