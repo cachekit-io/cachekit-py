@@ -437,6 +437,8 @@ _CLASS_CODE = (
     types.GetSetDescriptorType,
     types.WrapperDescriptorType,
     types.MethodDescriptorType,
+    types.ClassMethodDescriptorType,
+    types.MethodWrapperType,
     classmethod,
     staticmethod,
     property,
@@ -447,7 +449,7 @@ def _scan_type(kind: type) -> _TypeScan:
     """What reading an instance of ``kind`` needs, from one scan of its MRO: its member descriptors, its getset
     ``__dict__`` descriptor, its class-level ``_reports_write_deadline`` value, the entries scanned, and the
     objects its classes hold (``inner = backend`` on a wrapper class), read from the namespaces as stored, so no
-    descriptor runs; dunders, functions and descriptors are skipped."""
+    descriptor runs; functions and descriptors are skipped."""
     members: list[Any] = []
     class_values: list[object] = []
     scanned = 0
@@ -457,10 +459,12 @@ def _scan_type(kind: type) -> _TypeScan:
         namespace = _TYPE_DICT.__get__(klass)
         scanned += 1 + len(namespace)
         members += [d for d in namespace.values() if type(d) is types.MemberDescriptorType]
+        # Every name, dunders included (``__wrapped__ = backend``): interpreter metadata is strings, ints, types
+        # and tuples of them, which the walk treats as leaves, or code and descriptors, skipped here.
         class_values += [
             value
-            for name, value in namespace.items()
-            if not name.startswith("__") and not any(type(value) is code for code in _CLASS_CODE)
+            for value in namespace.values()
+            if not any(type(value) is code for code in _CLASS_CODE) and not issubclass(type(value), _REACH_LEAVES)
         ]
         if instance_dict is _MISSING and "__dict__" in namespace:
             instance_dict = namespace["__dict__"]
@@ -500,7 +504,7 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
                 flag = held["_reports_write_deadline"]
             if want_values:
                 values += dict.values(held)
-    if want_values:
+    if want_values and spent:  # a type's class values once per search, with its first read: seen dedups the rest
         values += class_values
     return flag is True, values, spent + unset  # the caller charges each value it walks
 

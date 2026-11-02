@@ -1880,11 +1880,10 @@ def create_cache_wrapper(
         already landed with: bounded by it when the write came first, else for ttl, and then dropped by
         _drop_copy_outliving_write if the bound turns out shorter."""
         with copy.lock:
-            if copy.l1_until is not None:
-                _put_l1(cache_key, serialized_data, None, twin=twin, expires_at=copy.l1_until)
-                return
-            # The exact expiry the copy is put with, so the writer compares against what L1 holds.
-            copy.put_until = time.time() + (DEFAULT_L1_TTL_SECONDS if ttl is None else ttl)
+            # The exact expiry the copy is put with, recorded in both branches, so any later and shorter report
+            # (a second PUT in the same write) still finds the copy and drops it.
+            local_until = time.time() + (DEFAULT_L1_TTL_SECONDS if ttl is None else ttl)
+            copy.put_until = local_until if copy.l1_until is None else min(local_until, copy.l1_until)
             _put_l1(cache_key, serialized_data, None, twin=twin, expires_at=copy.put_until)
 
     def _defer_write(cache_key: str, twin: str | None, envelope: bytes, *, copy: _DeferredCopy) -> bool:

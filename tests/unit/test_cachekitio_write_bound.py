@@ -1278,3 +1278,88 @@ def test_deferred_copy_is_bounded_at_receipt_not_after_post_response_work(
         release.set()
         for writer in writers:
             assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_wrapped_class_attribute_backend_is_bounded(
+    saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool
+) -> None:
+    """Cobel's probe: a class-level ``__wrapped__ = backend`` is held storage, not interpreter metadata."""
+
+    class _Wrapper:
+        __wrapped__ = backend
+
+        def get(self, key: str) -> bytes | None:
+            return self.__wrapped__.get(key)
+
+        def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+            self.__wrapped__.set(key, value, ttl)
+
+        def delete(self, key: str) -> bool:
+            return self.__wrapped__.delete(key)
+
+        def exists(self, key: str) -> bool:
+            return self.__wrapped__.exists(key)
+
+    saas.put_fresh_for = "0"
+    compute, _ = _decorated(_Wrapper(), is_async=is_async, distributed_lock=False)  # type: ignore[arg-type]
+    assert compute() == 1
+    gets = saas.gets()
+    assert compute() == 1
+    assert saas.gets() == gets + 1
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_later_shorter_report_revokes_a_copy_published_after_the_first(
+    saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
+) -> None:
+    """Cobel's probe: a set override making two PUTs. The first reports Fresh-For 59 before the miss publishes
+    its copy (bounded by it); the second reports 0 after, and must still revoke the published copy."""
+    first = threading.Event()
+    proceed = threading.Event()
+    second = threading.Event()
+    release = threading.Event()
+    writers: list[wb.WriteBehind] = []
+    init = wb.WriteBehind.__init__
+    submit = wb.WriteBehind.submit
+
+    def record(self: wb.WriteBehind, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        writers.append(self)
+
+    def submit_after_first(self: wb.WriteBehind, *args: Any, **kwargs: Any) -> bool:
+        queued = submit(self, *args, **kwargs)
+        assert first.wait(_GUARD_SECONDS)
+        return queued
+
+    monkeypatch.setattr(wb.WriteBehind, "__init__", record)
+    monkeypatch.setattr(wb.WriteBehind, "submit", submit_after_first)
+
+    class _Twice(CachekitIOBackend):
+        def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+            super().set(key, value, ttl, stale_ttl)
+            first.set()
+            assert proceed.wait(_GUARD_SECONDS)
+            super().set(key, value, ttl, stale_ttl)
+            second.set()
+            assert release.wait(_GUARD_SECONDS)
+
+    backend.__class__ = _Twice
+    saas.put_fresh_for = "59"
+    compute, _ = _decorated(backend, is_async=is_async, write_behind=True, distributed_lock=False)
+    try:
+        assert compute() == 1  # the first report lands before the miss publishes its copy
+        saas.put_fresh_for = "0"
+        proceed.set()
+        assert second.wait(_GUARD_SECONDS)
+        release.set()
+        for writer in writers:
+            assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
+        gets = saas.gets()
+        assert compute() == 1
+        assert saas.gets() == gets + 1
+    finally:
+        proceed.set()
+        release.set()
+        for writer in writers:
+            writer.close(time.monotonic() + _GUARD_SECONDS)
