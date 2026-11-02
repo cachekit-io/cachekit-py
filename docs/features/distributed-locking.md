@@ -39,7 +39,7 @@ report = await get_report("2025-01-15")
 ```
 
 > [!NOTE]
-> Locking requires **both** of:
+> Locking requires **all three** of:
 >
 > 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the CacheKit Cloud backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. `FileBackend` and pure-L1 (zero-config) caching do not either. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call: sync callers across the process's threads, async callers only on the event loop running the key's call ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).

@@ -420,7 +420,7 @@ first call (and runs uncached if nothing listens there): give it `backend=RedisB
 
 ## Backend Pages
 
-- [Redis Backend](redis.md) — Default, production-grade, shared cache
+- [Redis Backend](redis.md) — Production-grade, shared cache
 - [File Backend](file.md) — Local disk, single-process, no infrastructure
 - [Memcached Backend](memcached.md) — High-throughput, volatile, multi-process
 - [CacheKit Cloud Backend](cachekitio.md) — Managed, zero-ops, zero-knowledge
