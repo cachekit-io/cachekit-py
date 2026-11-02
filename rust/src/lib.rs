@@ -4,12 +4,9 @@
 //! Business logic lives in cachekit-core, including the untrusted msgpack decode bound
 //! (`cachekit_core::check_msgpack_structure`).
 //!
-//! Unsafe code belongs in cachekit-core, whose CI verifies it, so the crate denies it. CI's
-//! `Lint Rust` clippy (default features) rejects unsafe code outside `msgpack_decode` unless the
-//! same change adds an `allow(unsafe_code)`; the post-merge cargo-geiger check counts it either
-//! way (SECURITY.md). `msgpack_decode` is the one module exempt; it calls the `CPython` C API
-//! directly.
-#![deny(unsafe_code)]
+//! Unsafe code belongs in cachekit-core, whose CI verifies it, so the crate forbids it, and no
+//! module can allow it back. SECURITY.md says which checks enforce that.
+#![forbid(unsafe_code)]
 
 // Re-export core types for use in Python bindings
 pub use cachekit_core::{ByteStorage, StorageEnvelope};
@@ -27,7 +24,6 @@ pub mod python_bindings;
 
 // StandardSerializer's one-pass bounded MessagePack decode
 #[cfg(feature = "python")]
-#[allow(unsafe_code)]
 pub mod msgpack_decode;
 
 // The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's

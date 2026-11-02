@@ -21,10 +21,6 @@
 //! of at most `SHORT_LIST` items, a float or an int outside -5..=256 does not: running out of
 //! memory while building one aborts the process, where msgpack-python raises MemoryError.
 
-// cargo-geiger checks the crate only after a merge; this fails any build with the `python`
-// feature (a default one), which every PR's clippy job and wheel builds compile.
-#![forbid(unsafe_code)]
-
 use std::convert::Infallible;
 
 use cachekit_core::check_msgpack_structure;

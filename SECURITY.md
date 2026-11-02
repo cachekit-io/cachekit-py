@@ -310,10 +310,10 @@ On the tenant-scoped Redis backend, every successful invalidation is announced o
 | Tier | Timing | Trigger | Checks |
 |:-----|:------:|:--------|:-------|
 | **Fast** | < 3 min | Every PR | cargo-audit, cargo-deny, clippy, machete, pip-audit |
-| **Medium** | < 15 min | Post-merge | cargo-geiger. It fails if cachekit-rs holds any unsafe function, so `msgpack_decode`'s unsafe functions fail it. The Miri job runs no tests: this crate has none, and byte_storage and encryption are re-exports from cachekit-core |
+| **Medium** | < 15 min | Post-merge | cargo-geiger (zero unsafe functions in cachekit-rs). The Miri job runs no tests: this crate has none, and byte_storage and encryption are re-exports from cachekit-core |
 | **Deep** | < 2 hr | Nightly | Sanitizers (ASan, TSan, MSan), security report |
 
-cachekit-rs declares `#![deny(unsafe_code)]`, and `msgpack_decode`, which calls the CPython C API directly, is the one module exempt. On every PR, the `Lint Rust` clippy step in CI (`.github/workflows/ci.yml`, default features) rejects unsafe code outside `msgpack_decode`, unless the same change adds an `allow(unsafe_code)`. The post-merge cargo-geiger check counts it either way. Fast's clippy builds without the `python` feature, so it never compiles the Python-facing modules.
+cachekit-rs declares `#![forbid(unsafe_code)]`, which no `allow(unsafe_code)` or `expect(unsafe_code)` in the crate can lift. On every PR, the `Lint Rust` clippy step in CI (`.github/workflows/ci.yml`, default features) compiles every module and rejects unsafe code anywhere in the crate. Fast's clippy builds without the `python` feature, so it never compiles the Python-facing modules. After merge, the cargo-geiger report counts unsafe code in the crate; its check fails only on unsafe functions.
 
 <details>
 <summary><strong>📁 Workflow Files</strong></summary>
