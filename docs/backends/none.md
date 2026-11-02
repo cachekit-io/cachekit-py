@@ -207,7 +207,7 @@ assert len(calls) == 2  # ran on both calls: nothing was stored
 
 An L1-only entry expires, and its stale-while-revalidate refresh and retry back-off come due, on the OS monotonic clock, which the Rust extension reads itself, so the lock-free hit and the cache judge every deadline on one clock. Patching `time.monotonic` (pytest's `monkeypatch`, freezegun's `freeze_time` or `tick`) does not move it, so a test cannot expire an entry or bring a refresh due by moving fake time. The same holds for `@cache.local()`, and for any plaintext, non-interop decorator that finds no backend configured, as it runs in this mode ([Nothing Configured](README.md#4-nothing-configured-l1-only)). A cache with a backend is unchanged.
 
-To test what your code does once an entry has expired, remove the entry instead, so the next call misses as it would after expiry. This tests the miss, not the TTL: an entry expires only when the OS clock passes its `ttl`. For example:
+To test what your code does once an entry has expired, remove the entry instead, so the next call misses as it would after expiry. This tests the miss, not the TTL: an entry expires only once its `ttl` has elapsed on the OS clock. For example:
 
 ```python
 from cachekit import cache
@@ -229,7 +229,7 @@ assert calls == ["EUR", "EUR"]
 
 ## Characteristics
 
-- Latency: 0.34μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)), one call into the Rust extension that takes no lock; a call the [memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key, looks it up under the cache's lock and costs about 19 times the instructions; in-memory, no network
+- Latency: 0.34μs per hit with one `int` argument and no TTL, on a GitHub-hosted AMD EPYC 7763 ([measured](../performance.md#github-hosted-runner)), one call into the Rust extension that takes no lock; a call the [memo](../performance.md#decorator--l1-hit-hot-path) does not take builds its key, looks it up under the cache's lock and costs about 19 times the instructions of a memoised hit; in-memory, no network
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
