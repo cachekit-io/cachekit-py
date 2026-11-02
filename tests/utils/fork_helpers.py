@@ -35,19 +35,21 @@ def _sigusr1_has_handler() -> bool:
     return ctypes.c_void_p.from_buffer(action).value not in (None, 1)  # SIG_DFL is 0, SIG_IGN is 1
 
 
-def fork_dumping_stacks() -> tuple[int, bool]:
-    """os.fork(), with a child that writes every thread's stack to stderr on SIGUSR1: (pid, whether that dump is armed).
+def fork_dumping_stacks(fork: Callable[[], int] = os.fork) -> tuple[int, bool]:
+    """fork(), with a child that writes every thread's stack to stderr on SIGUSR1: (pid, whether that dump is armed).
 
     Armed before the fork, so a child hung in an at-fork hook, before os.fork() returns there, still dumps.
+    So does the child of a fork made from C (fork=ctypes.PyDLL(None).fork): faulthandler's handler is C code,
+    so it dumps from a child hung where no Python runs, waiting for the GIL included.
     A SIGUSR1 handler the parent already has is left alone, and the dump stays unarmed. Pass armed to
     child_outcome as dump_stacks, so SIGUSR1 never reaches a handler this helper did not install.
     """
     if _sigusr1_has_handler():  # faulthandler.unregister would restore SIG_DFL over it, not the handler
         warnings.warn("SIGUSR1 already has a handler: a hung child is killed without dumping its stacks", stacklevel=2)
-        return os.fork(), False
+        return fork(), False
     faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # the child inherits it
     try:
-        pid = os.fork()
+        pid = fork()
     except BaseException:
         faulthandler.unregister(signal.SIGUSR1)
         raise
