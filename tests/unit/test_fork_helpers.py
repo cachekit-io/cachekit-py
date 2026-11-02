@@ -12,9 +12,11 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from tests.utils import fork_helpers
 from tests.utils.fork_helpers import child_outcome, fork_dumping_stacks, report, run_fresh
 
 
@@ -79,6 +81,23 @@ def test_child_outcome_returns_the_outcome_while_another_process_holds_the_write
         assert child_outcome(pid, r, timeout=5) is True  # no EOF ever comes, but the child exited
     finally:
         os.close(leaked)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs F_SETPIPE_SZ")
+def test_child_outcome_reads_all_a_child_left_in_a_pipe_larger_than_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fcntl
+
+    big = "x" * (200 << 10)  # more than a default 64 KiB pipe holds, less than this one
+    r, w = os.pipe()
+    fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 1 << 20)  # as a 64 KiB-page kernel's default pipe holds
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        report(w, big)  # fits the pipe, so the child exits with all of it unread
+    os.close(w)
+    # The child exits before the parent reads anything, so only the post-exit drain reads the outcome.
+    monkeypatch.setattr(fork_helpers, "select", SimpleNamespace(select=lambda *_: ([], [], [])))
+    assert child_outcome(pid, r, timeout=10) == big
 
 
 def _write_forever(w: int) -> None:

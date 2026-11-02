@@ -8,6 +8,7 @@ import faulthandler
 import os
 import select
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -88,11 +89,14 @@ def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = F
         os.waitpid(pid, 0)
         os.close(r)
         return f"no outcome: timed out after {timeout:g} s"
-    # What the child wrote just before it exited: at most one pipe buffer, so a process still writing cannot hold us here.
-    left = 65536
-    while left > 0 and not eof and select.select([r], [], [], 0)[0]:
-        chunk = os.read(r, left)
-        data, eof, left = data + chunk, not chunk, left - len(chunk)
+    # What the child wrote just before it exited is what the pipe holds now, whatever its capacity. Reading only
+    # that much, a process still writing cannot hold us here. Imported here: POSIX-only, as os.fork is.
+    import fcntl
+    import termios
+
+    left = struct.unpack("i", fcntl.ioctl(r, termios.FIONREAD, b"\0\0\0\0"))[0]
+    while left > 0 and (chunk := os.read(r, left)):
+        data, left = data + chunk, left - len(chunk)
     os.close(r)
     if data:
         return ast.literal_eval(data.decode())
