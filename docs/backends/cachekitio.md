@@ -206,8 +206,10 @@ dropped and counts toward neither. The next request to
 cachekit.io carries the report and empties it, so each hit is reported once. A call that waited on another call's
 miss for the same key, a miss, an L2 hit and a direct `backend.get()` are never timed, and the health check never
 carries a report. A forked child starts with an empty report and its own random draws. Under uWSGI without
-`--py-call-uwsgi-fork-hooks`, a worker draws the same sequence as its siblings until it builds a backend or makes its
-first request or timed hit on one it inherited. Each call is still timed with probability 1/256, but those workers
+`--py-call-uwsgi-fork-hooks`, a worker draws the same sequence as its siblings until it first builds or uses a
+latency report: it builds a backend that keeps one, or makes its first request or timed hit on an inherited backend
+that keeps one. A backend keeps a report only with telemetry on and a qualifying clock. A health check does not end
+the window, and neither does building or using a backend that keeps no report. Each call is still timed with probability 1/256, but those workers
 time the same call positions. The flag removes the window. Hits timed after the last request are not sent.
 
 **Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` (name and value in any case) to `false`, `0`, `off` or `no`.
