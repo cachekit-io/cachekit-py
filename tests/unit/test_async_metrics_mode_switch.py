@@ -533,19 +533,41 @@ def test_child_of_a_c_level_fork_resets_metric_locks_once():
         collector.shutdown()
 
 
+def _park_threads(count: int, stop: threading.Event) -> list[threading.Thread]:
+    def park_until_stopped():
+        stop.wait()
+
+    threads = [threading.Thread(target=park_until_stopped, daemon=True) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    return threads
+
+
+# A child forked from C keeps every parent thread's state, and faulthandler dumps only the newest 100 of them: a busy
+# xdist worker has more, and the oldest, cut off, is the main thread that forked and hung.
 @needs_c_fork
-def test_hung_child_of_a_c_level_fork_fails_its_test_with_its_stacks(capfd):
+@pytest.mark.parametrize("parked", [0, 120], ids=["quiet-parent", "busy-parent"])
+def test_hung_child_of_a_c_level_fork_fails_its_test_with_its_stacks(capfd, parked):
     lock = threading.Lock()
+    stop = threading.Event()
+    threads = _park_threads(parked, stop)
 
     def wait_on_the_inherited_lock():
         return lock.acquire()  # held at the fork, and nothing in the child releases it
 
     started = time.monotonic()
-    with pytest.raises(pytest.fail.Exception, match="timed out after 1 s"):
-        _in_c_forked_child_holding(lock, wait_on_the_inherited_lock, timeout=1)
+    try:
+        with pytest.raises(pytest.fail.Exception, match="timed out after 1 s"):
+            _in_c_forked_child_holding(lock, wait_on_the_inherited_lock, timeout=1)
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join()
     # Failed within the helper's bound instead of holding the job, and the dump names the frame the child hung in.
     assert time.monotonic() - started < 10
-    assert "in wait_on_the_inherited_lock" in capfd.readouterr().err
+    err = capfd.readouterr().err
+    assert "in wait_on_the_inherited_lock" in err
+    assert ("in park_until_stopped" in err) == bool(parked)  # and the other threads' frames as the fork left them
 
 
 # The fork tests above run the fork handling in a child process, which coverage does not measure. The tests below run
