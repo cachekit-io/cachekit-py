@@ -44,7 +44,7 @@ Are you caching in Python?
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
-> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CachekitIO), the default `StandardSerializer` converts tuples to lists and cannot encode sets or frozensets (the result is returned uncached; see [Serialization unsupported type](error-codes.md#serialization-unsupported-type)), for cross-language SDK compatibility.
+> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CacheKit Cloud), the default `StandardSerializer` converts tuples to lists and cannot encode sets or frozensets (the result is returned uncached; see [Serialization unsupported type](error-codes.md#serialization-unsupported-type)), for cross-language SDK compatibility.
 >
 > **If you need type preservation with a distributed backend**, use `serializer='auto'`:
 > ```python
@@ -104,7 +104,7 @@ def expensive_computation(x: int) -> dict:
 > **Why cachekit wins:**
 > - **L1+L2 caching**: L1 hits from process memory with no network round trip, an L1 miss that hits L2 costs one Redis round trip (see [Performance](performance.md))
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
-> - **Distributed locking**: Prevents cache stampedes across pods
+> - **Distributed locking**: Best-effort guard against cache stampedes across pods, for async functions on a lock-capable backend (sync functions dedup within one process only)
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
 > - **Metrics**: Prometheus operation counts and latency and payload-size histograms, plus `cache_info()` hit/miss counters per function
 
@@ -117,7 +117,8 @@ def get_user_data(user_id: int) -> dict:
     # Different pod: L2 hit from Redis (one network round trip)
     # Redis down: errors are logged and the function runs, doesn't crash
     # Circuit breaker open: L1 hits still served; a miss runs the function and returns its result
-    # Multiple pods calling simultaneously: Distributed lock prevents stampede
+    # Multiple pods calling simultaneously: each pod computes once (sync functions take no
+    # distributed lock; use an async function on a lock-capable backend for cross-pod protection)
     return fetch_user_from_db(user_id)
 ```
 
@@ -167,7 +168,7 @@ sequenceDiagram
 
 **Why cachekit wins**:
 - **Same code**: `@cache` decorator works with or without Redis
-- **Pluggable backends**: Redis, CachekitIO, File, Memcached built-in, plus custom protocol
+- **Pluggable backends**: Redis, CacheKit Cloud, File, Memcached built-in, plus custom protocol
 - **Graceful degradation**: Redis down? L1 cache serves, app continues
 - **No vendor lock-in**: Backend protocol is documented, implement your own
 
@@ -213,13 +214,17 @@ def fetch_data(key):
 
 **Distributed Locking**: Prevents cache stampedes
 ```python
-@cache(ttl=300)  # Distributed locking enabled by default
-def expensive_compute(key):
+@cache(ttl=300)  # Distributed locking on by default for async functions
+async def expensive_compute(key):
+    # Needs a lock-capable backend: env-configured Redis or CacheKit Cloud
     # 1000 pods call simultaneously on cache miss
-    # Only ONE pod calls expensive_compute
-    # Others wait for L2 cache to be populated
-    # No cascade of simultaneous DB queries
-    return compute_expensive_value(key)
+    # The pod that wins the lock calls expensive_compute; the others wait up to
+    # blocking_timeout (5 s) for L2 to be populated, then re-check it and, if it
+    # is still empty, compute anyway. Best effort: a fill slower than 5 s, or one
+    # that lands between another pod's read and its lock request, means a second
+    # pod computes too (see features/distributed-locking.md)
+    # A sync function takes no distributed lock: misses dedup within one process only
+    return await compute_expensive_value(key)
 ```
 
 **Limitations of alternatives**:
@@ -268,14 +273,14 @@ The series carry no hit/miss label; `cache_info()` has those counts. cachekit st
 **Scenario**: You want distributed caching without standing up or operating Redis infrastructure.
 
 **Why cachekit wins**:
-- **CachekitIOBackend**: Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
+- **CacheKit Cloud** (`CachekitIOBackend`): Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
 - **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext values, never plaintext values; the cache key stays cleartext ([details](features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure))
 - **Same decorator API**: Swap backend by setting `CACHEKIT_API_KEY` — zero code changes
 
 ```python notest
 from cachekit import cache
 
-# Uses cachekit.io as the L2 backend (CACHEKIT_API_KEY in environment)
+# Uses CacheKit Cloud as the L2 backend (CACHEKIT_API_KEY in environment)
 @cache.io(ttl=3600)
 def get_user_data(user_id: int) -> dict:
     return fetch_from_db(user_id)
@@ -509,7 +514,7 @@ A: Yes. Works with any framework (FastAPI, Django, Flask, etc). Metrics integrat
 A: The app keeps working. Redis errors are logged, and your function runs and returns its result. If Redis was down when the backend was first built, nothing is cached and repeated failures open the circuit breaker, so calls stop waiting on Redis. If Redis goes away later, L1 still caches results in-process. While the breaker is open, L1 hits are still served and a miss runs the function.
 
 **Q: Can I use my own backend?**
-A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.
+A: Yes. Four built-in backends (Redis, CacheKit Cloud, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.
 
 ---
 

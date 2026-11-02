@@ -128,7 +128,7 @@ checks out its own connection, so threads sharing one backend never share a sock
 ## Limitations
 
 1. **No persistence**: All data is in-memory. Server restart = data loss.
-2. **No locking**: No distributed lock support (use Redis or CachekitIO for stampede prevention).
+2. **No locking**: No distributed lock support (use Redis or CacheKit Cloud for stampede prevention).
 3. **30-day TTL maximum**: TTLs exceeding 30 days are automatically clamped.
 4. **1MB value limit**: Default Memcached slab size limits values to ~1MB.
 5. **No TTL inspection (`get_ttl`)**: see below — `refresh_ttl` is supported, inspection is not.
@@ -146,7 +146,7 @@ Memcached ships only **half** of the `TTLInspectableBackend` protocol, by design
 Consequence: `@cache(..., refresh_ttl_on_get=True)` performs *threshold-based* sliding
 expiration, which needs to read the remaining TTL first — so it **does not apply to
 Memcached** and is ignored (the decorator warns once, then continues serving the hit). For
-automatic sliding expiration use the [Redis](redis.md), [CachekitIO](cachekitio.md), or
+automatic sliding expiration use the [Redis](redis.md), [CacheKit Cloud](cachekitio.md), or
 [File](file.md) backend. You can still call `backend.refresh_ttl(key, ttl)` yourself.
 
 ## See Also

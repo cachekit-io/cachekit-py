@@ -141,8 +141,9 @@ class TestInit:
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
         if env_key is not None:
             monkeypatch.setenv("CACHEKIT_API_KEY", env_key)
-        with pytest.raises(ConfigurationError, match="requires an API key"):
+        with pytest.raises(ConfigurationError, match="requires an API key") as info:
             CachekitIOBackend(api_key=key)  # type: ignore[arg-type]
+        assert "join the waitlist at https://dash.cachekit.io" in str(info.value)  # https://cachekit.io has no sign-up
 
     @pytest.mark.parametrize(
         "key",

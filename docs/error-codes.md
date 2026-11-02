@@ -4,7 +4,7 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function. Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CacheKit Cloud HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function. Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
 
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
@@ -571,7 +571,7 @@ One specific cause worth naming: `... envelope format 'X' disagrees with header 
 
 **Exception**: none: while the breaker is open, a function with an L2 backend still serves L1 hits, skips L2, and runs uncached on an L1 miss, sync or async. An L1 hit is never a probe and records no outcome, so it neither holds the breaker open nor closes it. In L1-only mode (`backend=None`) the breaker is never consulted.
 
-**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is a failure to create the backend client and, for async functions only, a result too large to cache (over `max_value_size`) or a multi-tenant encrypted write whose tenant id cannot be extracted. An exception raised by the decorated function never counts, and neither does an `InteropError` for a return value the interop data model can't represent: both reach the caller unchanged, sync or async. A result that fails to serialize or encrypt for the cache write never counts, sync or async: the write is skipped with an ERROR and a WARNING log line, and the function's result is returned uncached. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
+**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CacheKit Cloud HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is a failure to create the backend client and, for async functions only, a result too large to cache (over `max_value_size`) or a multi-tenant encrypted write whose tenant id cannot be extracted. An exception raised by the decorated function never counts, and neither does an `InteropError` for a return value the interop data model can't represent: both reach the caller unchanged, sync or async. A result that fails to serialize or encrypt for the cache write never counts, sync or async: the write is skipped with an ERROR and a WARNING log line, and the function's result is returned uncached. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
 
 **What it means**:
 - A failure listed under **Cause** has occurred `failure_threshold` times (five by default) within 60 seconds
@@ -701,7 +701,7 @@ export CACHEKIT_DEPLOYMENT_UUID=$(python -c 'import uuid; print(uuid.uuid4())')
 
 **Message** (logged): `Failed to acquire lock for ... after 5.0s, checking cache`
 
-**Exception**: none. On a cache miss, an async `@cache` function on CachekitIO, or Redis configured via `CACHEKIT_REDIS_URL`, waits about 5 seconds (plus request time) for the per-key lock. If another process still holds it, cachekit checks the cache once more, then runs the function itself.
+**Exception**: none. On a cache miss, an async `@cache` function on CacheKit Cloud, or Redis configured via `CACHEKIT_REDIS_URL`, waits about 5 seconds (plus request time) for the per-key lock. If another process still holds it, cachekit checks the cache once more, then runs the function itself.
 
 **Cause**: Distributed lock could not be acquired (another process holds the lock)
 
@@ -720,9 +720,9 @@ redis-cli DEL <lock-key>
 
 ---
 
-## CachekitIO HTTP Errors
+## CacheKit Cloud HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises, for sync or async functions: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs; its result is still stored in L1. One case is retried first: a write or delete (a `PUT` or `DELETE`, the lock release included) that the server answers `503` with a `Retry-After` of 2 seconds or less is sent once more, inline, after exactly that delay; see [Server error (5xx)](#server-error-5xx). Nothing else is retried. A failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
+These errors occur when using `@cache.io()` with the CacheKit Cloud backend. None raises, for sync or async functions: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs; its result is still stored in L1. One case is retried first: a write or delete (a `PUT` or `DELETE`, the lock release included) that the server answers `503` with a `Retry-After` of 2 seconds or less is sent once more, inline, after exactly that delay; see [Server error (5xx)](#server-error-5xx). Nothing else is retried. A failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
 
 On a miss, an async function first requests the per-key lock (see [Distributed Locking](features/distributed-locking.md)). Any HTTP failure of that request ends the lock wait at once: the function runs without the lock, and cachekit logs `Lock operation failed … executing without lock`. Only a lock another caller holds is waited on.
 
@@ -779,7 +779,7 @@ def get_data():
     return fetch()
 ```
 
-2. **Upgrade tier**: Increase plan limits at [cachekit.io](https://cachekit.io)
+2. **Upgrade tier**: Increase plan limits in the dashboard at [dash.cachekit.io](https://dash.cachekit.io)
 
 3. **Review cache key design**: Overly granular keys cause unnecessary misses
 
@@ -791,7 +791,7 @@ def get_data():
 
 **Exception**: none — logged as `BackendError` (`BackendErrorType.TRANSIENT`)
 
-**Cause**: Transient server-side error at the CachekitIO API
+**Cause**: Transient server-side error at the CacheKit Cloud API
 
 **Behavior**: TRANSIENT — logged; the function runs and its result is still stored in L1.
 
@@ -814,7 +814,7 @@ def my_function():
 
 ### Client error (4xx)
 
-**Message**: `Client error: HTTP 400` (or 404, etc.). A 413 reads `Value too large for cachekit.io backend (HTTP 413): value exceeds the server's maximum cache value size`.
+**Message**: `Client error: HTTP 400` (or 404, etc.). A 413's message names `HTTP 413` and ends `value exceeds the server's maximum cache value size`.
 
 **Exception**: none — logged as `BackendError` (`BackendErrorType.PERMANENT`)
 
@@ -830,7 +830,7 @@ def my_function():
 
 **Exception**: none — logged as `BackendError` (`BackendErrorType.TIMEOUT`)
 
-**Cause**: HTTP request to the CachekitIO API exceeded the configured timeout
+**Cause**: HTTP request to the CacheKit Cloud API exceeded the configured timeout
 
 **Behavior**: TIMEOUT — logged; the function runs and its result is still stored in L1.
 
@@ -869,7 +869,7 @@ echo $CACHEKIT_API_URL
 
 ---
 
-### CachekitIO error classification summary
+### CacheKit Cloud error classification summary
 
 | HTTP Status / Exception | `BackendErrorType` |
 |---|---|
@@ -878,7 +878,7 @@ echo $CACHEKIT_API_URL
 | 5xx | `TRANSIENT` |
 | 413, other 4xx | `PERMANENT` |
 | urllib3 `ConnectTimeoutError`, `ReadTimeoutError` | `TIMEOUT` |
-| urllib3 `NewConnectionError`, `ProtocolError`, `SSLError`, `ProxyError` | `TRANSIENT` (a failed certificate verification says so: see `SSL_CERT_FILE` in [CachekitIO](backends/cachekitio.md#characteristics)) |
+| urllib3 `NewConnectionError`, `ProtocolError`, `SSLError`, `ProxyError` | `TRANSIENT` (a failed certificate verification says so: see `SSL_CERT_FILE` in [CacheKit Cloud Backend](backends/cachekitio.md#characteristics)) |
 | Other | `UNKNOWN` |
 
 No type counts toward the circuit breaker. Only a `503` to a write or delete with a `Retry-After` of 2 seconds or less is retried, once, for sync and async functions alike (see [Server error (5xx)](#server-error-5xx)). A failed lock request is not retried: it ends the lock wait, as the note at the top of this section says.

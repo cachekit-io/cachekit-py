@@ -2,7 +2,7 @@
 
 # SSRF Protection
 
-Server-Side Request Forgery (SSRF) protection for the CachekitIO backend.
+Server-Side Request Forgery (SSRF) protection for the CacheKit Cloud backend.
 
 ## What This Means for @cache.io Users
 
@@ -12,7 +12,7 @@ If you're seeing URL validation errors in your app, see the [Troubleshooting Gui
 
 ## Overview
 
-When using `CachekitIOBackend` to connect to the cachekit.io SaaS, the SDK includes built-in SSRF protection to prevent attackers from using your application to make requests to internal networks or cloud metadata endpoints.
+When using `CachekitIOBackend` to connect to CacheKit Cloud, the SDK includes built-in SSRF protection to prevent attackers from using your application to make requests to internal networks or cloud metadata endpoints.
 
 ## What is SSRF?
 
@@ -85,7 +85,7 @@ config = CachekitIOBackendConfig(api_key="...", api_url="https://[::ffff:127.0.0
 
 ### 3. Hostname Allowlist
 
-Only the two cachekit.io API hostnames are allowed by default, matched exactly:
+Only the two CacheKit Cloud API hostnames are allowed by default, matched exactly:
 
 ```python notest
 from cachekit.backends.cachekitio import CachekitIOBackendConfig

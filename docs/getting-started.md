@@ -23,7 +23,7 @@
 ## Quick Start
 
 CacheKit provides a unified caching API with pluggable backends. You write `@cache`
-once; the backend (Redis, CachekitIO, Memcached, or File / L1-only) is selected from
+once; the backend (Redis, CacheKit Cloud, Memcached, or File / L1-only) is selected from
 your environment. See [Choose Your Backend](#choose-your-backend) for the full menu.
 
 With nothing configured, `@cache` caches in L1 only, in process, like `lru_cache`. It
@@ -71,7 +71,7 @@ The same `@cache` now caches in L1 and Redis.
 ```python
 from cachekit import cache
 
-@cache  # Default: 1 hour TTL (3600s)
+@cache(ttl=3600)  # Expire after 1 hour; with no ttl, entries do not expire
 def expensive_function():
     return do_expensive_computation()
 
@@ -84,7 +84,7 @@ result = expensive_function()
 
 **Prerequisites**: Redis running + `REDIS_URL` environment variable set
 
-**Defaults**: 1 hour TTL, no namespace, compression enabled
+**Defaults**: no TTL (backend entries do not expire; L1-only entries are kept for up to a year), no namespace, compression enabled
 
 ---
 
@@ -242,7 +242,7 @@ export REDIS_URL="redis://localhost:6379"
 export CACHEKIT_REDIS_URL="redis://localhost:6379"
 export CACHEKIT_CONNECTION_POOL_SIZE=50
 
-# CachekitIO Cloud (closed beta). CACHEKIT_API_KEY is also a backend selector: set it
+# CacheKit Cloud (closed beta). CACHEKIT_API_KEY is also a backend selector: set it
 # INSTEAD of CACHEKIT_REDIS_URL, never both (two selectors leave caches that rely on env
 # auto-detection uncached).
 # export CACHEKIT_API_KEY=ck_your_api_key
@@ -257,13 +257,13 @@ Four paths depending on your situation:
 | Backend | When to use | Setup effort |
 |:--------|:------------|:-------------|
 | **Redis** (recommended) | Production, existing infra, full control | Medium — run Redis yourself |
-| **CachekitIO Cloud** (beta) | Skip Redis ops, managed edge caching | Low — API key only |
+| **CacheKit Cloud** (closed beta) | Skip Redis ops, managed edge caching | Low — API key only |
 | **Memcached** (optional) | High-throughput, existing Memcached infra | Low — `pip install cachekit[memcached]` |
 | **File / L1-only** | Local dev, tests, no external deps | None |
 
 ### Redis (Recommended)
 
-Self-hosted, full control. The default and recommended path. Everything in this guide applies.
+Self-hosted, full control. The recommended path for production; the default, with nothing configured, is L1 only. Everything in this guide applies.
 
 ```bash
 docker run -p 6379:6379 redis
@@ -278,22 +278,22 @@ def get_user(user_id: int):
     return fetch_from_db(user_id)
 ```
 
-### CachekitIO Cloud
+### CacheKit Cloud
 
 > [!NOTE]
-> **cachekit.io is in closed beta — [request access](https://cachekit.io)**
+> **CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)**
 
 Managed edge caching — no Redis to run. Set your API key and switch the decorator to `@cache.io()`.
 
 ```bash
-# CachekitIO Cloud (closed beta)
+# CacheKit Cloud (closed beta)
 export CACHEKIT_API_KEY=ck_your_api_key
 ```
 
 ```python notest
 from cachekit import cache
 
-@cache.io(ttl=3600)  # cachekit.io is in closed beta — request access at https://cachekit.io
+@cache.io(ttl=3600)  # CacheKit Cloud is in closed beta: join the waitlist at https://dash.cachekit.io
 def get_user(user_id: int):
     return fetch_from_db(user_id)
 ```
@@ -353,7 +353,7 @@ result = critical_function()  # Works even if Redis is offline
 
 ### Multi-Pod Safe by Default
 
-- Distributed locking prevents cache stampedes
+- Distributed locking guards against cache stampedes across pods, best effort (async functions on a lock-capable backend; sync functions dedup within one process only)
 - All pods see consistent data
 - No local memory cache surprises
 
