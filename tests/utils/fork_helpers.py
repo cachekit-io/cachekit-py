@@ -88,9 +88,11 @@ def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = F
         os.waitpid(pid, 0)
         os.close(r)
         return f"no outcome: timed out after {timeout:g} s"
-    while not eof and select.select([r], [], [], 0)[0]:  # what the child wrote just before it exited
-        chunk = os.read(r, 65536)
-        data, eof = data + chunk, not chunk
+    # What the child wrote just before it exited: at most one pipe buffer, so a process still writing cannot hold us here.
+    left = 65536
+    while left > 0 and not eof and select.select([r], [], [], 0)[0]:
+        chunk = os.read(r, left)
+        data, eof, left = data + chunk, not chunk, left - len(chunk)
     os.close(r)
     if data:
         return ast.literal_eval(data.decode())
