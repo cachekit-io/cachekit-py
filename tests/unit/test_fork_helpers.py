@@ -1,4 +1,4 @@
-"""The fork helpers must not disturb a SIGUSR1 handler the process calling them already has."""
+"""The fork helpers stay bounded, import everywhere, and never disturb a SIGUSR1 handler their caller has."""
 
 from __future__ import annotations
 
@@ -6,11 +6,17 @@ import ast
 import faulthandler
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import time
+from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from tests.utils import fork_helpers
 from tests.utils.fork_helpers import child_outcome, fork_dumping_stacks, report, run_fresh
 
 
@@ -48,3 +54,93 @@ def test_fork_dumping_stacks_leaves_a_sigusr1_handler_it_did_not_install_alone()
         "parent_dumped": True,  # the parent's registration survived
     }
     assert "SIGUSR1 already has a handler" in run.stderr
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_child_outcome_reads_an_outcome_larger_than_the_pipe_buffer() -> None:
+    big = "x" * (1 << 20)  # a Linux pipe holds 64 KiB: the child blocks writing the rest until the parent reads it
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        report(w, big)
+    os.close(w)
+    assert child_outcome(pid, r, timeout=10) == big
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_child_outcome_returns_the_outcome_while_another_process_holds_the_write_end() -> None:
+    r, w = os.pipe()
+    leaked = os.dup(w)  # as a sibling forked meanwhile by another thread, or a grandchild, would hold it
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        report(w, True)
+    os.close(w)
+    try:
+        assert child_outcome(pid, r, timeout=5) is True  # no EOF ever comes, but the child exited
+    finally:
+        os.close(leaked)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs F_GETPIPE_SZ")
+def test_child_outcome_reads_all_a_child_left_in_a_full_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fcntl
+
+    r, w = os.pipe()
+    try:
+        try:
+            fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 1 << 20)  # as a 64 KiB-page kernel's default pipe holds
+        except PermissionError:
+            pass  # past the user's pipe-user-pages-soft, an unprivileged resize is refused: test the default pipe
+        big = "x" * (fcntl.fcntl(w, fcntl.F_GETPIPE_SZ) - 2)  # its repr fills the pipe exactly
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            report(w, big)  # fits the pipe, so the child exits with all of it unread
+    except BaseException:
+        os.close(r)  # child_outcome closes it otherwise
+        raise
+    finally:
+        os.close(w)
+    # The child exits before the parent reads anything, so only the post-exit drain reads the outcome.
+    monkeypatch.setattr(fork_helpers, "select", SimpleNamespace(select=lambda *_: ([], [], [])))
+    assert child_outcome(pid, r, timeout=10) == big
+
+
+def _write_forever(w: int) -> None:
+    while True:
+        os.write(w, b"x" * 65536)
+
+
+def _hang_after_reporting(w: int) -> None:
+    os.write(w, b"True")
+    os.close(w)
+    time.sleep(60)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("child", [_write_forever, _hang_after_reporting], ids=["writes-forever", "hangs-after-reporting"])
+def test_child_outcome_kills_a_child_still_running_at_its_deadline(child: Callable[[int], None]) -> None:
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            child(w)
+        finally:
+            os._exit(1)
+    os.close(w)
+    started = time.monotonic()
+    assert child_outcome(pid, r, timeout=0.5) == "no outcome: timed out after 0.5 s"
+    assert time.monotonic() - started < 5  # the deadline bounds reading and reaping alike
+
+
+def test_fork_helpers_import_where_os_fork_is_missing() -> None:
+    """Windows has no os.fork, and a test module there imports these helpers before its skip markers run."""
+    code = "import os; os.__dict__.pop('fork', None); import tests.utils.fork_helpers"
+    root = Path(__file__).resolve().parents[2]  # where `tests` imports from
+    run = subprocess.run(  # noqa: S603 - trusted: sys.executable + a literal
+        [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60
+    )
+    assert run.returncode == 0, run.stderr
