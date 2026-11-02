@@ -35,8 +35,8 @@ def _sigusr1_has_handler() -> bool:
     return ctypes.c_void_p.from_buffer(action).value not in (None, 1)  # SIG_DFL is 0, SIG_IGN is 1
 
 
-def fork_dumping_stacks(fork: Callable[[], int] = os.fork) -> tuple[int, bool]:
-    """fork(), with a child that writes every thread's stack to stderr on SIGUSR1: (pid, whether that dump is armed).
+def fork_dumping_stacks(fork: Callable[[], int] | None = None) -> tuple[int, bool]:
+    """fork() (os.fork by default), with a child that writes every thread's stack to stderr on SIGUSR1: (pid, armed).
 
     Armed before the fork, so a child hung in an at-fork hook, before os.fork() returns there, still dumps.
     So does the child of a fork made from C (fork=ctypes.PyDLL(None).fork): faulthandler's handler is C code,
@@ -44,6 +44,7 @@ def fork_dumping_stacks(fork: Callable[[], int] = os.fork) -> tuple[int, bool]:
     A SIGUSR1 handler the parent already has is left alone, and the dump stays unarmed. Pass armed to
     child_outcome as dump_stacks, so SIGUSR1 never reaches a handler this helper did not install.
     """
+    fork = fork or os.fork  # looked up here: a default of os.fork would fail this module's import where it is missing
     if _sigusr1_has_handler():  # faulthandler.unregister would restore SIG_DFL over it, not the handler
         warnings.warn("SIGUSR1 already has a handler: a hung child is killed without dumping its stacks", stacklevel=2)
         return fork(), False
@@ -65,19 +66,28 @@ def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = F
     """
     if pid <= 0:  # not an assert: python -O strips those, and os.kill(0, ...) signals pytest's whole process group
         raise ValueError("no child was forked")
-    ready = select.select([r], [], [], timeout)[0]
-    data = os.read(r, 65536) if ready else b""
-    if not data:  # on EOF the child has exited (it holds the only write end), and a kill leaves its exit status as is
-        if dump_stacks and not ready:
+    deadline = time.monotonic() + timeout
+    data = b""
+    # Read to EOF: a child whose outcome outgrows the pipe's buffer blocks writing the rest until it is read.
+    while select.select([r], [], [], max(0.0, deadline - time.monotonic()))[0]:
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        data += chunk
+    else:  # still no EOF at the deadline: the child is hung, mid-report or not
+        if dump_stacks:
             os.kill(pid, signal.SIGUSR1)
             time.sleep(1)  # the handler writes the dump in well under this
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        os.close(r)
+        return f"no outcome: timed out after {timeout:g} s"
+    if not data:  # on EOF the child has exited (it holds the only write end), and a kill leaves its exit status as is
         os.kill(pid, signal.SIGKILL)
     _, status = os.waitpid(pid, 0)
     os.close(r)
     if data:
         return ast.literal_eval(data.decode())
-    if not ready:
-        return f"no outcome: timed out after {timeout:g} s"
     if os.WIFSIGNALED(status):
         return f"no outcome: killed by signal {os.WTERMSIG(status)} ({signal.Signals(os.WTERMSIG(status)).name})"
     return f"no outcome: exited {os.WEXITSTATUS(status)}"
