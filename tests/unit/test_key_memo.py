@@ -21,9 +21,10 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cachekit import cache
+from cachekit._rust_serializer import MEMO_MAX_ARGS, MEMO_MAX_ENTRIES, MEMO_MAX_LEN
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _memo_key
+from cachekit.decorators.wrapper import _memo_key
 from cachekit.key_generator import CacheKeyGenerator
 from tests.unit.test_key_registry import _closure_cell
 
@@ -131,21 +132,24 @@ def _key_used(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | N
 
 
 class _Gate:
-    """An L1-only function's cache whose delete waits for the test, so an invalidation can be held
-    between deciding to erase an entry and erasing it while the test makes another call."""
+    """An L1-only function's cache whose delete and clear wait for the test, so an invalidation (of
+    one key, or of the whole function) can be held between deciding to erase entries and erasing
+    them while the test makes another call."""
 
     def __init__(self, fn: Any) -> None:
         self.deleting = threading.Event()
         self.release = threading.Event()
         oc = _closure_cell(fn, "_object_cache").cell_contents
-        delete = oc.delete
 
-        def gated(key: str) -> bool:
-            self.deleting.set()
-            assert self.release.wait(10), "the test never released the delete"
-            return delete(key)
+        def held(remove: Any) -> Any:
+            def gated(*args: Any) -> Any:
+                self.deleting.set()
+                assert self.release.wait(10), "the test never released the delete"
+                return remove(*args)
 
-        oc.delete = gated
+            return gated
+
+        oc.delete, oc.clear = held(oc.delete), held(oc.clear)
 
 
 def _gate(fn: Any) -> _Gate:
@@ -204,8 +208,8 @@ _NOT_MEMOISED = [
     _Int(1),
     Decimal(1),
     frozenset(),
-    "x" * (_MEMO_MAX_LEN + 1),
-    b"x" * (_MEMO_MAX_LEN + 1),
+    "x" * (MEMO_MAX_LEN + 1),
+    b"x" * (MEMO_MAX_LEN + 1),
 ]
 
 
@@ -225,20 +229,20 @@ class TestMemoKey:
         assert _memo_key((), {"x": value}) is None
 
     def test_admitted_types_at_the_length_cap_are_memoised(self) -> None:
-        for value in (0, -1, 2**63, 1.5, -0.0, True, None, "", "x" * _MEMO_MAX_LEN, b"x" * _MEMO_MAX_LEN):
+        for value in (0, -1, 2**63, 1.5, -0.0, True, None, "", "x" * MEMO_MAX_LEN, b"x" * MEMO_MAX_LEN):
             assert _memo_key((value,), {}) is not None
 
     def test_a_str_subclass_keyword_name_is_not_memoised(self) -> None:
         assert _memo_key((), {_Str("x"): 1}) is None
 
     def test_strings_and_keyword_names_share_one_length_budget(self) -> None:
-        half, rest = _MEMO_MAX_LEN // 2, _MEMO_MAX_LEN - _MEMO_MAX_LEN // 2
+        half, rest = MEMO_MAX_LEN // 2, MEMO_MAX_LEN - MEMO_MAX_LEN // 2
         for extra in (0, 1):
             fits = extra == 0
             assert (_memo_key(("x" * half, "y" * (rest + extra)), {}) is not None) is fits
             assert (_memo_key((b"x" * half, 1, "y" * (rest + extra)), {}) is not None) is fits
             assert (_memo_key(("x" * half,), {"y" * (rest - 1 + extra): "z"}) is not None) is fits
-            assert (_memo_key((), {"x": "y" * (_MEMO_MAX_LEN - 2 + extra), "n": 1}) is not None) is fits
+            assert (_memo_key((), {"x": "y" * (MEMO_MAX_LEN - 2 + extra), "n": 1}) is not None) is fits
 
     def test_types_are_tested_by_identity_never_hashed_or_compared(self) -> None:
         """A metaclass that defines __eq__ makes a class unhashable; one that hashes and compares
@@ -250,9 +254,9 @@ class TestMemoKey:
             assert _memo_key((), {"x": value}) is None
 
     def test_at_most_max_args_arguments_are_memoised(self) -> None:
-        assert _memo_key(tuple(range(_MEMO_MAX_ARGS)), {}) is not None
-        assert _memo_key(tuple(range(_MEMO_MAX_ARGS + 1)), {}) is None
-        assert _memo_key(tuple(range(_MEMO_MAX_ARGS)), {"x": 1}) is None
+        assert _memo_key(tuple(range(MEMO_MAX_ARGS)), {}) is not None
+        assert _memo_key(tuple(range(MEMO_MAX_ARGS + 1)), {}) is None
+        assert _memo_key(tuple(range(MEMO_MAX_ARGS)), {"x": 1}) is None
 
     def test_shapes_never_collide(self) -> None:
         calls = [((1,), {}), ((1, 2), {}), ((1, 2, 3), {}), ((), {}), ((1,), {"b": 2}), ((1, 2), {"b": 2})]
@@ -284,7 +288,7 @@ class TestKeyBytesUnchanged:
             ((1, 2, 3), {}, True),
             (("q",), {"limit": 10}, True),
             (("q",), {"limit": 10, "offset": 5}, True),
-            (("x" * (_MEMO_MAX_LEN + 1),), {}, False),
+            (("x" * (MEMO_MAX_LEN + 1),), {}, False),
             ((_Color.RED,), {}, False),
             (([1, 2],), {}, False),
         ],
@@ -312,7 +316,7 @@ class TestKeyBytesUnchanged:
     # Values that compare equal across types (1, 1.0, True; 0, 0.0, -0.0, False), values just past
     # the length cap, and a few the memo never takes, so equal-but-different calls interleave.
     _ARGS = st.sampled_from(
-        [0, 1, 1.0, True, False, 0.0, -0.0, None, "", "1", b"1", "x" * _MEMO_MAX_LEN, "x" * (_MEMO_MAX_LEN + 1), _Color.RED, [1]]
+        [0, 1, 1.0, True, False, 0.0, -0.0, None, "", "1", b"1", "x" * MEMO_MAX_LEN, "x" * (MEMO_MAX_LEN + 1), _Color.RED, [1]]
     )
 
     @settings(max_examples=200, deadline=None)
@@ -366,8 +370,8 @@ class TestKeyBytesUnchanged:
         assert ":elsewhere.renamed:" in moved
 
     def test_a_rename_rekeys_a_callable_that_is_not_a_plain_function(self) -> None:
-        """A plain function's names are read through the descriptors on its type; any other callable,
-        here a bound method reporting its function's names, through its own attribute access."""
+        """The memo reads every callable's names by attribute access, so a rename re-keys any callable,
+        here a bound method reporting its function's names, as it re-keys a plain function."""
 
         class Service:
             def lookup(self, x: int) -> int:
@@ -474,9 +478,9 @@ class TestL1OnlyFastPath:
         def fn(x: int) -> int:
             return x
 
-        for i in range(_MEMO_MAX_ENTRIES + 10):
+        for i in range(MEMO_MAX_ENTRIES + 10):
             fn(i)
-        assert 0 < len(_memo(fn)) <= _MEMO_MAX_ENTRIES
+        assert 0 < len(_memo(fn)) <= MEMO_MAX_ENTRIES
 
     def test_a_miss_runs_outside_the_stats_context(self) -> None:
         """Only a backed request reads the stats context, so an L1-only miss runs the function without one."""
@@ -608,7 +612,7 @@ class TestL1OnlyFastPath:
 
     def test_a_full_memo_at_every_cap_stays_small(self) -> None:
         """Every call at every cap: eight keyword names and eight values of 4-byte characters, sharing
-        _MEMO_MAX_LEN between them, the most a call can make the memo keep. docs/performance.md
+        MEMO_MAX_LEN between them, the most a call can make the memo keep. docs/performance.md
         states this bound: 3.7 to 4.0MiB measured on CPython 3.10, 3.12, 3.14 and 3.14t."""
 
         @cache(backend=None, encryption=False)
@@ -616,12 +620,12 @@ class TestL1OnlyFastPath:
             return 1
 
         wide = "\U0001f600"
-        each = _MEMO_MAX_LEN // (2 * _MEMO_MAX_ARGS)
-        for i in range(_MEMO_MAX_ENTRIES):
+        each = MEMO_MAX_LEN // (2 * MEMO_MAX_ARGS)
+        for i in range(MEMO_MAX_ENTRIES):
             tag = f"{i:04x}"
-            fn(**{tag + chr(97 + j) + wide * (each - 5): tag + wide * (each - 4) for j in range(_MEMO_MAX_ARGS)})
+            fn(**{tag + chr(97 + j) + wide * (each - 5): tag + wide * (each - 4) for j in range(MEMO_MAX_ARGS)})
         memo = _memo(fn)
-        assert len(memo) == _MEMO_MAX_ENTRIES
+        assert len(memo) == MEMO_MAX_ENTRIES
         assert _deep_size(memo.keys()) < 4.5 * 2**20  # what the memo keeps beyond the cache's entries
 
     def test_keyword_names_past_the_cap_cache_without_the_memo(self) -> None:
@@ -633,7 +637,7 @@ class TestL1OnlyFastPath:
             calls += 1
             return 1
 
-        name = "x" * (_MEMO_MAX_LEN + 1)
+        name = "x" * (MEMO_MAX_LEN + 1)
         for _ in range(3):
             fn(**{name: 1})
         assert calls == 1
