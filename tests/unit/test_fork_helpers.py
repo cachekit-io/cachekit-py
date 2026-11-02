@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -65,9 +66,52 @@ def test_child_outcome_reads_an_outcome_larger_than_the_pipe_buffer() -> None:
     assert child_outcome(pid, r, timeout=10) == big
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_child_outcome_returns_the_outcome_while_another_process_holds_the_write_end() -> None:
+    r, w = os.pipe()
+    leaked = os.dup(w)  # as a sibling forked meanwhile by another thread, or a grandchild, would hold it
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        report(w, True)
+    os.close(w)
+    try:
+        assert child_outcome(pid, r, timeout=5) is True  # no EOF ever comes, but the child exited
+    finally:
+        os.close(leaked)
+
+
+def _write_forever(w: int) -> None:
+    while True:
+        os.write(w, b"x" * 65536)
+
+
+def _hang_after_reporting(w: int) -> None:
+    os.write(w, b"True")
+    os.close(w)
+    time.sleep(60)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("child", [_write_forever, _hang_after_reporting], ids=["writes-forever", "hangs-after-reporting"])
+def test_child_outcome_kills_a_child_still_running_at_its_deadline(child: Callable[[int], None]) -> None:
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            child(w)
+        finally:
+            os._exit(1)
+    os.close(w)
+    started = time.monotonic()
+    assert child_outcome(pid, r, timeout=0.5) == "no outcome: timed out after 0.5 s"
+    assert time.monotonic() - started < 5  # the deadline bounds reading and reaping alike
+
+
 def test_fork_helpers_import_where_os_fork_is_missing() -> None:
     """Windows has no os.fork, and a test module there imports these helpers before its skip markers run."""
-    code = "import os; del os.fork; import tests.utils.fork_helpers"
+    code = "import os; os.__dict__.pop('fork', None); import tests.utils.fork_helpers"
     root = Path(__file__).resolve().parents[2]  # where `tests` imports from
     run = subprocess.run(  # noqa: S603 - trusted: sys.executable + a literal
         [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60

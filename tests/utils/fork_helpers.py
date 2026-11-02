@@ -67,14 +67,20 @@ def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = F
     if pid <= 0:  # not an assert: python -O strips those, and os.kill(0, ...) signals pytest's whole process group
         raise ValueError("no child was forked")
     deadline = time.monotonic() + timeout
-    data = b""
-    # Read to EOF: a child whose outcome outgrows the pipe's buffer blocks writing the rest until it is read.
-    while select.select([r], [], [], max(0.0, deadline - time.monotonic()))[0]:
-        chunk = os.read(r, 65536)
-        if not chunk:
+    data, eof = b"", False
+    # Done is the child's exit, not EOF: another process can hold the write end, and a child can close it and hang.
+    # Reading meanwhile lets a child whose outcome outgrows the pipe's buffer write the rest.
+    while (remaining := deadline - time.monotonic()) > 0:
+        if not eof and select.select([r], [], [], min(remaining, 0.05))[0]:
+            chunk = os.read(r, 65536)
+            data, eof = data + chunk, not chunk
+            continue
+        exited, status = os.waitpid(pid, os.WNOHANG)
+        if exited:
             break
-        data += chunk
-    else:  # still no EOF at the deadline: the child is hung, mid-report or not
+        if eof:
+            time.sleep(min(remaining, 0.05))
+    else:  # the child is still running at the deadline: hung, mid-report or not
         if dump_stacks:
             os.kill(pid, signal.SIGUSR1)
             time.sleep(1)  # the handler writes the dump in well under this
@@ -82,9 +88,9 @@ def child_outcome(pid: int, r: int, timeout: float = 20.0, dump_stacks: bool = F
         os.waitpid(pid, 0)
         os.close(r)
         return f"no outcome: timed out after {timeout:g} s"
-    if not data:  # on EOF the child has exited (it holds the only write end), and a kill leaves its exit status as is
-        os.kill(pid, signal.SIGKILL)
-    _, status = os.waitpid(pid, 0)
+    while not eof and select.select([r], [], [], 0)[0]:  # what the child wrote just before it exited
+        chunk = os.read(r, 65536)
+        data, eof = data + chunk, not chunk
     os.close(r)
     if data:
         return ast.literal_eval(data.decode())
