@@ -11,7 +11,8 @@ extension now does both in one pass. These tests hold it to that reference, inpu
   read paths' error handling see what they saw before;
 - the hook runs only on maps holding a marker key (the rule the speed rests on), and a heap
   amplification payload costs no more than it did;
-- no path leaks a reference, and the decode is safe to run from many threads.
+- no path leaks an object it allocates, nor a reference to its input, the input's buffer or the hook,
+  and the decode is safe to run from many threads.
 
 The inputs are values packed as the serializer packs them, the same with ``bytes`` packed as str
 (invalid UTF-8), and both after random byte edits, so the bounds, truncation, reserved-marker and
@@ -21,6 +22,10 @@ trailing-byte paths are reached as well as the happy path.
 from __future__ import annotations
 
 import gc
+import os
+import subprocess
+import sys
+import sysconfig
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -46,8 +51,16 @@ def reference(data: bytes) -> Any:
     return unpackb_bounded(data, raw=False, use_list=True, object_hook=_standard_object_hook)
 
 
-def rust(data: bytes) -> Any:
+def rust(data: bytes | bytearray | memoryview) -> Any:
     return unpackb_standard(data, MSGPACK_MAX_NESTING, _standard_object_hook)
+
+
+def _decode_or_refuse(data: bytes | bytearray | memoryview) -> None:
+    """Decode ``data``, swallowing only the refusals CASES pins; any other error fails the caller."""
+    try:
+        rust(data)
+    except (ValueError, SerializationError, TypeError):  # noqa: S110 - the refusal is the expected outcome
+        pass
 
 
 def outcome(decode: Callable[[bytes], Any], data: bytes) -> tuple[Any, ...]:
@@ -302,15 +315,51 @@ def test_an_amplifying_payload_costs_no_more_heap_than_before() -> None:
         assert now <= before, f"{name}: {now} bytes at peak, {before} before"
 
 
+_OUT_OF_MEMORY = """
+import resource, sys
+from cachekit._rust_serializer import unpackb_standard
+n = 1 << 27
+data = {shape}
+with open("/proc/self/statm") as f:
+    mapped = int(f.read().split()[0]) * resource.getpagesize()
+resource.setrlimit(resource.RLIMIT_AS, (mapped + (64 << 20), resource.getrlimit(resource.RLIMIT_AS)[1]))
+try:
+    unpackb_standard(data, 1024, None)
+except MemoryError:
+    sys.exit(0)
+sys.exit(3)
+"""
+# Each single allocation the input sizes (n is 128 MiB), as the `data` expression the script decodes. Many small
+# objects (dicts, short lists, floats, ints past the small-int cache) still abort: see msgpack_decode.rs's module doc.
+_OUT_OF_MEMORY_SHAPES = {
+    "str": 'b"\\xdb" + n.to_bytes(4, "big") + b"a" * n',
+    "bin": 'b"\\xc6" + n.to_bytes(4, "big") + bytes(n)',
+    "ext": 'b"\\xc9" + n.to_bytes(4, "big") + b"\\x05" + bytes(n)',
+    "trailing bytes": 'b"\\xc0" + bytes(n)',
+    "array of n / 8 items": 'b"\\xdd" + (n >> 3).to_bytes(4, "big") + b"\\xc0" * (n >> 3)',
+}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS is enforced on Linux")
+@pytest.mark.skipif(
+    bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+    reason="mimalloc's reserved arenas hold the allocation, so RLIMIT_AS never refuses it; the GIL legs run the same Rust",
+)
+@pytest.mark.parametrize("shape", _OUT_OF_MEMORY_SHAPES.values(), ids=_OUT_OF_MEMORY_SHAPES.keys())
+def test_an_allocation_the_input_sizes_raises_memory_error(shape: str) -> None:
+    """With panic = "abort", a PyO3 constructor that meets a NULL would kill the process, not raise."""
+    script = _OUT_OF_MEMORY.format(shape=shape)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}  # import this checkout's cachekit, as pytest does
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, check=False, env=env)  # noqa: S603 - this module's own script
+    assert run.returncode == 0, run.stderr.decode()[-2000:]
+
+
 def _measure_leaks() -> list[int]:
     import tracemalloc
 
     def every_path() -> None:
         for data in (*CASES.values(), _pack({"k": ["v" * 40, datetime(2024, 1, 15), b"b"] * 3}, True)):
-            try:
-                rust(data)
-            except (ValueError, SerializationError, TypeError):  # noqa: S110 - every refusal CASES pins; any other error fails
-                pass
+            _decode_or_refuse(data)
 
     for _ in range(50):  # warm caches and lazily imported msgpack classes
         every_path()
@@ -326,20 +375,42 @@ def _measure_leaks() -> list[int]:
     return sizes
 
 
-# A leak on any path keeps at least one object per call, and the smallest object (an int) is 28 bytes, so it adds at
-# least 500 * 28 = 13.7 KiB to EVERY round. The interpreter's own growth (caches, free lists, a dict resizing) comes
-# in a few one-off steps, and one such step can exceed any fixed budget on the total. So the gate bounds the quietest
-# of five rounds, which grows by under 1 KiB when nothing leaks.
+# This gate catches per-call allocations only: a path that keeps an object it allocated keeps at least one per call,
+# and the smallest object (an int) is 28 bytes, so it adds at least 500 * 28 = 13.7 KiB to EVERY round. A leaked
+# reference to an object that already exists (the input, its buffer, the hook) allocates nothing, so tracemalloc
+# cannot see it: test_no_decode_keeps_a_reference_to_its_input counts those. The interpreter's own growth (caches,
+# free lists, a dict resizing) comes in a few one-off steps, and one such step can exceed any fixed budget on the
+# total. So the gate bounds the quietest of five rounds, which grows by under 1 KiB when nothing leaks.
 LEAK_ROUNDS = 5
 LEAK_CALLS_PER_ROUND = 500
 LEAK_ROUND_BUDGET = 8 * 1024
 
 
-def test_no_path_leaks_a_reference() -> None:
-    """A leaked reference keeps its object alive, so traced memory would climb in every round."""
+def test_no_path_leaks_an_object() -> None:
+    """An object a decode allocates and never frees climbs traced memory every round (per-call allocations only)."""
     sizes = measure_in_subprocess(_measure_leaks)
     rounds = [after - before for before, after in zip(sizes, sizes[1:], strict=False)]
     assert min(rounds) < LEAK_ROUND_BUDGET, sizes
+
+
+# Empty and one-byte bytes are shared cached singletons (immortal from 3.12), so their counts are not the decode's alone.
+_MULTI_BYTE = {name: data for name, data in CASES.items() if len(data) > 1}
+
+
+@pytest.mark.parametrize("data", _MULTI_BYTE.values(), ids=_MULTI_BYTE.keys())
+def test_no_decode_keeps_a_reference_to_its_input(data: bytes) -> None:
+    """Every path, from every buffer type, gives back each reference it took to the input, its buffer and the hook."""
+    owned = bytes(bytearray(data))  # a fresh object: a code constant may be immortal too
+    view, buffer = memoryview(owned), bytearray(data)
+    assert view.obj is owned
+    watched = (owned, view, buffer, _standard_object_hook)
+    before = [sys.getrefcount(o) for o in watched]
+    for source in (owned, view, buffer):
+        for _ in range(100):
+            _decode_or_refuse(source)
+    del source  # still bound to the last input
+    assert [sys.getrefcount(o) for o in watched] == before
+    buffer.append(0)  # a buffer export never released refuses the resize with BufferError
 
 
 def test_threads_decode_one_document_concurrently() -> None:
