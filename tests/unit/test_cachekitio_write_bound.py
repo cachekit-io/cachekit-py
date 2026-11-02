@@ -512,6 +512,50 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Holder(backend))
         assert _reaches_write_deadlines(_Router(object())) is False
 
+    def test_class_held_backend_reached_by_a_longer_path_first(self, backend: CachekitIOBackend) -> None:
+        """The panel's probe: a router met first through a metrics wrapper (one level deeper), then through a
+        dict, with its shard's backend held on the shard's class. Its class values are yielded again from the
+        shorter route."""
+
+        class _ShardC:
+            pass
+
+        _ShardC.backend = backend  # type: ignore[attr-defined]
+
+        class _Router:
+            def __init__(self) -> None:
+                self.shard = _ShardC()
+
+        class _Metrics:
+            def __init__(self, inner: object) -> None:
+                self.inner = inner
+
+        class _Root:
+            def __init__(self) -> None:
+                router = _Router()
+                self.metrics = _Metrics(router)
+                self.routes = {"eu": router}
+
+        assert _reaches_write_deadlines(_Root())
+
+    def test_class_held_backend_after_its_type_was_first_met_at_the_limit(self, backend: CachekitIOBackend) -> None:
+        """Cobel's probe: a Holder first read at the depth limit (flag only), then another Holder at a shallow
+        depth through nested lists: its class-held backend is still searched."""
+
+        class _Holder:
+            inner = backend
+
+        class _Box:
+            def __init__(self, inner: object) -> None:
+                self.inner = inner
+
+        class _Root:
+            def __init__(self) -> None:
+                self.deep = _Box(_Box(_Holder()))
+                self.shallow = [[[_Holder()]]]
+
+        assert _reaches_write_deadlines(_Root())
+
     def test_a_none_flag_on_a_subclass_stops_the_lookup(self) -> None:
         """As Python's own lookup: the first namespace holding the name wins, even with None."""
 
@@ -568,7 +612,7 @@ class TestWriteBound:
     def test_a_search_that_raises_opens_the_list(self, backend: CachekitIOBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         """Opening the list is always safe, so a search that fails answers True."""
 
-        def broken(obj: object, types_read: object, want_values: bool) -> tuple[bool, list[object], int]:
+        def broken(obj: object, types_read: object, class_depths: object, depth: int) -> tuple[bool, list[object], int]:
             raise RuntimeError("unexpected")
 
         monkeypatch.setattr(cache_handler_module, "_read_object", broken)

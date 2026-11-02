@@ -473,9 +473,15 @@ def _scan_type(kind: type) -> _TypeScan:
     return kind, members, instance_dict, flag, scanned, class_values
 
 
-def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: bool) -> tuple[bool, list[object], int]:
-    """One read of ``obj``: (it says it reports a write deadline, its attribute values, reads spent). A type is
-    scanned once per search (``types_read``), and charged then.
+def _read_object(
+    obj: object, types_read: dict[int, _TypeScan], class_depths: dict[int, int], depth: int
+) -> tuple[bool, list[object], int]:
+    """One read of ``obj`` at ``depth``: (it says it reports a write deadline, its attribute values, reads spent).
+    A type is scanned once per search (``types_read``), and charged then. Values are read only below
+    ``_REACH_DEPTH``. A type's class values are yielded whenever one of its instances is read shallower than any
+    earlier yield of them (``class_depths``), so a type first met at the depth limit, or first met by a longer
+    path, still has its class-held backend searched from the shallowest route: at most ``_REACH_DEPTH`` yields
+    per type.
 
     Storage is read only through the C descriptors Python makes for it: the getset ``__dict__`` and every
     member descriptor along the MRO, so a property named ``__dict__`` or shadowing a slot is skipped, never
@@ -490,6 +496,7 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
         scan = types_read[id(kind)] = _scan_type(kind)
         spent = scan[4]
     _, members, instance_dict, flag, _, class_values = scan
+    want_values = depth < _REACH_DEPTH  # at the limit only the flag is read
     values: list[object] = []
     unset = 0
     for descriptor in members if want_values else ():
@@ -504,7 +511,8 @@ def _read_object(obj: object, types_read: dict[int, _TypeScan], want_values: boo
                 flag = held["_reports_write_deadline"]
             if want_values:
                 values += dict.values(held)
-    if want_values and spent:  # a type's class values once per search, with its first read: seen dedups the rest
+    if want_values and depth < class_depths.get(id(kind), _REACH_DEPTH):
+        class_depths[id(kind)] = depth
         values += class_values
     return flag is True, values, spent + unset  # the caller charges each value it walks
 
@@ -533,6 +541,7 @@ def _reaches_write_deadlines(backend: object) -> bool:
         queue: collections.deque[tuple[object, int]] = collections.deque([(backend, 0)])
         seen = {id(backend): 0}  # id -> the shallowest depth it was reached at
         types_read: dict[int, _TypeScan] = {}  # each type's MRO is scanned once per search
+        class_depths: dict[int, int] = {}  # type id -> the shallowest depth its class values were yielded at
         reads = 0
         while queue:
             obj, depth = queue.popleft()
@@ -544,7 +553,7 @@ def _reaches_write_deadlines(backend: object) -> bool:
             # An object, or a container subclass (a dict router with self.inner): read its own storage too.
             # Identity, not `in`: hashing the type could run a metaclass __hash__.
             if walk is None or not any(kind is base for base, _ in _REACH_CONTAINERS):
-                reports, values, scanned = _read_object(obj, types_read, depth < _REACH_DEPTH)
+                reports, values, scanned = _read_object(obj, types_read, class_depths, depth)
                 if reports and obj is not backend:  # the root's own flag was read with getattr above
                     return True
                 reads += scanned
