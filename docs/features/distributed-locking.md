@@ -8,7 +8,7 @@
 
 ## TL;DR
 
-Distributed locking prevents "cache stampede" - when multiple pods simultaneously call an expensive function on cache miss. With locking, only one pod calls the function; others wait for the cache result. Inside one pod, callers that miss a key while its call runs share that call's trip instead of each reaching the lock ([in-process single-flight](#in-process-single-flight-before-the-lock)). For async callers, sharing holds only on the event loop running the key's call: a caller on another thread's loop runs its own trip and takes the lock itself.
+Distributed locking prevents "cache stampede" - when multiple pods simultaneously call an expensive function on cache miss. With locking, only one pod calls the function; others wait for the cache result, for up to 5 s (see [Lock Timing](#lock-timing-30-second-expiry-5-second-wait)). Inside one pod, callers that miss a key while its call runs share that call's trip instead of each reaching the lock ([in-process single-flight](#in-process-single-flight-before-the-lock)). For async callers, sharing holds only on the event loop running the key's call: a caller on another thread's loop runs its own trip and takes the lock itself.
 
 ```python
 @cache(ttl=300)  # Distributed locking enabled by default (via LockableBackend)
@@ -16,8 +16,8 @@ async def expensive_query(key):
     return db.expensive_query(key)
 
 # 1000 pods call simultaneously on L2 miss
-# Only 1 pod calls expensive_query()
-# 999 pods wait for L2 cache to be populated
+# Only 1 pod calls expensive_query(), while it finishes within 5 s
+# 999 pods wait for L2 cache to be populated, up to 5 s (blocking_timeout)
 ```
 
 ---
@@ -34,7 +34,7 @@ async def get_report(date):
     return db.generate_report(date)  # Expensive operation
 
 # Multiple pods calling simultaneously on cache miss
-# Only one executes generate_report()
+# Only one executes generate_report(), while it finishes within 5 s
 report = await get_report("2025-01-15")
 ```
 
@@ -266,8 +266,8 @@ async def get_leaderboard():
     return db.expensive_leaderboard_query()
 
 # 1000 users request leaderboard simultaneously
-# Only 1 computes leaderboard
-# 999 wait for result
+# Only 1 computes leaderboard, while it finishes within 5 s
+# 999 wait for result, up to 5 s (blocking_timeout)
 leaderboard = await get_leaderboard()
 ```
 

@@ -218,9 +218,10 @@ def fetch_data(key):
 async def expensive_compute(key):
     # Needs a lock-capable backend: env-configured Redis or CacheKit Cloud
     # 1000 pods call simultaneously on cache miss
-    # Only ONE pod calls expensive_compute
-    # Others wait for L2 cache to be populated
-    # No cascade of simultaneous DB queries
+    # The pod that wins the lock calls expensive_compute; the others wait up to
+    # blocking_timeout (5 s) for L2 to be populated, then re-check it and, if it
+    # is still empty, compute anyway. Best effort: full protection only while
+    # the function finishes within 5 s (see features/distributed-locking.md)
     # A sync function takes no distributed lock: misses dedup within one process only
     return await compute_expensive_value(key)
 ```
