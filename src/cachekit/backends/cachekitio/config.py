@@ -5,13 +5,17 @@ Includes SSRF protection to prevent requests to private/internal networks.
 
 from __future__ import annotations
 
+import logging
 import re
 import socket
+from collections.abc import Mapping
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+from typing import Any
 from urllib.parse import ParseResult, urlparse
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from urllib3.util import parse_url
 
 from cachekit.backends.base_config import BaseBackendConfig, inherit_config
@@ -22,6 +26,59 @@ ALLOWED_HOSTS: tuple[str, ...] = ("api.cachekit.io", "api.staging.cachekit.io")
 # RFC 6750 §2.1 b64token: every character a bearer token may carry. Issued keys (ASCII letters, digits and
 # underscores) sit inside it. Explicit ASCII ranges, not \w, so no non-ASCII letter matches.
 _BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
+
+_logger = logging.getLogger(__name__)
+
+# spec/saas-api.md#telemetry-switch: read case-insensitively after trimming; anything else is off.
+TELEMETRY_ENV = "CACHEKIT_TELEMETRY"
+_TELEMETRY_OFF = frozenset({"false", "0", "off", "no"})
+_TELEMETRY_ON = frozenset({"true", "1", "on", "yes"})
+_warned_bad_telemetry = False
+
+
+def _parse_telemetry_env(raw: str | None) -> bool | None:
+    """``CACHEKIT_TELEMETRY`` as on (True), off (False) or unset (None). An unknown value is off, warned once.
+
+    Examples:
+        >>> [_parse_telemetry_env(v) for v in (None, "", "  ", " OFF ", "No", "TRUE", "1")]
+        [None, None, None, False, False, True, True]
+    """
+    global _warned_bad_telemetry
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    if value in _TELEMETRY_ON:
+        return True
+    if value not in _TELEMETRY_OFF and not _warned_bad_telemetry:
+        _warned_bad_telemetry = True
+        # The value is not echoed: an environment variable set by mistake can hold anything.
+        _logger.warning("%s is not one of true/false/1/0/on/off/yes/no; telemetry is off", TELEMETRY_ENV)
+    return False
+
+
+def resolve_telemetry(setting: bool | None, environ: Mapping[str, str]) -> bool:
+    """Whether a CachekitIO backend sends the optional metrics headers: off from either control wins, both unset is on.
+
+    The variable's name matches case-insensitively, as every other ``CACHEKIT_*`` variable loads
+    (``case_sensitive=False``). Where several casings are set, off from any of them wins.
+
+    Examples:
+        >>> resolve_telemetry(None, {})
+        True
+        >>> resolve_telemetry(True, {"CACHEKIT_TELEMETRY": "off"})
+        False
+        >>> resolve_telemetry(False, {"CACHEKIT_TELEMETRY": "on"})
+        False
+        >>> resolve_telemetry(None, {"cachekit_telemetry": "false"})
+        False
+        >>> resolve_telemetry(None, {"CACHEKIT_TELEMETRY": "on", "Cachekit_Telemetry": "off"})
+        False
+    """
+    if setting is False:
+        return False
+    found = [_parse_telemetry_env(v) for k, v in environ.items() if k.upper() == TELEMETRY_ENV]
+    return False not in found
 
 
 # Loopback, private, link-local (cloud metadata), "this network" and unspecified addresses. An IPv4-mapped IPv6
@@ -105,6 +162,20 @@ def _parse_api_url(url: str) -> tuple[str, ParseResult]:
     raise ValueError("Invalid API URL: could not be parsed")
 
 
+class _WithoutTelemetry(PydanticBaseSettingsSource):
+    """A settings source with any ``telemetry`` value it found removed (``CachekitIOBackendConfig.telemetry``)."""
+
+    def __init__(self, source: PydanticBaseSettingsSource) -> None:
+        super().__init__(source.settings_cls)
+        self._source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._source.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        return {k: v for k, v in self._source().items() if k != "telemetry"}
+
+
 class CachekitIOBackendConfig(BaseBackendConfig):
     """Configuration for cachekit.io backend.
 
@@ -150,6 +221,24 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         default=False,
         description="Allow custom API hostnames (disables SSRF hostname allowlist)",
     )
+    # Set in code only. CACHEKIT_TELEMETRY is combined with it by resolve_telemetry, never bound to it: this
+    # config lets an argument override the environment, which would let on win over off (spec API-95).
+    telemetry: bool | None = Field(
+        default=None,
+        description="False turns the optional metrics headers off; None (unset) leaves CACHEKIT_TELEMETRY to decide",
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Every source as pydantic-settings orders them, but only the constructor's arguments can set ``telemetry``."""
+        return (init_settings, *map(_WithoutTelemetry, (env_settings, dotenv_settings, file_secret_settings)))
 
     @field_validator("api_key")
     @classmethod

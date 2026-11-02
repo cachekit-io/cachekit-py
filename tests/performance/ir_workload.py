@@ -38,7 +38,12 @@ def build_workload(path: str) -> Callable[[], object]:
 
     import cachekit.decorators.orchestrator as orchestrator
     from cachekit import cache
+    from cachekit.decorators.l1_latency import L1LatencyReport, sampling_rng
     from cachekit.serializers import EncryptionWrapper, get_serializer
+
+    # The timing draw has its own generator, unseeded by pin_main_thread_clocks: seeded here, every run times the
+    # same calls of l1_hit_backed.
+    sampling_rng.seed(0)
 
     value = {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
     # Dict-heavy value (about 6 KB): the decoder's object_hook runs once per record.
@@ -69,6 +74,14 @@ def build_workload(path: str) -> Callable[[], object]:
 
         def health_check(self) -> tuple[bool, dict[str, Any]]:
             return True, {}
+
+    class ReportingBackend(DictBackend):
+        """DictBackend with an L1 hit-latency report, as a CachekitIO backend has with telemetry on (its default):
+        every call draws whether it is timed, and about one hit in ``ONE_IN`` is timed into the report."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.l1_latency_report = L1LatencyReport()
 
     class MissBackend(DictBackend):
         """Never holds a value, so every call takes the full miss path: get, compute, serialize, set."""
@@ -118,7 +131,7 @@ def build_workload(path: str) -> Callable[[], object]:
     # the default serializer and with the auto one.
     decorated: dict[str, Callable[[], Callable[..., dict]]] = {
         "l1_hit": lambda: cache(backend=None, ttl=300)(body),
-        "l1_hit_backed": lambda: cache(backend=DictBackend(), ttl=300)(body),
+        "l1_hit_backed": lambda: cache(backend=ReportingBackend(), ttl=300)(body),
         "l1_hit_backed_auto": lambda: cache(backend=DictBackend(), ttl=300, serializer="auto")(body),
         "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
         "l2_hit": l2,
