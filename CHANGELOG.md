@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.26.0](https://github.com/cachekit-io/cachekit-py/compare/v0.25.1...v0.26.0) (2026-11-02)
+
+
+### Features
+
+* **cachekitio:** report L1 hit latency and add a telemetry off switch (LAB-12079) ([#691](https://github.com/cachekit-io/cachekit-py/issues/691)) ([0cc1a9c](https://github.com/cachekit-io/cachekit-py/commit/0cc1a9ca0a5ddd81e3eabf3878d64adf81d89d5d))
+* **decorators:** let async [@cache](https://github.com/cache) opt out of the miss-path distributed lock (LAB-7166) ([#667](https://github.com/cachekit-io/cachekit-py/issues/667)) ([1e2295d](https://github.com/cachekit-io/cachekit-py/commit/1e2295d5f0a6ed894805685caa30cdcae5b3efc0))
+
+
+### Bug Fixes
+
+* **metrics:** skip thread-state retirement once the interpreter is exiting (LAB-12087) ([#679](https://github.com/cachekit-io/cachekit-py/issues/679)) ([42d7aea](https://github.com/cachekit-io/cachekit-py/commit/42d7aea89d21f9c3a887cee57dd391a5ef35f9c4))
+* **monitoring:** make enable_prometheus_metrics=False stop recording (LAB-12038) ([#681](https://github.com/cachekit-io/cachekit-py/issues/681)) ([3d81a93](https://github.com/cachekit-io/cachekit-py/commit/3d81a9369bc0e25690f5a69270521eacfb0a25ef))
+* **perf:** name the cachekit, Python and CPU a terrain recording ran (LAB-11993) ([#687](https://github.com/cachekit-io/cachekit-py/issues/687)) ([251a2fa](https://github.com/cachekit-io/cachekit-py/commit/251a2fad4fe50aef1e5275f956d8a4b11cf33e7c))
+* **perf:** terrain canary records the L2 label without its padding (LAB-11993) ([#676](https://github.com/cachekit-io/cachekit-py/issues/676)) ([4b2c65c](https://github.com/cachekit-io/cachekit-py/commit/4b2c65cca5b2e832dcf9cce840669be16bb613f7))
+* **rust:** decode StandardSerializer MessagePack in safe Rust (LAB-12250) ([#694](https://github.com/cachekit-io/cachekit-py/issues/694)) ([53bd1f3](https://github.com/cachekit-io/cachekit-py/commit/53bd1f3df867849309e038933054fd47666ee897))
+
+
+### Performance Improvements
+
+* **decorators:** a backed L1 hit skips the stats context and log kwargs (LAB-12115) ([#686](https://github.com/cachekit-io/cachekit-py/issues/686)) ([9c1bd7f](https://github.com/cachekit-io/cachekit-py/commit/9c1bd7f6fc2798683e69c4fdb88bf2a8b784acdb))
+* **decorators:** answer the L1-only hit in one lock-free call into the extension (LAB-12024) ([#673](https://github.com/cachekit-io/cachekit-py/issues/673)) ([8b17e51](https://github.com/cachekit-io/cachekit-py/commit/8b17e5109a00b3332252af40930c9cd966eb51e8))
+* **deps:** bump cachekit-core to 0.7.4 (LAB-12129) ([#684](https://github.com/cachekit-io/cachekit-py/issues/684)) ([9485ca8](https://github.com/cachekit-io/cachekit-py/commit/9485ca862dc23acafc9ae1a74d62cf9787c14671))
+* **ir:** run the 2,600 Ir/op paths over 300,000 calls (LAB-12245) ([#697](https://github.com/cachekit-io/cachekit-py/issues/697)) ([0e15cb6](https://github.com/cachekit-io/cachekit-py/commit/0e15cb6495a491edfbafe14915da8280974d6367))
+* **l1:** auto and orjson L1 hits skip re-verification and the per-read copy (LAB-12119) ([#696](https://github.com/cachekit-io/cachekit-py/issues/696)) ([9ce58b6](https://github.com/cachekit-io/cachekit-py/commit/9ce58b6f6c5455640473c8eeccd3109181578070))
+* **l1:** skip the structure walk and object hook on a kept L1 entry (LAB-12023) ([#671](https://github.com/cachekit-io/cachekit-py/issues/671)) ([7fbdfbe](https://github.com/cachekit-io/cachekit-py/commit/7fbdfbee51268198fae736245653a44f8fd7b2c8))
+* **l1:** sweep expired entries from a deadline heap in short lock holds (LAB-12117) ([#683](https://github.com/cachekit-io/cachekit-py/issues/683)) ([63cf745](https://github.com/cachekit-io/cachekit-py/commit/63cf7452ec3c853a883826b0a25c71b2cc2a31b6))
+* **memcached:** pick the server natively, as pymemcache's rendezvous hash does (LAB-12116) ([#680](https://github.com/cachekit-io/cachekit-py/issues/680)) ([a79cc90](https://github.com/cachekit-io/cachekit-py/commit/a79cc90323f3a0685492efeba29e7fb0feaf778b))
+* **redis:** an uncontended async miss waits on 3 round trips, not 5 (LAB-12118) ([#682](https://github.com/cachekit-io/cachekit-py/issues/682)) ([1ef1d05](https://github.com/cachekit-io/cachekit-py/commit/1ef1d05eafa112d6cf5f73cce86fb7d2804ff119))
+* **serializers:** decode StandardSerializer reads in Rust, bounds and decode in one pass (LAB-12030) ([#674](https://github.com/cachekit-io/cachekit-py/issues/674)) ([39b1bdf](https://github.com/cachekit-io/cachekit-py/commit/39b1bdf6d1ca59256e1d36f98a4ff4b7dbc4f9fc))
+* **write-behind:** park an idle writer thread instead of starting one per miss (LAB-12005) ([#692](https://github.com/cachekit-io/cachekit-py/issues/692)) ([96141b7](https://github.com/cachekit-io/cachekit-py/commit/96141b7c6c5ccd15211815767f4e12e7ff44a3dc))
+
 ## [0.25.1](https://github.com/cachekit-io/cachekit-py/compare/v0.25.0...v0.25.1) (2026-10-30)
 
 
