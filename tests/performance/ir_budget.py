@@ -22,8 +22,8 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   cache is warmed first, and the heap layout is sampled (``ir_workload.run_workload``, ``measure``
   and ``LAYOUTS``).
 
-Repeated runs agree within 0.04% per op, against a 1% fail threshold; the Arrow round trips and file_set
-keep up to 0.25% in one layout (docs/performance.md).
+Repeated runs agree within 0.04% per op on most paths, against a 1% fail threshold; docs/performance.md
+names the paths that keep more noise, and how much.
 
 The measured process is ``ir_workload.py``. Its text is compiled into every measured run, so
 editing it moves the heap layout the budgets were recorded at; this gate is kept out of that
@@ -72,7 +72,7 @@ N_LO, N_HI = 1000, 3000
 WARMUP = 50
 # The real-data paths cost about 60M main-thread Ir per op, 300 times a small path, so a run of
 # 3000 would take hours under callgrind. Fewer ops still resolve them: pyarrow's thread pool moves a
-# run by up to about 2M Ir, against a difference of over a billion.
+# run by up to about 2.8M Ir, against a difference of over a billion.
 LOOPS = dict.fromkeys(("serializer_arrow_usgs", "serializer_auto_usgs"), (5, 10, 30))  # path: (warmup, n_lo, n_hi)
 # Heap layout moves per-op counts: the allocators take shorter or longer paths in some heap
 # states. Any code change shifts the layout, even an edit to ir_workload.py's comments, so a single
@@ -262,10 +262,11 @@ def measure(
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
         # pyarrow's two allocators run on real time. Its bundled jemalloc starts a background thread at
         # import, and how that thread is scheduled against the main thread puts startup in one of two
-        # states, up to 1.2M Ir apart. With the thread off, jemalloc would check its real-time purge
-        # deadlines on the allocating thread instead, so it never purges. pyarrow's default pool, mimalloc,
-        # purges freed memory after a real-time delay that the freeing thread checks (10 clock reads per
-        # real-data round trip), so it never purges either.
+        # states, up to 1.2M Ir apart: background_thread:false stops it. With the thread off, jemalloc
+        # would check its real-time purge deadlines on the allocating thread instead; the two decay
+        # settings stop it purging at all. pyarrow's default pool, mimalloc, purges freed memory after a
+        # real-time delay that the freeing thread checks (10 clock reads per real-data round trip); -1
+        # stops it purging.
         "JE_ARROW_MALLOC_CONF": "background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1",
         "MIMALLOC_PURGE_DELAY": "-1",
         # cachekit's L1 sweeper wakes every 30 s of real time. A woken thread takes the GIL at a
