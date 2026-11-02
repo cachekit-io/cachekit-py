@@ -83,18 +83,26 @@ def test_child_outcome_returns_the_outcome_while_another_process_holds_the_write
         os.close(leaked)
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs F_SETPIPE_SZ")
-def test_child_outcome_reads_all_a_child_left_in_a_pipe_larger_than_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs F_GETPIPE_SZ")
+def test_child_outcome_reads_all_a_child_left_in_a_full_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
     import fcntl
 
-    big = "x" * (200 << 10)  # more than a default 64 KiB pipe holds, less than this one
     r, w = os.pipe()
-    fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 1 << 20)  # as a 64 KiB-page kernel's default pipe holds
-    pid = os.fork()
-    if pid == 0:
-        os.close(r)
-        report(w, big)  # fits the pipe, so the child exits with all of it unread
-    os.close(w)
+    try:
+        try:
+            fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 1 << 20)  # as a 64 KiB-page kernel's default pipe holds
+        except PermissionError:
+            pass  # past the user's pipe-user-pages-soft, an unprivileged resize is refused: test the default pipe
+        big = "x" * (fcntl.fcntl(w, fcntl.F_GETPIPE_SZ) - 2)  # its repr fills the pipe exactly
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            report(w, big)  # fits the pipe, so the child exits with all of it unread
+    except BaseException:
+        os.close(r)  # child_outcome closes it otherwise
+        raise
+    finally:
+        os.close(w)
     # The child exits before the parent reads anything, so only the post-exit drain reads the outcome.
     monkeypatch.setattr(fork_helpers, "select", SimpleNamespace(select=lambda *_: ([], [], [])))
     assert child_outcome(pid, r, timeout=10) == big
