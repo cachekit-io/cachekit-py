@@ -1,4 +1,4 @@
-"""The fork helpers must not disturb a SIGUSR1 handler the process calling them already has."""
+"""The fork helpers stay bounded, import everywhere, and never disturb a SIGUSR1 handler their caller has."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import ast
 import faulthandler
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -48,3 +51,25 @@ def test_fork_dumping_stacks_leaves_a_sigusr1_handler_it_did_not_install_alone()
         "parent_dumped": True,  # the parent's registration survived
     }
     assert "SIGUSR1 already has a handler" in run.stderr
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_child_outcome_reads_an_outcome_larger_than_the_pipe_buffer() -> None:
+    big = "x" * (1 << 20)  # a Linux pipe holds 64 KiB: the child blocks writing the rest until the parent reads it
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        report(w, big)
+    os.close(w)
+    assert child_outcome(pid, r, timeout=10) == big
+
+
+def test_fork_helpers_import_where_os_fork_is_missing() -> None:
+    """Windows has no os.fork, and a test module there imports these helpers before its skip markers run."""
+    code = "import os; del os.fork; import tests.utils.fork_helpers"
+    root = Path(__file__).resolve().parents[2]  # where `tests` imports from
+    run = subprocess.run(  # noqa: S603 - trusted: sys.executable + a literal
+        [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60
+    )
+    assert run.returncode == 0, run.stderr

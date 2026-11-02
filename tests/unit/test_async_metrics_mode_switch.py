@@ -17,6 +17,7 @@ import pytest
 
 from cachekit.reliability import async_metrics
 from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, AsyncMetricsCollector
+from tests.utils.fork_helpers import child_outcome, fork_dumping_stacks, report
 
 pytestmark = pytest.mark.skipif(not PROMETHEUS_AVAILABLE, reason="prometheus_client not installed")
 needs_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
@@ -270,36 +271,33 @@ def _in_child_forked_holding(lock: Any, child: Callable[[], Any]) -> Any:
         process.join(timeout=5)
 
 
-def _in_c_forked_child_holding(lock: Any, child: Callable[[], Any]) -> Any:
+def _in_c_forked_child_holding(lock: Any, child: Callable[[], Any], timeout: float = 20.0) -> Any:
     """Like ``_in_child_forked_holding``, but fork from C, skipping Python's after-fork handling as uWSGI can.
 
     ``child`` must not start a thread: CPython's own after-fork repair has not run either, so a thread started
-    there can hang or crash the interpreter.
+    there can hang or crash the interpreter. A child still running at ``timeout`` writes every thread's stack to
+    stderr and is killed, so a hang fails its test showing where it hung, even where no Python can run.
     """
-    import ast
     import ctypes
 
     libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
-    read_end, write_end = os.pipe()
+    r, w = os.pipe()
     with lock:
-        pid = libc_fork()
-        if pid == 0:  # child: SIGALRM kills it if it waits on a lock it inherited held
+        pid, armed = fork_dumping_stacks(libc_fork)
+        if pid == 0:
             try:
-                signal.alarm(5)
-                os.write(write_end, repr(child()).encode())
-                os._exit(0)
+                os.close(r)
+                report(w, child())
             except BaseException:
                 traceback.print_exc()
                 sys.stderr.flush()
             finally:
                 os._exit(2)
-    os.close(write_end)
-    with os.fdopen(read_end) as pipe:
-        result = pipe.read()
-    _, status = os.waitpid(pid, 0)
-    if status != 0:
-        pytest.fail(f"the child of a fork made from C hung or failed (exit code {os.waitstatus_to_exitcode(status)})")
-    return ast.literal_eval(result)
+    os.close(w)
+    outcome = child_outcome(pid, r, timeout=timeout, dump_stacks=armed)
+    if isinstance(outcome, str) and outcome.startswith("no outcome: "):
+        pytest.fail(f"the child of a fork made from C hung or failed: {outcome}")
+    return outcome
 
 
 needs_c_fork = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
@@ -533,6 +531,21 @@ def test_child_of_a_c_level_fork_resets_metric_locks_once():
     assert _in_c_forked_child_holding(inherited[0]._queue.mutex, child) == (1, 2)
     for collector in inherited:
         collector.shutdown()
+
+
+@needs_c_fork
+def test_hung_child_of_a_c_level_fork_fails_its_test_with_its_stacks(capfd):
+    lock = threading.Lock()
+
+    def wait_on_the_inherited_lock():
+        return lock.acquire()  # held at the fork, and nothing in the child releases it
+
+    started = time.monotonic()
+    with pytest.raises(pytest.fail.Exception, match="timed out after 1 s"):
+        _in_c_forked_child_holding(lock, wait_on_the_inherited_lock, timeout=1)
+    # Failed within the helper's bound instead of holding the job, and the dump names the frame the child hung in.
+    assert time.monotonic() - started < 10
+    assert "in wait_on_the_inherited_lock" in capfd.readouterr().err
 
 
 # The fork tests above run the fork handling in a child process, which coverage does not measure. The tests below run
