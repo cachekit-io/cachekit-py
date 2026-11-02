@@ -71,7 +71,7 @@ The same `@cache` now caches in L1 and Redis.
 ```python
 from cachekit import cache
 
-@cache  # Default: 1 hour TTL (3600s)
+@cache(ttl=3600)  # Expire after 1 hour; with no ttl, entries do not expire
 def expensive_function():
     return do_expensive_computation()
 
@@ -84,7 +84,7 @@ result = expensive_function()
 
 **Prerequisites**: Redis running + `REDIS_URL` environment variable set
 
-**Defaults**: 1 hour TTL, no namespace, compression enabled
+**Defaults**: no TTL (backend entries do not expire; L1-only entries are kept for up to a year), no namespace, compression enabled
 
 ---
 
@@ -353,7 +353,7 @@ result = critical_function()  # Works even if Redis is offline
 
 ### Multi-Pod Safe by Default
 
-- Distributed locking prevents cache stampedes
+- Distributed locking prevents cache stampedes across pods (async functions on a lock-capable backend; sync functions dedup within one process only)
 - All pods see consistent data
 - No local memory cache surprises
 

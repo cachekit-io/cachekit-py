@@ -104,7 +104,7 @@ def expensive_computation(x: int) -> dict:
 > **Why cachekit wins:**
 > - **L1+L2 caching**: L1 hits from process memory with no network round trip, an L1 miss that hits L2 costs one Redis round trip (see [Performance](performance.md))
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
-> - **Distributed locking**: Prevents cache stampedes across pods
+> - **Distributed locking**: Prevents cache stampedes across pods, for async functions on a lock-capable backend (sync functions dedup within one process only)
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
 > - **Metrics**: Prometheus operation counts and latency and payload-size histograms, plus `cache_info()` hit/miss counters per function
 
@@ -117,7 +117,8 @@ def get_user_data(user_id: int) -> dict:
     # Different pod: L2 hit from Redis (one network round trip)
     # Redis down: errors are logged and the function runs, doesn't crash
     # Circuit breaker open: L1 hits still served; a miss runs the function and returns its result
-    # Multiple pods calling simultaneously: Distributed lock prevents stampede
+    # Multiple pods calling simultaneously: each pod computes once (sync functions take no
+    # distributed lock; use an async function on a lock-capable backend for cross-pod protection)
     return fetch_user_from_db(user_id)
 ```
 
@@ -213,13 +214,15 @@ def fetch_data(key):
 
 **Distributed Locking**: Prevents cache stampedes
 ```python
-@cache(ttl=300)  # Distributed locking enabled by default
-def expensive_compute(key):
+@cache(ttl=300)  # Distributed locking on by default for async functions
+async def expensive_compute(key):
+    # Needs a lock-capable backend: env-configured Redis or CacheKit Cloud
     # 1000 pods call simultaneously on cache miss
     # Only ONE pod calls expensive_compute
     # Others wait for L2 cache to be populated
     # No cascade of simultaneous DB queries
-    return compute_expensive_value(key)
+    # A sync function takes no distributed lock: misses dedup within one process only
+    return await compute_expensive_value(key)
 ```
 
 **Limitations of alternatives**:

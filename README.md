@@ -293,7 +293,7 @@ Hosted runners come with other CPU models too: in a run of an earlier commit, an
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity
 - The CacheKit Cloud backend keeps idle connections pooled until the server closes them, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
-- Distributed locking prevents cache stampedes
+- Distributed locking prevents cache stampedes across pods (async functions, on a backend that supports it)
 - Pluggable backend abstraction (Redis, CacheKit Cloud, File, Memcached, custom)
 - Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/42ea601f3c1656df0a06904afa2406604f43f57d/test-vectors/decode-bounds.json) vectors
 
