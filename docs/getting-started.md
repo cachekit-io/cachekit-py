@@ -353,7 +353,7 @@ result = critical_function()  # Works even if Redis is offline
 
 ### Multi-Pod Safe by Default
 
-- Distributed locking prevents cache stampedes across pods (async functions on a lock-capable backend; sync functions dedup within one process only)
+- Distributed locking guards against cache stampedes across pods, best effort (async functions on a lock-capable backend; sync functions dedup within one process only)
 - All pods see consistent data
 - No local memory cache surprises
 

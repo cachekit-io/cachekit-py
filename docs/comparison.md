@@ -104,7 +104,7 @@ def expensive_computation(x: int) -> dict:
 > **Why cachekit wins:**
 > - **L1+L2 caching**: L1 hits from process memory with no network round trip, an L1 miss that hits L2 costs one Redis round trip (see [Performance](performance.md))
 > - **Graceful degradation**: Redis down? Errors are logged, the function runs, nothing raises
-> - **Distributed locking**: Prevents cache stampedes across pods, for async functions on a lock-capable backend (sync functions dedup within one process only)
+> - **Distributed locking**: Best-effort guard against cache stampedes across pods, for async functions on a lock-capable backend (sync functions dedup within one process only)
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
 > - **Metrics**: Prometheus operation counts and latency and payload-size histograms, plus `cache_info()` hit/miss counters per function
 
@@ -220,8 +220,9 @@ async def expensive_compute(key):
     # 1000 pods call simultaneously on cache miss
     # The pod that wins the lock calls expensive_compute; the others wait up to
     # blocking_timeout (5 s) for L2 to be populated, then re-check it and, if it
-    # is still empty, compute anyway. Best effort: full protection only while
-    # the function finishes within 5 s (see features/distributed-locking.md)
+    # is still empty, compute anyway. Best effort: a fill slower than 5 s, or one
+    # that lands between another pod's read and its lock request, means a second
+    # pod computes too (see features/distributed-locking.md)
     # A sync function takes no distributed lock: misses dedup within one process only
     return await compute_expensive_value(key)
 ```

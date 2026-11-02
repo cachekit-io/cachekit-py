@@ -103,7 +103,7 @@ class MyBackend:
 | `@cache.production` | Yes | Full | - |
 | `@cache.secure` | Yes | Full | AES-256-GCM |
 | `@cache.io()` | Yes | Full | - |
-| `@cache.dev` | Yes | Logging, no Prometheus | - |
+| `@cache.dev` | Yes | Logging; no cache-operation Prometheus metrics (the circuit-breaker state gauge is still exported) | - |
 | `@cache.test` | - | - | - |
 
 ## Serializers
