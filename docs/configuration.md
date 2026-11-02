@@ -16,11 +16,11 @@ cachekit supports four backends. Pick the one that fits your infrastructure:
 | Backend | Best For | Required Config |
 |---------|----------|----------------|
 | Redis | Self-hosted, full control | `CACHEKIT_REDIS_URL` |
-| CachekitIO | Managed, zero-ops | `CACHEKIT_API_KEY` |
+| CacheKit Cloud | Managed, zero-ops | `CACHEKIT_API_KEY` |
 | File | Local dev, testing | None |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 
-`@cache` picks its backend from env vars at a function's first call; with nothing configured it caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). CachekitIO is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
+`@cache` picks its backend from env vars at a function's first call; with nothing configured it caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). CacheKit Cloud is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
 
 ### Redis Backend
 
@@ -37,13 +37,13 @@ def fetch_data():
 
 **Configuration:** See [Redis Environment Variables](#redis-connection-for-redisbackendconfig) below.
 
-### CachekitIO Backend
+### CacheKit Cloud Backend
 
-> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
+> *CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)*
 
-Zero-ops managed caching via the cachekit.io SaaS API. No Redis to provision or maintain.
+Zero-ops managed caching via the CacheKit Cloud API. No Redis to provision or maintain.
 
-**Configuration:** See [CachekitIO Configuration](#cachekitio-configuration) below.
+**Configuration:** See [CacheKit Cloud Configuration](#cachekit-cloud-configuration) below.
 
 ### File Backend
 
@@ -118,13 +118,13 @@ REQUESTS_CA_BUNDLE=  # Unset to avoid SSL issues
 
 ---
 
-## CachekitIO Configuration
+## CacheKit Cloud Configuration
 
-> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
+> *CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)*
 
-Configure the CachekitIO managed backend through environment variables. All fields use the `CACHEKIT_` prefix.
+Configure the CacheKit Cloud backend through environment variables. All fields use the `CACHEKIT_` prefix.
 
-### CachekitIO Environment Variables
+### CacheKit Cloud Environment Variables
 
 ```bash
 # Required: API key for authentication (ck_live_... format)
@@ -149,7 +149,7 @@ CACHEKIT_TELEMETRY=false
 CACHEKIT_ALLOW_CUSTOM_HOST=false
 ```
 
-### CachekitIO Field Reference
+### `CachekitIOBackendConfig` Field Reference
 
 | Variable | Type | Default | Required | Description |
 |----------|------|---------|----------|-------------|
@@ -203,13 +203,13 @@ def report():
 Rules and behavior:
 
 - Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
-- **CachekitIO only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CachekitIO backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
+- **CacheKit Cloud only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CacheKit Cloud backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
 - At most 32 revalidations per decorated function run at once. A stale hit that finds the limit reached serves stale without revalidating, and a later hit retries. An async revalidation stranded on a stopped event loop (sync code that calls `loop.run_until_complete` and leaves the loop stopped, or closes it without cancelling its tasks) gives up its turn 30 seconds after it was scheduled and is cancelled, so a stale hit on another loop can revalidate that key again. If its loop resumes, it stores nothing, even when your function swallows the cancellation and returns. A write it had already sent before its loop stopped is not recalled, and can land after a newer revalidation's.
 - A failed background recompute never reaches the caller: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path. It logs a WARNING `SWR revalidation failed`, as does a revalidation skipped because the call's arguments cannot be deep-copied (`SWR revalidation skipped`) or one that could not be scheduled. It names the function by the same digest as the L1-only refresh WARNING. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
-- On the CachekitIO backend, every read (SWR-configured or not) also carries the server's remaining freshness (`X-CacheKit-Fresh-For`, [protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#remaining-freshness)): an L2 hit backfilled into L1 lives at most `min(ttl, remaining)` locally (with `ttl=None`, L1's own 300-second default lifetime, capped by `remaining`), so a value read near the end of its server-side freshness window is never served fresh from L1 past the server's bound. Pre-signal servers omit the header and behavior is unchanged.
+- On the CacheKit Cloud backend, every read (SWR-configured or not) also carries the server's remaining freshness (`X-CacheKit-Fresh-For`, [protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#remaining-freshness)): an L2 hit backfilled into L1 lives at most `min(ttl, remaining)` locally (with `ttl=None`, L1's own 300-second default lifetime, capped by `remaining`), so a value read near the end of its server-side freshness window is never served fresh from L1 past the server's bound. Pre-signal servers omit the header and behavior is unchanged.
 
 ### File Backend Environment Variables
 
@@ -379,7 +379,7 @@ def test_function():
 def secure_function():
     pass
 
-# cachekit.io SaaS - production-grade via managed API (closed beta)
+# CacheKit Cloud - production-grade via managed API (closed beta)
 # Requires: CACHEKIT_API_KEY env var
 # @cache.io(ttl=300)
 # def io_function():
@@ -395,7 +395,7 @@ def secure_function():
 | `dev()` | 300 s | L1-only¹ | 100 MB | Function runs, no error | Verbose logs, no cache-operation Prometheus series ([which still record](features/prometheus-metrics.md#series-that-ignore-monitoringconfig)) |
 | `production()` | 600 s | L1-only¹ | 100 MB | Function runs, no error | Full observability |
 | `secure()` | 600 s | ❌ | 100 MB | Function runs, no error | AES-256-GCM encryption required; refuses `backend=None`, so no L1-only SWR |
-| `io()` | 3600 s | ✓ | 100 MB | Function runs, no error | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| `io()` | 3600 s | ✓ | 100 MB | Function runs, no error | CacheKit Cloud backend (closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 **Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript; `dev()` / `test()` are SDK-local, Python-only presets and take `minimal`'s 300 s. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). Two consequences of a finite default: an entry this process writes also lives in its L1 for the same TTL (previously L1's own 300 s when no `ttl` was set), and the presets' `swr_enabled` / `stale_ttl` features — which need a positive `ttl` — are now active without an explicit `ttl=`.
 
@@ -428,7 +428,7 @@ export CACHEKIT_REDIS_URL=redis://prod.example.com:6379/0
 export REDIS_URL=redis://localhost:6379/0  # Ignored - won't be used
 ```
 
-### CachekitIO Config is Separate
+### CacheKit Cloud Config is Separate
 
 `@cache.io()` reads from `CachekitIOBackendConfig` — a completely separate config class from `RedisBackendConfig`. Redis URL precedence does not apply.
 
@@ -438,7 +438,7 @@ export REDIS_URL=redis://localhost:6379/0  # Ignored - won't be used
 | `@cache.io()` | `CachekitIOBackendConfig` | `CACHEKIT_API_KEY` |
 
 Setting `REDIS_URL` has no effect on `@cache.io()`. `CACHEKIT_API_KEY` is different: it is also
-one of the backend selectors, so a decorator without `backend=` resolves to cachekit.io from it,
+one of the backend selectors, so a decorator without `backend=` resolves to CacheKit Cloud from it,
 and with `CACHEKIT_REDIS_URL` also set it hits a selector conflict and runs uncached. To keep
 Redis-backed decorators beside `@cache.io()`, pass `backend=` to them, or pass `@cache.io()` its
 key as `api_key=`, read from your secret store (never a literal in source), instead of setting
@@ -656,7 +656,7 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 
 ### Connection Pooling
 
-One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 32. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins. A CachekitIO sync request holds a connection for its whole round trip (HTTP/1.1), so the pool caps how many run at once: size it to at least the number of threads that share one backend ([details](backends/cachekitio.md#characteristics)).
+One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CacheKit Cloud to 32. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins. A CacheKit Cloud sync request holds a connection for its whole round trip (HTTP/1.1), so the pool caps how many run at once: size it to at least the number of threads that share one backend ([details](backends/cachekitio.md#characteristics)).
 
 ```bash
 # Tune connection pool size based on concurrency

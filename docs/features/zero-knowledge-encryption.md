@@ -183,7 +183,7 @@ encrypted, until the rollout drains them.
 Once the last old-version process is gone, the old keys are never read again, but they are not deleted: they retire only by TTL (never, if none
 was set) and stay decryptable while the key is. If they hold personal data, delete them once the last
 old writer is gone — on Redis, `SCAN` for `<old-namespace>:<operation>:*` and `UNLINK` the matches;
-the File backend can only clear its whole `cache_dir`; Memcached and CachekitIO retire entries only by
+the File backend can only clear its whole `cache_dir`; Memcached and CacheKit Cloud retire entries only by
 TTL. Never `FLUSHDB` a shared database.
 
 ## What Can Go Wrong
@@ -215,7 +215,7 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 `@cache.secure` resolves its backend the way every preset does ([Backend Resolution
 Priority](../backends/README.md#backend-resolution-priority)), so without an explicit backend or a
 `set_default_backend()` default, the environment decides where the ciphertext goes. With `REDIS_URL` set and `CACHEKIT_API_KEY` unset,
-`@cache.secure` encrypts to Redis, not to the SaaS. The values are still ciphertext; what changes
+`@cache.secure` encrypts to Redis, not to CacheKit Cloud. The values are still ciphertext; what changes
 is which system holds them.
 
 When a particular backend is a requirement, pass it explicitly:
@@ -507,8 +507,8 @@ tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`; `t:defa
 tenant set) reports the calling tenant's `t:{tenant}:`. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
 `t:globex:`, is refused. A custom backend that prefixes keys must expose that prefix as
 `key_prefix` for it to be bound. Backend encodings of the key (the File backend's hashed file
-name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the tenant
-scoping the CachekitIO server applies.
+name, CacheKit Cloud's percent-encoded URL path) are not part of it, and neither is the tenant
+scoping the CacheKit Cloud server applies.
 
 There is one AAD per read. A read never retries with another form of the key, such as the key
 without its prefix, so a failed authentication is final.
@@ -599,7 +599,7 @@ the key verbatim, after the function's identity and the namespace
 personal data from it — derive them with an HMAC whose key never reaches the backend.
 
 Whoever operates the backend can therefore learn which record was read or written, when and how
-often, without decrypting anything. On the CachekitIO backend the key travels percent-encoded in
+often, without decrypting anything. On the CacheKit Cloud backend the key travels percent-encoded in
 the URL path (`/v1/cache/{key}`), so it also lands in access logs along the request path and stays
 there for their retention period, not the cache TTL. Ciphertext length reveals the approximate
 plaintext size, and because the default serializer compresses before encrypting, it also tracks
@@ -745,7 +745,7 @@ didn't recently disable encryption for that function, investigate.
 > Client-side encryption may *reduce* GDPR, HIPAA or PCI DSS scope, subject to assessment and
 > your other controls, and only on an explicit path (see
 > [Activation](#activation-the-master-key-is-a-source-not-a-switch)); it is not a compliance
-> guarantee. Encryption covers values only: the cache key is cleartext (and, on CachekitIO, lands
+> guarantee. Encryption covers values only: the cache key is cleartext (and, on CacheKit Cloud, lands
 > in access logs; see [Cleartext Cache Key](#cleartext-cache-key-accepted-exposure)).
 
 ### GDPR
@@ -845,7 +845,7 @@ from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
 from cachekit.serializers import OrjsonSerializer
 
-# An HTTP API backend: CachekitIOBackend talks to cachekit.io over HTTPS
+# An HTTP API backend: CachekitIOBackend talks to CacheKit Cloud over HTTPS
 @cache.secure(master_key=secret_key, serializer=OrjsonSerializer(), backend=CachekitIOBackend())
 def get_api_secrets(tenant_id: str):
     return {"api_key": "sk_live_...", "secret": "..."}  # illustrative

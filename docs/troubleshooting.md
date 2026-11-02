@@ -214,12 +214,12 @@ decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS` and follow the
 
 ---
 
-## CachekitIO Backend Issues
+## CacheKit Cloud Backend Issues
 
 <details>
-<summary><strong>Can't Connect to cachekit.io</strong></summary>
+<summary><strong>Can't Connect to CacheKit Cloud</strong></summary>
 
-**Issue**: Requests to cachekit.io fail immediately or time out
+**Issue**: Requests to CacheKit Cloud fail immediately or time out
 
 **What it means**:
 - API key not configured
@@ -253,7 +253,7 @@ curl -sf https://api.cachekit.io/healthz
 <details>
 <summary><strong>401 Unauthorized</strong></summary>
 
-**Issue**: cachekit.io returns `401 Unauthorized`
+**Issue**: CacheKit Cloud returns `401 Unauthorized`
 
 **What it means**:
 - API key is invalid, revoked, or expired
@@ -263,11 +263,11 @@ curl -sf https://api.cachekit.io/healthz
 
 1. **Confirm the key is correct**:
 ```bash
-# Compare against the key shown in your cachekit.io dashboard
+# Compare against the key shown in your CacheKit Cloud dashboard
 echo $CACHEKIT_API_KEY
 ```
 
-2. **Request a new key** at [cachekit.io](https://cachekit.io) and rotate:
+2. **Request a new key** in the dashboard at [dash.cachekit.io](https://dash.cachekit.io) and rotate:
 ```bash
 export CACHEKIT_API_KEY=new_key_here
 ```
@@ -279,7 +279,7 @@ export CACHEKIT_API_KEY=new_key_here
 <details>
 <summary><strong>429 Rate Limited</strong></summary>
 
-**Issue**: cachekit.io returns `429 Too Many Requests`
+**Issue**: CacheKit Cloud returns `429 Too Many Requests`
 
 **What it means**:
 - Request rate exceeds your plan's limit
@@ -295,9 +295,9 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **Sync calls do not retry a rate-limited request** — the function runs, its result is still stored in L1, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs without the lock (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **Sync calls do not retry a rate-limited request** — the function runs, its result is still stored in L1, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs without the lock (see [CacheKit Cloud HTTP Errors](error-codes.md#cachekit-cloud-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
-3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
+3. **Check your current usage** in the dashboard at [dash.cachekit.io](https://dash.cachekit.io).
 
 </details>
 
@@ -332,7 +332,7 @@ curl -sf $CACHEKIT_API_URL/healthz
 <details>
 <summary><strong>Connection Timeout</strong></summary>
 
-**Issue**: Requests to cachekit.io hang and eventually time out
+**Issue**: Requests to CacheKit Cloud hang and eventually time out
 
 **What it means**:
 - High network latency between your environment and api.cachekit.io
@@ -357,7 +357,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **A timeout does not fail the call**: the request is logged, the function runs, and its result is still stored in L1. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
+4. **A timeout does not fail the call**: the request is logged, the function runs, and its result is still stored in L1. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CacheKit Cloud HTTP Errors](error-codes.md#cachekit-cloud-http-errors)).
 
 </details>
 
@@ -498,7 +498,7 @@ logging.getLogger("redis").setLevel(logging.DEBUG)
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-With the CachekitIO backend, a `DEBUG` root also shows urllib3's request lines, raw cache keys in their paths, never the API key or lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) if your keys carry identifiers.
+With the CacheKit Cloud backend, a `DEBUG` root also shows urllib3's request lines, raw cache keys in their paths, never the API key or lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) if your keys carry identifiers.
 
 </details>
 

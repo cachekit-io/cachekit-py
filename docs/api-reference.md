@@ -22,7 +22,7 @@ The `@cache` decorator takes its configuration from a preset or from explicit ar
 ```python notest
 from cachekit import cache
 
-# Zero-config: automatic optimization (90% of use cases)
+# L1 only: backend=None forces L1 only, even when a backend is configured
 @cache(backend=None)
 def expensive_function():
     return do_expensive_computation()
@@ -47,7 +47,7 @@ def custom_function():
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
 - **`@cache.dev`** - SDK-local, Python-only development profile: Verbose logging, easy debugging, integrity checking on, Prometheus cache-operation series off ([series that ignore `MonitoringConfig`](features/prometheus-metrics.md#series-that-ignore-monitoringconfig) still record)
 - **`@cache.test`** - SDK-local, Python-only testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
-- **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
+- **`@cache.io`** - CacheKit Cloud profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io))*
 - **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
 
 ### `@cache(...)` - Manual Configuration
@@ -90,7 +90,7 @@ def your_function(args):
 
 #### Performance Parameters
 
-- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on async L2 hits when below threshold, in the background (no extra round trip on the hit). On CachekitIO the threshold is checked against the hit's remaining freshness; see [CachekitIO TTL inspection](backends/cachekitio.md#ttl-inspection-async-only)
+- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on async L2 hits when below threshold, in the background (no extra round trip on the hit). On CacheKit Cloud the threshold is checked against the hit's remaining freshness; see [CacheKit Cloud TTL inspection](backends/cachekitio.md#ttl-inspection-async-only)
 - **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Minimum remaining TTL fraction (0.0–1.0) to trigger refresh
 - **`write_behind`** (`bool`, default: `False`; set by no preset; any non-bool raises `ConfigurationError`) - Return a miss once its value is serialized and in L1; the L2 write follows on a bounded background writer. Until it lands, other processes miss the key, a process killed first loses it, and a write queued before another process's invalidation can land after it, so do not use it for values that must not outlive an invalidation. The async distributed-lock path and a sync miss's streaming write stay synchronous. See [Write-Behind](features/write-behind.md)
 - **`distributed_lock`** (`bool`, default: `True`; set off by no preset; any non-bool raises `ConfigurationError`) - Take the backend's distributed lock around an async miss. `False` skips it: no lock round trips, and write-behind, when on, applies to the miss. Concurrent misses on the event loop running the key's call still share it; every other process computes the key, and so does every caller on another thread's event loop while that call runs. Sync functions never take the lock. See [Distributed Locking](features/distributed-locking.md#turning-it-off-distributed_lockfalse)
@@ -180,11 +180,11 @@ def critical_business_logic():
 # The decorator automatically connects to Redis using the environment variable
 ```
 
-### `@cache.io` — cachekit.io SaaS Backend
+### `@cache.io` — CacheKit Cloud Backend
 
-> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
+> *CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)*
 
-**Profile for zero-infrastructure caching** via the cachekit.io edge network. Automatically configures `CachekitIOBackend` (HTTP) as the L2 backend with production-grade reliability settings (circuit breaker, L1 in-memory cache).
+**Profile for zero-infrastructure caching** via the CacheKit Cloud edge network. Automatically configures `CachekitIOBackend` (HTTP) as the L2 backend with production-grade reliability settings (circuit breaker, L1 in-memory cache).
 
 #### Environment Variables
 
@@ -711,7 +711,7 @@ For error examples and handling patterns, see [Troubleshooting Guide](troublesho
 
 ## Backend Abstraction
 
-cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. Built-in backends include Redis, CachekitIO, File, and Memcached. You can also implement custom backends for any key-value store.
+cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. Built-in backends include Redis, CacheKit Cloud, File, and Memcached. You can also implement custom backends for any key-value store.
 
 For comprehensive backend guide with examples and implementation patterns, see **[Backend Guide](backends/README.md)**.
 
@@ -815,7 +815,7 @@ lives in an external store, not a bounded in-process dict.
 Statistics are tracked per function identity (`module.qualname`) and are thread-safe.
 Re-applying a decorator to the same function — even with different options — reuses the
 existing counters from a process-global registry rather than resetting them, so `session_id`
-stays stable and the counters reported to the CachekitIO backend stay monotonic (counters
+stays stable and the counters reported to the CacheKit Cloud backend stay monotonic (counters
 that reset under an unchanged session ID would trip the server's anti-replay validation).
 `cache_clear()` resets the counters and rotates `session_id`. A forked child process starts
 with zeroed counters and a session ID derived from its own process UUID; the parent's
@@ -894,7 +894,7 @@ cachekit writes structured records through Python's `logging`, so your handlers 
 
 With `enable_structured_logging=True` (the default), these cache operations are logged at INFO on the `cachekit.decorators.orchestrator` logger: L1 and L2 hits of a sync function that has a backend, failed operations and circuit-breaker rejections. Each record's `structured` attribute holds the operation, the namespace and the redacted cache key, plus the duration, hit, serializer and error type where they apply. The message is plain text; your formatter decides whether those fields are rendered. The health checker behind `get_health_checker()`, `health_check_handler()` and `async_health_check_handler()` logs each full check it runs (`HealthLevel.FULL`, the default) the same way, at INFO on the `cachekit.health` logger, with the status, duration and component count, whatever `enable_structured_logging` says.
 
-SDK diagnostics, such as the CachekitIO backend's debug lines, are one JSON object per record on the `cachekit.logging` logger, with `timestamp`, `level`, `message`, `logger`, `hostname`, `pid` and `thread_id`. Each is written when it is logged, on the calling thread. DEBUG, INFO and WARNING records are sampled at `CACHEKIT_LOG_SAMPLING_RATE` (default `0.1`), and ERROR and CRITICAL records never are. A field value JSON cannot encode is written as its type name, such as `"<dict>"`, never as its text. Nothing is sampled or serialised below that logger's level. A child forked by Python (`os.fork()`, `multiprocessing`, Gunicorn, Celery) writes its own records, with its own `pid`. A child forked from C without Python's at-fork hooks (uWSGI without `--py-call-uwsgi-fork-hooks`) writes none, and no health-check record either: `logging`'s after-fork lock reset did not run there, so a lock a parent thread held at the fork would hang the call.
+SDK diagnostics, such as the CacheKit Cloud backend's debug lines, are one JSON object per record on the `cachekit.logging` logger, with `timestamp`, `level`, `message`, `logger`, `hostname`, `pid` and `thread_id`. Each is written when it is logged, on the calling thread. DEBUG, INFO and WARNING records are sampled at `CACHEKIT_LOG_SAMPLING_RATE` (default `0.1`), and ERROR and CRITICAL records never are. A field value JSON cannot encode is written as its type name, such as `"<dict>"`, never as its text. Nothing is sampled or serialised below that logger's level. A child forked by Python (`os.fork()`, `multiprocessing`, Gunicorn, Celery) writes its own records, with its own `pid`. A child forked from C without Python's at-fork hooks (uWSGI without `--py-call-uwsgi-fork-hooks`) writes none, and no health-check record either: `logging`'s after-fork lock reset did not run there, so a lock a parent thread held at the fork would hang the call.
 
 ## Best Practices
 

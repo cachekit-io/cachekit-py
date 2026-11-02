@@ -1,8 +1,8 @@
 # cachekit
 
-> Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CachekitIO.
+> Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CacheKit Cloud.
 
-cachekit provides decorator-based caching with circuit breaker, distributed locking, Prometheus metrics, L1+L2 dual-layer caching, and optional zero-knowledge encryption. Supports 4 built-in backends (Redis, Memcached, File, CachekitIO) plus custom backends via the BaseBackend protocol.
+cachekit provides decorator-based caching with circuit breaker, distributed locking, Prometheus metrics, L1+L2 dual-layer caching, and optional zero-knowledge encryption. Supports 4 built-in backends (Redis, Memcached, File, CacheKit Cloud) plus custom backends via the BaseBackend protocol.
 
 ## Quick Start
 
@@ -21,7 +21,9 @@ def get_price(symbol: str):
 def process_payment(amount):
     return gateway.charge(amount)
 
-@cache.secure             # Security-critical: client-side AES-256-GCM encryption
+# Security-critical: client-side AES-256-GCM. Needs master_key= or CACHEKIT_MASTER_KEY:
+# without either, @cache.secure raises ValueError.
+@cache.secure(master_key=key)
 def get_patient(id: int):
     return db.fetch_patient(id)
 ```
@@ -35,7 +37,7 @@ def get_patient(id: int):
 | **Redis** | included | Production, distributed |
 | **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra |
 | **File** | included | Single-machine, zero-dependency |
-| **CachekitIO** | included | Managed SaaS, zero infrastructure |
+| **CacheKit Cloud** (`CachekitIOBackend`) | included | Managed, zero infrastructure (closed beta) |
 
 ### Redis
 ```python
@@ -72,11 +74,11 @@ def cached_fn():
     return data
 ```
 
-### CachekitIO (Managed SaaS)
+### CacheKit Cloud (managed, closed beta)
 ```python
 # Environment: CACHEKIT_API_KEY=your-api-key
 
-@cache.io()  # Uses CachekitIO SaaS backend
+@cache.io()  # Uses the CacheKit Cloud backend; sign-up is by waitlist at https://dash.cachekit.io
 def cached_fn():
     return data
 ```
@@ -96,11 +98,12 @@ class MyBackend:
 
 | Preset | Circuit Breaker | Monitoring | Encryption |
 |--------|:-:|:-:|:-:|
-| `@cache` / `@cache.minimal` | - | - | - |
+| `@cache` | Yes | Full | - |
+| `@cache.minimal` | - | - | - |
 | `@cache.production` | Yes | Full | - |
 | `@cache.secure` | Yes | Full | AES-256-GCM |
 | `@cache.io()` | Yes | Full | - |
-| `@cache.dev` | - | Verbose | - |
+| `@cache.dev` | Yes | Logging, no Prometheus | - |
 | `@cache.test` | - | - | - |
 
 ## Serializers
@@ -136,7 +139,7 @@ CACHEKIT_MEMCACHED_KEY_PREFIX=myapp:
 CACHEKIT_FILE_CACHE_DIR=/tmp/cache
 CACHEKIT_FILE_MAX_SIZE_MB=500
 
-# CachekitIO
+# CacheKit Cloud
 CACHEKIT_API_KEY=your-api-key
 CACHEKIT_API_URL=https://api.cachekit.io
 
@@ -161,7 +164,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Redis](docs/backends/redis.md): Recommended production backend
 - [File](docs/backends/file.md): Local filesystem caching
 - [Memcached](docs/backends/memcached.md): High-throughput caching
-- [CachekitIO](docs/backends/cachekitio.md): Managed SaaS backend
+- [CacheKit Cloud](docs/backends/cachekitio.md): Managed backend (closed beta)
 - [Custom Backends](docs/backends/custom.md): Implement BaseBackend
 
 ### Serializers
@@ -182,7 +185,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [L1 Invalidation & SWR](docs/features/l1-invalidation.md): Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), opt-in cross-process L1 eviction, stale-while-revalidate
 - [Reference Caching](docs/features/reference-caching.md): @cache.local() for non-serializable objects
 - [Rust Serialization](docs/features/rust-serialization.md): ByteStorage layer (LZ4, xxHash3, AES-256-GCM)
-- [SSRF Protection](docs/features/ssrf-protection.md): CachekitIO URL allowlisting
+- [SSRF Protection](docs/features/ssrf-protection.md): CacheKit Cloud URL allowlisting
 - [Write-Behind](docs/features/write-behind.md): Opt-in `write_behind=True`: a miss returns before its L2 write lands
 - [Architecture](docs/data-flow-architecture.md): L1+L2 internals
 

@@ -102,7 +102,7 @@ AES-256-GCM needs the whole ciphertext to produce/verify its auth tag, so the se
 stays on buffered `set()`/`get()`. Streamed values also intentionally skip the L1 in-memory
 cache — holding a multi-GB envelope in-process would defeat the point.
 
-Other backends (Redis, CachekitIO, Memcached) fall back transparently to buffered
+Other backends (Redis, CacheKit Cloud, Memcached) fall back transparently to buffered
 `set(bytes)` with no behaviour change.
 
 ## TTL Inspection & Sliding Expiration

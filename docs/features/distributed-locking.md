@@ -41,7 +41,7 @@ report = await get_report("2025-01-15")
 > [!NOTE]
 > Locking requires **both** of:
 >
-> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. `FileBackend` and pure-L1 (zero-config) caching do not either. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call: sync callers across the process's threads, async callers only on the event loop running the key's call ([in-process single-flight](#in-process-single-flight-before-the-lock)).
+> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the CacheKit Cloud backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. `FileBackend` and pure-L1 (zero-config) caching do not either. All of them silently skip lock acquisition; the function still works, just without cross-process stampede protection. Concurrent misses inside one process still share one call: sync callers across the process's threads, async callers only on the event loop running the key's call ([in-process single-flight](#in-process-single-flight-before-the-lock)).
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
 > 3. The function has not opted out with `distributed_lock=False` — see [Turning It Off](#turning-it-off-distributed_lockfalse).
 
@@ -76,7 +76,7 @@ Sync callers share a call across the threads of one process; async callers share
 The `LockableBackend` protocol is async-only (`acquire_lock` is an async context
 manager), so **only async decorated functions get distributed locking**. The sync
 wrapper executes the function directly on cache miss — on every backend, including
-Redis and CachekitIO — with no lock. Inside one process, concurrent sync misses on a
+Redis and CacheKit Cloud — with no lock. Inside one process, concurrent sync misses on a
 key still share one trip ([in-process single-flight](#in-process-single-flight-before-the-lock)):
 twelve threads on a cold key mean one L2 read, one recompute and one write. Across
 processes nothing dedups them: twelve processes that each miss the key at once mean
@@ -174,7 +174,7 @@ Three behavioural edges to design around:
    the lock expires while the winner is still computing and another pod may
    start a concurrent recompute. This applies whether the holder is slow or
    crashed — the expiry is the crash-recovery safety net (Redis key TTL /
-   CachekitIO server-side expiry). Keep expensive functions well under 30 s,
+   CacheKit Cloud server-side expiry). Keep expensive functions well under 30 s,
    or split the work.
 3. **Lock backend errors degrade to no lock.** If lock acquisition raises a
    backend error (lock backend outage, authentication failure), the wrapper
@@ -183,7 +183,7 @@ Three behavioural edges to design around:
    running the key's call share its trip; a caller on another thread's loop
    runs its own ([in-process single-flight](#in-process-single-flight-before-the-lock)). A failed lock request is not retried; only a
    lock another caller holds is waited on. A failed release never runs the
-   function again: the Redis and CachekitIO backends swallow a backend error
+   function again: the Redis and CacheKit Cloud backends swallow a backend error
    on release, any other release failure is logged and the call keeps its
    result, and the lock may stay until its 30 s timeout. The lock is
    best-effort stampede mitigation, never load-bearing mutual exclusion: do
@@ -287,7 +287,7 @@ async def generate_stats(date):
     return stats_engine.compute(date)
 ```
 
-### With CachekitIO Backend (SaaS)
+### With the CacheKit Cloud Backend
 ```python notest
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
@@ -299,7 +299,7 @@ async def generate_stats(date):
     return stats_engine.compute(date)
 ```
 
-The SaaS lock is available to every authenticated API key — no extra
+The CacheKit Cloud lock is available to every authenticated API key — no extra
 configuration or plan tier required.
 
 ### Turning It Off (`distributed_lock=False`)
@@ -322,10 +322,10 @@ What changes on an async miss:
 
 | | `distributed_lock=True` (default) | `distributed_lock=False` |
 |---|---|---|
-| Lock requests (CachekitIO) | Uncontended: one `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
+| Lock requests (CacheKit Cloud) | Uncontended: one `POST …/lock` the caller waits on, one `DELETE …/lock` in the background | None |
 | Lock round trips (tenant-scoped Redis) | Uncontended: one `SET NX` the caller waits on, one release `EVALSHA` in the background | None |
 | Concurrent misses on one event loop | One call ([single-flight](#in-process-single-flight-before-the-lock)) | Single-flight is unchanged: within a process, only callers on the event loop running the key's call share it. While it runs, every caller on another thread's loop runs its own call (ten such callers, ten calls) |
-| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CachekitIO and Redis, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#round-trips-on-an-async-miss)) | At least one call per process that misses, each computing and writing |
+| Concurrent misses across processes | One call per key, within the [lock timing](#lock-timing-30-second-expiry-5-second-wait) limits. On CacheKit Cloud and Redis, a fill that lands between a process's clean miss and its uncontended lock grant is recomputed there ([no re-read](#round-trips-on-an-async-miss)) | At least one call per process that misses, each computing and writing |
 | [Write-behind](write-behind.md) | Not applied on the lock path: the L2 write stays synchronous, including after a timed-out lock wait. Write-behind can defer it only when the miss falls through to the unlocked path: a backend error while acquiring the lock, or a backend that cannot lock | Applied when on: the L2 write leaves the caller's path |
 
 The trade-off is cross-process stampede protection. Turn it off when the function is cheap or idempotent and a
@@ -372,7 +372,7 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
    Lock auto-expires via Redis TTL if holder crashes
 ```
 
-**Lock flow (CachekitIO / SaaS)**:
+**Lock flow (CacheKit Cloud)**:
 ```
 1. POST /v1/cache/{key}/lock with {"timeout_ms": 30000}
 2. Response carries a lock_id → lock acquired, yield True
@@ -385,9 +385,9 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 ```
 
 ### Performance Impact
-- **Lock already held**: Waiters poll for up to `blocking_timeout` (5 s) — fixed 0.1 s interval on Redis, exponential backoff + jitter on CachekitIO
+- **Lock already held**: Waiters poll for up to `blocking_timeout` (5 s) — fixed 0.1 s interval on Redis, exponential backoff + jitter on CacheKit Cloud
 - **Lock acquisition**: one backend round trip per attempt (`SET NX` on Redis)
-- **Lock release**: one backend round trip (`DELETE …/lock` on CachekitIO; on Redis, once the release script is cached on the server)
+- **Lock release**: one backend round trip (`DELETE …/lock` on CacheKit Cloud; on Redis, once the release script is cached on the server)
 - **Waiting cost**: Function execution cost saved * (pods_waiting - 1)
 
 **Example**: 1000 pods, 3s function call, 999 waiting

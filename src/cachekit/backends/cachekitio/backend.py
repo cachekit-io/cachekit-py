@@ -188,7 +188,8 @@ def _parse_fresh_for(value: str | None) -> int | None:
 _RESERVED_KEY_SEGMENTS = frozenset({"", ".", "..", "health", "ttl", "lock"})
 
 _API_KEY_HINT = (
-    "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
+    "\n\nCacheKit Cloud requires an API key: pass api_key=... or set CACHEKIT_API_KEY\n"
+    "CacheKit Cloud is in closed beta: join the waitlist at https://dash.cachekit.io"
 )
 
 

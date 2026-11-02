@@ -44,7 +44,7 @@ Are you caching in Python?
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
-> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CachekitIO), the default `StandardSerializer` converts tuples to lists and cannot encode sets or frozensets (the result is returned uncached; see [Serialization unsupported type](error-codes.md#serialization-unsupported-type)), for cross-language SDK compatibility.
+> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CacheKit Cloud), the default `StandardSerializer` converts tuples to lists and cannot encode sets or frozensets (the result is returned uncached; see [Serialization unsupported type](error-codes.md#serialization-unsupported-type)), for cross-language SDK compatibility.
 >
 > **If you need type preservation with a distributed backend**, use `serializer='auto'`:
 > ```python
@@ -167,7 +167,7 @@ sequenceDiagram
 
 **Why cachekit wins**:
 - **Same code**: `@cache` decorator works with or without Redis
-- **Pluggable backends**: Redis, CachekitIO, File, Memcached built-in, plus custom protocol
+- **Pluggable backends**: Redis, CacheKit Cloud, File, Memcached built-in, plus custom protocol
 - **Graceful degradation**: Redis down? L1 cache serves, app continues
 - **No vendor lock-in**: Backend protocol is documented, implement your own
 
@@ -268,14 +268,14 @@ The series carry no hit/miss label; `cache_info()` has those counts. cachekit st
 **Scenario**: You want distributed caching without standing up or operating Redis infrastructure.
 
 **Why cachekit wins**:
-- **CachekitIOBackend**: Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
+- **CacheKit Cloud** (`CachekitIOBackend`): Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
 - **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext values, never plaintext values; the cache key stays cleartext ([details](features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure))
 - **Same decorator API**: Swap backend by setting `CACHEKIT_API_KEY` — zero code changes
 
 ```python notest
 from cachekit import cache
 
-# Uses cachekit.io as the L2 backend (CACHEKIT_API_KEY in environment)
+# Uses CacheKit Cloud as the L2 backend (CACHEKIT_API_KEY in environment)
 @cache.io(ttl=3600)
 def get_user_data(user_id: int) -> dict:
     return fetch_from_db(user_id)
@@ -509,7 +509,7 @@ A: Yes. Works with any framework (FastAPI, Django, Flask, etc). Metrics integrat
 A: The app keeps working. Redis errors are logged, and your function runs and returns its result. If Redis was down when the backend was first built, nothing is cached and repeated failures open the circuit breaker, so calls stop waiting on Redis. If Redis goes away later, L1 still caches results in-process. While the breaker is open, L1 hits are still served and a miss runs the function.
 
 **Q: Can I use my own backend?**
-A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.
+A: Yes. Four built-in backends (Redis, CacheKit Cloud, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.
 
 ---
 

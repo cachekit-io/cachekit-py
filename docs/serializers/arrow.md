@@ -152,7 +152,7 @@ A read of a compressed payload (the default) decompresses it into new buffers. A
 (File backend only today) and the value is plaintext (no encryption), serialization streams
 ~8 MiB record batches directly into the cache file instead of materializing the whole Arrow
 IPC payload in memory first — cutting write peak RSS from ~5.6x to ~2.3x the DataFrame's
-logical size. Wire backends (Redis, CachekitIO, Memcached) and encrypted values use the
+logical size. Wire backends (Redis, CacheKit Cloud, Memcached) and encrypted values use the
 buffered path unchanged. See [File Backend](../backends/file.md#bounded-memory-large-values-arrow).
 
 ### Zero-Copy Reads on the File Backend
