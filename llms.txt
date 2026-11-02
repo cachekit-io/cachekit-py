@@ -98,7 +98,7 @@ class MyBackend:
 
 | Preset | Circuit Breaker | Monitoring | Encryption |
 |--------|:-:|:-:|:-:|
-| `@cache` | Yes | Full | - |
+| `@cache` (with a backend) | Yes | Full | - |
 | `@cache.minimal` | - | - | - |
 | `@cache.production` | Yes | Full | - |
 | `@cache.secure` | Yes | Full | AES-256-GCM |

@@ -251,7 +251,7 @@ def test_cached_function():
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)      │
-│       in-process       │  Redis / CachekitIO / File /       │
+│       in-process       │  Redis / CacheKit Cloud / File /   │
 │                        │  Memcached: one backend round trip │
 ├─────────────────────────────────────────────────────────────┤
 │                    Rust Core (PyO3)                         │

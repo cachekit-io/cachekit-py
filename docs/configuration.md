@@ -660,7 +660,7 @@ One variable sizes the pool of whichever backend is in use: Redis defaults to 50
 
 ```bash
 # Tune connection pool size based on concurrency
-export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 32
+export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CacheKit Cloud 32
 
 # Higher for:
 # - Many concurrent requests
