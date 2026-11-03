@@ -13,7 +13,7 @@ import itertools
 import sys
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -435,7 +435,7 @@ class TrackingBackend(HoldDeleteBackend):
     def track_key(self, registry_id: str, key: str) -> None:
         self.registry.setdefault(registry_id, set()).add(key)
 
-    def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+    def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
         gate, self.hold_delete = self.hold_delete, None
         if gate is not None:
             gate.entered.set()
@@ -485,9 +485,27 @@ def test_backed_read_during_the_invalidation_does_not_backfill_the_old_entry(
     assert get(1) == "new"
 
 
-def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("serializer", ["default", "arrow"])
+def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: pytest.MonkeyPatch, serializer: str) -> None:
     """A skipped fill still hands its value to the callers that joined it before the invalidation: they
-    do not each run the function again."""
+    do not each run the function again. Arrow can stream, but not to this backend, so it shares too."""
+    if serializer == "arrow":
+        pa = pytest.importorskip("pyarrow")
+
+        def wrap(value: str) -> Any:
+            return pa.table({"v": [value]})
+
+        def unwrap(value: Any) -> str:  # the caller that ran gets its Table, a joined one a decoded DataFrame
+            first = value["v"][0]
+            return first.as_py() if hasattr(first, "as_py") else first
+    else:
+
+        def wrap(value: str) -> Any:
+            return value
+
+        def unwrap(value: Any) -> str:
+            return value
+
     joined = threading.Event()
     run = ThreadFlights.run
 
@@ -502,16 +520,16 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: 
     monkeypatch.setattr(ThreadFlights, "run", run_signalling_joins)
     source, backend = _Source(), DictBackend()
 
-    @cache(backend=backend, ttl=300, namespace=_ns())
-    def get(x: int) -> str:
-        return source.read()
+    @cache(backend=backend, ttl=300, namespace=_ns(), serializer=serializer)
+    def get(x: int) -> Any:
+        return wrap(source.read())
 
     source.hold_next()
     out: list[str] = []
-    first = threading.Thread(target=lambda: out.append(get(1)))
+    first = threading.Thread(target=lambda: out.append(unwrap(get(1))))
     first.start()
     assert source.entered.wait(_WAIT)
-    second = threading.Thread(target=lambda: out.append(get(1)))
+    second = threading.Thread(target=lambda: out.append(unwrap(get(1))))
     second.start()
     assert joined.wait(_WAIT)
     source.value = "new"
@@ -523,7 +541,7 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: 
     assert out == ["old", "old"]
     assert source.reads == 1
     assert backend.store == {}
-    assert get(1) == "new"
+    assert unwrap(get(1)) == "new"
 
 
 @pytest.mark.parametrize("backend_cls", [DictBackend, TrackingBackend], ids=["local", "drain"])

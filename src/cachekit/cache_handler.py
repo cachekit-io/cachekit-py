@@ -2185,8 +2185,13 @@ class CacheOperationHandler:
             if stale_ttl is None and self.serialization_handler.supports_streaming_write():
                 set_streaming = getattr(self._cache_handler, "set_streaming", None)
                 if set_streaming is not None and not write:
-                    return StoreOutcome(envelope=None, stored=False)
-                if set_streaming is not None:
+                    # Only a value the write would stream has no envelope; on a backend that cannot stream,
+                    # set_streaming answers None and the write would buffer it, so serialize it below.
+                    # A handler that does not say which backend it writes to counts as streaming.
+                    backend = getattr(self._cache_handler, "backend", None)
+                    if backend is None or supports_streaming_write(backend):
+                        return StoreOutcome(envelope=None, stored=False)
+                elif set_streaming is not None:
                     streamed = set_streaming(
                         cache_key,
                         lambda sink: self.serialization_handler.write_serialized_to(sink, result),
