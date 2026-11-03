@@ -213,7 +213,7 @@ assert get_price.invalidate_cache("A1") is InvalidationOutcome.NO_L2
 
 ### Whole-Function Invalidation
 
-Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function. How far "every" reaches depends on the backend:
+Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function, on `@cache` and on `@cache.local()` alike. A function whose parameters all have defaults counts as parameterized; only a zero-parameter function's no-args call removes its one entry. How far "every" reaches depends on the backend:
 
 ```python
 calls = []
@@ -237,7 +237,7 @@ assert calls == [1, 2, 1, 2]
 |--------------------------------|--------------------|
 | Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `backend=`), or a backend from `RedisBackendProvider` | Every entry **any process** wrote for the function, for the calling tenant |
 | `RedisBackend` passed as `backend=`, File, Memcached, CacheKit Cloud | Only entries **this process** wrote or read |
-| L1-only (`backend=None`) | No L2; this process's L1 only |
+| L1-only (`backend=None`) or `@cache.local()` | No L2; this process's L1 only |
 
 On a generated key with a non-default serializer, each entry this process wrote or read also takes with it the key a pre-v0.20.0 release wrote for the same arguments (see [the v0.20.0 key change](../serializers/README.md#breaking-change-in-v0200-the-key-carries-the-real-serializer)). The pre-v0.20.0 key of an entry only another process, or this one before a restart, saw is not reached, with one exception on tenant-scoped Redis: a v0.20.0 or later decorator on the default serializer for the same function, namespace, tenant and `integrity_checking` setting writes that same `:{integrity_flag}s` key and registers it, so the drain deletes it while the registration lasts (see **Set lifetime** below).
 

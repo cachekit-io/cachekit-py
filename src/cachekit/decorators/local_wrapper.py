@@ -100,12 +100,20 @@ def create_local_wrapper(
     flights = AsyncFlights()
     thread_flights = ThreadFlights()
 
+    # A no-args invalidate_cache() on a function that takes parameters means the whole function,
+    # as on @cache: its zero-argument key was never cached, and a custom key= could not build it.
+    func_has_params = bool(inspect.signature(func).parameters)
+
     # --- Shared helper functions (defined once, attached to either wrapper) ---
     # Each invalidation also forgets the key's call in flight: a read that starts after it never
     # joins a miss that started before it.
 
     def invalidate_cache(*args: Any, **kw: Any) -> InvalidationOutcome:
-        """Remove a specific cached entry by regenerating its key. There is no L2: always NO_L2."""
+        """Remove the cached entry for these arguments, or every entry when a function that takes
+        parameters is called with none. There is no L2: always NO_L2."""
+        if not args and not kw and func_has_params:
+            cache_clear()
+            return InvalidationOutcome.NO_L2
         cache_key = _make_key(args, kw)
         flights.forget([cache_key])
         thread_flights.forget([cache_key])
