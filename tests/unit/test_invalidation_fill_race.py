@@ -364,8 +364,15 @@ def test_backed_single_key_invalidation_drops_another_key_only_in_its_stripe(str
     stripes = {int(stored.rsplit(":k", 1)[1]): hash(stored) & wrapper._EPOCH_STRIPE_MASK for stored in backend.store}
     get.cache_clear()
     backend.store.clear()
-    k = 0
-    j = next(x for x in stripes if x != k and (stripes[x] == stripes[k]) is (stripe == "same"))
+    # str hashes vary per process, so pick the pair from the keys' groups: 256 keys in 64 stripes put at
+    # least two keys in one stripe, and in at least two stripes.
+    by_stripe: dict[int, list[int]] = {}
+    for x, s in stripes.items():
+        by_stripe.setdefault(s, []).append(x)
+    if stripe == "same":
+        k, j = next(xs[:2] for xs in by_stripe.values() if len(xs) >= 2)
+    else:
+        k, j = (xs[0] for xs in list(by_stripe.values())[:2])
 
     assert _race_sync(lambda: get(j), source, lambda: get.invalidate_cache(k)) == "old"
     landed = any(stored.endswith(f":k{j}") for stored in backend.store)

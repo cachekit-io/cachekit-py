@@ -2446,22 +2446,23 @@ def create_cache_wrapper(
         return False, (None, None)
 
     def _skip_writes(
-        result: Any, args: tuple[Any, ...], kwargs: dict[str, Any], cache_key: str, probe_cycle: int
+        result: Any, args: tuple[Any, ...], kwargs: dict[str, Any], cache_key: str, probe_cycle: int, *, may_stream: bool
     ) -> tuple[Any, bytes | None]:
         """End a backed miss whose key an invalidation moved since its L2 read (_moved_since): the result may
         predate the invalidation, so neither write runs. The callers that joined the trip started before
-        the invalidation returned, so they still get its envelope, serialized as the store would have
-        serialized it: an interop or keyring error still fails loud, and any other failure, like a value
-        the store would have streamed, leaves no envelope and each joined caller takes its own trip. The
-        L2 read and the lock that brought the trip here succeeded, so the breaker records a success."""
+        the invalidation returned, so they still get its envelope, serialized and handled as the store
+        would have: an interop or keyring error fails loud, and any other failure is logged and leaves no
+        envelope, as does a value the sync store may stream (may_stream), so each joined caller takes its
+        own trip. The L2 read and the lock that brought the trip here succeeded, so the breaker records a
+        success."""
         envelope: bytes | None = None
-        if not operation_handler.serialization_handler.supports_streaming_write():
+        if not (may_stream and operation_handler.serialization_handler.supports_streaming_write()):
             try:
                 envelope = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
             except (InteropError, KeyringConfigurationError):
                 raise
-            except Exception as e:
-                _logger.debug("Skipped fill not serialized for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+            except Exception as e:  # the store path's handling (CacheOperationHandler.store_result)
+                _logger.warning("Skipped fill not serialized for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
         features.record_success(probe_cycle)
         return result, envelope
 
@@ -2608,7 +2609,7 @@ def create_cache_wrapper(
             raise
 
         if epoch != _epoch_seq and _moved_since(cache_key, epoch):  # the first test inline: see _moved_since
-            return _skip_writes(result, args, kwargs, cache_key, probe_cycle)
+            return _skip_writes(result, args, kwargs, cache_key, probe_cycle, may_stream=_stale_ttl is None)
 
         # Serialize and cache the result. The `set` sample times serialization plus the store,
         # the same span as the async write: store_result serializes, and the clock stops when it
@@ -3167,7 +3168,7 @@ def create_cache_wrapper(
                         func_error = e
                     else:
                         if epoch != _epoch_seq and _moved_since(cache_key, epoch):
-                            return _skip_writes(result, args, kwargs, cache_key, probe_cycle)
+                            return _skip_writes(result, args, kwargs, cache_key, probe_cycle, may_stream=False)
                         # Serialize and cache the result
                         serialized_data = None  # stays None if serialization fails: no envelope to share
                         # `set` times serialization plus the store, as the sync write does: not the
@@ -3290,7 +3291,7 @@ def create_cache_wrapper(
             raise
 
         if epoch != _epoch_seq and _moved_since(cache_key, epoch):
-            return _skip_writes(result, args, kwargs, cache_key, probe_cycle)
+            return _skip_writes(result, args, kwargs, cache_key, probe_cycle, may_stream=False)
 
         # Serialize and cache the result
         serialized_data = None
