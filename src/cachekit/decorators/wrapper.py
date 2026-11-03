@@ -58,7 +58,7 @@ from ..interop import (
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
-from ..object_cache import EpochStripes, ObjectCache
+from ..object_cache import ObjectCache, ScopedEpochStripes
 from ..reliability import CircuitBreakerConfig
 from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
@@ -1210,23 +1210,27 @@ def create_cache_wrapper(
 
         task.add_done_callback(_done)
 
-    # Backed mode's invalidation epochs (EpochStripes); an L1-only function's ObjectCache keeps its own.
-    # Every move of the epochs, the first step of every invalidation (_delete_then_forget), stamps its
-    # keys' stripes, or every stripe for the whole function. A fill reads _stripes.seq before its first
-    # source read, the L2 read or the function, and skips each write it makes once its key's stripe was
-    # stamped since: the L2 write if the stamp came before the write was sent (checked after the value
-    # is serialized), the L1 put if it came before the put. An invalidation moves the epochs
-    # again between its L2 deletes and its L1 ones: a read that starts between the first move and the L2
-    # delete can fetch the old entry, and the second move skips its backfill, or the L1 delete after it
-    # removes the copy. A counter per key would outlive its key, and one per function would make every
-    # single-key invalidation skip the L2 write of every overlapping fill, which every process then
-    # misses. The stripes are not scoped by tenant: one tenant's invalidation also skips the writes in
-    # flight of other tenants' keys in the stripes it moves (all of them, for the whole function).
-    _stripes = EpochStripes()
+    # Backed mode's invalidation epochs (ScopedEpochStripes); an L1-only function's ObjectCache keeps its
+    # own. Every move of the epochs, the first step of every invalidation (_delete_then_forget), stamps its
+    # keys' stripes, or every stripe for the whole function, and the same keys' stripes in the calling L2
+    # scope (_l2_scope), or that scope's stripe. A fill reads _stripes.seq before its first source read,
+    # the L2 read or the function, and skips each write it makes once a stripe it reads was stamped since:
+    # the L2 write if a stamp in its own scope came before the write was sent (checked after the value is
+    # serialized; a streamed value serializes inside its stream, so it is checked before the stream
+    # starts), the L1 put if any stamp on its key's stripe came before the put. The L2 gate is scoped
+    # because L2 is per tenant: another tenant's invalidation deletes none of this one's entries, so it
+    # skips this one's L2 write only when the two share a stripe. L1 is not per tenant, so its gate is
+    # function-wide. An invalidation moves the epochs again between its L2 deletes and its L1 ones: a read
+    # that starts between the first move and the L2 delete can fetch the old entry, and the second move
+    # skips its backfill, or the L1 delete after it removes the copy. A counter per key, or per tenant,
+    # would outlive its key or tenant; one per function would make every single-key invalidation skip the
+    # L2 write of every overlapping fill, which every process then misses. All three arrays are fixed size.
+    _stripes = ScopedEpochStripes(_l2_scope)
     _epoch_locks: dict[int, threading.Lock] = {}  # one per process: see invalidation._pid_lock
     # The L2 checks read the stripes without the lock, so one racing a move can miss it and let the
     # write through: that write is one already in flight (see "Writes in flight"). _put_l1 checks under it.
     _moved_since = _stripes.moved_since
+    _moved_in_scope = _stripes.moved_in_scope
 
     def _move_epochs(cache_keys: list[str] | None) -> None:
         """Stamp these keys' stripes, or every stripe for None. A backed function's only: an L1-only
@@ -1498,7 +1502,7 @@ def create_cache_wrapper(
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
         )
-        if _moved_since(cache_key, epoch):
+        if _moved_in_scope(cache_key, epoch):
             return  # invalidated while it ran: the result may predate it, so neither write runs
         stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
             cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
@@ -1542,7 +1546,7 @@ def create_cache_wrapper(
             serialized_data = operation_handler.serialization_handler.serialize_data(
                 result, call_args, call_kwargs, cache_key=cache_key
             )
-            if _moved_since(cache_key, epoch):
+            if _moved_in_scope(cache_key, epoch):
                 return  # invalidated while it ran: neither write runs
             stored = operation_handler.cache_handler.set(  # type: ignore[attr-defined]
                 cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
@@ -2589,8 +2593,9 @@ def create_cache_wrapper(
                 defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
                 registry_id=_registry_id if trackable else None,
                 on_track_error=_warn_track_failure,
-                # Checked at the write point, after serialization: an invalidation since the L2 read means the
-                # result may predate it, so nothing is written (see _stripes).
+                # Checked at the write point, after serialization (a streamed value: before its stream starts):
+                # an invalidation in this scope since the L2 read means the result may predate it, so nothing
+                # is written (see _stripes).
                 epochs=_stripes,
                 epoch=epoch,
             )
@@ -3140,7 +3145,7 @@ def create_cache_wrapper(
                             serialized_data = operation_handler.serialization_handler.serialize_data(
                                 result, args, kwargs, cache_key=cache_key
                             )
-                            if _moved_since(cache_key, epoch):
+                            if _moved_in_scope(cache_key, epoch):
                                 features.record_success(probe_cycle)  # writes nothing: see _backed_miss_sync
                                 return result, serialized_data
 
@@ -3260,7 +3265,7 @@ def create_cache_wrapper(
         set_start = time.perf_counter()  # `set` times serialization plus the store (see the locked write)
         try:
             serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
-            if _moved_since(cache_key, epoch):
+            if _moved_in_scope(cache_key, epoch):
                 features.record_success(probe_cycle)  # writes nothing: see _backed_miss_sync
                 return result, serialized_data
 
