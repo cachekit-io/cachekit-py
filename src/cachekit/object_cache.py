@@ -282,6 +282,16 @@ class ObjectCache:
     replacement can never resurrect stale data — without retaining any per-key
     state for removed entries.
 
+    Invalidation epoch: ``delete`` and ``clear`` move a counter,
+    ``invalidation_epoch``, under the lock that ``put`` takes too. A fill (a
+    miss that computes a value and stores it) reads the epoch before it reads
+    its source and passes it to ``put``, which drops the store if the epoch has
+    moved since. So once a ``delete`` or ``clear`` has returned, no fill that
+    read its source before it stores what it read. The counter is one per
+    cache, not one per key: a ``delete`` of any key drops every fill that
+    overlaps it, which stores nothing and leaves the next call to compute again.
+    No per-key state outlives its key.
+
     Thread safety: RLock on every public method so callers need no external
     synchronisation.
 
@@ -382,12 +392,14 @@ class ObjectCache:
         # Every critical section binds this once: `s = self._state; with s.lock: ...`. Reading
         # self._state again inside one would mix states if the at-fork hook replaced it meanwhile.
         self._state = _ObjectCacheState(memo)
-        # Kept outside _state, so the at-fork hook keeps them: lifetime stats, and the generation
-        # counter stamped onto every stored entry. A generation is never reused across states, so a
-        # refresh started before a swap cannot land on an entry stored after it.
+        # Kept outside _state, so the at-fork hook keeps them: lifetime stats, the generation counter
+        # stamped onto every stored entry, and the invalidation epoch. A generation is never reused
+        # across states, so a refresh started before a swap cannot land on an entry stored after it.
+        # The epoch moves only under the lock, in delete() and clear().
         self._hits = 0
         self._misses = 0
         self._generation = 0
+        self._invalidations = 0
         _caches.add(self)
 
     # ------------------------------------------------------------------
@@ -624,7 +636,16 @@ class ObjectCache:
             entry = s.store[key]
             entry.refresh_failed_at = _monotonic()
 
-    def put(self, key: str, value: Any, ttl: int, memo_key: Hashable | None = None) -> None:
+    @property
+    def invalidation_epoch(self) -> int:
+        """How many ``delete`` and ``clear`` calls have run: a fill reads it before its source, for ``put``.
+
+        Read without the lock. A read that races a ``delete`` or ``clear`` returns the count before
+        or after it, and both are safe: the earlier one only makes ``put`` drop the store.
+        """
+        return self._invalidations
+
+    def put(self, key: str, value: Any, ttl: int, memo_key: Hashable | None = None, epoch: int | None = None) -> None:
         """Store a value in the cache.
 
         When a bound is exceeded:
@@ -642,6 +663,9 @@ class ObjectCache:
             value: Python object to store (no serialisation performed).
             ttl: Time-to-live in seconds (must be >= 1).
             memo_key: As ``get`` takes it.
+            epoch: The ``invalidation_epoch`` the caller read before it read the value's source. If a
+                ``delete`` or ``clear`` has moved it since, the value may predate that invalidation, and
+                nothing is stored. None stores unconditionally.
 
         Raises:
             ValueError: If ttl is less than 1.
@@ -653,10 +677,13 @@ class ObjectCache:
         s = self._state
         if self._max_size_bytes is not None and size > self._max_size_bytes:
             with s.lock:
-                s.remove(key)
+                if epoch is None or epoch == self._invalidations:  # else the entry is newer than the value
+                    s.remove(key)
             return
 
         with s.lock:
+            if epoch is not None and epoch != self._invalidations:
+                return  # read before an invalidation that has returned since: storing it would undo that
             # Replacing? Remove through remove() so byte accounting, any in-flight
             # refresh marker and the memo stay consistent. The fresh generation
             # below makes an older in-flight refresh unable to overwrite this newer value.
@@ -685,7 +712,9 @@ class ObjectCache:
         """Remove a single entry from the cache.
 
         An in-flight SWR refresh cannot resurrect it: the refresh only lands
-        on the exact entry (generation) it was started against.
+        on the exact entry (generation) it was started against. A fill in flight
+        cannot either: this moves the invalidation epoch, also when the key holds
+        no entry, as it does while its fill runs.
 
         Args:
             key: Cache key to remove.
@@ -695,6 +724,7 @@ class ObjectCache:
         """
         s = self._state
         with s.lock:
+            self._invalidations += 1
             if key in s.store:
                 s.remove(key)
                 return True
@@ -705,10 +735,12 @@ class ObjectCache:
 
         Hit/miss counters are NOT reset; they represent lifetime statistics.
         In-flight SWR refreshes cannot resurrect cleared entries — their
-        target entries no longer exist.
+        target entries no longer exist. Fills in flight store nothing: this moves
+        the invalidation epoch.
         """
         s = self._state
         with s.lock:
+            self._invalidations += 1
             s.kill_all()
             s.store.clear()
             s.size_bytes = 0

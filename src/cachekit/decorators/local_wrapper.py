@@ -148,8 +148,9 @@ def create_local_wrapper(
 
         async def _fill_async(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)
+            epoch = object_cache.invalidation_epoch  # before the call: see ObjectCache, "Invalidation epoch"
             result = await func(*args, **kw)
-            object_cache.put(cache_key, result, ttl)
+            object_cache.put(cache_key, result, ttl, epoch=epoch)
             return result
 
         @functools.wraps(func)
@@ -168,8 +169,9 @@ def create_local_wrapper(
 
         def _fill(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)
+            epoch = object_cache.invalidation_epoch  # before the call: see ObjectCache, "Invalidation epoch"
             result = func(*args, **kw)
-            object_cache.put(cache_key, result, ttl)
+            object_cache.put(cache_key, result, ttl, epoch=epoch)
             return result
 
         @functools.wraps(func)
