@@ -15,7 +15,7 @@ import sys
 import threading
 import weakref
 from collections import OrderedDict, deque
-from collections.abc import Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -34,6 +34,11 @@ EPOCH_STRIPES = 64
 def epoch_stripe(key: str) -> int:
     """The invalidation epoch stripe of key: its hash, which a str caches, masked to EPOCH_STRIPES."""
     return hash(key) & (EPOCH_STRIPES - 1)
+
+
+def scoped_epoch_stripe(scope: str, key: str) -> int:
+    """The stripe of key in scope (ScopedEpochStripes): the hash of the pair, masked to EPOCH_STRIPES."""
+    return hash((scope, key)) & (EPOCH_STRIPES - 1)
 
 
 class EpochStripes:
@@ -65,6 +70,44 @@ class EpochStripes:
     def moved_since(self, key: str, epoch: int) -> bool:
         """Whether a stamp on key's stripe ran after a fill read ``seq`` as epoch."""
         return epoch != self.seq and self._stripes[epoch_stripe(key)] > epoch
+
+
+class ScopedEpochStripes(EpochStripes):
+    """EpochStripes plus a second gate scoped by the L2 scope ``scope()`` reads in the calling context.
+
+    A backed function's L2 is per tenant, so its L2 write asks ``moved_in_scope``: a stamp of keys also
+    moves the stripe of each (scope, key), and a stamp of every key the stripe of its scope. Its L1 put,
+    which is not per tenant, still asks ``moved_since``. The arrays are fixed: two tenants, or two keys,
+    that share a stripe still skip each other's writes, about one pair in EPOCH_STRIPES.
+    """
+
+    __slots__ = ("_scope", "_keys", "_scopes")
+
+    def __init__(self, scope: Callable[[], str]) -> None:
+        super().__init__()
+        self._scope = scope
+        self._keys = [0] * EPOCH_STRIPES  # per stripe of (scope, key)
+        self._scopes = [0] * EPOCH_STRIPES  # per stripe of scope: the whole-function stamps
+
+    def stamp(self, keys: Iterable[str] | None) -> None:
+        """Stamp as EpochStripes does, and these keys' stripes in the calling scope, or its scope's stripe."""
+        scope = self._scope()
+        seq = self.seq + 1
+        if keys is None:
+            self._stripes[:] = [seq] * EPOCH_STRIPES
+            self._scopes[epoch_stripe(scope)] = seq
+        else:
+            for key in keys:
+                self._stripes[epoch_stripe(key)] = seq
+                self._keys[scoped_epoch_stripe(scope, key)] = seq
+        self.seq = seq  # last, as in EpochStripes.stamp
+
+    def moved_in_scope(self, key: str, epoch: int) -> bool:
+        """Whether a stamp in the calling scope on key's stripe, or on the whole scope, ran after epoch."""
+        if epoch == self.seq:
+            return False
+        scope = self._scope()
+        return self._scopes[epoch_stripe(scope)] > epoch or self._keys[scoped_epoch_stripe(scope, key)] > epoch
 
 
 def _estimate_object_size(obj: Any) -> int:

@@ -9,6 +9,7 @@ free-threaded build too.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import sys
 import threading
@@ -23,7 +24,8 @@ import pytest
 from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.decorators.single_flight import ThreadFlights
-from cachekit.object_cache import EPOCH_STRIPES, ObjectCache, epoch_stripe
+from cachekit.object_cache import EPOCH_STRIPES, ObjectCache, epoch_stripe, scoped_epoch_stripe
+from tests.unit.test_key_registry import _closure_cell
 
 pytestmark = pytest.mark.unit
 
@@ -176,13 +178,13 @@ async def test_local_async_fill_after_invalidation_is_not_stored(how: str) -> No
     assert source.reads == 2
 
 
-def _stripe_pairs(keys: list[str]) -> tuple[tuple[str, str], tuple[str, str]]:
+def _stripe_pairs(keys: list[str], stripe: Callable[[str], int] = epoch_stripe) -> tuple[tuple[str, str], tuple[str, str]]:
     """Two pairs of keys: one sharing an epoch stripe, one not. str hashes vary per process, so the keys are
     grouped by stripe: 4 * EPOCH_STRIPES keys put at least two in one stripe, and use at least two stripes."""
     assert len(keys) >= 4 * EPOCH_STRIPES
     by_stripe: dict[int, list[str]] = {}
     for key in keys:
-        by_stripe.setdefault(epoch_stripe(key), []).append(key)
+        by_stripe.setdefault(stripe(key), []).append(key)
     same = next(group[:2] for group in by_stripe.values() if len(group) >= 2)
     first, second = list(by_stripe.values())[:2]
     return (same[0], same[1]), (first[0], second[0])
@@ -372,7 +374,7 @@ def test_backed_single_key_invalidation_drops_another_key_only_in_its_stripe(str
     # Learn the stripe of each argument's key from the keys the backend stores.
     for x in range(4 * EPOCH_STRIPES):
         get(x)
-    same, other = _stripe_pairs(list(backend.store))
+    same, other = _stripe_pairs(list(backend.store), lambda key: scoped_epoch_stripe("", key))  # the L2 gate's stripe
     k, j = (int(stored.rsplit(":k", 1)[1]) for stored in (same if stripe == "same" else other))
     get.cache_clear()
     backend.store.clear()
@@ -495,6 +497,26 @@ def joined(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
     return event
 
 
+def _race_joined(call: Callable[[], Any], source: _Source, joined: threading.Event, invalidate: Callable[[], Any]) -> list[Any]:
+    """Hold call() after its source read, start a second call() and wait until it joins the first, change
+    the source, run invalidate() to completion, then release both. Their results, in the order they returned."""
+    source.hold_next()
+    out: list[Any] = []
+    first = threading.Thread(target=lambda: out.append(call()))
+    first.start()
+    assert source.entered.wait(_WAIT)
+    second = threading.Thread(target=lambda: out.append(call()))
+    second.start()
+    assert joined.wait(_WAIT)
+    source.value = "new"
+    invalidate()
+    source.release.set()
+    for t in (first, second):
+        t.join(_WAIT)
+        assert not t.is_alive()
+    return out
+
+
 def _arrow_value(value: Any) -> str:
     """The one cell of an arrow result: a Table for the caller that ran, a decoded DataFrame otherwise."""
     first = value["v"][0]
@@ -526,21 +548,7 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(joined: threa
     def get(x: int) -> Any:
         return wrap(source.read())
 
-    source.hold_next()
-    out: list[str] = []
-    first = threading.Thread(target=lambda: out.append(unwrap(get(1))))
-    first.start()
-    assert source.entered.wait(_WAIT)
-    second = threading.Thread(target=lambda: out.append(unwrap(get(1))))
-    second.start()
-    assert joined.wait(_WAIT)
-    source.value = "new"
-    get.invalidate_cache(1)
-    source.release.set()
-    for t in (first, second):
-        t.join(_WAIT)
-        assert not t.is_alive()
-    assert out == ["old", "old"]
+    assert _race_joined(lambda: unwrap(get(1)), source, joined, lambda: get.invalidate_cache(1)) == ["old", "old"]
     assert source.reads == 1
     assert backend.store == {}
     assert unwrap(get(1)) == "new"
@@ -655,37 +663,46 @@ _WRITE_POINTS = {
 }
 
 
-@pytest.mark.parametrize("path", sorted(_WRITE_POINTS))
-def test_backed_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
-    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2
-    write: every buffered write site checks after serialize_data, not before it. The async calls run on an
-    event loop in the caller's thread, which hold_serialize blocks."""
-    backend_cls, is_async, swr = _WRITE_POINTS[path]
-    source, backend = _Source(), backend_cls()
+def _write_point(
+    path: str, source: _Source, backend: DictBackend, *, invalidate_all: bool = False
+) -> tuple[Any, Callable[[], str], Callable[[], Any]]:
+    """For one _WRITE_POINTS path: a function on backend that reads source; a call of it with 1, which also
+    waits out a stale hit's revalidation; and its invalidation of that key, or of every entry. The async
+    calls run on an event loop of their own in the calling thread."""
+    _, is_async, swr = _WRITE_POINTS[path]
     ttls: dict[str, Any] = {"ttl": 60, "stale_ttl": 120} if swr else {"ttl": 60}
-
-    if is_async:
-
-        @cache(backend=backend, namespace=_ns(), **ttls)
-        async def aget(x: int) -> str:
-            return source.read()
-
-        async def call_and_settle() -> str:
-            value = await aget(1)
-            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            await asyncio.gather(*pending)  # a stale hit's revalidation, before the loop closes
-            return value
-
-        fn: Any = aget
-        call: Callable[[], str] = lambda: asyncio.run(call_and_settle())  # noqa: E731
-        invalidate: Callable[[], Any] = lambda: asyncio.run(aget.ainvalidate_cache(1))  # noqa: E731
-    else:
+    if not is_async:
 
         @cache(backend=backend, namespace=_ns(), **ttls)
         def get(x: int) -> str:
             return source.read()
 
-        fn, call, invalidate = get, lambda: get(1), lambda: get.invalidate_cache(1)
+        return get, lambda: get(1), (get.invalidate_cache if invalidate_all else lambda: get.invalidate_cache(1))
+
+    @cache(backend=backend, namespace=_ns(), **ttls)
+    async def aget(x: int) -> str:
+        return source.read()
+
+    async def call_and_settle() -> str:
+        value = await aget(1)
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        await asyncio.gather(*pending)  # a stale hit's revalidation, before the loop closes
+        return value
+
+    def invalidate() -> Any:
+        return asyncio.run(aget.ainvalidate_cache() if invalidate_all else aget.ainvalidate_cache(1))
+
+    return aget, lambda: asyncio.run(call_and_settle()), invalidate
+
+
+@pytest.mark.parametrize("path", sorted(_WRITE_POINTS))
+def test_backed_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
+    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2
+    write: every buffered write site checks after serialize_data, not before it. The async calls run on an
+    event loop in the caller's thread, which hold_serialize blocks."""
+    backend_cls, _, swr = _WRITE_POINTS[path]
+    source, backend = _Source(), backend_cls()
+    fn, call, invalidate = _write_point(path, source, backend)
 
     if swr:
         assert call() == "old"
@@ -721,22 +738,139 @@ def test_streamed_write_is_skipped_when_invalidated_before_its_stream(tmp_path: 
     def get(x: int) -> Any:
         return pa.table({"v": [source.read()]})
 
-    source.hold_next()
-    out: list[str] = []
-    first = threading.Thread(target=lambda: out.append(_arrow_value(get(1))))
-    first.start()
-    assert source.entered.wait(_WAIT)
-    second = threading.Thread(target=lambda: out.append(_arrow_value(get(1))))
-    second.start()
-    assert joined.wait(_WAIT)
-    source.value = "new"
-    get.invalidate_cache(1)
-    source.release.set()
-    for t in (first, second):
-        t.join(_WAIT)
-        assert not t.is_alive()
+    out = _race_joined(lambda: _arrow_value(get(1)), source, joined, lambda: get.invalidate_cache(1))
     assert sorted(out) == ["new", "old"]  # the joined caller took its own trip
     assert source.reads == 2
     assert CountingFileBackend.streams == 1  # only that trip streamed
     assert _arrow_value(get(1)) == "new"
     assert source.reads == 2
+
+
+# ── Tenants: the L2 gate is scoped by the backend's key prefix, the L1 gate is not ──────────────────
+
+_tenant: contextvars.ContextVar[str] = contextvars.ContextVar("tenant", default="a")
+
+
+class _TenantScoped(DictBackend):
+    """Prefixes every key with the calling context's tenant, as the tenant-scoped backend does; counts L2 reads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{_tenant.get()}:"
+
+    def _read(self, key: str) -> bytes | None:
+        self.reads += 1
+        return super()._read(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+        super().set(self.key_prefix + key, value, ttl, stale_ttl)
+
+    def delete(self, key: str) -> bool:
+        return super().delete(self.key_prefix + key)
+
+    def exists(self, key: str) -> bool:
+        return super().exists(self.key_prefix + key)
+
+
+class _TenantLockingBackend(_TenantScoped, LockingBackend):
+    pass
+
+
+class _TenantSWRBackend(_TenantScoped, SWRBackend):
+    pass
+
+
+_TENANT_BACKENDS: dict[type[DictBackend], type[_TenantScoped]] = {
+    DictBackend: _TenantScoped,
+    LockingBackend: _TenantLockingBackend,
+    SWRBackend: _TenantSWRBackend,
+}
+
+
+def _as(tenant: str, call: Callable[[], Any]) -> Callable[[], Any]:
+    """call, run in tenant's scope."""
+
+    def run() -> Any:
+        token = _tenant.set(tenant)
+        try:
+            return call()
+        finally:
+            _tenant.reset(token)
+
+    return run
+
+
+def _other_tenant(fn: Any, key: str, invalidate: Callable[[], Any]) -> str:
+    """A tenant whose L2 stripes for key are none of those tenant a's invalidate() stamps. str hashes vary per
+    process, so this runs invalidate() once, before any fill starts, and reads the stripes it stamped, its
+    twin key's included."""
+    stripes = _closure_cell(fn, "_stripes").cell_contents
+    before = stripes.seq
+    invalidate()
+    keys = {i for i, seq in enumerate(stripes._keys) if seq > before}
+    scopes = {i for i, seq in enumerate(stripes._scopes) if seq > before}
+    return next(
+        tenant
+        for tenant in (f"b{i}" for i in itertools.count())
+        if epoch_stripe(f"t:{tenant}:") not in scopes and scoped_epoch_stripe(f"t:{tenant}:", key) not in keys
+    )
+
+
+@pytest.mark.parametrize("whose", ["other", "same"])
+@pytest.mark.parametrize("how", ["key", "all"])
+@pytest.mark.parametrize("path", sorted(_WRITE_POINTS))
+def test_tenant_invalidation_skips_only_its_own_tenants_l2_write(
+    path: str, how: str, whose: str, hold_serialize: _Source
+) -> None:
+    """Tenant a's invalidation runs while a fill of the same key is held after its source read. Tenant a's
+    own fill writes nothing; another tenant's fill, in other L2 stripes, still writes its L2 entry, which a's
+    invalidation never deleted. Both skip the L1 put: L1 is not per tenant, so its gate stays function-wide."""
+    backend_cls, _, swr = _WRITE_POINTS[path]
+    source, backend = _Source(), _TENANT_BACKENDS[backend_cls]()
+    fn, call, invalidate = _write_point(path, source, backend, invalidate_all=how == "all")  # invalidate: tenant a
+
+    assert _as("probe", call)() == "old"  # learn the cache key
+    (stored,) = backend.store
+    key = stored.split(":", 2)[2]
+    filler = "a" if whose == "same" else _other_tenant(fn, key, invalidate)
+    backend.store.clear()
+    fn._cachekit_evict(None)
+    fill = _as(filler, call)
+    if swr:
+        assert fill() == "old"
+        fn._cachekit_evict(None)
+        backend.stale = True  # the next call is a stale hit, which revalidates in the background
+    sets = len(backend.sets)
+    hold_serialize.hold_next()
+    assert _race_sync(fill, source, invalidate, hold_serialize) == "old"
+    backend.stale = False
+    _await_threads("cachekit-swr-revalidate")
+
+    assert (len(backend.sets) > sets) is (whose == "other")
+    assert (f"t:{filler}:{key}" in backend.store) is (whose == "other")
+    reads = backend.reads
+    assert fill() == ("old" if whose == "other" else "new")  # from L2, or computed again
+    assert backend.reads > reads  # no L1 copy: the L1 put was skipped
+
+
+def test_scoped_epoch_state_does_not_grow_with_tenants() -> None:
+    """Invalidations under 1,000 tenants, of one key and of every entry, leave the epoch state's size as it was."""
+    backend = _TenantScoped()
+
+    @cache(backend=backend, ttl=60, namespace=_ns())
+    def get(x: int) -> int:
+        return x
+
+    stripes = _closure_cell(get, "_stripes").cell_contents
+    arrays = (stripes._stripes, stripes._keys, stripes._scopes)
+    sizes = [sys.getsizeof(array) for array in arrays]
+    for i in range(1_000):
+        _as(f"t{i}", lambda: (get(1), get.invalidate_cache(1), get.invalidate_cache()))()
+    assert not hasattr(stripes, "__dict__")
+    assert [len(array) for array in arrays] == [EPOCH_STRIPES] * 3
+    assert [sys.getsizeof(array) for array in arrays] == sizes
+    assert stripes.seq >= 2_000  # every invalidation moved the epochs
