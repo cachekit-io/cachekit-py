@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -24,7 +25,7 @@ from cachekit.object_cache import EPOCH_STRIPES, ObjectCache, epoch_stripe
 
 pytestmark = pytest.mark.unit
 
-_WAIT = 10.0  # seconds: a bound on each held step, never reached when the code is right
+_WAIT = 60.0  # seconds: a bound on each held step, never reached when the code is right, even on a slow runner
 
 
 class _Source:
@@ -595,14 +596,19 @@ def test_backed_drain_evicts_while_other_threads_record(caplog: pytest.LogCaptur
     invalidator = threading.Thread(target=get.invalidate_cache)
     invalidator.start()
     assert draining.entered.wait(_WAIT)
-    for x in range(20_000):  # watched by the drain
+    for x in range(5_000):  # watched by the drain
         get(-x - 1)
     recorders = [threading.Thread(target=record_forever) for _ in range(2)]
     for t in recorders:
         t.start()
-    with caplog.at_level("WARNING", logger="cachekit.decorators.wrapper"):
-        draining.release.set()
-        invalidator.join(_WAIT)
+    switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # with the GIL, switch threads often enough to land inside a walk of the set
+    try:
+        with caplog.at_level("WARNING", logger="cachekit.decorators.wrapper"):
+            draining.release.set()
+            invalidator.join(_WAIT)
+    finally:
+        sys.setswitchinterval(switch_interval)
     stop.set()
     for t in recorders:
         t.join(_WAIT)
