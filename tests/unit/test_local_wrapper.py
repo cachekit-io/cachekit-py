@@ -10,7 +10,7 @@ import warnings
 
 import pytest
 
-from cachekit import cache
+from cachekit import InvalidationOutcome, cache
 from cachekit.decorators.local_wrapper import create_local_wrapper
 
 
@@ -203,3 +203,83 @@ class TestLocalWrapperKeyGeneration:
         # Second call — cache hit, no error
         result2 = process({"a": 1, "b": 2})
         assert result2 == 2
+
+
+@pytest.mark.unit
+class TestLocalWrapperNoArgsInvalidation:
+    """A no-args invalidate_cache() on a function that takes parameters clears every entry, as on @cache."""
+
+    def test_no_args_invalidate_clears_every_entry(self) -> None:
+        calls: list[int] = []
+
+        @cache.local()
+        def fn(x: int) -> int:
+            calls.append(x)
+            return x
+
+        fn(1), fn(2)
+        assert fn.invalidate_cache() is InvalidationOutcome.NO_L2
+        fn(1), fn(2)
+        assert calls == [1, 2, 1, 2]
+
+    async def test_no_args_ainvalidate_clears_every_entry(self) -> None:
+        calls: list[int] = []
+
+        @cache.local()
+        async def afn(x: int) -> int:
+            calls.append(x)
+            return x
+
+        await afn(1), await afn(2)
+        assert await afn.ainvalidate_cache() is InvalidationOutcome.NO_L2
+        await afn(1), await afn(2)
+        assert calls == [1, 2, 1, 2]
+
+    def test_no_args_invalidate_with_custom_key_does_not_call_it(self) -> None:
+        calls: list[int] = []
+
+        @cache.local(key=lambda user_id: f"user:{user_id}")
+        def fn(user_id: int) -> int:
+            calls.append(user_id)
+            return user_id
+
+        fn(1), fn(2)
+        assert fn.invalidate_cache() is InvalidationOutcome.NO_L2
+        fn(1), fn(2)
+        assert calls == [1, 2, 1, 2]
+
+    def test_all_defaulted_params_follow_the_whole_function_rule(self) -> None:
+        calls: list[int] = []
+
+        @cache.local()
+        def fn(x: int = 1) -> int:
+            calls.append(x)
+            return x
+
+        fn(), fn(2)
+        assert fn.invalidate_cache() is InvalidationOutcome.NO_L2
+        fn(), fn(2)
+        assert calls == [1, 2, 1, 2]
+
+    def test_zero_param_function_removes_its_one_entry(self) -> None:
+        calls = 0
+
+        @cache.local()
+        def fn() -> int:
+            nonlocal calls
+            calls += 1
+            return calls
+
+        assert fn() == 1
+        assert fn.invalidate_cache() is InvalidationOutcome.NO_L2
+        assert fn() == 2
+        assert fn() == 2
+
+    def test_callable_without_signature_still_caches_and_clears(self) -> None:
+        cached_max = cache.local()(max)  # inspect.signature(max) raises ValueError
+
+        assert cached_max(3, 7) == 7
+        assert cached_max(3, 7) == 7
+        assert cached_max.cache_info().hits == 1
+        assert cached_max.invalidate_cache() is InvalidationOutcome.NO_L2
+        assert cached_max.cache_info().currsize == 0

@@ -117,7 +117,7 @@ _ASYNC_INVALIDATIONS = {
     "ainvalidate_all": lambda fn: fn.ainvalidate_cache(),
     "ainvalidate_key": lambda fn: fn.ainvalidate_cache(1),
 }
-_LOCAL_INVALIDATIONS = ("cache_clear", "invalidate_key")
+_LOCAL_INVALIDATIONS = ("cache_clear", "invalidate_all", "invalidate_key")
 
 
 @pytest.mark.parametrize("how", sorted(_SYNC_INVALIDATIONS))

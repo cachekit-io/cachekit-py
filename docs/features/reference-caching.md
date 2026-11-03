@@ -200,6 +200,12 @@ assert get_client.invalidate_cache("key1") is InvalidationOutcome.NO_L2
 assert get_client.cache_info().currsize == 0
 
 get_client("key2")
+get_client("key3")
+# No arguments on a function that takes parameters: remove every entry, still NO_L2
+assert get_client.invalidate_cache() is InvalidationOutcome.NO_L2
+assert get_client.cache_info().currsize == 0
+
+get_client("key2")
 get_client.cache_clear()  # Remove all entries
 assert get_client.cache_info().currsize == 0
 
