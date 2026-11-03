@@ -15,6 +15,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -698,7 +699,7 @@ def test_backed_write_is_checked_after_serialization(path: str, hold_serialize: 
     assert call() == "new"
 
 
-def test_streamed_write_is_skipped_when_invalidated_before_its_stream(tmp_path: Any, joined: threading.Event) -> None:
+def test_streamed_write_is_skipped_when_invalidated_before_its_stream(tmp_path: Path, joined: threading.Event) -> None:
     """A streamed value serializes inside its stream, so the check runs before the stream starts. A fill
     invalidated before then streams nothing and has no envelope to share: the caller that joined it takes
     its own trip, which streams the value read after the invalidation."""
