@@ -25,6 +25,7 @@ from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.decorators.single_flight import ThreadFlights
 from cachekit.object_cache import EPOCH_STRIPES, ObjectCache, epoch_stripe, scoped_epoch_stripe
+from tests.unit.test_key_registry import _closure_cell
 
 pytestmark = pytest.mark.unit
 
@@ -662,37 +663,46 @@ _WRITE_POINTS = {
 }
 
 
-@pytest.mark.parametrize("path", sorted(_WRITE_POINTS))
-def test_backed_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
-    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2
-    write: every buffered write site checks after serialize_data, not before it. The async calls run on an
-    event loop in the caller's thread, which hold_serialize blocks."""
-    backend_cls, is_async, swr = _WRITE_POINTS[path]
-    source, backend = _Source(), backend_cls()
+def _write_point(
+    path: str, source: _Source, backend: DictBackend, *, invalidate_all: bool = False
+) -> tuple[Any, Callable[[], str], Callable[[], Any]]:
+    """For one _WRITE_POINTS path: a function on backend that reads source; a call of it with 1, which also
+    waits out a stale hit's revalidation; and its invalidation of that key, or of every entry. The async
+    calls run on an event loop of their own in the calling thread."""
+    _, is_async, swr = _WRITE_POINTS[path]
     ttls: dict[str, Any] = {"ttl": 60, "stale_ttl": 120} if swr else {"ttl": 60}
-
-    if is_async:
-
-        @cache(backend=backend, namespace=_ns(), **ttls)
-        async def aget(x: int) -> str:
-            return source.read()
-
-        async def call_and_settle() -> str:
-            value = await aget(1)
-            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            await asyncio.gather(*pending)  # a stale hit's revalidation, before the loop closes
-            return value
-
-        fn: Any = aget
-        call: Callable[[], str] = lambda: asyncio.run(call_and_settle())  # noqa: E731
-        invalidate: Callable[[], Any] = lambda: asyncio.run(aget.ainvalidate_cache(1))  # noqa: E731
-    else:
+    if not is_async:
 
         @cache(backend=backend, namespace=_ns(), **ttls)
         def get(x: int) -> str:
             return source.read()
 
-        fn, call, invalidate = get, lambda: get(1), lambda: get.invalidate_cache(1)
+        return get, lambda: get(1), (get.invalidate_cache if invalidate_all else lambda: get.invalidate_cache(1))
+
+    @cache(backend=backend, namespace=_ns(), **ttls)
+    async def aget(x: int) -> str:
+        return source.read()
+
+    async def call_and_settle() -> str:
+        value = await aget(1)
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        await asyncio.gather(*pending)  # a stale hit's revalidation, before the loop closes
+        return value
+
+    def invalidate() -> Any:
+        return asyncio.run(aget.ainvalidate_cache() if invalidate_all else aget.ainvalidate_cache(1))
+
+    return aget, lambda: asyncio.run(call_and_settle()), invalidate
+
+
+@pytest.mark.parametrize("path", sorted(_WRITE_POINTS))
+def test_backed_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
+    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2
+    write: every buffered write site checks after serialize_data, not before it. The async calls run on an
+    event loop in the caller's thread, which hold_serialize blocks."""
+    backend_cls, _, swr = _WRITE_POINTS[path]
+    source, backend = _Source(), backend_cls()
+    fn, call, invalidate = _write_point(path, source, backend)
 
     if swr:
         assert call() == "old"
@@ -796,9 +806,8 @@ def _as(tenant: str, call: Callable[[], Any]) -> Callable[[], Any]:
 
 def _other_tenant(fn: Any, key: str, invalidate: Callable[[], Any]) -> str:
     """A tenant whose L2 stripes for key are none of those tenant a's invalidate() stamps. str hashes vary per
-    process, so the stripes it stamps, its twin key's included, are read from a dry run."""
-    from tests.unit.test_key_registry import _closure_cell
-
+    process, so this runs invalidate() once, before any fill starts, and reads the stripes it stamped, its
+    twin key's included."""
     stripes = _closure_cell(fn, "_stripes").cell_contents
     before = stripes.seq
     invalidate()
@@ -820,35 +829,9 @@ def test_tenant_invalidation_skips_only_its_own_tenants_l2_write(
     """Tenant a's invalidation runs while a fill of the same key is held after its source read. Tenant a's
     own fill writes nothing; another tenant's fill, in other L2 stripes, still writes its L2 entry, which a's
     invalidation never deleted. Both skip the L1 put: L1 is not per tenant, so its gate stays function-wide."""
-    backend_cls, is_async, swr = _WRITE_POINTS[path]
+    backend_cls, _, swr = _WRITE_POINTS[path]
     source, backend = _Source(), _TENANT_BACKENDS[backend_cls]()
-    ttls: dict[str, Any] = {"ttl": 60, "stale_ttl": 120} if swr else {"ttl": 60}
-
-    if is_async:
-
-        @cache(backend=backend, namespace=_ns(), **ttls)
-        async def aget(x: int) -> str:
-            return source.read()
-
-        async def call_and_settle() -> str:
-            value = await aget(1)
-            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            await asyncio.gather(*pending)  # a stale hit's revalidation, before the loop closes
-            return value
-
-        fn: Any = aget
-        call: Callable[[], str] = lambda: asyncio.run(call_and_settle())  # noqa: E731
-        invalidate: Callable[[], Any] = (  # tenant a: the default
-            (lambda: asyncio.run(aget.ainvalidate_cache(1))) if how == "key" else (lambda: asyncio.run(aget.ainvalidate_cache()))
-        )
-    else:
-
-        @cache(backend=backend, namespace=_ns(), **ttls)
-        def get(x: int) -> str:
-            return source.read()
-
-        fn, call = get, lambda: get(1)
-        invalidate = (lambda: get.invalidate_cache(1)) if how == "key" else (lambda: get.invalidate_cache())
+    fn, call, invalidate = _write_point(path, source, backend, invalidate_all=how == "all")  # invalidate: tenant a
 
     assert _as("probe", call)() == "old"  # learn the cache key
     (stored,) = backend.store
@@ -876,8 +859,6 @@ def test_tenant_invalidation_skips_only_its_own_tenants_l2_write(
 
 def test_scoped_epoch_state_does_not_grow_with_tenants() -> None:
     """Invalidations under 1,000 tenants, of one key and of every entry, leave the epoch state's size as it was."""
-    from tests.unit.test_key_registry import _closure_cell
-
     backend = _TenantScoped()
 
     @cache(backend=backend, ttl=60, namespace=_ns())

@@ -1229,12 +1229,12 @@ def create_cache_wrapper(
     _epoch_locks: dict[int, threading.Lock] = {}  # one per process: see invalidation._pid_lock
     # The L2 checks read the stripes without the lock, so one racing a move can miss it and let the
     # write through: that write is one already in flight (see "Writes in flight"). _put_l1 checks under it.
-    _moved_since = _stripes.moved_since
     _moved_in_scope = _stripes.moved_in_scope
 
     def _move_epochs(cache_keys: list[str] | None) -> None:
-        """Stamp these keys' stripes, or every stripe for None. A backed function's only: an L1-only
-        one's ObjectCache stamps its own, in its delete and clear."""
+        """Stamp these keys' stripes, or every stripe for None, in the calling context's L2 scope
+        (_l2_scope): call it only in the context of the invalidation's own L2 deletes. A backed
+        function's only: an L1-only one's ObjectCache stamps its own, in its delete and clear."""
         if _object_cache is not None:
             return
         with invalidation._pid_lock(_epoch_locks):
@@ -1261,7 +1261,7 @@ def create_cache_wrapper(
         if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
             with invalidation._pid_lock(_epoch_locks):
-                if not _moved_since(cache_key, epoch):
+                if not _stripes.moved_since(cache_key, epoch):
                     _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
                 _record(cache_key, twin)
         else:
