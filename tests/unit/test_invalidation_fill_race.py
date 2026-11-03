@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from cachekit import cache
+from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.decorators.single_flight import ThreadFlights
 from cachekit.object_cache import EPOCH_STRIPES, ObjectCache, epoch_stripe
 
@@ -168,41 +169,32 @@ async def test_local_async_fill_after_invalidation_is_not_stored(how: str) -> No
     assert source.reads == 2
 
 
-def _stripe_pairs(n: int = 4 * EPOCH_STRIPES) -> tuple[tuple[str, str], tuple[str, str]]:
-    """Two key pairs among n keys: one sharing an epoch stripe, one not. str hashes vary per process, so the
-    keys are grouped by stripe: 256 keys in 64 stripes put at least two in one stripe, and use two stripes."""
+def _stripe_pairs(keys: list[str]) -> tuple[tuple[str, str], tuple[str, str]]:
+    """Two pairs of keys: one sharing an epoch stripe, one not. str hashes vary per process, so the keys are
+    grouped by stripe: 4 * EPOCH_STRIPES keys put at least two in one stripe, and use at least two stripes."""
+    assert len(keys) >= 4 * EPOCH_STRIPES
     by_stripe: dict[int, list[str]] = {}
-    for x in range(n):
-        by_stripe.setdefault(epoch_stripe(f"k{x}"), []).append(f"k{x}")
-    same = next(tuple(keys[:2]) for keys in by_stripe.values() if len(keys) >= 2)
+    for key in keys:
+        by_stripe.setdefault(epoch_stripe(key), []).append(key)
+    same = next(group[:2] for group in by_stripe.values() if len(group) >= 2)
     first, second = list(by_stripe.values())[:2]
     return (same[0], same[1]), (first[0], second[0])
 
 
-@pytest.mark.parametrize("stripe", ["same", "other"])
-def test_object_cache_delete_drops_another_keys_fill_only_in_its_stripe(stripe: str) -> None:
-    same, other = _stripe_pairs()
-    invalidated, filled = same if stripe == "same" else other
+@pytest.mark.parametrize("how", ["same", "other", "clear"])
+def test_object_cache_invalidation_drops_another_keys_fill_only_in_its_stripe(how: str) -> None:
+    """A delete reaches only its key's stripe, so a fill outpaced by 100 deletes of a key in another stripe
+    still lands; clear reaches every stripe."""
+    same, other = _stripe_pairs([f"k{x}" for x in range(4 * EPOCH_STRIPES)])
+    invalidated, filled = same if how == "same" else other
     oc = ObjectCache(max_entries=8)
     epoch = oc.invalidation_epoch  # the fill of `filled` starts
-    oc.delete(invalidated)
-    oc.put(filled, "old", ttl=60, epoch=epoch)
-    assert oc.get(filled) == ((False, None) if stripe == "same" else (True, "old"))
-
-
-def test_object_cache_fill_lands_while_other_stripes_are_invalidated_faster_than_it_runs() -> None:
-    """A single-key delete reaches only its stripe, so a fill outpaced by deletes of other keys still lands."""
-    (_, _), (filled, invalidated) = _stripe_pairs()
-    oc = ObjectCache(max_entries=8)
-    epoch = oc.invalidation_epoch
     for _ in range(100):
         oc.delete(invalidated)
-    oc.put(filled, "v", ttl=60, epoch=epoch)
-    assert oc.get(filled) == (True, "v")
-    oc.clear()  # clear reaches every stripe
-    epoch_before_clear = epoch
-    oc.put(filled, "stale", ttl=60, epoch=epoch_before_clear)
-    assert oc.get(filled) == (False, None)
+    if how == "clear":
+        oc.clear()
+    oc.put(filled, "old", ttl=60, epoch=epoch)
+    assert oc.get(filled) == ((True, "old") if how == "other" else (False, None))
 
 
 # ── Backed ──────────────────────────────────────────────────────────────────────────────────────
@@ -263,9 +255,13 @@ def _ns() -> str:
     return f"race-{uuid.uuid4().hex}"
 
 
-@pytest.mark.parametrize("how", ["invalidate_key", "invalidate_all"])
-def test_backed_sync_fill_after_invalidation_writes_neither_tier(how: str) -> None:
-    source, backend = _Source(), DictBackend()
+@pytest.mark.parametrize(
+    ("how", "backend_cls"),
+    [("invalidate_key", "DictBackend"), ("invalidate_all", "DictBackend"), ("invalidate_all", "TrackingBackend")],
+    ids=["key", "all-local", "all-drain"],
+)
+def test_backed_sync_fill_after_invalidation_writes_neither_tier(how: str, backend_cls: str) -> None:
+    source, backend = _Source(), globals()[backend_cls]()
 
     @cache(backend=backend, ttl=300, namespace=_ns())
     def get(x: int) -> str:
@@ -388,18 +384,10 @@ def test_backed_single_key_invalidation_drops_another_key_only_in_its_stripe(str
     # Learn the stripe of each argument's key from the keys the backend stores.
     for x in range(4 * EPOCH_STRIPES):
         get(x)
-    stripes = {int(stored.rsplit(":k", 1)[1]): epoch_stripe(stored) for stored in backend.store}
+    same, other = _stripe_pairs(list(backend.store))
+    k, j = (int(stored.rsplit(":k", 1)[1]) for stored in (same if stripe == "same" else other))
     get.cache_clear()
     backend.store.clear()
-    # str hashes vary per process, so pick the pair from the keys' groups: 256 keys in 64 stripes put at
-    # least two keys in one stripe, and in at least two stripes.
-    by_stripe: dict[int, list[int]] = {}
-    for x, s in stripes.items():
-        by_stripe.setdefault(s, []).append(x)
-    if stripe == "same":
-        k, j = next(xs[:2] for xs in by_stripe.values() if len(xs) >= 2)
-    else:
-        k, j = (xs[0] for xs in list(by_stripe.values())[:2])
 
     assert _race_sync(lambda: get(j), source, lambda: get.invalidate_cache(k)) == "old"
     landed = any(stored.endswith(f":k{j}") for stored in backend.store)
@@ -544,20 +532,6 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: 
     assert unwrap(get(1)) == "new"
 
 
-@pytest.mark.parametrize("backend_cls", [DictBackend, TrackingBackend], ids=["local", "drain"])
-def test_backed_sync_fill_after_whole_function_invalidation_writes_neither_tier(backend_cls: type[DictBackend]) -> None:
-    source, backend = _Source(), backend_cls()
-
-    @cache(backend=backend, ttl=300, namespace=_ns())
-    def get(x: int) -> str:
-        return source.read()
-
-    assert get(2) == "old"  # something for the drain to drain
-    assert _race_sync(lambda: get(1), source, lambda: get.invalidate_cache()) == "old"
-    assert backend.store == {}
-    assert get(1) == "new"
-
-
 def test_backed_drain_that_raises_after_deleting_leaves_no_l1_copy() -> None:
     """A drain that deleted on the server and then raised falls back to the local invalidation. A read that
     fetched the old entry from L2 during the drain still leaves no L1 copy once the invalidation returns,
@@ -595,12 +569,15 @@ def test_backed_drain_that_raises_after_deleting_leaves_no_l1_copy() -> None:
 
 
 def test_backed_drain_evicts_while_other_threads_record(caplog: pytest.LogCaptureFixture) -> None:
-    """Keys recorded while a drain runs are evicted from a copy of the drain's watch set: walking the live
-    set while other threads add to it raises, and the drain would fall back to the local invalidation."""
+    """A stress test, not an event-ordered one: keys recorded while a drain runs are evicted from a copy of
+    the drain's watch set. Walking the live set while other threads add to it raises, and the drain would
+    fall back to the local invalidation. A tiny switch interval makes that walk race the recorders."""
     backend = TrackingBackend()
+    calls: dict[int, int] = {}
 
     @cache(backend=backend, ttl=300, namespace=_ns())
     def get(x: int) -> int:
+        calls[x] = calls.get(x, 0) + 1
         return x
 
     stop = threading.Event()
@@ -632,3 +609,53 @@ def test_backed_drain_evicts_while_other_threads_record(caplog: pytest.LogCaptur
         t.join(_WAIT)
     assert not invalidator.is_alive()
     assert "Key registry drain failed" not in caplog.text
+    sample = range(-1, -5_001, -500)  # watched keys: the drain deleted them from both tiers
+    for x in sample:
+        get(x)
+    assert [calls[x] for x in sample] == [2] * len(sample)
+
+
+@pytest.fixture
+def hold_serialize(monkeypatch: pytest.MonkeyPatch) -> _Source:
+    """A gate that holds the next serialize_data call after it has serialized, before its caller writes."""
+    gate = _Source()
+    serialize = CacheSerializationHandler.serialize_data
+
+    def held(self: CacheSerializationHandler, *args: Any, **kwargs: Any) -> Any:
+        data = serialize(self, *args, **kwargs)
+        if gate._hold:
+            gate._hold = False
+            gate.entered.set()
+            assert gate.release.wait(_WAIT)
+        return data
+
+    monkeypatch.setattr(CacheSerializationHandler, "serialize_data", held)
+    return gate
+
+
+@pytest.mark.parametrize("path", ["miss", "swr"])
+def test_backed_sync_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
+    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2 write."""
+    source, backend = _Source(), SWRBackend()
+
+    @cache(backend=backend, ttl=60, stale_ttl=120, namespace=_ns())
+    def get(x: int) -> str:
+        return source.read()
+
+    if path == "swr":
+        assert get(1) == "old"
+        get._cachekit_evict(None)
+        backend.stale = True
+    hold_serialize.hold_next()
+    if path == "miss":
+        assert _race_sync(lambda: get(1), source, lambda: get.invalidate_cache(1), hold_serialize) == "old"
+    else:
+        assert get(1) == "old"  # the stale hit; its revalidation now holds in serialize_data
+        assert hold_serialize.entered.wait(_WAIT)
+        source.value = "new"
+        get.invalidate_cache(1)
+        backend.stale = False
+        hold_serialize.release.set()
+        _await_threads("cachekit-swr-revalidate")
+    assert backend.store == {}
+    assert get(1) == "new"

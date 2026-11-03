@@ -36,6 +36,37 @@ def epoch_stripe(key: str) -> int:
     return hash(key) & (EPOCH_STRIPES - 1)
 
 
+class EpochStripes:
+    """Invalidation epochs, one per stripe of keys, and the sequence number that orders them.
+
+    An invalidation stamps the next sequence number on its keys' stripes (every stripe for None). A
+    fill reads ``seq`` before its source and asks ``moved_since`` before it stores. The owner holds
+    its own lock around ``stamp`` and the checks that must be exact; a check without it can miss a
+    stamp that races it. Reading ``seq`` costs one attribute load; a key is hashed only once some
+    stamp has run since the fill read it.
+    """
+
+    __slots__ = ("_stripes", "seq")
+
+    def __init__(self) -> None:
+        self.seq = 0
+        self._stripes = [0] * EPOCH_STRIPES  # per stripe, the seq of the latest stamp on it
+
+    def stamp(self, keys: Iterable[str] | None) -> None:
+        """Stamp these keys' stripes, or every stripe for None, with the next sequence number."""
+        seq = self.seq + 1
+        if keys is None:
+            self._stripes[:] = [seq] * EPOCH_STRIPES
+        else:
+            for key in keys:
+                self._stripes[epoch_stripe(key)] = seq
+        self.seq = seq  # last: a reader that sees it may still see an older stripe, and only skips less
+
+    def moved_since(self, key: str, epoch: int) -> bool:
+        """Whether a stamp on key's stripe ran after a fill read ``seq`` as epoch."""
+        return epoch != self.seq and self._stripes[epoch_stripe(key)] > epoch
+
+
 def _estimate_object_size(obj: Any) -> int:
     """Best-effort byte-size estimate of a Python object graph.
 
@@ -297,11 +328,13 @@ class ObjectCache:
     key hash; ``clear`` stamps them all). A fill (a miss that computes a value
     and stores it) reads the sequence number before it reads its source and
     passes it to ``put``, which drops the store if its key's stripe carries a
-    later number. So once a ``delete`` or ``clear`` has returned, no fill that
-    read its source before it stores what it read. A ``delete`` also drops the
-    overlapping fills of the other keys in its stripe, about one in
-    ``EPOCH_STRIPES``, which store nothing and leave the next call to compute
-    again. The stripes are fixed, so no per-key state outlives its key.
+    later number. So once a ``delete`` has returned, no fill of its key that
+    read its source before it stores what it read (no fill of any key, for
+    ``clear``). A ``delete`` also drops the overlapping fills of the other keys
+    in its stripe, about one in ``EPOCH_STRIPES``, which store nothing and leave
+    the next call to compute again: a key that shares a stripe with a key
+    deleted more often than its fill takes never caches. The stripes are fixed,
+    so no per-key state outlives its key.
 
     Thread safety: RLock on every public method so callers need no external
     synchronisation.
@@ -410,8 +443,7 @@ class ObjectCache:
         self._hits = 0
         self._misses = 0
         self._generation = 0
-        self._epoch_seq = 0
-        self._epochs = [0] * EPOCH_STRIPES  # per stripe, the _epoch_seq of the latest delete or clear to stamp it
+        self._epochs = EpochStripes()
         _caches.add(self)
 
     # ------------------------------------------------------------------
@@ -655,20 +687,7 @@ class ObjectCache:
         Read without the lock. A read that races a ``delete`` or ``clear`` returns the number before
         or after it, and both are safe: the earlier one only makes ``put`` drop more stores.
         """
-        return self._epoch_seq
-
-    def _moved_since(self, key: str, epoch: int) -> bool:
-        """Whether a ``delete`` or ``clear`` stamped key's stripe after a fill read epoch; call with the lock held."""
-        return epoch != self._epoch_seq and self._epochs[epoch_stripe(key)] > epoch
-
-    def _stamp(self, key: str | None) -> None:
-        """Stamp key's stripe, or every stripe for None, with the next sequence number; call with the lock held."""
-        seq = self._epoch_seq + 1
-        if key is None:
-            self._epochs[:] = [seq] * EPOCH_STRIPES
-        else:
-            self._epochs[epoch_stripe(key)] = seq
-        self._epoch_seq = seq
+        return self._epochs.seq
 
     def put(self, key: str, value: Any, ttl: int, memo_key: Hashable | None = None, epoch: int | None = None) -> None:
         """Store a value in the cache.
@@ -702,12 +721,12 @@ class ObjectCache:
         s = self._state
         if self._max_size_bytes is not None and size > self._max_size_bytes:
             with s.lock:
-                if epoch is None or not self._moved_since(key, epoch):  # else the entry is newer than the value
+                if epoch is None or not self._epochs.moved_since(key, epoch):  # else the entry is newer than the value
                     s.remove(key)
             return
 
         with s.lock:
-            if epoch is not None and self._moved_since(key, epoch):
+            if epoch is not None and self._epochs.moved_since(key, epoch):
                 return  # read before an invalidation that has returned since: storing it would undo that
             # Replacing? Remove through remove() so byte accounting, any in-flight
             # refresh marker and the memo stay consistent. The fresh generation
@@ -749,7 +768,7 @@ class ObjectCache:
         """
         s = self._state
         with s.lock:
-            self._stamp(key)
+            self._epochs.stamp((key,))
             if key in s.store:
                 s.remove(key)
                 return True
@@ -765,7 +784,7 @@ class ObjectCache:
         """
         s = self._state
         with s.lock:
-            self._stamp(None)
+            self._epochs.stamp(None)
             s.kill_all()
             s.store.clear()
             s.size_bytes = 0

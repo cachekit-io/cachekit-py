@@ -1707,13 +1707,15 @@ class StoreOutcome(NamedTuple):
     a successful stream has none. Key tracking follows stored, L1 follows envelope. deferred says the
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
-    already reported: the caller must not track the key again.
+    already reported: the caller must not track the key again. skipped says the caller's ``skip``
+    stopped the write (stored is then False).
     """
 
     envelope: Optional[bytes]
     stored: bool
     deferred: bool = False
     tracked: bool = False
+    skipped: bool = False
 
 
 class CacheOperationHandler:
@@ -2140,13 +2142,13 @@ class CacheOperationHandler:
         registry_id: str | None = None,
         on_track_error: Callable[[str, Exception], None] = lambda _key, _error: None,
         *,
-        write: bool = True,
+        skip: Callable[[], bool] | None = None,
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
-        ``write=False`` runs everything but the backend write and returns the envelope the store would
-        have written, with the same error handling: for a caller that must not write (an invalidation
-        overlapped its fill) but still shares the value. A value the store would stream has no envelope.
+        ``skip``, when given, is asked at the write point: after serialization and before the write is
+        handed off or sent, or before a streamed write starts. True writes nothing (StoreOutcome.skipped)
+        and still returns the envelope the write would have used, for callers that share the value.
 
         Args:
             cache_key: Cache key (also used for AAD binding if encryption enabled)
@@ -2184,14 +2186,14 @@ class CacheOperationHandler:
             # getattr guards custom CacheHandlerStrategy impls that predate set_streaming.
             if stale_ttl is None and self.serialization_handler.supports_streaming_write():
                 set_streaming = getattr(self._cache_handler, "set_streaming", None)
-                if set_streaming is not None and not write:
-                    # Only a value the write would stream has no envelope; on a backend that cannot stream,
-                    # set_streaming answers None and the write would buffer it, so serialize it below.
-                    # A handler that does not say which backend it writes to counts as streaming.
+                if set_streaming is not None and skip is not None:
+                    # Asked before a streamed write starts. On a backend that cannot stream, set_streaming
+                    # answers None and the write buffers below, where skip is asked again; a handler that
+                    # does not say which backend it writes to counts as streaming.
                     backend = getattr(self._cache_handler, "backend", None)
-                    if backend is None or supports_streaming_write(backend):
-                        return StoreOutcome(envelope=None, stored=False)
-                elif set_streaming is not None:
+                    if (backend is None or supports_streaming_write(backend)) and skip():
+                        return StoreOutcome(envelope=None, stored=False, skipped=True)
+                if set_streaming is not None:
                     streamed = set_streaming(
                         cache_key,
                         lambda sink: self.serialization_handler.write_serialized_to(sink, result),
@@ -2209,8 +2211,8 @@ class CacheOperationHandler:
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
-            if not write:
-                return StoreOutcome(envelope=serialized_data, stored=False)
+            if skip is not None and skip():
+                return StoreOutcome(envelope=serialized_data, stored=False, skipped=True)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
             stored, tracked = _set_l2(
