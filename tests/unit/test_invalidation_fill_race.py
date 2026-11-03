@@ -44,22 +44,28 @@ class _Source:
         self.entered.clear()
         self.release.clear()
 
+    def take_hold(self) -> bool:
+        """Whether the caller is the one hold_next armed; disarms it."""
+        held, self._hold = self._hold, False
+        return held
+
+    def pause(self) -> None:
+        """Signal entered, then block until release."""
+        self.entered.set()
+        assert self.release.wait(_WAIT)
+
     def read(self) -> str:
         value = self.value
         self.reads += 1
-        if self._hold:
-            self._hold = False
-            self.entered.set()
-            assert self.release.wait(_WAIT)
+        if self.take_hold():
+            self.pause()
         return value
 
     async def aread(self) -> str:
         value = self.value
         self.reads += 1
-        if self._hold:
-            self._hold = False
-            self.entered.set()
-            assert await asyncio.to_thread(self.release.wait, _WAIT)
+        if self.take_hold():
+            await asyncio.to_thread(self.pause)
         return value
 
 
@@ -213,8 +219,7 @@ class DictBackend:
         value = self.store.get(key)
         gate, self.hold_get = self.hold_get, None
         if gate is not None:
-            gate.entered.set()
-            assert gate.release.wait(_WAIT)
+            gate.pause()
         return value
 
     def get(self, key: str) -> bytes | None:
@@ -253,24 +258,6 @@ class SWRBackend(DictBackend):
 def _ns() -> str:
     """A namespace of its own per test: backed functions share an L1 per namespace, and these share a qualname."""
     return f"race-{uuid.uuid4().hex}"
-
-
-@pytest.mark.parametrize(
-    ("how", "backend_cls"),
-    [("invalidate_key", "DictBackend"), ("invalidate_all", "DictBackend"), ("invalidate_all", "TrackingBackend")],
-    ids=["key", "all-local", "all-drain"],
-)
-def test_backed_sync_fill_after_invalidation_writes_neither_tier(how: str, backend_cls: str) -> None:
-    source, backend = _Source(), globals()[backend_cls]()
-
-    @cache(backend=backend, ttl=300, namespace=_ns())
-    def get(x: int) -> str:
-        return source.read()
-
-    assert _race_sync(lambda: get(1), source, lambda: _SYNC_INVALIDATIONS[how](get)) == "old"
-    assert backend.store == {}  # the L2 write was skipped
-    assert get(1) == "new"  # and the L1 put: an L1 copy of "old" would be served here
-    assert source.reads == 2
 
 
 @pytest.mark.parametrize("backend_cls", [DictBackend, LockingBackend], ids=["unlocked", "locked"])
@@ -404,8 +391,7 @@ class HoldDeleteBackend(DictBackend):
     def delete(self, key: str) -> bool:
         gate, self.hold_delete = self.hold_delete, None
         if gate is not None:
-            gate.entered.set()
-            assert gate.release.wait(_WAIT)
+            gate.pause()
         return super().delete(key)
 
 
@@ -426,14 +412,31 @@ class TrackingBackend(HoldDeleteBackend):
     def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
         gate, self.hold_delete = self.hold_delete, None
         if gate is not None:
-            gate.entered.set()
-            assert gate.release.wait(_WAIT)
+            gate.pause()
         keys = self.registry.pop(registry_id, set()) | set(local_keys)
         for key in keys:
             self.store.pop(key, None)
         if self.fail_after_delete:
             raise ConnectionError("reply lost after the drain deleted")
         return keys
+
+
+@pytest.mark.parametrize(
+    ("how", "backend_cls"),
+    [("invalidate_key", DictBackend), ("invalidate_all", DictBackend), ("invalidate_all", TrackingBackend)],
+    ids=["key", "all-local", "all-drain"],
+)
+def test_backed_sync_fill_after_invalidation_writes_neither_tier(how: str, backend_cls: type[DictBackend]) -> None:
+    source, backend = _Source(), backend_cls()
+
+    @cache(backend=backend, ttl=300, namespace=_ns())
+    def get(x: int) -> str:
+        return source.read()
+
+    assert _race_sync(lambda: get(1), source, lambda: _SYNC_INVALIDATIONS[how](get)) == "old"
+    assert backend.store == {}  # the L2 write was skipped
+    assert get(1) == "new"  # and the L1 put: an L1 copy of "old" would be served here
+    assert source.reads == 2
 
 
 @pytest.mark.parametrize(
@@ -473,8 +476,32 @@ def test_backed_read_during_the_invalidation_does_not_backfill_the_old_entry(
     assert get(1) == "new"
 
 
+@pytest.fixture
+def joined(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Set when a caller joins a sync backed miss in flight (ThreadFlights)."""
+    event = threading.Event()
+    run = ThreadFlights.run
+
+    def run_signalling_joins(self: ThreadFlights, key: Any, call: Any, recheck: Any, on_join: Any = None) -> Any:
+        def hook() -> None:
+            if on_join is not None:
+                on_join()
+            event.set()
+
+        return run(self, key, call, recheck, hook)
+
+    monkeypatch.setattr(ThreadFlights, "run", run_signalling_joins)
+    return event
+
+
+def _arrow_value(value: Any) -> str:
+    """The one cell of an arrow result: a Table for the caller that ran, a decoded DataFrame otherwise."""
+    first = value["v"][0]
+    return first.as_py() if hasattr(first, "as_py") else first
+
+
 @pytest.mark.parametrize("serializer", ["default", "arrow"])
-def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: pytest.MonkeyPatch, serializer: str) -> None:
+def test_backed_callers_that_joined_a_skipped_fill_share_its_value(joined: threading.Event, serializer: str) -> None:
     """A skipped fill still hands its value to the callers that joined it before the invalidation: they
     do not each run the function again. Arrow can stream, but not to this backend, so it shares too."""
     if serializer == "arrow":
@@ -483,9 +510,7 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: 
         def wrap(value: str) -> Any:
             return pa.table({"v": [value]})
 
-        def unwrap(value: Any) -> str:  # the caller that ran gets its Table, a joined one a decoded DataFrame
-            first = value["v"][0]
-            return first.as_py() if hasattr(first, "as_py") else first
+        unwrap = _arrow_value
     else:
 
         def wrap(value: str) -> Any:
@@ -494,18 +519,6 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: 
         def unwrap(value: Any) -> str:
             return value
 
-    joined = threading.Event()
-    run = ThreadFlights.run
-
-    def run_signalling_joins(self: ThreadFlights, key: Any, call: Any, recheck: Any, on_join: Any = None) -> Any:
-        def hook() -> None:
-            if on_join is not None:
-                on_join()
-            joined.set()
-
-        return run(self, key, call, recheck, hook)
-
-    monkeypatch.setattr(ThreadFlights, "run", run_signalling_joins)
     source, backend = _Source(), DictBackend()
 
     @cache(backend=backend, ttl=300, namespace=_ns(), serializer=serializer)
@@ -623,39 +636,106 @@ def hold_serialize(monkeypatch: pytest.MonkeyPatch) -> _Source:
 
     def held(self: CacheSerializationHandler, *args: Any, **kwargs: Any) -> Any:
         data = serialize(self, *args, **kwargs)
-        if gate._hold:
-            gate._hold = False
-            gate.entered.set()
-            assert gate.release.wait(_WAIT)
+        if gate.take_hold():
+            gate.pause()
         return data
 
     monkeypatch.setattr(CacheSerializationHandler, "serialize_data", held)
     return gate
 
 
-@pytest.mark.parametrize("path", ["miss", "swr"])
-def test_backed_sync_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
-    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2 write."""
-    source, backend = _Source(), SWRBackend()
+# path: (backend, coroutine function, stale_ttl refresh)
+_WRITE_POINTS = {
+    "sync-miss": (DictBackend, False, False),
+    "sync-swr": (SWRBackend, False, True),
+    "async-miss-unlocked": (DictBackend, True, False),
+    "async-miss-locked": (LockingBackend, True, False),
+    "async-swr": (SWRBackend, True, True),
+}
 
-    @cache(backend=backend, ttl=60, stale_ttl=120, namespace=_ns())
-    def get(x: int) -> str:
-        return source.read()
 
-    if path == "swr":
-        assert get(1) == "old"
-        get._cachekit_evict(None)
-        backend.stale = True
-    hold_serialize.hold_next()
-    if path == "miss":
-        assert _race_sync(lambda: get(1), source, lambda: get.invalidate_cache(1), hold_serialize) == "old"
+@pytest.mark.parametrize("path", sorted(_WRITE_POINTS))
+def test_backed_write_is_checked_after_serialization(path: str, hold_serialize: _Source) -> None:
+    """An invalidation that runs while the value is serialized, after the fill's source read, skips the L2
+    write: every buffered write site checks after serialize_data, not before it. The async calls run on an
+    event loop in the caller's thread, which hold_serialize blocks."""
+    backend_cls, is_async, swr = _WRITE_POINTS[path]
+    source, backend = _Source(), backend_cls()
+    ttls: dict[str, Any] = {"ttl": 60, "stale_ttl": 120} if swr else {"ttl": 60}
+
+    if is_async:
+
+        @cache(backend=backend, namespace=_ns(), **ttls)
+        async def aget(x: int) -> str:
+            return source.read()
+
+        async def call_and_settle() -> str:
+            value = await aget(1)
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            await asyncio.gather(*pending)  # a stale hit's revalidation, before the loop closes
+            return value
+
+        fn: Any = aget
+        call: Callable[[], str] = lambda: asyncio.run(call_and_settle())  # noqa: E731
+        invalidate: Callable[[], Any] = lambda: asyncio.run(aget.ainvalidate_cache(1))  # noqa: E731
     else:
-        assert get(1) == "old"  # the stale hit; its revalidation now holds in serialize_data
-        assert hold_serialize.entered.wait(_WAIT)
-        source.value = "new"
-        get.invalidate_cache(1)
-        backend.stale = False
-        hold_serialize.release.set()
-        _await_threads("cachekit-swr-revalidate")
+
+        @cache(backend=backend, namespace=_ns(), **ttls)
+        def get(x: int) -> str:
+            return source.read()
+
+        fn, call, invalidate = get, lambda: get(1), lambda: get.invalidate_cache(1)
+
+    if swr:
+        assert call() == "old"
+        fn._cachekit_evict(None)
+        backend.stale = True  # the next call is a stale hit, which revalidates in the background
+    hold_serialize.hold_next()
+    assert _race_sync(call, source, invalidate, hold_serialize) == "old"
+    backend.stale = False
+    _await_threads("cachekit-swr-revalidate")
     assert backend.store == {}
-    assert get(1) == "new"
+    assert call() == "new"
+
+
+def test_streamed_write_is_skipped_when_invalidated_before_its_stream(tmp_path: Any, joined: threading.Event) -> None:
+    """A streamed value serializes inside its stream, so the check runs before the stream starts. A fill
+    invalidated before then streams nothing and has no envelope to share: the caller that joined it takes
+    its own trip, which streams the value read after the invalidation."""
+    pa = pytest.importorskip("pyarrow")
+    from cachekit.backends.file import FileBackend
+    from cachekit.backends.file.config import FileBackendConfig
+
+    class CountingFileBackend(FileBackend):
+        streams = 0
+
+        def set_streaming(self, *args: Any, **kwargs: Any) -> Any:
+            CountingFileBackend.streams += 1
+            return super().set_streaming(*args, **kwargs)
+
+    backend = CountingFileBackend(FileBackendConfig(cache_dir=str(tmp_path), max_size_mb=64, max_value_mb=32))
+    source = _Source()
+
+    @cache(backend=backend, ttl=300, namespace=_ns(), serializer="arrow")
+    def get(x: int) -> Any:
+        return pa.table({"v": [source.read()]})
+
+    source.hold_next()
+    out: list[str] = []
+    first = threading.Thread(target=lambda: out.append(_arrow_value(get(1))))
+    first.start()
+    assert source.entered.wait(_WAIT)
+    second = threading.Thread(target=lambda: out.append(_arrow_value(get(1))))
+    second.start()
+    assert joined.wait(_WAIT)
+    source.value = "new"
+    get.invalidate_cache(1)
+    source.release.set()
+    for t in (first, second):
+        t.join(_WAIT)
+        assert not t.is_alive()
+    assert sorted(out) == ["new", "old"]  # the joined caller took its own trip
+    assert source.reads == 2
+    assert CountingFileBackend.streams == 1  # only that trip streamed
+    assert _arrow_value(get(1)) == "new"
+    assert source.reads == 2

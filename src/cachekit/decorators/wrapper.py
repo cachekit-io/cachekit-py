@@ -2454,7 +2454,7 @@ def create_cache_wrapper(
         (the function then ran uncached). A backend that fails a read or write does not get here: the
         cache handler reports a miss and a failed store, so the trip still shares its envelope. Runs
         once per concurrent miss on a key in this process (_thread_flights, in _sync_shared_miss).
-        An invalidation during the trip makes it write nothing (_moved_since).
+        An invalidation during the trip makes it write nothing (see _stripes; the check is store_result(epochs=)).
         """
         epoch = _stripes.seq  # before the L2 read (see _stripes)
         # Try to get cached value with optional TTL refresh
@@ -2944,7 +2944,7 @@ def create_cache_wrapper(
         serialization, or a lock release that failed after the locked work finished; the async L2
         read has no mmap fast path), so a caller that shared this trip can decode its own copy. Runs
         once per concurrent miss on a key in this process (_flights, in _async_call). An invalidation
-        during the trip makes it write nothing (_moved_since).
+        during the trip makes it write nothing (see _stripes).
         """
         assert _backend is not None  # noqa: S101 - async_wrapper resolves it before any trip
         epoch = _stripes.seq  # before the L2 read, as in _backed_miss_sync

@@ -1708,8 +1708,8 @@ class StoreOutcome(NamedTuple):
     a successful stream has none. Key tracking follows stored, L1 follows envelope. deferred says the
     backend write was handed to a write-behind writer (stored is then False: the writer tracks it).
     tracked says the key-registry write rode with the backend write (``set_tracked``), its failure
-    already reported: the caller must not track the key again. skipped says the caller's ``skip``
-    stopped the write (stored is then False).
+    already reported: the caller must not track the key again. skipped says an invalidation since the
+    caller's ``epoch`` stopped the write (stored is then False; see ``store_result``).
     """
 
     envelope: Optional[bytes]
@@ -2148,11 +2148,6 @@ class CacheOperationHandler:
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
-        ``epochs`` and ``epoch``, when given, are checked at the write point: after serialization and before the write is
-        handed off or sent, or before a streamed write starts. A stamp on the key's stripe since the caller read
-        ``epoch`` writes nothing (StoreOutcome.skipped)
-        and still returns the envelope the write would have used, for callers that share the value.
-
         Args:
             cache_key: Cache key (also used for AAD binding if encryption enabled)
             result: Result to cache
@@ -2167,6 +2162,12 @@ class CacheOperationHandler:
                 write when the handler can (``set_tracked``; StoreOutcome.tracked). None writes only.
             on_track_error: Called with the key and the error when that registry write fails; the write
                 still counts as stored.
+            epochs: The caller's invalidation epochs (EpochStripes), or None to write unconditionally.
+            epoch: ``epochs.seq`` as the caller read it before it read its source. If a stamp on the key's
+                stripe has run since, nothing is written (StoreOutcome.skipped). It is checked after
+                serialization and before the write is handed off or sent, and, for a streamed value, which
+                serializes inside the stream, before the stream starts. A buffered skip still returns its
+                envelope, for callers that share the value; a streamed skip returns none.
 
         Returns:
             StoreOutcome. envelope: serialized bytes when the buffered path produced them
@@ -2189,14 +2190,16 @@ class CacheOperationHandler:
             # getattr guards custom CacheHandlerStrategy impls that predate set_streaming.
             if stale_ttl is None and self.serialization_handler.supports_streaming_write():
                 set_streaming = getattr(self._cache_handler, "set_streaming", None)
-                if set_streaming is not None and epochs is not None:
-                    # Asked before a streamed write starts. On a backend that cannot stream, set_streaming
-                    # answers None and the write buffers below, where the epoch is checked again; a handler that
-                    # does not say which backend it writes to counts as streaming.
-                    backend = getattr(self._cache_handler, "backend", None)
-                    if (backend is None or supports_streaming_write(backend)) and epochs.moved_since(cache_key, epoch):
-                        return StoreOutcome(envelope=None, stored=False, skipped=True)
                 if set_streaming is not None:
+                    # A streamed value serializes inside the stream, so its epoch is checked before the stream
+                    # starts: a stream that has begun counts as a write on its way. On a backend that cannot
+                    # stream, set_streaming answers None and the write buffers below, where the epoch is checked
+                    # after serialization; a handler that does not say which backend it writes to counts as
+                    # streaming.
+                    if epochs is not None and epoch != epochs.seq and epochs.moved_since(cache_key, epoch):
+                        backend = getattr(self._cache_handler, "backend", None)
+                        if backend is None or supports_streaming_write(backend):
+                            return StoreOutcome(envelope=None, stored=False, skipped=True)
                     streamed = set_streaming(
                         cache_key,
                         lambda sink: self.serialization_handler.write_serialized_to(sink, result),
