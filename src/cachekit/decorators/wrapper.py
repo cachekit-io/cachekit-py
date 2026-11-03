@@ -333,8 +333,9 @@ class InvalidationOutcome(Enum):
     """What one exact-key ``invalidate_cache(*args)`` or ``ainvalidate_cache(*args)`` call did in L2.
 
     Invalidation never raises on a backend failure, so this return value is how a caller learns
-    whether the entry is gone from shared L2. Whole-function invalidation (no arguments on a function
-    that takes parameters) reports nothing and returns ``None``.
+    whether the entry is gone from shared L2. On ``@cache``, whole-function invalidation (no arguments
+    on a function that takes parameters) reports nothing and returns ``None``; ``@cache.local``
+    returns ``NO_L2`` for it, as for every call.
 
     - ``SUCCEEDED``: the L2 delete of the key returned normally. The entry is no longer in L2; the
       delete does not say whether one was there.

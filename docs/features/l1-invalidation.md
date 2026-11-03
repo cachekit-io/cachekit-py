@@ -213,7 +213,7 @@ assert get_price.invalidate_cache("A1") is InvalidationOutcome.NO_L2
 
 ### Whole-Function Invalidation
 
-Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function, on `@cache` and on `@cache.local()` alike. A function whose parameters all have defaults counts as parameterized; only a zero-parameter function's no-args call removes its one entry. How far "every" reaches depends on the backend:
+Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function, on `@cache` and on `@cache.local()` alike. A function whose parameters all have defaults counts as parameterized. On a zero-parameter function, a no-args call removes only the entry for the key it derives: one entry, unless a custom `key=` reads context, such as the current tenant, and so gives each context its own. How far "every" reaches depends on the backend:
 
 ```python
 calls = []
