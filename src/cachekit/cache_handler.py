@@ -70,6 +70,7 @@ from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
+    from cachekit.object_cache import EpochStripes
     from cachekit.reliability.load_control import BackpressureController
     from cachekit.serializers.base import SerializerProtocol
 
@@ -2142,12 +2143,14 @@ class CacheOperationHandler:
         registry_id: str | None = None,
         on_track_error: Callable[[str, Exception], None] = lambda _key, _error: None,
         *,
-        skip: Callable[[], bool] | None = None,
+        epochs: EpochStripes | None = None,
+        epoch: int = 0,
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
-        ``skip``, when given, is asked at the write point: after serialization and before the write is
-        handed off or sent, or before a streamed write starts. True writes nothing (StoreOutcome.skipped)
+        ``epochs`` and ``epoch``, when given, are checked at the write point: after serialization and before the write is
+        handed off or sent, or before a streamed write starts. A stamp on the key's stripe since the caller read
+        ``epoch`` writes nothing (StoreOutcome.skipped)
         and still returns the envelope the write would have used, for callers that share the value.
 
         Args:
@@ -2186,12 +2189,12 @@ class CacheOperationHandler:
             # getattr guards custom CacheHandlerStrategy impls that predate set_streaming.
             if stale_ttl is None and self.serialization_handler.supports_streaming_write():
                 set_streaming = getattr(self._cache_handler, "set_streaming", None)
-                if set_streaming is not None and skip is not None:
+                if set_streaming is not None and epochs is not None:
                     # Asked before a streamed write starts. On a backend that cannot stream, set_streaming
-                    # answers None and the write buffers below, where skip is asked again; a handler that
+                    # answers None and the write buffers below, where the epoch is checked again; a handler that
                     # does not say which backend it writes to counts as streaming.
                     backend = getattr(self._cache_handler, "backend", None)
-                    if (backend is None or supports_streaming_write(backend)) and skip():
+                    if (backend is None or supports_streaming_write(backend)) and epochs.moved_since(cache_key, epoch):
                         return StoreOutcome(envelope=None, stored=False, skipped=True)
                 if set_streaming is not None:
                     streamed = set_streaming(
@@ -2211,7 +2214,7 @@ class CacheOperationHandler:
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
-            if skip is not None and skip():
+            if epochs is not None and epoch != epochs.seq and epochs.moved_since(cache_key, epoch):  # no call unless one ran
                 return StoreOutcome(envelope=serialized_data, stored=False, skipped=True)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)

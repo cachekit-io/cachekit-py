@@ -2589,9 +2589,10 @@ def create_cache_wrapper(
                 defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
                 registry_id=_registry_id if trackable else None,
                 on_track_error=_warn_track_failure,
-                # Asked at the write point, after serialization: an invalidation since the L2 read means the
+                # Checked at the write point, after serialization: an invalidation since the L2 read means the
                 # result may predate it, so nothing is written (see _stripes).
-                skip=functools.partial(_moved_since, cache_key, epoch),
+                epochs=_stripes,
+                epoch=epoch,
             )
             envelope = outcome.envelope
             if outcome.skipped:
