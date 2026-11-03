@@ -30,7 +30,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 > [!TIP]
 > **Architecture Principles:**
 > - **L1 + L2 Caching**: In-memory bytes cache (L1) + pluggable backend storage (L2) for optimal performance
-> - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CachekitIO, File, Memcached, custom)
+> - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CacheKit Cloud, File, Memcached, custom)
 > - **Bytes-Only Storage**: with a backend configured, L1 stores serialized bytes (encrypted or plaintext), not Python objects; L1-only mode (`backend=None`) stores the object itself. After its first hit, a plaintext entry of the default or auto serializer with integrity checking on is held as its verified MessagePack where that is no longer than the envelope, so later hits skip the decompress and checksum, and an orjson entry as its checksummed JSON, so later hits skip the checksum; every hit still runs the bounded decode (see [Storage Architecture](#storage-architecture)); encrypted caches keep the ciphertext
 > - **Security First**: Decompression bomb protection, checksum validation, size limits, encrypted-at-rest
 > - **Performance Optimized**: Thread affinity, connection pooling, pre-cached serializers
@@ -56,7 +56,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  @cache.minimal                  # Speed-critical (low latency)             │
 │  @cache.production               # Reliability-critical (circuit breaker)   │
 │  @cache.secure                   # Security-critical (encrypted L1+L2)      │
-│  @cache(l1=True, l2=None)        # L1-only mode (local dev, no Redis)       │
+│  @cache(backend=None)            # L1-only mode (local dev, no Redis)       │
 │                                                                             │
 │  Intent Resolution → Config Dictionary (includes l1_enabled, l2_backend)    │
 └──────────────────────────────────┬──────────────────────────────────────────┘
@@ -218,8 +218,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  # After acquiring lock, check cache again                                  │
 │  # Another thread may have populated it while we waited                     │
-│  # On an async miss, CachekitIO and the tenant-scoped Redis backend skip it │
-│  # when the first lock attempt won after a clean miss                       │
+│  # On an async miss, CacheKit Cloud and the tenant-scoped Redis backend     │
+│  # skip it when the first lock attempt won after a clean miss               │
 │                                                                             │
 │  cached_result = get_cached_value(cache_key)                                │
 │  if cached_result:                                                          │
@@ -384,7 +384,7 @@ def custom_function():
 | **secure** | ✓ | ✓ | Resolved² | ✓ | Encrypted sensitive data (L1 stores ciphertext) |
 | **dev** | ✓ | ✓ | Resolved¹ | ✗ | Local development |
 | **test** | ✗ | ✓ | Resolved¹ | ✗ | Test environments |
-| **io** | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
+| **io** | ✓ | ✓ | `CachekitIOBackend` | ✓ | Managed backend (CacheKit Cloud) |
 
 ¹ Per [Backend Resolution Priority](backends/README.md#backend-resolution-priority); with nothing configured, L1-only.
 ² As ¹, but never L1-only: with nothing configured, Redis at `redis://localhost:6379`.
@@ -405,7 +405,7 @@ Trailing suffix: `1`/`0` for integrity checking, then a one-character serializer
 (`s` standard, `a` auto, `o` orjson, `w` arrow, `l` reference/local; `x` plus four hex
 digits for any serializer passed as an instance). See [Changing Serializers](serializers/README.md#changing-serializers-separate-keyspaces).
 
-> **SDK convention, not a server contract.** The CachekitIO backend validates
+> **SDK convention, not a server contract.** The CacheKit Cloud backend validates
 > keys security-only (length cap, charset whitelist, `..` rejection,
 > `ns:{namespace}:` prefix shape) and otherwise stores them as opaque strings —
 > the `func:`/`args:` structure exists for deterministic generation and
@@ -528,7 +528,7 @@ class BaseBackend(Protocol):
 - **Bytes-only interface**: Language-agnostic, no Python-specific types
 - **Stateless operations**: No connection management in protocol
 - **Simple and focused**: Four operations only (get/set/delete/exists)
-- **Works for any backend**: Redis, CachekitIO, File, Memcached, custom implementations
+- **Works for any backend**: Redis, CacheKit Cloud, File, Memcached, custom implementations
 
 ### RedisBackend
 

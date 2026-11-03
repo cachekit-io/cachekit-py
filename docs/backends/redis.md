@@ -61,7 +61,7 @@ Query options in `redis_url` override the pool fields above, because redis-py's 
 
 ### hiredis and the reply parser
 
-redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. cachekit loads redis-py only for a program that uses its Redis backend, so with the variable unset, the default below never touches a program that uses L1 only, CachekitIO, File or Memcached. `true` is the exception: it blocks hiredis at `import cachekit` for every program, whichever backend it uses.
+redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. cachekit loads redis-py only for a program that uses its Redis backend, so with the variable unset, the default below never touches a program that uses L1 only, CacheKit Cloud, File or Memcached. `true` is the exception: it blocks hiredis at `import cachekit` for every program, whichever backend it uses.
 
 `CACHEKIT_DISABLE_HIREDIS=true` keeps hiredis out and gives every connection redis-py's pure-Python parser. cachekit applies it at `import cachekit`, so import cachekit before redis; if hiredis is already loaded it logs a warning and the setting cannot take effect. `CACHEKIT_DISABLE_HIREDIS=false` keeps hiredis on every build.
 
@@ -109,7 +109,7 @@ When the decorator resolves Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `b
 
 - [Backend Guide](README.md) — Backend comparison and resolution priority
 - [Memcached Backend](memcached.md) — Alternative in-memory shared backend
-- [CachekitIO Backend](cachekitio.md) — Managed SaaS alternative to self-hosted Redis
+- [CacheKit Cloud Backend](cachekitio.md) — Managed alternative to self-hosted Redis
 - [Configuration Guide](../configuration.md) — Full environment variable reference
 
 ---

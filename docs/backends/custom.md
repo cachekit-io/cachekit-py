@@ -90,7 +90,7 @@ a URL) are not prefixes and stay out of `key_prefix`.
 
 ## HTTPBackend Example
 
-A generic HTTP API backend — useful as a starting point for integrating cloud-based cache services (Cloudflare KV, Vercel KV, etc.). For managed cachekit.io storage, use [`CachekitIOBackend`](cachekitio.md) instead.
+A generic HTTP API backend — useful as a starting point for integrating cloud-based cache services (Cloudflare KV, Vercel KV, etc.). For managed CacheKit Cloud storage, use [`CachekitIOBackend`](cachekitio.md) instead.
 
 ```python notest
 from cachekit import cache
@@ -244,7 +244,7 @@ def test_custom_backend():
 ## See Also
 
 - [Backend Guide](README.md) — Backend comparison and resolution priority
-- [CachekitIO Backend](cachekitio.md) — Managed SaaS backend (no custom implementation needed)
+- [CacheKit Cloud Backend](cachekitio.md) — Managed backend (no custom implementation needed)
 - [Redis Backend](redis.md) — Recommended production backend
 - [API Reference](../api-reference.md) — Decorator parameters
 

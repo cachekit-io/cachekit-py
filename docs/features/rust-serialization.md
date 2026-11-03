@@ -24,7 +24,7 @@ xxHash3-64 integrity hash  (detects corruption)
     ↓
 [Optional] AES-256-GCM encryption  (if @cache.secure; AutoSerializer is refused)
     ↓
-Storage backend (Redis / CachekitIO / File)
+Storage backend (Redis / CacheKit Cloud / File)
 ```
 
 **Retrieval is the exact reverse pipeline.** ArrowSerializer and OrjsonSerializer skip ByteStorage; for them only `@cache.secure`'s AES-256-GCM step runs in cachekit's Rust extension.

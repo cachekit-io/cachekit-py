@@ -39,7 +39,7 @@ from cachekit.serializers import OrjsonSerializer
 # 64 hex chars from your secret store, e.g. generated once with: openssl rand -hex 32
 secret_key = os.environ["CACHEKIT_MASTER_KEY"]
 
-# A file backend keeps this example self-contained; production uses Redis or cachekit.io.
+# A file backend keeps this example self-contained; production uses Redis or CacheKit Cloud.
 # Encryption needs a backend: backend=None (L1-only) stores raw objects and is refused.
 backend = FileBackend(FileBackendConfig(cache_dir=tempfile.mkdtemp()))
 
@@ -147,7 +147,7 @@ def get_secrets(tenant_id: str):
 # Backend receives encrypted blob, never sees plaintext values
 ```
 
-With a remote backend such as cachekit.io, the backend stores only opaque ciphertext. It has no access to keys and cannot decrypt values. That supports a HIPAA/PCI DSS scope-*reduction* argument, subject to assessment and your other controls. It does not take regulated data out of scope on its own, and the cache key still travels in cleartext (see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)).
+With a remote backend such as CacheKit Cloud, the backend stores only opaque ciphertext. It has no access to keys and cannot decrypt values. That supports a HIPAA/PCI DSS scope-*reduction* argument, subject to assessment and your other controls. It does not take regulated data out of scope on its own, and the cache key still travels in cleartext (see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)).
 
 ## Performance
 

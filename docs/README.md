@@ -29,7 +29,7 @@ Choose your storage backend:
 | [Redis](backends/redis.md) | Self-hosted, production-grade, connection pooling |
 | [File](backends/file.md) | Local filesystem, zero dependencies |
 | [Memcached](backends/memcached.md) | High-throughput, consistent hashing |
-| [CachekitIO](backends/cachekitio.md) | Managed SaaS, zero infrastructure |
+| [CacheKit Cloud](backends/cachekitio.md) | Managed, zero infrastructure |
 | [L1-Only (None)](backends/none.md) | In-memory only, no external services |
 | [Custom](backends/custom.md) | Implement your own backend |
 
@@ -60,7 +60,7 @@ Choose how data is stored:
 | [L1 Invalidation & SWR](features/l1-invalidation.md) | Invalidation scope, opt-in cross-process L1 eviction, stale-while-revalidate |
 | [Reference Caching](features/reference-caching.md) | `@cache.local()` for non-serializable objects |
 | [Rust Serialization](features/rust-serialization.md) | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
-| [SSRF Protection](features/ssrf-protection.md) | URL allowlisting for the CachekitIO backend |
+| [SSRF Protection](features/ssrf-protection.md) | URL allowlisting for the CacheKit Cloud backend |
 | [Write-Behind](features/write-behind.md) | Opt-in `write_behind=True`: a miss returns before its L2 write lands |
 
 ## Architecture & Reference

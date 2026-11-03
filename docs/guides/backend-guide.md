@@ -9,5 +9,5 @@ See the [Backend Documentation](../backends/README.md) for an overview.
 - [Redis](../backends/redis.md) — Recommended production backend, connection pooling
 - [File](../backends/file.md) — Local filesystem, zero dependencies
 - [Memcached](../backends/memcached.md) — High-throughput, consistent hashing
-- [CachekitIO](../backends/cachekitio.md) — Managed SaaS, zero infrastructure
+- [CacheKit Cloud](../backends/cachekitio.md) — Managed, zero infrastructure
 - [Custom](../backends/custom.md) — Implement your own backend

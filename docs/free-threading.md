@@ -121,7 +121,7 @@ The exclusion also means the lane never sees what a default install gets:
 `pip install cachekit` pulls in hiredis. A default install keeps the GIL off
 anyway, in one of two ways.
 
-A program that uses no Redis backend (L1-only, CachekitIO, File or Memcached)
+A program that uses no Redis backend (L1-only, CacheKit Cloud, File or Memcached)
 never loads redis-py: `import cachekit` imports no redis-py, and
 `RedisBackend` is loaded only on first use, through the module `__getattr__`
 of `cachekit.backends`. With `CACHEKIT_DISABLE_HIREDIS` unset nothing is
@@ -206,8 +206,8 @@ sees the shared state a real call touches: the L1 lock, per-function stats,
 the metrics path, the Rust `ByteStorage` and the backend client. It is a
 manual bench and no CI job runs it. It runs three cells at 1, 4 and 16
 threads: an L1 hit, an L2 hit over an in-process backend, and an L2 hit
-through the shipped CachekitIO backend against a loopback TLS fake
-(`tests/performance/loopback_saas.py`). The CachekitIO cell measures
+through the shipped `CachekitIOBackend` against a loopback TLS fake
+(`tests/performance/loopback_saas.py`). The CacheKit Cloud cell measures
 client-side contention only, never service latency. The fake serves each
 connection on one worker thread, so the summary flags a cell `SERVER-BOUND`
 when a worker was more than 80% busy: there the fake, not the client, sets
@@ -247,7 +247,7 @@ not a free-threaded build, or if `--gil-python` is one. It refuses an existing
 that repeats an arm's repetition. The summary also drops a process whose GIL
 state changed while the cells ran.
 
-The CachekitIO cell no longer taints under no-GIL. On httpx it did: threads
+The CacheKit Cloud cell no longer taints under no-GIL. On httpx it did: threads
 sharing one HTTP/2 connection raced in httpcore's send path
 ([encode/httpcore#1118](https://github.com/encode/httpcore/pull/1118)), failing
 23–32% of raw requests with 8 threads on 3.14t and 1–4% with the GIL, and its
