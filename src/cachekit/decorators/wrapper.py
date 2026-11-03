@@ -1949,8 +1949,11 @@ def create_cache_wrapper(
         erasure, and the memo holds the arguments it was given: deleting an entry drops its memo slots,
         whatever arguments they were spelled with (ObjectCache, "Lock-free hits").
         The keys' epoch stripes move first, before any delete: a backed fill in flight then skips each
-        write it has not yet made (_epoch). An L1-only fill is gated by its ObjectCache's own epoch,
-        which the delete or clear moves under the cache's lock.
+        write it has not yet made (_epoch). They move again between the L2 deletes and the L1 ones, in
+        _invalidate_key, _drain_all and _local_invalidate_all: a read that starts between the first move
+        and the L2 delete can fetch the old entry, and the second move skips its L1 backfill, or the L1
+        delete after it removes the copy. An L1-only fill is gated by its ObjectCache's own epoch, which
+        the delete or clear moves under the cache's lock, atomically with the removal.
         Returns the current-format key's outcome (see _invalidate_keys); None for all."""
         _move_epochs(cache_keys)
         try:
@@ -2434,6 +2437,26 @@ def create_cache_wrapper(
         """The re-check with L1 off: no entry to peek."""
         return False, (None, None)
 
+    def _skip_writes(
+        result: Any, args: tuple[Any, ...], kwargs: dict[str, Any], cache_key: str, probe_cycle: int
+    ) -> tuple[Any, bytes | None]:
+        """End a backed miss whose key an invalidation moved since its L2 read (_epoch): the result may
+        predate the invalidation, so neither write runs. The callers that joined the trip started before
+        the invalidation returned, so they still get its envelope, serialized as the store would have
+        serialized it: an interop or keyring error still fails loud, and any other failure, like a value
+        the store would have streamed, leaves no envelope and each joined caller takes its own trip. The
+        L2 read and the lock that brought the trip here succeeded, so the breaker records a success."""
+        envelope: bytes | None = None
+        if not operation_handler.serialization_handler.supports_streaming_write():
+            try:
+                envelope = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
+            except (InteropError, KeyringConfigurationError):
+                raise
+            except Exception as e:
+                _logger.debug("Skipped fill not serialized for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+        features.record_success(probe_cycle)
+        return result, envelope
+
     def _own_trip_sync(
         cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any], twin_key: str | None
     ) -> tuple[Any, bytes | None]:
@@ -2575,11 +2598,7 @@ def create_cache_wrapper(
             raise
 
         if _epoch(cache_key) != epoch:
-            # Invalidated since the L2 read: the result may predate it, so neither write runs. Nothing
-            # reached the backend to record, so the probe slot goes back as for a raising function.
-            # The interop value check the store would have made still runs (_uncached_result).
-            features.release_probe(probe_cycle)
-            return _uncached_result(result), None
+            return _skip_writes(result, args, kwargs, cache_key, probe_cycle)
 
         # Serialize and cache the result. The `set` sample times serialization plus the store,
         # the same span as the async write: store_result serializes, and the clock stops when it
@@ -3138,9 +3157,7 @@ def create_cache_wrapper(
                         func_error = e
                     else:
                         if _epoch(cache_key) != epoch:
-                            # Invalidated since the L2 read: neither write runs (see _backed_miss_sync).
-                            features.release_probe(probe_cycle)
-                            return _uncached_result(result), None
+                            return _skip_writes(result, args, kwargs, cache_key, probe_cycle)
                         # Serialize and cache the result
                         serialized_data = None  # stays None if serialization fails: no envelope to share
                         # `set` times serialization plus the store, as the sync write does: not the
@@ -3263,9 +3280,7 @@ def create_cache_wrapper(
             raise
 
         if _epoch(cache_key) != epoch:
-            # Invalidated since the L2 read: neither write runs (see _backed_miss_sync).
-            features.release_probe(probe_cycle)
-            return _uncached_result(result), None
+            return _skip_writes(result, args, kwargs, cache_key, probe_cycle)
 
         # Serialize and cache the result
         serialized_data = None
@@ -3393,6 +3408,8 @@ def create_cache_wrapper(
                 failed += len(undeleted)
                 if batch_error is not None:
                     fallbacks, last_fallback = fallbacks + 1, batch_error
+                if _object_cache is None and _l1_cache:
+                    _move_epochs(None)  # again, between this batch's L2 deletes and its L1 ones: see _delete_then_forget
                 for entry in batch:
                     entry_scope, key = entry
                     if entry_scope == scope and key not in undeleted:
@@ -3462,7 +3479,10 @@ def create_cache_wrapper(
                 _cached_keys.difference_update(trim)
                 _cached_keys.update(trim & watch)  # recorded while the trim ran
                 if _l1_cache:
-                    _l1_cache.invalidate_many(deleted | {key for _, key in snap})
+                    # Again, between the L2 deletes and the L1 ones (see _delete_then_forget). A read that
+                    # backfilled before this move recorded its key under the same lock: it is in watch.
+                    _move_epochs(None)
+                    _l1_cache.invalidate_many(deleted | {key for _, key in snap} | {key for _, key in watch})
         except Exception as e:
             _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
             _local_invalidate_all()
@@ -3503,6 +3523,7 @@ def create_cache_wrapper(
             if _object_cache:
                 _object_cache.delete(cache_key)
             elif _l1_cache:
+                _move_epochs([cache_key])  # again, between the L2 delete and the L1 one: see _delete_then_forget
                 _l1_cache.invalidate(cache_key)
         return outcome
 

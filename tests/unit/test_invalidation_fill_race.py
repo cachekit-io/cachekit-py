@@ -19,6 +19,7 @@ import pytest
 
 from cachekit import cache
 from cachekit.decorators import wrapper
+from cachekit.decorators.single_flight import ThreadFlights
 
 pytestmark = pytest.mark.unit
 
@@ -369,3 +370,90 @@ def test_backed_single_key_invalidation_drops_another_key_only_in_its_stripe(str
     assert _race_sync(lambda: get(j), source, lambda: get.invalidate_cache(k)) == "old"
     landed = any(stored.endswith(f":k{j}") for stored in backend.store)
     assert landed is (stripe == "other")
+
+
+class HoldDeleteBackend(DictBackend):
+    """DictBackend whose delete can hold the invalidation before it deletes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hold_delete: _Source | None = None
+
+    def delete(self, key: str) -> bool:
+        gate, self.hold_delete = self.hold_delete, None
+        if gate is not None:
+            gate.entered.set()
+            assert gate.release.wait(_WAIT)
+        return super().delete(key)
+
+
+@pytest.mark.parametrize("how", ["invalidate_key", "invalidate_all"])
+def test_backed_read_during_the_invalidation_does_not_backfill_the_old_entry(how: str) -> None:
+    """A read that starts inside the invalidation, before its L2 delete, can fetch the old entry. Once the
+    invalidation has returned, L1 must not hold it."""
+    source, backend = _Source(), HoldDeleteBackend()
+
+    @cache(backend=backend, ttl=300, namespace=_ns())
+    def get(x: int) -> str:
+        return source.read()
+
+    assert get(1) == "old"
+    get._cachekit_evict(None)  # L1 empty, L2 holds "old"
+    source.value = "new"
+    backend.hold_delete = deleting = _Source()
+    invalidator = threading.Thread(target=lambda: _SYNC_INVALIDATIONS[how](get))
+    invalidator.start()
+    assert deleting.entered.wait(_WAIT)  # inside the invalidation, before its L2 delete
+    backend.hold_get = reading = _Source()
+    out: list[str] = []
+    reader = threading.Thread(target=lambda: out.append(get(1)))
+    reader.start()
+    assert reading.entered.wait(_WAIT)  # the reader has fetched "old" from L2
+    deleting.release.set()
+    invalidator.join(_WAIT)
+    assert not invalidator.is_alive()
+    reading.release.set()
+    reader.join(_WAIT)
+    assert out == ["old"]  # its call began before the invalidation returned
+    assert get(1) == "new"
+
+
+def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A skipped fill still hands its value to the callers that joined it before the invalidation: they
+    do not each run the function again."""
+    joined = threading.Event()
+    run = ThreadFlights.run
+
+    def run_signalling_joins(self: ThreadFlights, key: Any, call: Any, recheck: Any, on_join: Any = None) -> Any:
+        def hook() -> None:
+            if on_join is not None:
+                on_join()
+            joined.set()
+
+        return run(self, key, call, recheck, hook)
+
+    monkeypatch.setattr(ThreadFlights, "run", run_signalling_joins)
+    source, backend = _Source(), DictBackend()
+
+    @cache(backend=backend, ttl=300, namespace=_ns())
+    def get(x: int) -> str:
+        return source.read()
+
+    source.hold_next()
+    out: list[str] = []
+    first = threading.Thread(target=lambda: out.append(get(1)))
+    first.start()
+    assert source.entered.wait(_WAIT)
+    second = threading.Thread(target=lambda: out.append(get(1)))
+    second.start()
+    assert joined.wait(_WAIT)
+    source.value = "new"
+    get.invalidate_cache(1)
+    source.release.set()
+    for t in (first, second):
+        t.join(_WAIT)
+        assert not t.is_alive()
+    assert out == ["old", "old"]
+    assert source.reads == 1
+    assert backend.store == {}
+    assert get(1) == "new"
