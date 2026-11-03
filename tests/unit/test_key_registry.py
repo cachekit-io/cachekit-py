@@ -770,8 +770,9 @@ class TestSingleL1WriteSite:
         records = [
             n for n in ast.walk(put_l1) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_record"
         ]
-        assert len(records) == 1
-        assert records[0].lineno > puts[0].lineno
+        # One record where it puts, after the put, and one in the branch with nothing to put.
+        assert len(records) == 2
+        assert all(record.lineno > puts[0].lineno for record in records)
 
 
 @pytest.mark.unit
