@@ -190,6 +190,24 @@ class TestInvalidateNoArgsWithL2Backend:
             f"Expected 4 calls after invalidation, got {call_count}. L2 entries survived invalidate_cache() with no args."
         )
 
+    def test_cache_clear_without_parameters_deletes_the_key_in_l2(self, tmp_path):
+        """A backed function without parameters: cache_clear() deletes the call's key in L2, as
+        invalidate_cache() does, even from a decoration that never filled or read it, so recorded
+        no key to drain."""
+        calls = 0
+        backend = FileBackend(FileBackendConfig(cache_dir=str(tmp_path), max_size_mb=256))
+
+        def report() -> int:
+            nonlocal calls
+            calls += 1
+            return calls
+
+        writer = cache(backend=backend, ttl=300, namespace="test_clear_no_params", l1_enabled=False)(report)
+        clearer = cache(backend=backend, ttl=300, namespace="test_clear_no_params", l1_enabled=False)(report)
+        assert (writer(), writer()) == (1, 1)  # the second read is served from L2
+        clearer.cache_clear()
+        assert writer() == 2
+
     def test_file_backend_partial_failure_retains_keys(self, tmp_path):
         """If L2 delete fails, the key stays in _cached_keys for retry."""
         from unittest.mock import patch

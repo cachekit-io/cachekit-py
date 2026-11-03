@@ -1,14 +1,16 @@
 """The L1-only hit answered without a lock: cachekit._rust_serializer.HitMemo (ObjectCache, "Lock-free hits").
 
-Pins what the hit must never do: serve an entry once its removal has returned, by any of the five routes
-(expiry, eviction, invalidation, cache_clear, the at-fork reset); keep a removed value referenced from the
-extension; judge a deadline on another clock than ObjectCache's; evict out of LRU order; or key a call
-differently from the memo-key rules the Python implementation had.
+Pins what the hit must never do: serve an entry once its removal has returned, by any route (expiry,
+eviction, invalidation, replacement, cache_clear, the at-fork reset, and a refresh, which replaces the
+entry's HitEntry); keep a removed value referenced from the extension; judge a deadline on another clock
+than ObjectCache's; evict out of LRU order; or key a call differently from the memo-key rules the Python
+implementation had.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import enum
 import gc
 import itertools
@@ -20,6 +22,7 @@ import threading
 import time
 import weakref
 from collections import Counter, OrderedDict
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -28,9 +31,9 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from cachekit import cache, object_cache
-from cachekit._rust_serializer import HitCounter, HitMemo, monotonic
+from cachekit._rust_serializer import MEMO_MAX_ARGS, MEMO_MAX_ENTRIES, MEMO_MAX_LEN, HitCounter, HitMemo, monotonic
 from cachekit.config import L1CacheConfig
-from cachekit.decorators.wrapper import _MEMO_MAX_ARGS, _MEMO_MAX_ENTRIES, _MEMO_MAX_LEN, _memo_key
+from cachekit.decorators.wrapper import _memo_key
 from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
 from tests.utils.clock import fake_clock, shared_clock
@@ -177,6 +180,68 @@ class TestRemovalRoutes:
         fn(1)
         assert calls == [1, 2, 1]
 
+    @pytest.mark.parametrize("clear", ["cache_clear", "invalidate_cache"])
+    def test_a_whole_function_invalidation_removes_an_entry_it_has_no_record_of(self, clear: str) -> None:
+        """A fill records its key only after its put, and a single-key invalidation untracks its key
+        before its delete, so a whole-function invalidation cannot work from those records: an entry
+        stored before it must not outlive it, recorded or not."""
+
+        @cache(backend=None, ttl=300)
+        def fn(x: int) -> _Value:
+            return _Value(x)
+
+        oc, memo = _cache_and_memo(fn)
+        unrecorded = _Value("unrecorded")
+        ref = weakref.ref(unrecorded)
+        oc.put("no record names this key", unrecorded, 300, memo_key=_memo_key((1,), {}))  # a fill before its record
+        assert fn(1) is unrecorded  # served without the lock
+        del unrecorded
+        getattr(fn, clear)()
+        assert len(memo) == 0
+        assert _gone(ref)
+        assert fn(1).n == 1
+
+    def test_cache_clear_removes_every_entry_of_a_function_without_parameters(self) -> None:
+        """On an L1-only function without parameters, invalidate_cache() with no arguments deletes the
+        entry of the call without arguments, but a key= that reads its context files that call under many
+        keys: cache_clear() removes every one, not only the clearing context's. (A backed function keeps
+        invalidate_cache()'s meaning; see test_invalidate_no_args.py.)"""
+        tenant: contextvars.ContextVar[str] = contextvars.ContextVar("tenant")
+        calls: list[str] = []
+
+        @cache(backend=None, ttl=300, key=lambda: f"cfg:{tenant.get()}")
+        def config() -> str:
+            calls.append(tenant.get())
+            return tenant.get()
+
+        def in_tenant(name: str, call: Callable[[], Any]) -> Any:
+            def run() -> Any:
+                tenant.set(name)
+                return call()
+
+            return contextvars.copy_context().run(run)
+
+        assert (in_tenant("a", config), in_tenant("b", config)) == ("a", "b")
+        in_tenant("a", config.cache_clear)
+        assert _cache_and_memo(config)[0].size == 0
+        assert in_tenant("b", config) == "b"
+        assert calls == ["a", "b", "b"]
+
+    def test_replacement(self) -> None:
+        """A put over a stored key replaces its entry, and the old entry's slots go with it whatever memo
+        key holds them: the replacing put is memoised under another key here, so it cannot re-point
+        the old slot and hide a replacement that skipped the removal."""
+        oc, memo = _memo_cache(max_entries=8)
+        old = _Value("old")
+        ref = weakref.ref(old)
+        stale = _put_and_hit_entry(oc, "a", old)
+        key_b = _memo_key(("b",), {})
+        oc.put("key:a", _Value("new"), 3600, memo_key=key_b)
+        assert (stale.alive, _hit(memo, "a"), memo.keys()) == (False, _MISS, [key_b])
+        assert _hit(memo, "b").n == "new"
+        del old, stale
+        assert _gone(ref)
+
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_the_at_fork_reset(self) -> None:
         """A parent thread holds the cache's lock at fork, so the child's cache starts empty: its memo
@@ -257,8 +322,8 @@ class TestTheCacheKeepsTheMemoInStep:
         """A full memo empties before it takes a new key, and the entries it held drop their key lists
         with it: an entry keeps a call's arguments only while that call has a slot, so the memo bounds
         what all of them keep."""
-        oc, memo = _memo_cache(max_entries=4 * _MEMO_MAX_ENTRIES)
-        for i in range(_MEMO_MAX_ENTRIES + 100):
+        oc, memo = _memo_cache(max_entries=4 * MEMO_MAX_ENTRIES)
+        for i in range(MEMO_MAX_ENTRIES + 100):
             _put_and_hit_entry(oc, f"k{i}", i)
         assert len(memo) == 100
         assert _keys_held_by_entries(oc) == Counter(memo.keys())
@@ -274,18 +339,47 @@ class TestTheCacheKeepsTheMemoInStep:
         assert len(memo) == 0
         assert first.alive  # the entry that lost its slot stays stored, for the lock to serve
 
-    def test_a_slot_set_on_a_state_the_fork_reset_retired_is_taken_back(self) -> None:
+    def test_no_slot_is_set_for_an_entry_of_a_state_the_fork_reset_retired(self) -> None:
         """A thread that forks inside its critical section (from a signal handler or a finalizer) returns
-        there in the child on the state the at-fork hook retired. A slot it then sets would point at an
-        entry no removal will ever reach, so the cache ends that entry and drops the slot."""
+        there in the child on the state the at-fork hook retired. A slot it set for an entry of that
+        state would point at an entry no removal will ever reach, and would displace the slot the
+        child set for the same call meanwhile, so the cache sets none."""
         oc, memo = _memo_cache(max_entries=8)
         oc.put("key:k", _Value("k"), 3600)  # stored without a slot
         s = oc._state
         entry = s.store["key:k"]
+        key = _memo_key(("k",), {})
         with s.lock:
             oc._reset_after_fork()  # what the hook does in a child forked inside this section
-            oc._memoise(s, entry, _memo_key(("k",), {}))
-        assert (len(memo), entry.hit.alive, _hit(memo, "k")) == (0, False, _MISS)
+            oc.put("key:k", _Value("child"), 3600, memo_key=key)  # the child, before the section resumes
+            oc._memoise(s, entry, key)
+        assert (len(memo), entry.hit.alive, _hit(memo, "k").n) == (1, False, "child")
+
+    def test_a_fork_inside_a_refresh_leaves_the_old_entry_dead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A refresh stores its new HitEntry on the entry, then has the memo repoint the old one's slots.
+        A fork between the two runs the at-fork reset while the old HitEntry holds slots that no stored
+        entry points at. Emptying the memo already leaves the child no slot to reach it; the reset also
+        kills it, as defence in depth, so the child holds no live entry it dropped."""
+        clock = fake_clock(monkeypatch)
+        oc, memo = _memo_cache(max_entries=8)
+        stale = _put_and_hit_entry(oc, "k", _Value("old"), ttl=100)
+        clock.monotonic = lambda: 1060.0
+        _, _, needs_refresh, version = oc.get_with_swr("key:k", 100, _memo_key(("k",), {}))
+        assert needs_refresh
+        seen: list[tuple[int, bool, Any]] = []
+
+        class ForkingMemo:  # the memo, with a fork just before the refresh's repoint
+            def repoint(self, *args: Any) -> None:
+                oc._reset_after_fork()
+                seen.append((len(memo), stale.alive, _hit(memo, "k")))  # what a child that never returns sees
+                memo.repoint(*args)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(memo, name)
+
+        oc._state.memo = ForkingMemo()  # type: ignore[assignment]
+        oc.complete_refresh("key:k", version, _Value("new"), ttl=100)
+        assert seen == [(0, False, _MISS)]
 
     def test_a_refresh_on_a_state_the_fork_reset_retired_leaves_no_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
         clock = fake_clock(monkeypatch)
@@ -314,6 +408,18 @@ class TestTheCacheKeepsTheMemoInStep:
         oc.delete("key:k")
         memo.set(_memo_key(("k",), {}), entry_hit)  # what no cache does: a slot on a removed entry
         assert _hit(memo, "k") is _MISS
+
+    def test_an_object_planted_in_a_slot_is_a_miss_not_a_crash(self) -> None:
+        """Python code can reach the memo's dict through gc.get_referents and put any object in a slot.
+        The extension reads a slot back with a type check, so the hit misses and a memo write over the
+        slot raises; neither reads the object as a HitEntry."""
+        oc, memo = _memo_cache(max_entries=8)
+        _put(oc, "k", _Value("k"))
+        (slots,) = [o for o in gc.get_referents(memo) if type(o) is dict]
+        slots[_memo_key(("k",), {})] = _Value("planted")
+        assert _hit(memo, "k") is _MISS
+        with pytest.raises(TypeError):
+            oc.get("key:k", _memo_key(("k",), {}))  # memoises its entry over the planted slot
 
 
 def _keys_held_by_entries(oc: ObjectCache) -> Counter[Any]:
@@ -430,7 +536,7 @@ def _reference_memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[
         if n == 1:
             a = args[0]
             t = type(a)
-            if t is int or ((t is str or t is bytes) and len(a) <= _MEMO_MAX_LEN) or t is float or t is bool or a is None:
+            if t is int or ((t is str or t is bytes) and len(a) <= MEMO_MAX_LEN) or t is float or t is bool or a is None:
                 return (t, a)
             return None
         if n == 2:
@@ -438,16 +544,16 @@ def _reference_memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[
             t = type(a)
             u = type(b)
             if t is int or t is float or t is bool or a is None:
-                if u is int or ((u is str or u is bytes) and len(b) <= _MEMO_MAX_LEN) or u is float or u is bool or b is None:
+                if u is int or ((u is str or u is bytes) and len(b) <= MEMO_MAX_LEN) or u is float or u is bool or b is None:
                     return (t, a, u, b)
             elif t is str or t is bytes:
                 if u is int or u is float or u is bool or b is None:
-                    if len(a) <= _MEMO_MAX_LEN:
+                    if len(a) <= MEMO_MAX_LEN:
                         return (t, a, u, b)
-                elif (u is str or u is bytes) and len(a) + len(b) <= _MEMO_MAX_LEN:
+                elif (u is str or u is bytes) and len(a) + len(b) <= MEMO_MAX_LEN:
                     return (t, a, u, b)
             return None
-    if len(args) + len(kwargs) > _MEMO_MAX_ARGS:
+    if len(args) + len(kwargs) > MEMO_MAX_ARGS:
         return None
     size = 0
     for a in args:
@@ -456,13 +562,13 @@ def _reference_memo_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[
             return None
         size += cost
     if not kwargs:
-        return (args, tuple(map(type, args))) if size <= _MEMO_MAX_LEN else None
+        return (args, tuple(map(type, args))) if size <= MEMO_MAX_LEN else None
     for name, a in kwargs.items():
         cost = _reference_memo_size(a)
         if type(name) is not str or cost < 0:
             return None
         size += len(name) + cost
-    if size > _MEMO_MAX_LEN:
+    if size > MEMO_MAX_LEN:
         return None
     items = tuple(sorted(kwargs.items()))
     return (args, tuple(map(type, args)), items, tuple([type(value) for _, value in items]))
@@ -486,7 +592,7 @@ _VALUES = st.one_of(
     st.sampled_from([_Color.RED, _Str("a"), Decimal(1), [1], (1,), frozenset()]),
 )
 _CALLS = st.tuples(
-    st.lists(_VALUES, max_size=_MEMO_MAX_ARGS + 1),
+    st.lists(_VALUES, max_size=MEMO_MAX_ARGS + 1),
     st.dictionaries(st.sampled_from(["a", "b", "c", "x" * 100, _Str("s")]), _VALUES, max_size=3),
 )
 
@@ -694,6 +800,18 @@ def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.Monke
         created.append(value)
         return value
 
+    oc, _ = _cache_and_memo(fn)
+
+    def cleared() -> None:
+        """fn.cache_clear(), then every entry stored before it began is stamped removed: whatever way
+        the clear empties the cache, none of them may be served once it has returned."""
+        with oc._state.lock:
+            live = [entry.value for entry in oc._state.store.values()]
+        fn.cache_clear()
+        at = tick()
+        for value in live:
+            removed_at.setdefault(id(value), at)
+
     stop = threading.Event()
     violations: list[tuple[int, int, int]] = []
     served = itertools.count()
@@ -714,7 +832,7 @@ def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.Monke
         rng = random.Random(seed)
         while not stop.is_set():
             if rng.random() < 0.05:
-                fn.cache_clear()
+                cleared()
             else:
                 fn.invalidate_cache(rng.randrange(16))
 
