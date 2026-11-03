@@ -102,7 +102,12 @@ def create_local_wrapper(
 
     # A no-args invalidate_cache() on a function that takes parameters means the whole function,
     # as on @cache: its zero-argument key was never cached, and a custom key= could not build it.
-    func_has_params = bool(inspect.signature(func).parameters)
+    # A callable with no signature (a builtin such as max) counts as taking parameters: clearing
+    # every entry can never leave one stale.
+    try:
+        func_has_params = bool(inspect.signature(func).parameters)
+    except (TypeError, ValueError):
+        func_has_params = True
 
     # --- Shared helper functions (defined once, attached to either wrapper) ---
     # Each invalidation also forgets the key's call in flight: a read that starts after it never

@@ -274,3 +274,12 @@ class TestLocalWrapperNoArgsInvalidation:
         assert fn.invalidate_cache() is InvalidationOutcome.NO_L2
         assert fn() == 2
         assert fn() == 2
+
+    def test_callable_without_signature_still_caches_and_clears(self) -> None:
+        cached_max = cache.local()(max)  # inspect.signature(max) raises ValueError
+
+        assert cached_max(3, 7) == 7
+        assert cached_max(3, 7) == 7
+        assert cached_max.cache_info().hits == 1
+        assert cached_max.invalidate_cache() is InvalidationOutcome.NO_L2
+        assert cached_max.cache_info().currsize == 0
