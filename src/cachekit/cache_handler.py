@@ -2139,8 +2139,14 @@ class CacheOperationHandler:
         defer: Callable[[bytes], bool] | None = None,
         registry_id: str | None = None,
         on_track_error: Callable[[str, Exception], None] = lambda _key, _error: None,
+        *,
+        write: bool = True,
     ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
+
+        ``write=False`` runs everything but the backend write and returns the envelope the store would
+        have written, with the same error handling: for a caller that must not write (an invalidation
+        overlapped its fill) but still shares the value. A value the store would stream has no envelope.
 
         Args:
             cache_key: Cache key (also used for AAD binding if encryption enabled)
@@ -2178,6 +2184,8 @@ class CacheOperationHandler:
             # getattr guards custom CacheHandlerStrategy impls that predate set_streaming.
             if stale_ttl is None and self.serialization_handler.supports_streaming_write():
                 set_streaming = getattr(self._cache_handler, "set_streaming", None)
+                if set_streaming is not None and not write:
+                    return StoreOutcome(envelope=None, stored=False)
                 if set_streaming is not None:
                     streamed = set_streaming(
                         cache_key,
@@ -2196,6 +2204,8 @@ class CacheOperationHandler:
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
+            if not write:
+                return StoreOutcome(envelope=serialized_data, stored=False)
             if defer is not None and defer(serialized_data):
                 return StoreOutcome(envelope=serialized_data, stored=False, deferred=True)
             stored, tracked = _set_l2(

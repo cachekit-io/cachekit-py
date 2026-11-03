@@ -9,6 +9,7 @@ free-threaded build too.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import threading
 import uuid
 from collections.abc import Callable
@@ -18,8 +19,8 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.decorators import wrapper
 from cachekit.decorators.single_flight import ThreadFlights
+from cachekit.object_cache import EPOCH_STRIPES, ObjectCache, epoch_stripe
 
 pytestmark = pytest.mark.unit
 
@@ -166,16 +167,41 @@ async def test_local_async_fill_after_invalidation_is_not_stored(how: str) -> No
     assert source.reads == 2
 
 
-def test_l1_only_fill_of_another_key_after_a_single_key_invalidation_is_not_stored() -> None:
-    """The ObjectCache epoch is one per cache: invalidating key 2 drops the overlapping fill of key 1."""
-    source = _Source()
+def _stripe_pairs(n: int = 4 * EPOCH_STRIPES) -> tuple[tuple[str, str], tuple[str, str]]:
+    """Two key pairs among n keys: one sharing an epoch stripe, one not. str hashes vary per process, so the
+    keys are grouped by stripe: 256 keys in 64 stripes put at least two in one stripe, and use two stripes."""
+    by_stripe: dict[int, list[str]] = {}
+    for x in range(n):
+        by_stripe.setdefault(epoch_stripe(f"k{x}"), []).append(f"k{x}")
+    same = next(tuple(keys[:2]) for keys in by_stripe.values() if len(keys) >= 2)
+    first, second = list(by_stripe.values())[:2]
+    return (same[0], same[1]), (first[0], second[0])
 
-    @cache(backend=None)
-    def get(x: int) -> str:
-        return source.read()
 
-    assert _race_sync(lambda: get(1), source, lambda: get.invalidate_cache(2)) == "old"
-    assert get(1) == "new"
+@pytest.mark.parametrize("stripe", ["same", "other"])
+def test_object_cache_delete_drops_another_keys_fill_only_in_its_stripe(stripe: str) -> None:
+    same, other = _stripe_pairs()
+    invalidated, filled = same if stripe == "same" else other
+    oc = ObjectCache(max_entries=8)
+    epoch = oc.invalidation_epoch  # the fill of `filled` starts
+    oc.delete(invalidated)
+    oc.put(filled, "old", ttl=60, epoch=epoch)
+    assert oc.get(filled) == ((False, None) if stripe == "same" else (True, "old"))
+
+
+def test_object_cache_fill_lands_while_other_stripes_are_invalidated_faster_than_it_runs() -> None:
+    """A single-key delete reaches only its stripe, so a fill outpaced by deletes of other keys still lands."""
+    (_, _), (filled, invalidated) = _stripe_pairs()
+    oc = ObjectCache(max_entries=8)
+    epoch = oc.invalidation_epoch
+    for _ in range(100):
+        oc.delete(invalidated)
+    oc.put(filled, "v", ttl=60, epoch=epoch)
+    assert oc.get(filled) == (True, "v")
+    oc.clear()  # clear reaches every stripe
+    epoch_before_clear = epoch
+    oc.put(filled, "stale", ttl=60, epoch=epoch_before_clear)
+    assert oc.get(filled) == (False, None)
 
 
 # ── Backed ──────────────────────────────────────────────────────────────────────────────────────
@@ -359,9 +385,9 @@ def test_backed_single_key_invalidation_drops_another_key_only_in_its_stripe(str
         return source.read()
 
     # Learn the stripe of each argument's key from the keys the backend stores.
-    for x in range(4 * wrapper._EPOCH_STRIPES):
+    for x in range(4 * EPOCH_STRIPES):
         get(x)
-    stripes = {int(stored.rsplit(":k", 1)[1]): hash(stored) & wrapper._EPOCH_STRIPE_MASK for stored in backend.store}
+    stripes = {int(stored.rsplit(":k", 1)[1]): epoch_stripe(stored) for stored in backend.store}
     get.cache_clear()
     backend.store.clear()
     # str hashes vary per process, so pick the pair from the keys' groups: 256 keys in 64 stripes put at
@@ -394,11 +420,44 @@ class HoldDeleteBackend(DictBackend):
         return super().delete(key)
 
 
-@pytest.mark.parametrize("how", ["invalidate_key", "invalidate_all"])
-def test_backed_read_during_the_invalidation_does_not_backfill_the_old_entry(how: str) -> None:
+class TrackingBackend(HoldDeleteBackend):
+    """HoldDeleteBackend with a key registry, so a whole-function invalidation drains it (_drain_all).
+
+    hold_delete holds the drain before it deletes; fail_after_delete makes it raise once it has deleted,
+    as a drain whose reply is lost does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.registry: dict[str, set[str]] = {}
+        self.fail_after_delete = False
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        self.registry.setdefault(registry_id, set()).add(key)
+
+    def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+        gate, self.hold_delete = self.hold_delete, None
+        if gate is not None:
+            gate.entered.set()
+            assert gate.release.wait(_WAIT)
+        keys = self.registry.pop(registry_id, set()) | set(local_keys)
+        for key in keys:
+            self.store.pop(key, None)
+        if self.fail_after_delete:
+            raise ConnectionError("reply lost after the drain deleted")
+        return keys
+
+
+@pytest.mark.parametrize(
+    ("how", "backend_cls"),
+    [("invalidate_key", HoldDeleteBackend), ("invalidate_all", HoldDeleteBackend), ("invalidate_all", TrackingBackend)],
+    ids=["key", "all-local", "all-drain"],
+)
+def test_backed_read_during_the_invalidation_does_not_backfill_the_old_entry(
+    how: str, backend_cls: type[HoldDeleteBackend]
+) -> None:
     """A read that starts inside the invalidation, before its L2 delete, can fetch the old entry. Once the
     invalidation has returned, L1 must not hold it."""
-    source, backend = _Source(), HoldDeleteBackend()
+    source, backend = _Source(), backend_cls()
 
     @cache(backend=backend, ttl=300, namespace=_ns())
     def get(x: int) -> str:
@@ -464,3 +523,88 @@ def test_backed_callers_that_joined_a_skipped_fill_share_its_value(monkeypatch: 
     assert source.reads == 1
     assert backend.store == {}
     assert get(1) == "new"
+
+
+@pytest.mark.parametrize("backend_cls", [DictBackend, TrackingBackend], ids=["local", "drain"])
+def test_backed_sync_fill_after_whole_function_invalidation_writes_neither_tier(backend_cls: type[DictBackend]) -> None:
+    source, backend = _Source(), backend_cls()
+
+    @cache(backend=backend, ttl=300, namespace=_ns())
+    def get(x: int) -> str:
+        return source.read()
+
+    assert get(2) == "old"  # something for the drain to drain
+    assert _race_sync(lambda: get(1), source, lambda: get.invalidate_cache()) == "old"
+    assert backend.store == {}
+    assert get(1) == "new"
+
+
+def test_backed_drain_that_raises_after_deleting_leaves_no_l1_copy() -> None:
+    """A drain that deleted on the server and then raised falls back to the local invalidation. A read that
+    fetched the old entry from L2 during the drain still leaves no L1 copy once the invalidation returns,
+    even when this process recorded nothing for the fallback to delete."""
+    source, backend = _Source(), TrackingBackend()
+    namespace = _ns()
+
+    def body(x: int) -> str:
+        return source.read()
+
+    writer = cache(backend=backend, ttl=300, namespace=namespace)(body)  # another decoration wrote the entry
+    get = cache(backend=backend, ttl=300, namespace=namespace)(body)
+    assert writer(1) == "old"
+    writer._cachekit_evict(None)  # the shared L1 (one per namespace) empty, L2 holds "old"
+    source.value = "new"
+    backend.fail_after_delete = True
+    backend.hold_delete = draining = _Source()
+    invalidator = threading.Thread(target=get.invalidate_cache)
+    invalidator.start()
+    assert draining.entered.wait(_WAIT)  # epochs moved, the drain has not deleted yet
+    backend.hold_get = reading = _Source()
+    out: list[str] = []
+    reader = threading.Thread(target=lambda: out.append(get(1)))
+    reader.start()
+    assert reading.entered.wait(_WAIT)  # the reader has fetched "old" from L2
+    draining.release.set()
+    invalidator.join(_WAIT)
+    assert not invalidator.is_alive()
+    reading.release.set()
+    reader.join(_WAIT)
+    assert out == ["old"]
+    backend.fail_after_delete = False
+    assert backend.store == {}
+    assert get(1) == "new"
+
+
+def test_backed_drain_evicts_while_other_threads_record(caplog: pytest.LogCaptureFixture) -> None:
+    """Keys recorded while a drain runs are evicted from a copy of the drain's watch set: walking the live
+    set while other threads add to it raises, and the drain would fall back to the local invalidation."""
+    backend = TrackingBackend()
+
+    @cache(backend=backend, ttl=300, namespace=_ns())
+    def get(x: int) -> int:
+        return x
+
+    stop = threading.Event()
+    counter = itertools.count()
+
+    def record_forever() -> None:
+        while not stop.is_set():
+            get(next(counter))
+
+    backend.hold_delete = draining = _Source()
+    invalidator = threading.Thread(target=get.invalidate_cache)
+    invalidator.start()
+    assert draining.entered.wait(_WAIT)
+    for x in range(20_000):  # watched by the drain
+        get(-x - 1)
+    recorders = [threading.Thread(target=record_forever) for _ in range(2)]
+    for t in recorders:
+        t.start()
+    with caplog.at_level("WARNING", logger="cachekit.decorators.wrapper"):
+        draining.release.set()
+        invalidator.join(_WAIT)
+    stop.set()
+    for t in recorders:
+        t.join(_WAIT)
+    assert not invalidator.is_alive()
+    assert "Key registry drain failed" not in caplog.text

@@ -26,6 +26,15 @@ from cachekit._rust_serializer import monotonic as _monotonic
 # flag a refresh, so the hit may serve an entry up to there without the lock.
 _JITTER_LOW, _JITTER_HIGH = 0.9, 1.1
 
+# Invalidation epoch stripes, here and in the decorator's backed mode: a power of two. An invalidation of
+# one key also drops the overlapping fills of the other keys in its stripe, about one in this many.
+EPOCH_STRIPES = 64
+
+
+def epoch_stripe(key: str) -> int:
+    """The invalidation epoch stripe of key: its hash, which a str caches, masked to EPOCH_STRIPES."""
+    return hash(key) & (EPOCH_STRIPES - 1)
+
 
 def _estimate_object_size(obj: Any) -> int:
     """Best-effort byte-size estimate of a Python object graph.
@@ -282,15 +291,17 @@ class ObjectCache:
     replacement can never resurrect stale data — without retaining any per-key
     state for removed entries.
 
-    Invalidation epoch: ``delete`` and ``clear`` move a counter,
-    ``invalidation_epoch``, under the lock that ``put`` takes too. A fill (a
-    miss that computes a value and stores it) reads the epoch before it reads
-    its source and passes it to ``put``, which drops the store if the epoch has
-    moved since. So once a ``delete`` or ``clear`` has returned, no fill that
-    read its source before it stores what it read. The counter is one per
-    cache, not one per key: a ``delete`` of any key drops every fill that
-    overlaps it, which stores nothing and leaves the next call to compute again.
-    No per-key state outlives its key.
+    Invalidation epoch: every ``delete`` and ``clear`` takes the next number
+    of a sequence, ``invalidation_epoch``, and stamps it, under the lock that
+    ``put`` takes too, on the stripe of its key (one of ``EPOCH_STRIPES``, by
+    key hash; ``clear`` stamps them all). A fill (a miss that computes a value
+    and stores it) reads the sequence number before it reads its source and
+    passes it to ``put``, which drops the store if its key's stripe carries a
+    later number. So once a ``delete`` or ``clear`` has returned, no fill that
+    read its source before it stores what it read. A ``delete`` also drops the
+    overlapping fills of the other keys in its stripe, about one in
+    ``EPOCH_STRIPES``, which store nothing and leave the next call to compute
+    again. The stripes are fixed, so no per-key state outlives its key.
 
     Thread safety: RLock on every public method so callers need no external
     synchronisation.
@@ -399,7 +410,8 @@ class ObjectCache:
         self._hits = 0
         self._misses = 0
         self._generation = 0
-        self._invalidations = 0
+        self._epoch_seq = 0
+        self._epochs = [0] * EPOCH_STRIPES  # per stripe, the _epoch_seq of the latest delete or clear to stamp it
         _caches.add(self)
 
     # ------------------------------------------------------------------
@@ -638,12 +650,25 @@ class ObjectCache:
 
     @property
     def invalidation_epoch(self) -> int:
-        """How many ``delete`` and ``clear`` calls have run: a fill reads it before its source, for ``put``.
+        """The sequence number of the latest ``delete`` or ``clear``: a fill reads it before its source, for ``put``.
 
-        Read without the lock. A read that races a ``delete`` or ``clear`` returns the count before
-        or after it, and both are safe: the earlier one only makes ``put`` drop the store.
+        Read without the lock. A read that races a ``delete`` or ``clear`` returns the number before
+        or after it, and both are safe: the earlier one only makes ``put`` drop more stores.
         """
-        return self._invalidations
+        return self._epoch_seq
+
+    def _moved_since(self, key: str, epoch: int) -> bool:
+        """Whether a ``delete`` or ``clear`` stamped key's stripe after a fill read epoch; call with the lock held."""
+        return epoch != self._epoch_seq and self._epochs[epoch_stripe(key)] > epoch
+
+    def _stamp(self, key: str | None) -> None:
+        """Stamp key's stripe, or every stripe for None, with the next sequence number; call with the lock held."""
+        seq = self._epoch_seq + 1
+        if key is None:
+            self._epochs[:] = [seq] * EPOCH_STRIPES
+        else:
+            self._epochs[epoch_stripe(key)] = seq
+        self._epoch_seq = seq
 
     def put(self, key: str, value: Any, ttl: int, memo_key: Hashable | None = None, epoch: int | None = None) -> None:
         """Store a value in the cache.
@@ -664,8 +689,8 @@ class ObjectCache:
             ttl: Time-to-live in seconds (must be >= 1).
             memo_key: As ``get`` takes it.
             epoch: The ``invalidation_epoch`` the caller read before it read the value's source. If a
-                ``delete`` or ``clear`` has moved it since, the value may predate that invalidation, and
-                nothing is stored. None stores unconditionally.
+                ``delete`` or ``clear`` has stamped the key's stripe since, the value may predate that
+                invalidation, and nothing is stored. None stores unconditionally.
 
         Raises:
             ValueError: If ttl is less than 1.
@@ -677,12 +702,12 @@ class ObjectCache:
         s = self._state
         if self._max_size_bytes is not None and size > self._max_size_bytes:
             with s.lock:
-                if epoch is None or epoch == self._invalidations:  # else the entry is newer than the value
+                if epoch is None or not self._moved_since(key, epoch):  # else the entry is newer than the value
                     s.remove(key)
             return
 
         with s.lock:
-            if epoch is not None and epoch != self._invalidations:
+            if epoch is not None and self._moved_since(key, epoch):
                 return  # read before an invalidation that has returned since: storing it would undo that
             # Replacing? Remove through remove() so byte accounting, any in-flight
             # refresh marker and the memo stay consistent. The fresh generation
@@ -713,7 +738,7 @@ class ObjectCache:
 
         An in-flight SWR refresh cannot resurrect it: the refresh only lands
         on the exact entry (generation) it was started against. A fill in flight
-        cannot either: this moves the invalidation epoch, also when the key holds
+        cannot either: this stamps the key's epoch stripe, also when the key holds
         no entry, as it does while its fill runs.
 
         Args:
@@ -724,7 +749,7 @@ class ObjectCache:
         """
         s = self._state
         with s.lock:
-            self._invalidations += 1
+            self._stamp(key)
             if key in s.store:
                 s.remove(key)
                 return True
@@ -735,12 +760,12 @@ class ObjectCache:
 
         Hit/miss counters are NOT reset; they represent lifetime statistics.
         In-flight SWR refreshes cannot resurrect cleared entries — their
-        target entries no longer exist. Fills in flight store nothing: this moves
-        the invalidation epoch.
+        target entries no longer exist. Fills in flight store nothing: this stamps
+        every epoch stripe.
         """
         s = self._state
         with s.lock:
-            self._invalidations += 1
+            self._stamp(None)
             s.kill_all()
             s.store.clear()
             s.size_bytes = 0
