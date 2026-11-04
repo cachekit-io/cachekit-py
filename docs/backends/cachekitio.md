@@ -1,10 +1,10 @@
-**[Home](../README.md)** › **[Backends](README.md)** › **CachekitIO Backend**
+**[Home](../README.md)** › **[Backends](README.md)** › **CacheKit Cloud Backend**
 
-# CachekitIO Backend
+# CacheKit Cloud Backend
 
-> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
+> *CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)*
 
-`CachekitIOBackend` connects to the cachekit.io managed cache API over HTTPS (HTTP/1.1, through urllib3). It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
+`CachekitIOBackend` connects to the CacheKit Cloud API (`api.cachekit.io`) over HTTPS (HTTP/1.1, through urllib3). It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
 
 ## Setup
 
@@ -37,6 +37,7 @@ backend = CachekitIOBackend(
     api_key="ck_live_...",              # default: CACHEKIT_API_KEY
     api_url="https://api.cachekit.io",  # default: CACHEKIT_API_URL, then api.cachekit.io
     timeout=5.0,                        # default: CACHEKIT_TIMEOUT, then 5.0 seconds
+    telemetry=None,                     # False turns telemetry off; see Telemetry below
 )
 ```
 
@@ -69,7 +70,7 @@ To cache through another backend, use `@cache.production(backend=...)`.
 A function with a custom `key=` is filed in the service's `default` namespace, an open write space,
 whatever its `namespace=`. For a `key=` namespace of `ns` or `nsapi` that is a change from earlier
 releases, and any API key that can reach `default` can read, overwrite, delete or lock those entries:
-see [CachekitIO files every custom key in its `default` namespace](../features/l1-invalidation.md#upgrading-custom-key-keys-carry-the-functions-identity).
+see [CacheKit Cloud files every custom key in its `default` namespace](../features/l1-invalidation.md#upgrading-custom-key-keys-carry-the-functions-identity).
 
 A bearer token carries only `A-Z a-z 0-9 - . _ ~ + /`, then any number of trailing `=`. So cachekit
 rejects a key with whitespace (usually a trailing newline from a secrets file), a byte-order mark (from
@@ -219,11 +220,51 @@ The API URL is validated on construction — HTTPS required, credentials in the 
 CACHEKIT_API_KEY=ck_live_...          # API key — or pass api_key= to CachekitIOBackend / @cache.io
 CACHEKIT_API_URL=https://api.cachekit.io  # Optional — defaults to api.cachekit.io
 CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
+CACHEKIT_TELEMETRY=false              # Optional — turns telemetry off (see Telemetry)
 ```
+
+## Telemetry
+
+While CacheKit Cloud is in closed beta, a `CachekitIOBackend` sends usage telemetry to CacheKit Cloud by default. It
+becomes opt-in when the service launches. It goes only to the API URL the backend is configured with, as headers
+on the cache requests the backend already makes; nothing is sent on its own, and the Redis, Memcached and File
+backends and L1-only caches send none.
+
+| Headers | What they carry |
+|---------|-----------------|
+| `X-CacheKit-Session-ID`, `X-CacheKit-Session-Start` | A per-function session id, a random per-process id joined to the decorated function's `module.qualname` (so it carries the function's name), and its start time |
+| `X-CacheKit-L1-Hits`, `X-CacheKit-L2-Hits`, `X-CacheKit-Misses` | The calling function's hit and miss counts this session |
+| `X-CacheKit-L1-Hit-Rate` | L1 hits / (L1 hits + L2 hits + misses), three decimals |
+| `X-CacheKit-L1-Latency-Buckets`, `-Sum-Ns`, `-One-In` | How long the L1 hits timed since the previous request took (below) |
+
+**L1 hit latency.** Each `@cache` call through the backend is timed with probability 1/256, chosen at random before
+the call runs. A timed call that is an L1 hit adds its duration, from entering the wrapper to returning the value,
+to a report: sixteen duration buckets doubling from 128 ns, and their sum in nanoseconds. A duration over 60 s is
+dropped and counts toward neither. The next request to
+CacheKit Cloud carries the report and empties it, so each hit is reported once. A call that waited on another call's
+miss for the same key, a miss, an L2 hit and a direct `backend.get()` are never timed, and the health check never
+carries a report. A forked child starts with an empty report and its own random draws. Under uWSGI without
+`--py-call-uwsgi-fork-hooks`, a worker draws the same sequence as its siblings until it builds a backend or makes its
+first request or timed hit on one it inherited. Each call is still timed with probability 1/256, but those workers
+time the same call positions. The flag removes the window. Hits timed after the last request are not sent.
+
+**Turning it off.** Pass `telemetry=False`, or set `CACHEKIT_TELEMETRY` (name and value in any case) to `false`, `0`, `off` or `no`.
+Off from either wins over on from the other; both unset is on. An empty or blank value counts as unset, so it leaves
+telemetry on. Any other value of the variable also turns telemetry off and logs one warning. Both are read once, when the backend is constructed: set the variable before creating it.
+`@cache.io()` builds its own backend, so use the variable there.
+
+```python notest
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+backend = CachekitIOBackend(telemetry=False)
+```
+
+With telemetry off, requests carry none of the headers above. They still carry `X-CacheKit-L1-Status`, which the
+API requires, and a `User-Agent` naming cachekit-py and its version.
 
 ## When to Use
 
-**Use CachekitIOBackend when**:
+**Use `CachekitIOBackend` when**:
 - Managed, zero-infrastructure caching
 - Multi-region distributed caching without operating Redis
 - Teams that want caching without DevOps overhead
@@ -286,17 +327,17 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   [Forked Processes](../features/l1-invalidation.md#forked-processes) explains;
   [Free-threading](../free-threading.md) gives the detail
 - Every request identifies the SDK with a `User-Agent: cachekit-py/<version> urllib3/<version>` header,
-  taken from the installed packages, so cachekit.io can attribute traffic to an SDK release
+  taken from the installed packages, so CacheKit Cloud can attribute traffic to an SDK release
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 
 ---
 
-## Encrypted SaaS Pattern (Zero-Knowledge)
+## Encrypted CacheKit Cloud Pattern (Zero-Knowledge)
 
-> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
+> *CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io)*
 
-Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge encryption over managed SaaS storage. The backend stores opaque ciphertext values — it never sees plaintext values or your master key. The cache key stays cleartext ([details](../features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure)).
+Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge encryption over CacheKit Cloud storage. The backend stores opaque ciphertext values — it never sees plaintext values or your master key. The cache key stays cleartext ([details](../features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure)).
 
 ```python notest
 from cachekit import cache
@@ -313,7 +354,7 @@ def get_user_profile(user_id: str) -> dict:
       serialize(result) -> encrypt(HKDF-derived key) -> PUT /v1/cache/{key}
       GET /v1/cache/{key} -> decrypt() -> deserialize() -> return result
 
-    The cachekit.io API sees only encrypted values; the cache key in the URL path is cleartext.
+    The CacheKit Cloud API sees only encrypted values; the cache key in the URL path is cleartext.
     """
     return fetch_user_from_db(user_id)
 ```
@@ -321,10 +362,10 @@ def get_user_profile(user_id: str) -> dict:
 **Why this matters**:
 - `@cache.secure` applies AES-256-GCM client-side encryption before any data leaves the process
 - Per-tenant key derivation via HKDF — not a tenancy boundary; see [Multi-Tenant Isolation](../features/zero-knowledge-encryption.md#multi-tenant-isolation)
-- The SaaS backend stores whatever bytes arrive and never holds a key to decrypt the values
-- With `@cache.secure`: the SaaS holds only ciphertext values, which supports a HIPAA/PCI DSS scope-*reduction* argument — not a guarantee, and the cache key stays cleartext; see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
-- Without encryption: SaaS stores plaintext, may be in compliance scope
-- Pass `backend=` explicitly, as above: `@cache.secure` does not pin the SaaS on its own ([why](../features/zero-knowledge-encryption.md#cachesecure-does-not-pin-a-backend))
+- CacheKit Cloud stores whatever bytes arrive and never holds a key to decrypt the values
+- With `@cache.secure`: CacheKit Cloud holds only ciphertext values, which supports a HIPAA/PCI DSS scope-*reduction* argument — not a guarantee, and the cache key stays cleartext; see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
+- Without encryption: CacheKit Cloud stores plaintext, may be in compliance scope
+- Pass `backend=` explicitly, as above: `@cache.secure` does not pin CacheKit Cloud on its own ([why](../features/zero-knowledge-encryption.md#cachesecure-does-not-pin-a-backend))
 
 **Requirements**:
 

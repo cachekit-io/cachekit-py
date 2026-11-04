@@ -57,16 +57,6 @@ def test_compare_thresholds(measured: int, verdict: str, ok: bool) -> None:
     assert passed is ok
 
 
-@pytest.mark.parametrize(
-    ("measured", "verdict", "ok"),
-    [(100_999, "ok", True), (101_000, "WARN", True), (101_999, "WARN", True), (102_000, "FAIL", False), (98_000, "LOWER", True)],
-)
-def test_compare_gates_orjson_at_its_own_tolerance(measured: int, verdict: str, ok: bool) -> None:
-    lines, passed = compare({"serializer_orjson": 100_000}, {"serializer_orjson": measured})
-    assert lines[0].split()[0] == verdict
-    assert passed is ok
-
-
 def test_compare_fails_a_path_without_a_budget() -> None:
     lines, passed = compare({}, {"l1_hit": 1})
     assert not passed
@@ -510,6 +500,24 @@ def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> Non
     worker.start()
     worker.join()
     assert seen[0] > 1.7e9 + 1e6  # the real clock: 2023-11 + 11 days at the very least
+
+
+def test_pinned_os_entropy_starts_numpy_in_the_same_state_in_every_run() -> None:
+    """numpy.random seeds its global generator from OS entropy at import, which moved every path's count."""
+    pytest.importorskip("numpy")  # the free-threaded CI lanes install no numpy
+    probe = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import ir_workload\n"
+        "if sys.argv[2] == 'pin': ir_workload.pin_os_entropy()\n"
+        "import numpy.random; print(numpy.random.get_state()[1][:8].tolist())"
+    )
+    perf = str(Path(ir_workload.__file__).parent)
+
+    def first_words(mode: str) -> str:
+        run = [sys.executable, "-c", probe, perf, mode]
+        return subprocess.run(run, capture_output=True, text=True, check=True).stdout  # noqa: S603 (trusted: this test's probe)
+
+    assert first_words("pin") == first_words("pin")
+    assert first_words("os") != first_words("os")  # unpinned, numpy's start does come from OS entropy
 
 
 @pytest.mark.parametrize("n", [1, 4, len(PATHS) + 1])

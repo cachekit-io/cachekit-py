@@ -123,6 +123,15 @@ repos:
         files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
         stages: [pre-commit]
+      - id: no-retired-names
+        name: No retired product names or wrong package names in docs
+        # The hosted service is "CacheKit Cloud" in prose; `CachekitIO` is only a code identifier.
+        # Naming rules: https://docs.cachekit.io/contributing/#names
+        language: pygrep
+        entry: '(?i:\bCachekitIO[ -](?:Cloud|SaaS|backend|service|server|API)s?\b)|\bSaaS\b|(?i:(?<![\w./-])cachekit\.io (?:backend|service|cloud|server|platform|API|client|account|tenant|dashboard|plan|tier)s?\b)|\bCacheKit ?IO\b|\bCachekit\.IO\b|\bCacheKit\.io\b|\b(?!CacheKit Cloud\b)[Cc]ache[Kk]it [Cc]loud\b|(?<![\w./@`-])Cachekit(?![\w.-])|(?i:Production-ready Redis caching)|(?i:\bno backend required\b)|\bcargo add cachekit(?![\w-])|\b(?:npm (?:i|install)|pnpm (?:add|i|install)|yarn add|bun add) +cachekit(?![\w-])|\bpip install \W?cachekit-py\b'
+        files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/|^llms\.txt$
+        types: [text]
+        stages: [pre-commit]
       - id: no-ticket-ids
         name: No internal ticket ids in tracked files
         # Ticket ids only, but in every file: code comments and docstrings are public too.

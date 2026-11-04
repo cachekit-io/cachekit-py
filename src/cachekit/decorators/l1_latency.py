@@ -1,0 +1,204 @@
+"""The L1 hit-latency report a CachekitIO backend sends to the server (protocol ``spec/saas-api.md#l1-hit-latency``).
+
+A wrapper times a sample of its backed-mode calls, and adds each one that turns out to be an L1 hit to the
+report of the backend its cache is configured with. The backend takes the report, whole, into the next request
+it sends. Here, not in the backend package, because the wrapper imports it and must not load the HTTP client.
+"""
+
+from __future__ import annotations
+
+import os
+import random
+import threading
+import time
+from collections.abc import Callable
+
+# Bucket i (0-based) holds the durations up to 2**(i + 7) ns, the last up to the 60 s ceiling (spec table).
+BUCKETS = 16
+MAX_DURATION_NS = 60_000_000_000
+# Every integer on the wire is at most 2**53 - 1, the largest a JavaScript number holds exactly.
+_MAX_WIRE_INT = 2**53 - 1
+# Each call is timed with probability 1/N, the same N for every backend: the wrapper's draw is SAMPLE_BITS random
+# bits all zero, so N is derived from it and is always the probability the draw has.
+SAMPLE_BITS = 8
+ONE_IN = 1 << SAMPLE_BITS
+_ONE_IN_VALUE = str(ONE_IN)
+# perf_counter qualifies only at 100 ns or finer (spec: Clock).
+_MAX_CLOCK_RESOLUTION_S = 1e-7
+
+BUCKETS_HEADER = "X-CacheKit-L1-Latency-Buckets"
+SUM_HEADER = "X-CacheKit-L1-Latency-Sum-Ns"
+ONE_IN_HEADER = "X-CacheKit-L1-Latency-One-In"
+
+
+def clock_qualifies() -> bool:
+    """Whether ``time.perf_counter_ns`` resolves 100 ns or finer here; without it no latency header is sent (API-82)."""
+    return time.get_clock_info("perf_counter").resolution <= _MAX_CLOCK_RESOLUTION_S
+
+
+def bucket_index(duration_ns: int) -> int:
+    """The 0-based bucket a duration falls in: above the previous bound, up to and including its own.
+
+    Examples:
+        >>> [bucket_index(d) for d in (0, 128, 129, 256, 2_097_152, 2_097_153, MAX_DURATION_NS)]
+        [0, 0, 1, 1, 14, 15, 15]
+    """
+    return min(max((duration_ns - 1).bit_length() - 7, 0), BUCKETS - 1)
+
+
+class _State:
+    """One process's accumulator. Its ``pid`` never changes: a forked child gets a new ``_State``, never a reset one."""
+
+    __slots__ = ("buckets", "lock", "pid", "sum")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pid = os.getpid()
+        self.buckets = [0] * BUCKETS
+        self.sum = 0
+
+
+# One lock per process, for replacing an inherited state. dict.setdefault is atomic, so every thread of a process
+# gets the same lock, and a child never uses one its parent's threads could hold. Reentrant: the reseed and the new
+# state allocate under it, and a garbage-collection finalizer that calls cachekit on the same thread must not
+# deadlock the process's first use.
+_REPLACEMENT_LOCKS: dict[int, threading.RLock] = {}
+
+
+def _replacement_lock(pid: int) -> threading.RLock:
+    return _REPLACEMENT_LOCKS.setdefault(pid, threading.RLock())
+
+
+# The wrappers' sampling draw (spec API-81). A private generator, never the module-level one: drawing from the
+# user's own `random` stream would change the output of their seeded code, and a worker that re-seeds `random` per
+# job would time the same call positions in every job. A forked child must not replay its parent's sequence, or
+# sibling workers, and every job a prefork master forks from one state, would time the same call positions. The
+# at-fork hook reseeds it; a fork made from C runs no hook (uWSGI without --py-call-uwsgi-fork-hooks), so the
+# child's first report construction or use reseeds it too: a backend it builds, or its first request or first timed
+# hit on one it inherited, whichever comes first. Until then such a worker draws the same sequence as its siblings:
+# every call is still timed with probability 1/N, but the workers time the same call positions. A PID check on every
+# draw would close that window, at the cost of an os.getpid() system call on every call.
+sampling_rng = random.Random()  # noqa: S311 (a sampling draw, not a secret)
+_sampling_pid = os.getpid()
+
+
+def _reseed_sampling(pid: int) -> None:
+    """Reseed the sampling draw once per process; the caller holds ``_replacement_lock(pid)`` or is the at-fork hook."""
+    global _sampling_pid
+    if _sampling_pid != pid:
+        sampling_rng.seed()
+        _sampling_pid = pid
+
+
+def _reseed_if_forked(pid: int) -> None:
+    """Reseed the draw if this process has not yet: the check every report construction and use makes, so a
+    report built inside a child forked from C, whose state never carries the parent's PID, reseeds it too."""
+    if _sampling_pid != pid:
+        with _replacement_lock(pid):
+            _reseed_sampling(pid)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=lambda: _reseed_sampling(os.getpid()))
+
+
+class L1LatencyReport:
+    """One CachekitIO backend's accumulator of timed L1 hits since its last report.
+
+    ``add``, ``record`` and ``take`` hold one lock, so a report's buckets and sum always describe the same hits and
+    no two requests carry the same hit (API-85). A forked child starts empty (API-83): each use checks the state's
+    PID rather than relying on an at-fork hook, which uWSGI forks without running. The child never touches the
+    parent's state, whose lock a parent thread may have held at the fork: it builds a complete new state and
+    publishes it with one assignment, under a lock of the child's own, so threads racing their first use agree on
+    one state and none loses hits another counted.
+
+    Examples:
+        >>> report = L1LatencyReport()
+        >>> for d in (90, 300, 300, 40_000):
+        ...     report.add(d)
+        >>> report.take()
+        {'X-CacheKit-L1-Latency-Buckets': '1,0,2,0,0,0,0,0,0,1,0,0,0,0,0,0', 'X-CacheKit-L1-Latency-Sum-Ns': '40690', 'X-CacheKit-L1-Latency-One-In': '256'}
+        >>> report.take() is None
+        True
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self) -> None:
+        self._state = _State()
+        _reseed_if_forked(self._state.pid)
+
+    def _current(self) -> _State:
+        state = self._state
+        pid = os.getpid()
+        if _sampling_pid != pid:  # tested here, not in a call: this runs on every timed hit
+            _reseed_if_forked(pid)  # a fork no hook reached: see sampling_rng
+        if state.pid != pid:
+            # A forked child's first use: threads racing their first use agree on one new state, so none
+            # discards hits another already counted into its own. The lock is this process's own, never one
+            # inherited from the parent, which a parent thread may have held at the fork. The new state is built
+            # before the lock: building it allocates, and a garbage-collection finalizer that calls a cached
+            # function on this thread may re-enter here meanwhile, publish its own state and count a hit into it.
+            # Only a state still stale under the lock is replaced, so that hit is kept.
+            fresh = _State()
+            with _replacement_lock(pid):
+                state = self._state
+                if state.pid != pid:
+                    state = self._state = fresh
+        return state
+
+    @staticmethod
+    def _count(state: _State, duration_ns: int) -> None:
+        """Count one duration into ``state``; the caller holds its lock. Above 60 s it is discarded (API-87).
+
+        bucket_index, inlined without min and max: each timed hit runs this, and on CPython 3.12 the builtin calls
+        cost more than the rest of the count.
+
+        Every step that can raise (each allocates an int) runs before the sum is stored, and storing it cannot raise,
+        so a failure leaves the buckets and the sum describing the same hits.
+        """
+        if not 0 <= duration_ns <= MAX_DURATION_NS:
+            return
+        total = state.sum + duration_ns
+        if total > _MAX_WIRE_INT:  # never reached in practice: about 150,000 hits of 60 s in one report
+            return
+        i = (duration_ns - 1).bit_length() - 7
+        state.buckets[0 if i < 0 else BUCKETS - 1 if i >= BUCKETS else i] += 1
+        state.sum = total
+
+    def add(self, duration_ns: int) -> None:
+        """Count one timed L1 hit of ``duration_ns``."""
+        state = self._current()
+        with state.lock:
+            self._count(state, duration_ns)
+
+    def record(self, start_ns: int, clock: Callable[[], int]) -> None:
+        """Count one timed L1 hit that started at ``start_ns`` on ``clock`` and ends now.
+
+        The clock is read once the lock is held, so the time spent waiting for it, which the caller pays before it
+        gets its value, is in the duration.
+        """
+        state = self._current()
+        with state.lock:
+            self._count(state, clock() - start_ns)
+
+    def take(self) -> dict[str, str] | None:
+        """The report's headers, emptying it in the same step; None while its duration sum is 0.
+
+        A report whose sum is 0 stays: all-zero buckets are never attached.
+        """
+        state = self._current()
+        with state.lock:
+            if state.sum < 1:
+                return None
+            buckets, total = state.buckets, state.sum
+            state.buckets = [0] * BUCKETS
+            state.sum = 0
+        return {
+            BUCKETS_HEADER: ",".join(map(str, buckets)),
+            SUM_HEADER: str(total),
+            ONE_IN_HEADER: _ONE_IN_VALUE,
+        }
+
+
+__all__ = ["ONE_IN", "SAMPLE_BITS", "L1LatencyReport", "bucket_index", "clock_qualifies"]

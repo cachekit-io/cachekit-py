@@ -1,5 +1,6 @@
 """Whenever the collector is batched, exactly one live worker of its own process must be reading its queue."""
 
+import ast
 import multiprocessing
 import os
 import queue
@@ -17,6 +18,7 @@ import pytest
 
 from cachekit.reliability import async_metrics
 from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, AsyncMetricsCollector
+from tests.utils.fork_helpers import child_outcome, fork_dumping_stacks, report, run_fresh
 
 pytestmark = pytest.mark.skipif(not PROMETHEUS_AVAILABLE, reason="prometheus_client not installed")
 needs_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
@@ -270,43 +272,76 @@ def _in_child_forked_holding(lock: Any, child: Callable[[], Any]) -> Any:
         process.join(timeout=5)
 
 
-def _in_c_forked_child_holding(lock: Any, child: Callable[[], Any]) -> Any:
+def _in_fresh_interpreter(scenario: Callable[..., object], *args: object) -> object:
+    """scenario(*args)'s outcome, from a fresh interpreter that runs no thread but the scenario's own (run_fresh).
+
+    For every fork made from C: pytest's interpreter runs threads it cannot end or park (xdist's, other tests'), and
+    one waiting for the GIL at such a fork hangs the child in no cachekit code, more often the more of them there are.
+    """
+    run = run_fresh(scenario, *args)
+    if run.returncode:
+        pytest.fail(f"{scenario.__name__}{args!r} failed in a fresh interpreter:\n{run.stderr}")
+    return ast.literal_eval(run.stdout)
+
+
+# The only threads a fork made from C may run beside, each blocked in a lock wait it cannot leave during the fork
+# (_until_waiting): a thread that wants the GIL at the fork can hang the child.
+_PARKED_THREADS = ("AsyncMetricsWorker", "parked")
+
+
+def _until_waiting(cond: threading.Condition, count: int) -> None:
+    """Return once count threads block in cond.wait(), so none of them wants the GIL at a fork made from C."""
+    deadline = time.monotonic() + 10
+    while len(cond._waiters) < count:  # a waiter is listed just before it blocks
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"only {len(cond._waiters)} of {count} threads waited on {cond}")
+        time.sleep(0.001)
+    time.sleep(0.05)  # gives up the GIL, so a thread listed but not yet blocked takes it and blocks
+
+
+def _parked_batched_collector() -> AsyncMetricsCollector:
+    """A batched collector whose worker waits on its empty queue for an hour, past any fork the test makes."""
+    collector = AsyncMetricsCollector(flush_interval=3600.0, sync_mode=False)
+    assert collector._queue is not None
+    _until_waiting(collector._queue.not_empty, 1)
+    return collector
+
+
+def _in_c_forked_child_holding(lock: Any, child: Callable[[], Any], timeout: float = 20.0) -> Any:
     """Like ``_in_child_forked_holding``, but fork from C, skipping Python's after-fork handling as uWSGI can.
 
+    Call it only from a scenario run by ``_in_fresh_interpreter``, beside no thread but parked ones (_PARKED_THREADS).
     ``child`` must not start a thread: CPython's own after-fork repair has not run either, so a thread started
-    there can hang or crash the interpreter.
+    there can hang or crash the interpreter. A child still running at ``timeout`` writes every thread's stack to
+    stderr and is killed, so a hang fails its test showing where it hung, even where no Python can run.
     """
-    import ast
     import ctypes
 
+    me = threading.current_thread()
+    strays = [t for t in threading.enumerate() if t is not me and t.name not in _PARKED_THREADS]
+    if strays:  # not an assert: python -O strips those
+        raise RuntimeError(f"a thread that may want the GIL would be alive at the fork: {strays}")
     libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
-    read_end, write_end = os.pipe()
+    r, w = os.pipe()
     with lock:
-        pid = libc_fork()
-        if pid == 0:  # child: SIGALRM kills it if it waits on a lock it inherited held
+        pid, armed = fork_dumping_stacks(libc_fork)
+        if pid == 0:
             try:
-                signal.alarm(5)
-                os.write(write_end, repr(child()).encode())
-                os._exit(0)
+                os.close(r)
+                report(w, child())
             except BaseException:
                 traceback.print_exc()
                 sys.stderr.flush()
             finally:
                 os._exit(2)
-    os.close(write_end)
-    with os.fdopen(read_end) as pipe:
-        result = pipe.read()
-    _, status = os.waitpid(pid, 0)
-    if status != 0:
-        pytest.fail(f"the child of a fork made from C hung or failed (exit code {os.waitstatus_to_exitcode(status)})")
-    return ast.literal_eval(result)
+    os.close(w)
+    outcome = child_outcome(pid, r, timeout=timeout, dump_stacks=armed)
+    if isinstance(outcome, str) and outcome.startswith("no outcome: "):
+        pytest.fail(f"the child of a fork made from C hung or failed: {outcome}")
+    return outcome
 
 
 needs_c_fork = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
-FORKS = [
-    pytest.param(_in_child_forked_holding, id="fork", marks=needs_fork),
-    pytest.param(_in_c_forked_child_holding, id="c-fork", marks=needs_c_fork),
-]
 
 
 def _metric_name(namespace: str) -> str:
@@ -360,21 +395,22 @@ def _prometheus_lock(held: str) -> Any:
 
 # The at-fork hook takes the series lock itself, so only a fork made from C can inherit it held.
 PROMETHEUS_LOCKS = [
-    pytest.param(held, fork.values[0], id=f"{held}-{fork.id}", marks=fork.marks)
+    pytest.param(held, fork, id=f"{held}-{fork}", marks=needs_c_fork if fork == "c-fork" else needs_fork)
     for held in ("counter", "series", "registry")
-    for fork in FORKS
-    if not (held == "series" and fork.id == "fork")
+    for fork in ("fork", "c-fork")
+    if not (held == "series" and fork == "fork")
 ]
 
 
-@pytest.mark.parametrize(("held", "fork_holding"), PROMETHEUS_LOCKS)
-def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
+def _prometheus_lock_outcome(held: str, fork: str) -> object:
+    """What a child forked while the prometheus_client lock named by ``held`` is held records; fork is "fork" or "c-fork"."""
     namespace = f"fork-prometheus-{held}-{uuid.uuid4().hex}"
     # Create the series first, as a parent that has recorded before has; its worker updates them under these locks.
     AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False).record_cache_operation(
         operation="get", namespace=namespace, success=True, duration_ms=1.0
     )
-    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    c_fork = fork == "c-fork"
+    collector = _parked_batched_collector() if c_fork else AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
 
     def child():
         collector._last_mode_check = time.time()  # the first record takes the batched path, so the child takes over
@@ -383,9 +419,22 @@ def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
         collector.record_counter(_metric_name(namespace))
         return _flushed(namespace), _sample(f"{_metric_name(namespace)}_total")
 
+    if c_fork:  # in a fresh interpreter, whose exit ends the parked worker
+        return _in_c_forked_child_holding(_prometheus_lock(held), child)
+    try:
+        return _in_child_forked_holding(_prometheus_lock(held), child)
+    finally:
+        collector.shutdown()
+
+
+@pytest.mark.parametrize(("held", "fork"), PROMETHEUS_LOCKS)
+def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork):
+    if fork == "c-fork":
+        outcome = _in_fresh_interpreter(_prometheus_lock_outcome, held, fork)
+    else:
+        outcome = _prometheus_lock_outcome(held, fork)
     # prometheus_client resets none of its locks after a fork, so the child must not use the parent's copies.
-    assert fork_holding(_prometheus_lock(held), child) == (2, 1)
-    collector.shutdown()
+    assert outcome == (2, 1)
 
 
 @needs_fork
@@ -459,11 +508,11 @@ class _UnstartedThread(threading.Thread):
         self.started.append(self)
 
 
-@needs_c_fork
-def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
-    """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-uwsgi-fork-hooks."""
+# The scenarios below fork from C, so each runs in a fresh interpreter (_in_fresh_interpreter), whose exit ends the
+# workers they leave parked.
+def _hookless_child_of_a_batched_parent_outcome() -> object:
     namespace = f"fork-hookless-{uuid.uuid4().hex}"
-    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    collector = _parked_batched_collector()
     inherited_worker, q = collector._worker_thread, collector._queue
     assert inherited_worker is not None and q is not None
 
@@ -480,13 +529,17 @@ def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
         prompt_shutdown = time.monotonic() - started < 1.0
         return stale, first, collector._sync_mode, len(_UnstartedThread.started), _flushed(namespace), prompt_shutdown
 
-    # CPython's own after-fork repair has not run in this child either, so the collector never starts a thread here.
-    assert _in_c_forked_child_holding(q.mutex, child) == (True, 1, True, 0, 2, True)
-    collector.shutdown()
+    return _in_c_forked_child_holding(q.mutex, child)
 
 
 @needs_c_fork
-def test_collector_built_in_a_c_level_fork_child_records_synchronously_and_starts_no_thread():
+def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
+    """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-uwsgi-fork-hooks."""
+    # CPython's own after-fork repair has not run in this child either, so the collector never starts a thread here.
+    assert _in_fresh_interpreter(_hookless_child_of_a_batched_parent_outcome) == (True, 1, True, 0, 2, True)
+
+
+def _collector_built_in_a_hookless_child_outcome() -> object:
     namespace = f"fork-hookless-built-{uuid.uuid4().hex}"
     AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False).record_cache_operation(
         operation="get", namespace=namespace, success=True, duration_ms=1.0
@@ -505,14 +558,17 @@ def test_collector_built_in_a_c_level_fork_child_records_synchronously_and_start
         return len(_UnstartedThread.started), modes, _flushed(namespace)
 
     # A parent thread holds the series lock, so a record into it hangs unless the child's locks are fresh.
-    held = _prometheus_lock("series")
-    assert _in_c_forked_child_holding(held, child) == (0, [(True, True), (True, True)], 3)
+    return _in_c_forked_child_holding(_prometheus_lock("series"), child)
 
 
 @needs_c_fork
-def test_child_of_a_c_level_fork_resets_metric_locks_once():
+def test_collector_built_in_a_c_level_fork_child_records_synchronously_and_starts_no_thread():
+    assert _in_fresh_interpreter(_collector_built_in_a_hookless_child_outcome) == (0, [(True, True), (True, True)], 3)
+
+
+def _hookless_child_resets_metric_locks_outcome() -> object:
     namespace = f"fork-hookless-reset-once-{uuid.uuid4().hex}"
-    inherited = [AsyncMetricsCollector(flush_interval=0.05, sync_mode=False) for _ in range(2)]
+    inherited = [_parked_batched_collector() for _ in range(2)]
     real_reset = async_metrics._reset_metric_locks
 
     def child():
@@ -530,9 +586,56 @@ def test_child_of_a_c_level_fork_resets_metric_locks_once():
         # Replacing a lock another thread is using can cost that thread an update, so it happens once per process.
         return len(resets), _flushed(namespace)
 
-    assert _in_c_forked_child_holding(inherited[0]._queue.mutex, child) == (1, 2)
-    for collector in inherited:
-        collector.shutdown()
+    return _in_c_forked_child_holding(inherited[0]._queue.mutex, child)
+
+
+@needs_c_fork
+def test_child_of_a_c_level_fork_resets_metric_locks_once():
+    assert _in_fresh_interpreter(_hookless_child_resets_metric_locks_outcome) == (1, 2)
+
+
+def _park_threads(count: int) -> None:
+    """Start count threads that wait, until the process exits, on an event nothing sets."""
+    never = threading.Event()
+
+    def park_until_stopped():
+        never.wait()
+
+    for _ in range(count):
+        threading.Thread(target=park_until_stopped, daemon=True, name="parked").start()
+    _until_waiting(never._cond, count)
+
+
+def _hung_child_outcome(parked: int) -> object:
+    """How _in_c_forked_child_holding fails a child that hangs, forked beside parked threads: (message, seconds)."""
+    lock = threading.Lock()
+    _park_threads(parked)
+
+    def wait_on_the_inherited_lock():
+        return lock.acquire()  # held at the fork, and nothing in the child releases it
+
+    started = time.monotonic()
+    try:
+        _in_c_forked_child_holding(lock, wait_on_the_inherited_lock, timeout=1)
+    except pytest.fail.Exception as failed:
+        return str(failed), time.monotonic() - started
+    return "the hung child passed", time.monotonic() - started
+
+
+# A child forked from C keeps every parent thread's state, and faulthandler dumps only the newest 100 of them: a busy
+# xdist worker has more, and the oldest, cut off, is the main thread that forked and hung.
+@needs_c_fork
+@pytest.mark.parametrize("parked", [0, 120], ids=["quiet-parent", "busy-parent"])
+def test_hung_child_of_a_c_level_fork_fails_its_test_with_its_stacks(parked):
+    run = run_fresh(_hung_child_outcome, parked)
+
+    assert run.returncode == 0, run.stderr
+    message, seconds = ast.literal_eval(run.stdout)
+    # Failed within the helper's bound instead of holding the job, and the dump names the frame the child hung in.
+    assert "timed out after 1 s" in message and seconds < 10, run.stderr
+    assert "in wait_on_the_inherited_lock" in run.stderr
+    # And the other threads' frames as the fork left them.
+    assert ("in park_until_stopped" in run.stderr) == bool(parked), run.stderr
 
 
 # The fork tests above run the fork handling in a child process, which coverage does not measure. The tests below run

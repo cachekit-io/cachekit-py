@@ -38,7 +38,12 @@ def build_workload(path: str) -> Callable[[], object]:
 
     import cachekit.decorators.orchestrator as orchestrator
     from cachekit import cache
+    from cachekit.decorators.l1_latency import L1LatencyReport, sampling_rng
     from cachekit.serializers import EncryptionWrapper, get_serializer
+
+    # The timing draw has its own generator, unseeded by pin_main_thread_clocks: seeded here, every run times the
+    # same calls of l1_hit_backed.
+    sampling_rng.seed(0)
 
     value = {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
     # Dict-heavy value (about 6 KB): the decoder's object_hook runs once per record.
@@ -69,6 +74,14 @@ def build_workload(path: str) -> Callable[[], object]:
 
         def health_check(self) -> tuple[bool, dict[str, Any]]:
             return True, {}
+
+    class ReportingBackend(DictBackend):
+        """DictBackend with an L1 hit-latency report, as a CachekitIO backend has with telemetry on (its default):
+        every call draws whether it is timed, and about one hit in ``ONE_IN`` is timed into the report."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.l1_latency_report = L1LatencyReport()
 
     class MissBackend(DictBackend):
         """Never holds a value, so every call takes the full miss path: get, compute, serialize, set."""
@@ -118,7 +131,7 @@ def build_workload(path: str) -> Callable[[], object]:
     # the default serializer and with the auto one.
     decorated: dict[str, Callable[[], Callable[..., dict]]] = {
         "l1_hit": lambda: cache(backend=None, ttl=300)(body),
-        "l1_hit_backed": lambda: cache(backend=DictBackend(), ttl=300)(body),
+        "l1_hit_backed": lambda: cache(backend=ReportingBackend(), ttl=300)(body),
         "l1_hit_backed_auto": lambda: cache(backend=DictBackend(), ttl=300, serializer="auto")(body),
         "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
         "l2_hit": l2,
@@ -217,6 +230,21 @@ def pin_main_thread_clocks() -> None:
         setattr(time, f"{name}_ns", pinned(getattr(time, f"{name}_ns"), int(origin * 1e9), 1000))
 
 
+def pin_os_entropy() -> None:
+    """Give Python code the same OS entropy in every run.
+
+    Importing pandas imports ``numpy.random``, which seeds its global generator from 128 bits of
+    ``secrets.randbits``. The cost of that seeding and the sizes of what it allocates depend on the
+    bits drawn, and the heap layout everything after it runs in moves with them: on CPython 3.14,
+    16 runs of one path spread over 57,000 instructions, and over 557 with this. ``secrets`` reads
+    ``random._urandom``, which is ``os.urandom`` bound at import, so both are replaced. Must run
+    before ``import pandas``. C code that reads OS entropy itself is not covered.
+    """
+    import random
+
+    random._urandom = os.urandom = random.Random(0).randbytes  # pyright: ignore[reportAttributeAccessIssue]
+
+
 def run_workload(path: str, n: int, warmup: int) -> None:
     import gc
 
@@ -230,6 +258,7 @@ def run_workload(path: str, n: int, warmup: int) -> None:
     # main thread gives up the GIL only where the code releases it itself.
     sys.setswitchinterval(1e6)
     pin_main_thread_clocks()
+    pin_os_entropy()
     _shift = [object() for _ in range(int(os.environ.get("IR_BUDGET_LAYOUT", "0")))]  # noqa: F841 (held: see LAYOUTS in ir_budget.py)
     op = build_workload(path)
     for _ in range(warmup):  # identical warmup at both N: first-call costs (L1 fill, lazy imports) cancel

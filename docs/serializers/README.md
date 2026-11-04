@@ -193,7 +193,7 @@ def get_data():
 > its `shortened` pattern matches only once no other namespace or function shares their
 > first 50 characters, or flush the database if it is dedicated to cachekit. The File
 > backend stores one file per hashed key in `cache_dir`, so the only flush
-> is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
+> is the whole directory. Memcached and CacheKit Cloud offer no pattern delete, so old entries
 > there retire only by TTL. During a rolling deploy, flush **after the last replica still
 > writing the old keys is gone** — anything written behind the flush is orphaned.
 
