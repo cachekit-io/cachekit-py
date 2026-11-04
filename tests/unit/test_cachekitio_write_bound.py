@@ -513,7 +513,7 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Router(object())) is False
 
     def test_class_held_backend_reached_by_a_longer_path_first(self, backend: CachekitIOBackend) -> None:
-        """The panel's probe: a router met first through a metrics wrapper (one level deeper), then through a
+        """A router met first through a metrics wrapper (one level deeper), then through a
         dict, with its shard's backend held on the shard's class. Its class values are yielded again from the
         shorter route."""
 
@@ -539,7 +539,7 @@ class TestWriteBound:
         assert _reaches_write_deadlines(_Root())
 
     def test_class_held_backend_after_its_type_was_first_met_at_the_limit(self, backend: CachekitIOBackend) -> None:
-        """Cobel's probe: a Holder first read at the depth limit (flag only), then another Holder at a shallow
+        """A Holder first read at the depth limit (flag only), then another Holder at a shallow
         depth through nested lists: its class-held backend is still searched."""
 
         class _Holder:
@@ -896,7 +896,7 @@ class TestWriterCopyBound:
     def test_container_subclass_router_keeps_a_zero_bound(
         self, saas: _FakeSaaS, backend: CachekitIOBackend, is_async: bool
     ) -> None:
-        """Helena Eagen's probe: a dict-subclass router with ``self.inner``, Fresh-For 0, keeps no copy."""
+        """A dict-subclass router with ``self.inner``, Fresh-For 0, keeps no copy."""
 
         class _Router(dict):  # type: ignore[type-arg]
             def __init__(self, inner: CachekitIOBackend) -> None:
@@ -1256,7 +1256,7 @@ class TestL1DeclinedPutDropsOlderEntry:
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 def test_class_attribute_backend_is_bounded(saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool) -> None:
-    """Cobel's probe: a wrapper holding its backend as a class attribute (``inner = backend``) is found, so a
+    """A wrapper holding its backend as a class attribute (``inner = backend``) is found, so a
     0 Fresh-For keeps no copy."""
 
     class _Wrapper:
@@ -1286,7 +1286,7 @@ def test_class_attribute_backend_is_bounded(saas: _FakeSaaS, backend: CachekitIO
 def test_deferred_copy_is_bounded_at_receipt_not_after_post_response_work(
     saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
 ) -> None:
-    """Cobel's probe: a ``set`` override that blocks in post-response work after ``super().set`` returns. The
+    """A ``set`` override that blocks in post-response work after ``super().set`` returns. The
     write-behind copy is bounded when the 2xx is read, so at receipt + 6 with Fresh-For 5 the call reaches L2.
     The server also sends Fresh-For on reads, so a read's backfill cannot stand in for the writer's copy."""
     received = threading.Event()
@@ -1328,7 +1328,7 @@ def test_deferred_copy_is_bounded_at_receipt_not_after_post_response_work(
 def test_wrapped_class_attribute_backend_is_bounded(
     saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, is_async: bool
 ) -> None:
-    """Cobel's probe: a class-level ``__wrapped__ = backend`` is held storage, not interpreter metadata."""
+    """A class-level ``__wrapped__ = backend`` is held storage, not interpreter metadata."""
 
     class _Wrapper:
         __wrapped__ = backend
@@ -1357,7 +1357,7 @@ def test_wrapped_class_attribute_backend_is_bounded(
 def test_a_later_shorter_report_revokes_a_copy_published_after_the_first(
     saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
 ) -> None:
-    """Cobel's probe: a set override making two PUTs. The first reports Fresh-For 59 before the miss publishes
+    """A set override making two PUTs. The first reports Fresh-For 59 before the miss publishes
     its copy (bounded by it); the second reports 0 after, and must still revoke the published copy."""
     first = threading.Event()
     proceed = threading.Event()
@@ -1446,6 +1446,27 @@ class TestWriteBehindDiscardsUnsentJobs:
         release.set()
         assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
 
+    def test_a_job_superseded_at_the_cap_runs_on_drop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A newer value that would take the queue past MAX_BYTES is refused, and the queued value it
+        supersedes is discarded unsent: that job's on_drop runs."""
+        monkeypatch.setattr(wb, "MAX_WORKERS", 1)  # the one thread is busy, so the queued job stays queued
+        monkeypatch.setattr(wb, "MAX_BYTES", 10)
+        writer = wb.WriteBehind(on_error=lambda entry, exc: None)
+        started, release = threading.Event(), threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            assert release.wait(_GUARD_SECONDS)
+
+        assert writer.submit(("s", "busy"), 1, blocking)
+        assert started.wait(_GUARD_SECONDS)
+        drops: list[str] = []
+        assert writer.submit(("s", "k"), 1, lambda: None, on_drop=lambda: drops.append("queued"))
+        assert not writer.submit(("s", "k"), 100, lambda: None)  # over the cap: the caller writes it itself
+        assert drops == ["queued"]
+        release.set()
+        assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
+
     def test_a_raising_on_drop_is_reported_not_raised(self) -> None:
         errors: list[BaseException] = []
         writer = wb.WriteBehind(on_error=lambda entry, exc: errors.append(exc))
@@ -1471,7 +1492,7 @@ class TestWriteBehindDiscardsUnsentJobs:
 def test_a_deferred_write_dropped_unsent_keeps_no_copy(
     saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
 ) -> None:
-    """Winston's case: a write-behind value whose job is discarded unsent never reaches L2, so its L1 copy must
+    """A write-behind value whose job is discarded unsent never reaches L2, so its L1 copy must
     not serve for its full ttl. The writer here takes the job and drops it, as a replacement or cancel would."""
     dropped: list[Callable[[], None]] = []
 
@@ -1492,3 +1513,38 @@ def test_a_deferred_write_dropped_unsent_keeps_no_copy(
     # recomputes. A served copy would have returned 1 with no GET.
     assert compute() == 2
     assert saas.gets() == gets + 1
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_write_cancelled_before_its_copy_is_put_keeps_no_copy(
+    saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
+) -> None:
+    """A write-behind job cancelled after it is queued but before the miss puts its L1 copy (an eviction
+    from another process's invalidation can do this, and moves no epoch). Only on_drop's bound of 0 makes the
+    later put decline: the copy of a value that never reached L2 is never published."""
+    monkeypatch.setattr(wb, "MAX_WORKERS", 1)  # the one thread is busy, so the job stays queued until cancelled
+    started, release = threading.Event(), threading.Event()
+    submit = wb.WriteBehind.submit
+
+    def blocking() -> None:
+        started.set()
+        assert release.wait(_GUARD_SECONDS)
+
+    def submit_then_cancel(self: wb.WriteBehind, entry: Any, size: int, send: Any, on_drop: Any = None) -> bool:
+        assert submit(self, ("blocker", "x"), 1, blocking)
+        assert started.wait(_GUARD_SECONDS)
+        queued = submit(self, entry, size, send, on_drop=on_drop)
+        self.cancel(lambda queued_entry: queued_entry == entry, wait=False)
+        return queued
+
+    monkeypatch.setattr(wb.WriteBehind, "submit", submit_then_cancel)
+    saas.put_fresh_for = "59"
+    compute, _ = _decorated(backend, is_async=is_async, write_behind=True, distributed_lock=False)
+    try:
+        assert compute() == 1
+        assert "PUT" not in saas.ops  # the write was cancelled before it was sent
+        monkeypatch.setattr(wb.WriteBehind, "submit", submit)
+        # No L1 copy: the call reaches L2, misses and recomputes. A published copy would return 1.
+        assert compute() == 2
+    finally:
+        release.set()
