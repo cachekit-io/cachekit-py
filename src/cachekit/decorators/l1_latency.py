@@ -74,10 +74,12 @@ def _replacement_lock(pid: int) -> threading.RLock:
 # job would time the same call positions in every job. A forked child must not replay its parent's sequence, or
 # sibling workers, and every job a prefork master forks from one state, would time the same call positions. The
 # at-fork hook reseeds it; a fork made from C runs no hook (uWSGI without --py-call-uwsgi-fork-hooks), so the
-# child's first report construction or use reseeds it too: a backend it builds, or its first request or first timed
-# hit on one it inherited, whichever comes first. Until then such a worker draws the same sequence as its siblings:
-# every call is still timed with probability 1/N, but the workers time the same call positions. A PID check on every
-# draw would close that window, at the cost of an os.getpid() system call on every call.
+# child's first construction or use of a latency report reseeds it too: a backend it builds with a report, or its
+# first request other than the health check, or first timed hit, on an inherited backend that has a report,
+# whichever comes first. A backend with no report (telemetry off, or a clock that does not qualify) does not end
+# the window, whether the child builds it or uses it. Until then such a worker draws the same sequence as its
+# siblings: every call is still timed with probability 1/N, but the workers time the same call positions. A PID
+# check on every draw would close that window, at the cost of an os.getpid() system call on every call.
 sampling_rng = random.Random()  # noqa: S311 (a sampling draw, not a secret)
 _sampling_pid = os.getpid()
 
