@@ -188,7 +188,8 @@ def _parse_fresh_for(value: str | None) -> int | None:
 _RESERVED_KEY_SEGMENTS = frozenset({"", ".", "..", "health", "ttl", "lock"})
 
 _API_KEY_HINT = (
-    "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
+    "\n\nCacheKit Cloud requires an API key: pass api_key=... or set CACHEKIT_API_KEY\n"
+    "CacheKit Cloud is in closed beta: join the waitlist at https://dash.cachekit.io"
 )
 
 
@@ -384,7 +385,7 @@ class CachekitIOBackend:
             problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
             key_absent = any(err["loc"] == ("api_key",) and err["type"] in ("missing", "too_short") for err in errors)
             hint = _API_KEY_HINT if key_absent else ""
-            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
+            raise ConfigurationError(f"Invalid CacheKit Cloud backend configuration — {problems}{hint}")
 
         # One thread-safe client per config and process, for sync and async methods alike: an async method sends
         # on it through asyncio.to_thread. Holding the lease keeps the client open; dropping it closes the client.

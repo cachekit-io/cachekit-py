@@ -34,15 +34,17 @@ def expensive_function():
     return fetch_data()
 ```
 
-That's it. You get:
+With nothing configured, that plain `@cache` caches in process memory (L1) only: no backend,
+no distributed lock, no encryption. Configure a backend and pick a [preset](#intent-based-optimization),
+and you get:
 
 | Feature | Description |
 |:--------|:------------|
 | **Circuit breaker** | Prevents cascading failures |
-| **Distributed locking** | Multi-pod safety |
+| **Distributed locking** | Multi-pod safety (async functions, on a backend that supports it) |
 | **Prometheus metrics** | Built-in observability |
 | **MessagePack serialization** | Efficient with optional compression |
-| **Zero-knowledge encryption** | Client-side AES-256-GCM |
+| **Zero-knowledge encryption** | Client-side AES-256-GCM, opt-in (`@cache.secure`) |
 
 ---
 
@@ -84,7 +86,7 @@ backend that fits your infrastructure — they're peers behind the same `@cache`
 | Backend | Best for | Select with |
 |---------|----------|-------------|
 | Redis | Self-hosted, full control | `REDIS_URL` / `CACHEKIT_REDIS_URL` |
-| CachekitIO | Managed, zero-ops (beta) | `CACHEKIT_API_KEY` |
+| CacheKit Cloud | Managed, zero-ops (closed beta) | `CACHEKIT_API_KEY` |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 | File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / nothing (or `backend=None`) |
 
@@ -102,8 +104,9 @@ def expensive_api_call(user_id: int):
 ```
 
 > [!WARNING]
-> Earlier releases connected to `redis://localhost:6379` when nothing was configured. To keep
-> that Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`). `@cache.secure`
+> With nothing configured, `@cache` never connects to `redis://localhost:6379`. To use that
+> Redis, set `REDIS_URL=redis://localhost:6379` (or `CACHEKIT_REDIS_URL`); upgraders, see the
+> [CHANGELOG](CHANGELOG.md). `@cache.secure`
 > and `encryption=True` still need a backend and still fall back to localhost Redis; see
 > [Backend Resolution Priority](docs/backends/README.md#backend-resolution-priority). `interop=`
 > refuses that Redis, and any Redis resolved without `backend=`, because it prefixes keys with the
@@ -112,25 +115,25 @@ def expensive_api_call(user_id: int):
 ### More Backends
 
 <details>
-<summary><strong>CachekitIO — Managed SaaS (Beta)</strong></summary>
+<summary><strong>CacheKit Cloud — Managed (Closed Beta)</strong></summary>
 
 ```python notest
 import os
 from cachekit import cache
 
-# Set your CachekitIO API key
+# Set your CacheKit Cloud API key
 # export CACHEKIT_API_KEY="your-api-key"  # pragma: allowlist secret
 
-@cache.io()  # Uses CachekitIO SaaS backend — no Redis to manage
+@cache.io()  # Uses the CacheKit Cloud backend — no Redis to manage
 def expensive_api_call(user_id: int):
     return fetch_user_data(user_id)
 ```
 
-*cachekit.io is in closed beta — [request access](https://cachekit.io) to get started.*
+*CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io).*
 
-During the beta the backend reports hit counts and L1 hit latency to cachekit.io by default; `CACHEKIT_TELEMETRY=false` turns that off ([Telemetry](docs/backends/cachekitio.md#telemetry)).
+During the beta the backend reports hit counts and L1 hit latency to CacheKit Cloud by default; `CACHEKIT_TELEMETRY=false` turns that off ([Telemetry](docs/backends/cachekitio.md#telemetry)).
 
-How fresh a cachekit.io read is, and how long a deleted project's data stays readable: [Consistency and Deletion](https://docs.cachekit.io/concepts/consistency/).
+How fresh a CacheKit Cloud read is, and how long a deleted project's data stays readable: [Consistency and Deletion](https://docs.cachekit.io/concepts/consistency/).
 
 </details>
 
@@ -156,9 +159,9 @@ def expensive_api_call(user_id: int):
 
 ---
 
-> **CachekitIO Cloud (Beta)**
+> **CacheKit Cloud (Closed Beta)**
 > Managed caching with zero infrastructure. L1+L2 caching, circuit breaker, and automatic failover — no Redis to manage.
-> *cachekit.io is in closed beta — [request access](https://cachekit.io) to get started.*
+> *CacheKit Cloud is in closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io).*
 
 ---
 
@@ -212,7 +215,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 >
 > **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >
-> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a Python-only, SDK-local preset: a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
+> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to CacheKit Cloud instead of Redis. **`@cache.local()`** is a Python-only, SDK-local preset: a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
 
 <details>
 <summary><strong>Additional Presets: <code>@cache.dev</code> and <code>@cache.test</code></strong></summary>
@@ -248,7 +251,7 @@ def test_cached_function():
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)      │
-│       in-process       │  Redis / CachekitIO / File /       │
+│       in-process       │  Redis / CacheKit Cloud / File /   │
 │                        │  Memcached: one backend round trip │
 ├─────────────────────────────────────────────────────────────┤
 │                    Rust Core (PyO3)                         │
@@ -266,17 +269,17 @@ def test_cached_function():
 
 ## Performance
 
-What a call costs inside your process, from the wall-clock guards in `tests/performance/` run on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with CPython 3.14.7. Each figure is the mean of five run medians with its 95% band.
+What a call costs inside your process, from the wall-clock guards in `tests/performance/` run on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with CPython 3.14.7. Each figure is the mean of five run medians with its 95% band. The two L1-only rows come from [a later run](https://github.com/cachekit-io/cachekit-py/actions/runs/41210621694) on the same CPU model and Python as the other two.
 
 | Path | Time per call |
 |:-----|--------------:|
-| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.311 ± 0.000 µs |
-| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.31 ± 0.00 µs |
+| `@cache(backend=None)` L1 hit, 100-user nested dict (23.5 KB as MessagePack) | 0.341 ± 0.001 µs |
+| `@cache(backend=None)` L1 hit, 10K-row DataFrame | 0.34 ± 0.00 µs |
 | L1 hit with an L2 backend configured, same dict | 284 ± 2 µs |
 | Redis L2 hit with L1 disabled, same dict, Redis in a container on the same machine | 539 ± 3 µs |
 
 - With no backend, L1 keeps the returned object itself, whatever the payload's size, and a repeat call with a few short scalar arguments is answered by one call into the Rust extension that takes no lock ([which calls](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#decorator--l1-hit-hot-path)). Any other call builds its key every time, as does every call to a function with a backend.
-- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 910 times the L1-only hit. This run predates the Rust decode every such hit now runs, which bounds and decodes the MessagePack in one pass at about half the instructions. Encryption adds a decrypt to each such hit; this run measured the difference at 9.3 ± 1.0 µs.
+- With an L2 backend, L1 holds the serialized bytes and every hit deserializes them: for this dict, about 830 times the L1-only hit. This run predates the Rust decode every such hit now runs, which bounds and decodes the MessagePack in one pass at about half the instructions. Encryption adds a decrypt to each such hit; this run measured the difference at 9.3 ± 1.0 µs.
 - An L2 hit adds the backend's round trip. A Redis on another machine adds its network latency to the last row.
 
 Hosted runners come with other CPU models too: in a run of an earlier commit, an EPYC 9V45 runner took about half as long on every row, and other machines give other figures. The [Performance Guide](https://github.com/cachekit-io/cachekit-py/blob/main/docs/performance.md#github-hosted-runner) names the guard behind each figure and how to run it, and the repository's `Bench` workflow repeats the run.
@@ -289,9 +292,9 @@ Hosted runners come with other CPU models too: in a run of an earlier commit, an
 
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity
-- CachekitIO keeps idle connections pooled until the server closes them, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
-- Distributed locking prevents cache stampedes
-- Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
+- The CacheKit Cloud backend keeps idle connections pooled until the server closes them, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
+- Distributed locking guards against cache stampedes across pods, best effort (async functions, on a backend that supports it)
+- Pluggable backend abstraction (Redis, CacheKit Cloud, File, Memcached, custom)
 - Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/42ea601f3c1656df0a06904afa2406604f43f57d/test-vectors/decode-bounds.json) vectors
 
 > [!NOTE]
@@ -323,7 +326,7 @@ def get_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")
 ```
 
-Encrypted DataFrames go through `@cache.secure`, which takes any serializer whose class declares `cross_sdk_compatible = True` ([details](docs/serializers/encryption.md#composability)). A file backend keeps this example self-contained; production uses Redis or cachekit.io:
+Encrypted DataFrames go through `@cache.secure`, which takes any serializer whose class declares `cross_sdk_compatible = True` ([details](docs/serializers/encryption.md#composability)). A file backend keeps this example self-contained; production uses Redis or CacheKit Cloud:
 
 ```python
 import tempfile
@@ -445,9 +448,9 @@ exposition setup.
 **Free-threaded CPython (3.15t, 3.14t):** the core suites run green on
 free-threaded 3.14 and 3.15 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
-(`gil_used = false`). **From the release after 0.24.1, 3.15t has a wheel**:
+(`gil_used = false`). **3.15t has a wheel**:
 the 3.15+ wheel is `abi3t`, so it installs on 3.15t without a Rust toolchain
-(pip 26.1+ or uv 0.11.3+). **3.14t is tested
+([with a recent pip or uv](docs/free-threading.md#cpython-315-one-abi3t-wheel)). **3.14t is tested
 but has no wheel** (it builds from source). Free-threaded builds are not
 officially supported yet — blocked upstream on
 orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import;
@@ -506,7 +509,7 @@ info = expensive_func.cache_info()
 | [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), opt-in cross-process L1 eviction, stale-while-revalidate |
 | [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
 | [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
-| [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
+| [SSRF Protection][ssrf-url] | URL allowlisting for the CacheKit Cloud backend |
 | [Write-Behind][write-behind-url] | Opt-in `write_behind=True`: a miss returns before its L2 write lands |
 
 ---
@@ -527,10 +530,10 @@ info = expensive_func.cache_info()
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
 REDIS_URL="redis://localhost:6379"           # Fallback
 
-# CachekitIO SaaS Backend (closed beta — request access at cachekit.io)
+# CacheKit Cloud backend (closed beta: join the waitlist at https://dash.cachekit.io)
 # For @cache.io() next to Redis, pass api_key= from your secret store instead.
 # CACHEKIT_API_KEY="your-api-key"  # pragma: allowlist secret
-CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
+CACHEKIT_API_URL="https://api.cachekit.io"  # Default CacheKit Cloud endpoint
 
 # Memcached Backend (optional: pip install cachekit[memcached])
 # CACHEKIT_MEMCACHED_SERVERS='["mc1:11211", "mc2:11211"]'  # Default: 127.0.0.1:11211

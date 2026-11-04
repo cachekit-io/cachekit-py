@@ -11,7 +11,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Hashable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
@@ -19,6 +19,10 @@ from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation, l1_cache
 from .._rust_serializer import HitCounter, HitMemo
+
+# _memo_key, the memo key of a call's arguments or None when the memo (create_cache_wrapper's HitMemo)
+# does not take the call, is the extension's memo_key, so the lock-free hit and the slow path that
+# memoises compute one key. rust/src/l1_hit.rs documents which calls it takes and the memo's bounds.
 from .._rust_serializer import memo_key as _memo_key
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
@@ -54,7 +58,7 @@ from ..interop import (
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
-from ..object_cache import ObjectCache
+from ..object_cache import ObjectCache, ScopedEpochStripes
 from ..reliability import CircuitBreakerConfig
 from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
@@ -329,8 +333,9 @@ class InvalidationOutcome(Enum):
     """What one exact-key ``invalidate_cache(*args)`` or ``ainvalidate_cache(*args)`` call did in L2.
 
     Invalidation never raises on a backend failure, so this return value is how a caller learns
-    whether the entry is gone from shared L2. Whole-function invalidation (no arguments on a function
-    that takes parameters) reports nothing and returns ``None``.
+    whether the entry is gone from shared L2. On ``@cache``, whole-function invalidation (no arguments
+    on a function that takes parameters) reports nothing and returns ``None``; ``@cache.local``
+    returns ``NO_L2`` for it, as for every call.
 
     - ``SUCCEEDED``: the L2 delete of the key returned normally. The entry is no longer in L2; the
       delete does not say whether one was there.
@@ -612,27 +617,6 @@ _ENCRYPTING_SERIALIZER_REFUSAL = (
 )
 
 
-# The memo (create_cache_wrapper's HitMemo) takes a call only when every argument's exact type is int,
-# float, bool, NoneType, str or bytes. Two equal values of one of these types always produce the same
-# key: their MessagePack is the same, 0.0 and -0.0 included, since both normalise to 0.0. Types are
-# tested by identity, as the key generator's fast path does, so an argument's type is never hashed or
-# compared through its metaclass. A subclass (IntEnum, a str subclass) or a container never matches,
-# so it takes the full key path on every call.
-# The memo keeps what it is keyed by, keyword names included, so a call's str and bytes arguments and
-# keyword names may hold at most _MEMO_MAX_LEN characters or bytes between them. That bounds an entry
-# at a few KiB: a str of 4-byte characters also keeps its UTF-8 copy once the key generator encodes
-# it. It also bounds the hashing a lookup repeats for strings that are new to each call.
-# _memo_key, the memo key of a call's arguments or None, is the extension's memo_key
-# (rust/src/l1_hit.rs), so the lock-free hit and the slow path that memoises compute one key. A call
-# of only ints, strs and Nones is keyed by its argument tuple itself: those never compare equal
-# across types. A float or bool (1, 1.0 and True are equal) or a bytes puts every type in the key.
-# These mirror the extension's constants.
-_MEMO_MAX_LEN = 256
-# Arguments per call, positional and keyword together.
-_MEMO_MAX_ARGS = 8
-# Slots per decorated function. A full memo is emptied rather than evicted slot by slot, so a hit
-# writes nothing to it.
-_MEMO_MAX_ENTRIES = 1024
 # The L1 hit-latency timer's draw, chance and clock. Globals, not closure cells: a wrapper's every free variable
 # costs its every call, the memoised L1-only hit included, which never times anything. A test can replace them.
 # getrandbits(k) == 0 holds with probability 2**-k: one draw, and a cached small int rather than a new float.
@@ -1227,22 +1211,62 @@ def create_cache_wrapper(
 
         task.add_done_callback(_done)
 
-    def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None, *, twin: str | None) -> None:
+    # Backed mode's invalidation epochs (ScopedEpochStripes); an L1-only function's ObjectCache keeps its
+    # own. Every move of the epochs, the first step of every invalidation (_delete_then_forget), stamps its
+    # keys' stripes, or every stripe for the whole function, and the same keys' stripes in the calling L2
+    # scope (_l2_scope), or that scope's stripe. A fill reads _stripes.seq before its first source read,
+    # the L2 read or the function, and skips each write it makes once a stripe it reads was stamped since:
+    # the L2 write if a stamp in its own scope came before the write was sent (checked after the value is
+    # serialized; a streamed value serializes inside its stream, so it is checked before the stream
+    # starts), the L1 put if any stamp on its key's stripe came before the put. The L2 gate is scoped
+    # because L2 is per tenant: another tenant's invalidation deletes none of this one's entries, so it
+    # skips this one's L2 write only when the two share a stripe. L1 is not per tenant, so its gate is
+    # function-wide. An invalidation moves the epochs again between its L2 deletes and its L1 ones: a read
+    # that starts between the first move and the L2 delete can fetch the old entry, and the second move
+    # skips its backfill, or the L1 delete after it removes the copy. A counter per key, or per tenant,
+    # would outlive its key or tenant; one per function would make every single-key invalidation skip the
+    # L2 write of every overlapping fill, which every process then misses. All three arrays are fixed size.
+    _stripes = ScopedEpochStripes(_l2_scope)
+    _epoch_locks: dict[int, threading.Lock] = {}  # one per process: see invalidation._pid_lock
+    # The L2 checks read the stripes without the lock, so one racing a move can miss it and let the
+    # write through: that write is one already in flight (see "Writes in flight"). _put_l1 checks under it.
+    _moved_in_scope = _stripes.moved_in_scope
+
+    def _move_epochs(cache_keys: list[str] | None) -> None:
+        """Stamp these keys' stripes, or every stripe for None, in the calling context's L2 scope
+        (_l2_scope): call it only in the context of the invalidation's own L2 deletes. A backed
+        function's only: an L1-only one's ObjectCache stamps its own, in its delete and clear."""
+        if _object_cache is not None:
+            return
+        with invalidation._pid_lock(_epoch_locks):
+            _stripes.stamp(cache_keys)
+
+    def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None, *, twin: str | None, epoch: int) -> None:
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
         then record the key, and its pre-0.20.0 twin if it has one (_twin_key), in _cached_keys.
+
+        epoch is the _stripes.seq the fill read before its first source read. The put is skipped if a
+        move has stamped the key's stripe since. When there is a put, the check, the put and the record
+        run under the lock the move takes, and each move comes before the invalidation reads
+        _cached_keys or deletes from L1, so that invalidation removes any entry put before it.
 
         Recording after the put makes "in L1 => in _cached_keys" hold by construction, so a
         whole-function invalidation that trims _cached_keys before evicting L1 cannot miss an
         entry. The key is recorded even when there is nothing to put (L1 disabled, a streamed
-        value): _cached_keys also drives the L2 deletes of process-local invalidation.
+        value, a put the epoch skipped): _cached_keys also drives the L2 deletes of process-local
+        invalidation, and the L2 write may have landed.
 
         The twin is recorded in the same _record step: recorded separately, a trim could keep a
         rewritten key and drop its twin, which a later no-args invalidation would then miss.
         """
         if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-            _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
-        _record(cache_key, twin)
+            with invalidation._pid_lock(_epoch_locks):
+                if not _stripes.moved_since(cache_key, epoch):
+                    _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
+                _record(cache_key, twin)
+        else:
+            _record(cache_key, twin)  # no lock: a record alone races nothing the move orders
 
     def _record(cache_key: str, twin: str | None) -> None:
         """Record ``cache_key`` and its ``twin`` (if any) in _cached_keys under the current L2 scope,
@@ -1358,12 +1382,13 @@ def create_cache_wrapper(
         return await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs), False, None
 
     def _l1_backfill_from_l2(
-        cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None, *, twin: str | None
+        cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None, *, twin: str | None, epoch: int
     ) -> None:
         """Backfill L1 from an L2 hit's raw envelope, holding both freshness
         invariants at every call site in lockstep: a stale-labelled hit is never
         recorded (spec: local caches MUST NOT record stale as fresh), and a
-        fresh hit's local lifetime is bounded by _l1_backfill_ttl.
+        fresh hit's local lifetime is bounded by _l1_backfill_ttl. epoch: see
+        _put_l1, read before the L2 read.
 
         Best-effort: the hit is already decoded, so the one refusal L1Cache.put
         documents — TypeError on a non-bytes envelope from an out-of-contract
@@ -1380,7 +1405,7 @@ def create_cache_wrapper(
             _record(cache_key, twin)
             return
         try:
-            _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for), twin=twin)
+            _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for), twin=twin, epoch=epoch)
         except TypeError as exc:
             _record(cache_key, twin)
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
@@ -1467,6 +1492,7 @@ def create_cache_wrapper(
     async def _l2_swr_recompute_store_async(
         slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
     ) -> None:
+        epoch = _stripes.seq  # before the function reads its source, as a miss reads it
         result = await func(*call_args, **call_kwargs)
         if not _l2_swr_pool.holds(slot):
             # Pruned while its loop was stopped, and func swallowed the cancellation: a newer
@@ -1477,11 +1503,13 @@ def create_cache_wrapper(
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
         )
+        if _moved_in_scope(cache_key, epoch):
+            return  # invalidated while it ran: the result may predate it, so neither write runs
         stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
             cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
         )
         # Refresh L1 with the new fresh bytes (mirrors the miss-path store).
-        _put_l1(cache_key, serialized_data, ttl, twin=_twin_key(call_args, call_kwargs))
+        _put_l1(cache_key, serialized_data, ttl, twin=_twin_key(call_args, call_kwargs), epoch=epoch)
         if stored:
             await _track_and_record_async(cache_key)
 
@@ -1514,14 +1542,17 @@ def create_cache_wrapper(
         duplicate recomputes ever measurably matter.
         """
         try:
+            epoch = _stripes.seq  # as in _l2_swr_recompute_store_async
             result = func(*call_args, **call_kwargs)
             serialized_data = operation_handler.serialization_handler.serialize_data(
                 result, call_args, call_kwargs, cache_key=cache_key
             )
+            if _moved_in_scope(cache_key, epoch):
+                return  # invalidated while it ran: neither write runs
             stored = operation_handler.cache_handler.set(  # type: ignore[attr-defined]
                 cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
             )
-            _put_l1(cache_key, serialized_data, ttl, twin=_twin_key(call_args, call_kwargs))
+            _put_l1(cache_key, serialized_data, ttl, twin=_twin_key(call_args, call_kwargs), epoch=epoch)
             if stored:
                 _track_and_record(cache_key)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
@@ -1916,7 +1947,10 @@ def create_cache_wrapper(
         the delete runs, even in a worker an async caller stopped waiting for. An invalidation can be an
         erasure, and the memo holds the arguments it was given: deleting an entry drops its memo slots,
         whatever arguments they were spelled with (ObjectCache, "Lock-free hits").
+        The epochs move first (see _stripes); _invalidate_key, _drain_all and _local_invalidate_all
+        move them again between their L2 and L1 deletes.
         Returns the current-format key's outcome (see _invalidate_keys); None for all."""
+        _move_epochs(cache_keys)
         try:
             if cache_keys is None:
                 _drain_all()
@@ -1925,30 +1959,29 @@ def create_cache_wrapper(
         finally:
             _forget_flights(cache_keys)
 
-    def _l1_only_fill(
-        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
-    ) -> Any:
+    def _l1_only_fill(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None) -> Any:
         """Run the function for an L1-only miss and store its result, memoised under memo_key (see
-        _call_key). A miss is a call that runs it."""
+        _call_key). A miss is a call that runs it. The key is not recorded in _cached_keys: an L1-only
+        function has nothing in L2, and its whole-function invalidation clears the cache whole."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
+        epoch = _object_cache.invalidation_epoch  # before the call: see ObjectCache, "Invalidation epoch"
         result = func(*call_args, **call_kwargs)
-        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
-        _cached_keys.add((_l2_scope(), cache_key))
+        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key, epoch=epoch)
         return result
 
     async def _l1_only_fill_async(
-        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: tuple[Any, ...] | None
+        cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], memo_key: Hashable | None
     ) -> Any:
         """_l1_only_fill for a coroutine function."""
         assert _object_cache is not None  # noqa: S101 - L1-only miss path only
         _stats.record_miss()
+        epoch = _object_cache.invalidation_epoch  # as in _l1_only_fill
         result = await func(*call_args, **call_kwargs)
-        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key)
-        _cached_keys.add((_l2_scope(), cache_key))
+        _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000, memo_key=memo_key, epoch=epoch)
         return result
 
-    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, tuple[Any, ...] | None]:
+    def _call_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[str, Hashable | None]:
         """A call's cache key, and for an L1-only function with a memo the memo key to memoise its
         entry under, or None.
 
@@ -2426,7 +2459,9 @@ def create_cache_wrapper(
         (the function then ran uncached). A backend that fails a read or write does not get here: the
         cache handler reports a miss and a failed store, so the trip still shares its envelope. Runs
         once per concurrent miss on a key in this process (_thread_flights, in _sync_shared_miss).
+        An invalidation during the trip makes it write nothing (see _stripes; the check is store_result(epochs=)).
         """
+        epoch = _stripes.seq  # before the L2 read (see _stripes)
         # Try to get cached value with optional TTL refresh
         start_time = time.perf_counter()
         try:
@@ -2481,7 +2516,7 @@ def create_cache_wrapper(
 
                 # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
                 # + remaining-freshness bound, as on the async path.
-                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
+                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key, epoch=epoch)
 
                 # Record L2 hit with latency for cache_info()
                 duration_ms = duration * 1000
@@ -2559,12 +2594,22 @@ def create_cache_wrapper(
                 defer=None if _write_behind is None else functools.partial(_defer_write, cache_key, twin_key),
                 registry_id=_registry_id if trackable else None,
                 on_track_error=_warn_track_failure,
+                # Checked at the write point, after serialization (a streamed value: before its stream starts):
+                # an invalidation in this scope since the L2 read means the result may predate it, so nothing
+                # is written (see _stripes).
+                epochs=_stripes,
+                epoch=epoch,
             )
             envelope = outcome.envelope
+            if outcome.skipped:
+                # The callers that joined this trip still get its envelope. The L2 read succeeded, so the
+                # breaker records a success.
+                features.record_success(probe_cycle)
+                return result, envelope
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
-            _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
+            _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key, epoch=epoch)
             if outcome.stored and trackable and not outcome.tracked:
                 _track_and_record(cache_key)
 
@@ -2904,9 +2949,11 @@ def create_cache_wrapper(
         Returns the value and its serialized envelope (None when there is none: a failed
         serialization, or a lock release that failed after the locked work finished; the async L2
         read has no mmap fast path), so a caller that shared this trip can decode its own copy. Runs
-        once per concurrent miss on a key in this process (_flights, in _async_call).
+        once per concurrent miss on a key in this process (_flights, in _async_call). An invalidation
+        during the trip makes it write nothing (see _stripes).
         """
         assert _backend is not None  # noqa: S101 - async_wrapper resolves it before any trip
+        epoch = _stripes.seq  # before the L2 read, as in _backed_miss_sync
         # Try to get from Redis cache (always measure time for L2 latency tracking)
         start_time = time.perf_counter()
 
@@ -2942,7 +2989,7 @@ def create_cache_wrapper(
 
                 # Update L1 cache with the L2 value (serialized bytes) for subsequent
                 # fast access — stale-exclusion + remaining-freshness bound.
-                _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for, twin=twin_key)
+                _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for, twin=twin_key, epoch=epoch)
 
                 # TTL refresh, never on the caller's path. Decide from the
                 # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
@@ -3023,7 +3070,9 @@ def create_cache_wrapper(
                                 result, cached_data = cached_result.value, cached_result.envelope
                                 _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
                                 _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms, probe_cycle)
-                                _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                _l1_backfill_from_l2(
+                                    cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key, epoch=epoch
+                                )
                                 return result, cached_data
                         except (DecryptionAuthenticationError, KeyringConfigurationError):
                             # Same as the lock-acquired double-check below.
@@ -3053,7 +3102,9 @@ def create_cache_wrapper(
                                 result, cached_data = cached_result.value, cached_result.envelope
                                 _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
                                 _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms, probe_cycle)
-                                _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                _l1_backfill_from_l2(
+                                    cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key, epoch=epoch
+                                )
                                 return result, cached_data
                         except (DecryptionAuthenticationError, KeyringConfigurationError):
                             # Fail-closed tamper raise from get_cached_value_async
@@ -3095,13 +3146,16 @@ def create_cache_wrapper(
                             serialized_data = operation_handler.serialization_handler.serialize_data(
                                 result, args, kwargs, cache_key=cache_key
                             )
+                            if _moved_in_scope(cache_key, epoch):
+                                features.record_success(probe_cycle)  # writes nothing: see _backed_miss_sync
+                                return result, serialized_data
 
                             # Store in Redis with TTL
                             stored, tracked = await _set_l2_async(cache_key, serialized_data)
                             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                            _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
+                            _put_l1(cache_key, serialized_data, ttl, twin=twin_key, epoch=epoch)
                             if stored and not tracked:
                                 await _track_and_record_async(cache_key)
 
@@ -3212,6 +3266,9 @@ def create_cache_wrapper(
         set_start = time.perf_counter()  # `set` times serialization plus the store (see the locked write)
         try:
             serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs, cache_key=cache_key)
+            if _moved_in_scope(cache_key, epoch):
+                features.record_success(probe_cycle)  # writes nothing: see _backed_miss_sync
+                return result, serialized_data
 
             # Write-behind (unlocked path only: the locked path's write must land inside its lock, or
             # waiters re-read before L2 holds the value and recompute). A refusal writes here, as without it.
@@ -3222,7 +3279,7 @@ def create_cache_wrapper(
             set_duration_ms = (time.perf_counter() - set_start) * 1000
 
             # Also store in L1 cache for fast subsequent access (using serialized bytes)
-            _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
+            _put_l1(cache_key, serialized_data, ttl, twin=twin_key, epoch=epoch)
             if stored and not tracked:
                 await _track_and_record_async(cache_key)
 
@@ -3271,7 +3328,10 @@ def create_cache_wrapper(
         for stale in [o for o in _drain_watches.copy() if o[0] != pid]:
             _drain_watches.pop(stale, None)  # a forked child's inherited, orphaned watches
         owner, watch = (pid, object()), set[tuple[str, str]]()
-        _drain_watches[owner] = watch
+        # Under the lock _put_l1 records under: a backfill that put before this either recorded before the
+        # watch opened, so the snapshot after it holds the key, or records into the watch.
+        with invalidation._pid_lock(_epoch_locks):
+            _drain_watches[owner] = watch
         try:
             yield watch
         finally:
@@ -3306,13 +3366,14 @@ def create_cache_wrapper(
         The whole-function path for backends without a key registry, and the fallback when a
         drain fails. Keys go to L2 in batches of at most _DELETE_BATCH: one multi-key call per
         batch where the backend supports it (the backend may split it; Memcached sends per
-        server, 1,000 keys a send), else one call per key. Per batch, the L2 delete
-        comes first: evicting L1 first would let an L2-hit backfill landing in between
+        server, 1,000 keys a send), else one call per key. L1 is evicted once every L2
+        delete has run: evicting it first would let an L2-hit backfill landing in between
         re-cache the old value in L1. A key whose delete failed, or that was re-recorded
         while this runs, stays in _cached_keys for the next attempt. Keys other processes
         wrote and this one never saw stay in L2 until their TTL. Another tenant's entry keeps
         its L2 value and stays tracked; only its L1 copy is evicted, because L1 is not
-        tenant-scoped.
+        tenant-scoped. An L1-only function records no keys (_l1_only_fill); its ObjectCache is
+        cleared whole.
 
         Failed deletes are logged once per call with their count: the call never raises, so
         this record is the caller's only signal, and a per-key record would flood during an
@@ -3338,10 +3399,13 @@ def create_cache_wrapper(
                         _cached_keys.discard(entry)
                         if entry in watch:  # rewritten meanwhile: its new value may still be in L2
                             _cached_keys.add(entry)
-                    if _object_cache:
-                        _object_cache.delete(key)
-                    elif _l1_cache:
-                        _l1_cache.invalidate(key)
+            if _object_cache is None and _l1_cache:
+                # After every L2 delete and trim: the second move, then L1, every tenant's copy (see _stripes).
+                _move_then_evict({key for _, key in snap}, watch)
+            if _object_cache:
+                # An L1-only function records no keys (_l1_only_fill), so its cache goes whole: L1 is
+                # not tenant-scoped, and it has nothing in L2.
+                _object_cache.clear()
         if fallbacks:
             # Once per call, like the ERROR below. A backend whose multi-key delete always fails
             # (e.g. an ACL that denies UNLINK) otherwise silently pays one round trip per key.
@@ -3380,8 +3444,10 @@ def create_cache_wrapper(
         if not _is_trackable():
             _local_invalidate_all()
             return
-        try:
-            with _watch_records() as watch:  # opened before the snapshot: later records are watched
+        drained = False
+        with _watch_records() as watch:  # opened before the snapshot: later records are watched
+            evict: set[str] = set()
+            try:
                 snap = set(_cached_keys)  # this process's view, taken before the drain
                 mine = {entry for entry in snap if entry[0] == scope}
                 deleted = _backend.drain_tracked(_registry_id, {key for _, key in mine})  # type: ignore[union-attr]
@@ -3398,13 +3464,28 @@ def create_cache_wrapper(
                 trim = mine - watch
                 _cached_keys.difference_update(trim)
                 _cached_keys.update(trim & watch)  # recorded while the trim ran
-                if _l1_cache:
-                    _l1_cache.invalidate_many(deleted | {key for _, key in snap})
-        except Exception as e:
-            _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
-            _local_invalidate_all()
-        else:
+                evict = deleted | {key for _, key in snap}
+                drained = True
+            except Exception as e:
+                # The drain may have deleted on the server before it raised, so the fallback's L1
+                # deletes are not the last: the move and the eviction of what was recorded since the
+                # drain began, below, still run.
+                _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
+                _local_invalidate_all()
+            if _l1_cache:
+                _move_then_evict(evict, watch)
+        if drained:
             invalidation.publish(_backend, _registry_id, None)
+
+    def _move_then_evict(evict: set[str], watch: set[tuple[str, str]]) -> None:
+        """A whole-function invalidation's second move (see _stripes), then its L1 deletes: evict, and
+        every key recorded since watch opened. A backfill that ran before the move recorded its key under
+        the lock the move takes, so the copy taken after the move holds it; one after the move is skipped.
+        The copy is one C-level step, as other threads' _record calls add to watch meanwhile."""
+        assert _l1_cache is not None  # noqa: S101 - called only with L1 on
+        _move_epochs(None)
+        watched = watch.copy()
+        _l1_cache.invalidate_many(evict | {key for _, key in watched})
 
     def _invalidate_key(cache_key: str) -> InvalidationOutcome:
         """Single-key invalidation: untrack, L2 delete, then L1. Sync; ainvalidate_cache runs it
@@ -3440,6 +3521,7 @@ def create_cache_wrapper(
             if _object_cache:
                 _object_cache.delete(cache_key)
             elif _l1_cache:
+                _move_epochs([cache_key])  # again, between the L2 delete and the L1 one: see _delete_then_forget
                 _l1_cache.invalidate(cache_key)
         return outcome
 
@@ -3460,12 +3542,9 @@ def create_cache_wrapper(
             invalidation.publish(_backend, _registry_id, None if custom_key_func is not None else cache_keys[0])
         return outcome
 
-    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
-        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
-        takes parameters, every entry of the function. Never raises on a backend failure.
-
-        Returns the call's InvalidationOutcome for one entry, and None for every entry.
-        """
+    def _ready_to_invalidate() -> None:
+        """What every invalidation does first: settle a zero-config function, resolve a backed function's
+        lazy backend, and apply the interop guard reads and writes apply."""
         nonlocal _backend, _l1_latency
 
         if _zero_config_pending:
@@ -3487,6 +3566,14 @@ def create_cache_wrapper(
         if interop is not None:
             ensure_interop_backend_compatible(_backend)
 
+    def invalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
+        """Delete the entry for these arguments from L1 and L2; with no arguments on a function that
+        takes parameters, every entry of the function. Never raises on a backend failure.
+
+        Returns the call's InvalidationOutcome for one entry, and None for every entry.
+        """
+        _ready_to_invalidate()
+
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
@@ -3503,24 +3590,7 @@ def create_cache_wrapper(
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> InvalidationOutcome | None:
         """Async invalidate_cache: the same deletes, run off the event loop, and the same return value."""
-        nonlocal _backend, _l1_latency
-
-        if _zero_config_pending:
-            _settle_zero_config()
-
-        # L1-ONLY MODE: Skip backend lookup entirely
-        # This fixes the sentinel problem: when backend=None is explicitly passed,
-        # we should NOT try to get a backend from the provider
-        if not _l1_only_mode and _backend is None:
-            try:
-                _backend = _resolve_lazy_backend()
-                _l1_latency = _latency_report_of(_backend)  # as in invalidate_cache
-            except Exception as e:
-                # If backend creation fails, can't invalidate L2
-                _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
-
-        if interop is not None:  # interop guard, as in invalidate_cache
-            ensure_interop_backend_compatible(_backend)
+        _ready_to_invalidate()
 
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
@@ -3581,13 +3651,22 @@ def create_cache_wrapper(
         return _stats.get_info()
 
     def cache_clear() -> None:
-        """Clear cache statistics and invalidate all cached entries."""
+        """Clear cache statistics and invalidate cached entries.
+
+        An L1-only function loses every entry, in every context: on a function without parameters, a
+        key= that reads its context can file the one call under many keys. A backed function loses what
+        invalidate_cache() with no arguments deletes: every entry when it takes parameters, and without
+        parameters the calling context's key and its pre-0.20.0 twin, in L2 too.
+        """
         _stats.clear()
         if _zero_config_pending:
             _settle_zero_config()
-        # In L1-only mode, invalidation is synchronous (no backend I/O needed)
-        # so cache_clear() works for both sync and async functions.
-        if inspect.iscoroutinefunction(func) and not _l1_only_mode:
+        # In L1-only mode, invalidation is synchronous (no backend I/O needed), so cache_clear() works
+        # for both sync and async functions.
+        if _l1_only_mode:
+            _delete_then_forget(None)
+            return
+        if inspect.iscoroutinefunction(func):
             raise TypeError(
                 "cache_clear() cannot clear cache for async functions with a backend. Use 'await fn.ainvalidate_cache()' instead."
             )

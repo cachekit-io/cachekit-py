@@ -15,12 +15,99 @@ import sys
 import threading
 import weakref
 from collections import OrderedDict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
 from cachekit._rust_serializer import HitEntry, HitMemo
 from cachekit._rust_serializer import monotonic as _monotonic
+
+# The SWR threshold's ±10% jitter. Its low end also bounds a lock-free hit: short of it no read can
+# flag a refresh, so the hit may serve an entry up to there without the lock.
+_JITTER_LOW, _JITTER_HIGH = 0.9, 1.1
+
+# Invalidation epoch stripes, here and in the decorator's backed mode: a power of two. An invalidation of
+# one key also drops the overlapping fills of the other keys in its stripe, about one in this many.
+EPOCH_STRIPES = 64
+
+
+def epoch_stripe(key: str) -> int:
+    """The invalidation epoch stripe of key: its hash, which a str caches, masked to EPOCH_STRIPES."""
+    return hash(key) & (EPOCH_STRIPES - 1)
+
+
+def scoped_epoch_stripe(scope: str, key: str) -> int:
+    """The stripe of key in scope (ScopedEpochStripes): the hash of the pair, masked to EPOCH_STRIPES."""
+    return hash((scope, key)) & (EPOCH_STRIPES - 1)
+
+
+class EpochStripes:
+    """Invalidation epochs, one per stripe of keys, and the sequence number that orders them.
+
+    An invalidation stamps the next sequence number on its keys' stripes (every stripe for None). A
+    fill reads ``seq`` before its source and asks ``moved_since`` before it stores. The owner holds
+    its own lock around ``stamp`` and the checks that must be exact; a check without it can miss a
+    stamp that races it. Reading ``seq`` costs one attribute load; a key is hashed only once some
+    stamp has run since the fill read it.
+    """
+
+    __slots__ = ("_stripes", "seq")
+
+    def __init__(self) -> None:
+        self.seq = 0
+        self._stripes = [0] * EPOCH_STRIPES  # per stripe, the seq of the latest stamp on it
+
+    def stamp(self, keys: Iterable[str] | None) -> None:
+        """Stamp these keys' stripes, or every stripe for None, with the next sequence number."""
+        seq = self.seq + 1
+        if keys is None:
+            self._stripes[:] = [seq] * EPOCH_STRIPES
+        else:
+            for key in keys:
+                self._stripes[epoch_stripe(key)] = seq
+        self.seq = seq  # last: a reader that sees it may still see an older stripe, and only skips less
+
+    def moved_since(self, key: str, epoch: int) -> bool:
+        """Whether a stamp on key's stripe ran after a fill read ``seq`` as epoch."""
+        return epoch != self.seq and self._stripes[epoch_stripe(key)] > epoch
+
+
+class ScopedEpochStripes(EpochStripes):
+    """EpochStripes plus a second gate scoped by the L2 scope ``scope()`` reads in the calling context.
+
+    A backed function's L2 is per tenant, so its L2 write asks ``moved_in_scope``: a stamp of keys also
+    moves the stripe of each (scope, key), and a stamp of every key the stripe of its scope. Its L1 put,
+    which is not per tenant, still asks ``moved_since``. The arrays are fixed: two tenants, or two keys,
+    that share a stripe still skip each other's writes, about one pair in EPOCH_STRIPES.
+    """
+
+    __slots__ = ("_scope", "_keys", "_scopes")
+
+    def __init__(self, scope: Callable[[], str]) -> None:
+        super().__init__()
+        self._scope = scope
+        self._keys = [0] * EPOCH_STRIPES  # per stripe of (scope, key)
+        self._scopes = [0] * EPOCH_STRIPES  # per stripe of scope: the whole-function stamps
+
+    def stamp(self, keys: Iterable[str] | None) -> None:
+        """Stamp as EpochStripes does, and these keys' stripes in the calling scope, or its scope's stripe."""
+        scope = self._scope()
+        seq = self.seq + 1
+        if keys is None:
+            self._stripes[:] = [seq] * EPOCH_STRIPES
+            self._scopes[epoch_stripe(scope)] = seq
+        else:
+            for key in keys:
+                self._stripes[epoch_stripe(key)] = seq
+                self._keys[scoped_epoch_stripe(scope, key)] = seq
+        self.seq = seq  # last, as in EpochStripes.stamp
+
+    def moved_in_scope(self, key: str, epoch: int) -> bool:
+        """Whether a stamp in the calling scope on key's stripe, or on the whole scope, ran after epoch."""
+        if epoch == self.seq:
+            return False
+        scope = self._scope()
+        return self._scopes[epoch_stripe(scope)] > epoch or self._keys[scoped_epoch_stripe(scope, key)] > epoch
 
 
 def _estimate_object_size(obj: Any) -> int:
@@ -129,16 +216,14 @@ class _ObjectCacheState:
         the memo stay consistent. Anti-resurrection needs no per-key residue: a refresh can only land
         on the exact entry (generation) it was started against.
 
-        A lock-free hit of the entry ends before the entry leaves the store. The kill comes first, so
-        a hit that found the entry before its memo slots go reads it dead, and the slots go next, so
-        the memo holds no removed value.
+        A lock-free hit of the entry ends before the entry leaves the store: the memo's forget kills
+        the entry, then drops its slots (see HitMemo.forget).
         """
         entry = self.store.get(key)
         if entry is None:
             return
         hit = entry.hit
         if hit is not None:
-            hit.kill()
             memo = self.memo
             assert memo is not None  # noqa: S101 - an entry has a hit only in a cache with a memo
             memo.forget(hit)
@@ -215,13 +300,20 @@ class _ObjectCacheState:
             return
 
     def kill_all(self) -> None:
-        """End every entry's lock-free hits at once: kill them all, then empty the memo; call with lock held."""
+        """End every entry's lock-free hits: forget every stored entry, then clear the memo; call with lock held.
+
+        Every stored entry is killed, memoised or not: a thread that forked inside a critical section
+        returns there in the child on the state this retires and may memoise one of its entries
+        before _take_back_if_retired forgets it, and a hit in between must find it dead. The memo's
+        clear then drops every slot left, which already leaves no hit a way to an entry a refresh or a
+        memo write had in hand when a fork interrupted it; it kills such an entry too, as defence in
+        depth.
+        """
         memo = self.memo
         if memo is None:
             return
-        for entry in list(self.store.values()):
-            if entry.hit is not None:
-                entry.hit.kill()
+        for entry in list(self.store.values()):  # a snapshot: a finalizer may re-enter and write
+            memo.forget(cast("HitEntry", entry.hit))
         memo.clear()
 
 
@@ -253,7 +345,9 @@ class ObjectCache:
 
     Times are read on ``cachekit._rust_serializer.monotonic``, the clock a
     lock-free hit (below) reads too, so a deadline means the same instant to
-    both. With a memo, an entry's LRU recency is the clock reading of its latest
+    both. The extension reads the OS monotonic clock itself, so patching
+    ``time.monotonic`` (monkeypatch, freezegun) does not move this cache's
+    deadlines. With a memo, an entry's LRU recency is the clock reading of its latest
     use: exact wherever the clock advances between two uses, as the OS monotonic
     clock it reads does within nanoseconds. Of two entries last used at one
     reading, the one stored first is evicted first.
@@ -271,6 +365,20 @@ class ObjectCache:
     replacement can never resurrect stale data — without retaining any per-key
     state for removed entries.
 
+    Invalidation epoch: every ``delete`` and ``clear`` takes the next number
+    of a sequence, ``invalidation_epoch``, and stamps it, under the lock that
+    ``put`` takes too, on the stripe of its key (one of ``EPOCH_STRIPES``, by
+    key hash; ``clear`` stamps them all). A fill (a miss that computes a value
+    and stores it) reads the sequence number before it reads its source and
+    passes it to ``put``, which drops the store if its key's stripe carries a
+    later number. So once a ``delete`` has returned, no fill of its key that
+    read its source before it stores what it read (no fill of any key, for
+    ``clear``). A ``delete`` also drops the overlapping fills of the other keys
+    in its stripe, about one in ``EPOCH_STRIPES``, which store nothing and leave
+    the next call to compute again: a key that shares a stripe with a key
+    deleted more often than its fill takes never caches. The stripes are fixed,
+    so no per-key state outlives its key.
+
     Thread safety: RLock on every public method so callers need no external
     synchronisation.
 
@@ -282,10 +390,12 @@ class ObjectCache:
     its hard expiry, or with ``swr=True`` the earliest point ``get_with_swr``
     could flag it for refresh (``ttl * swr_threshold_ratio * 0.9`` after it was
     stored, with the ttl it was stored with). Every removal (expiry, eviction,
-    ``delete``, replacement, ``clear``, the at-fork reset) kills the entry's
-    ``HitEntry`` and drops its memo slots before it returns, so no lock-free hit
-    serves a removed entry once its removal has returned, and the memo keeps no
-    removed value. ``hits`` counts lookups through the lock only.
+    ``delete``, replacement, ``clear``, the at-fork reset) has the memo forget
+    the entry's ``HitEntry`` before it returns, and a refresh has it repoint the
+    entry's slots at the new one: either way the memo kills the old ``HitEntry``
+    and holds it no more. So no lock-free hit serves a removed entry once its
+    removal has returned, and the memo keeps no removed value. ``hits`` counts
+    lookups through the lock only.
 
     Fork safety: in a forked child an at-fork hook (``_reset_caches_after_fork``)
     repairs every live cache before the child's first call. The parent's threads
@@ -361,26 +471,29 @@ class ObjectCache:
         self._max_size_bytes = max_size_bytes
         self._swr_threshold_ratio = swr_threshold_ratio
         self._swr_retry_interval = swr_retry_interval
-        # The part of an entry's ttl a lock-free hit may serve it for: up to the jitter's low end of the
-        # SWR threshold, short of which get_with_swr never flags a refresh, or all of it.
-        self._fresh_ratio = swr_threshold_ratio * 0.9 if swr else 1.0
-        self._memo = memo
+        # The part of an entry's ttl short of which no read can flag a refresh: the SWR threshold at its
+        # jitter's low end. get_with_swr serves an entry that young without drawing a jitter.
+        self._swr_floor = swr_threshold_ratio * _JITTER_LOW
+        # The part of an entry's ttl a lock-free hit may serve it for: up to that floor, or all of it.
+        self._fresh_ratio = self._swr_floor if swr else 1.0
         # Every critical section binds this once: `s = self._state; with s.lock: ...`. Reading
         # self._state again inside one would mix states if the at-fork hook replaced it meanwhile.
         self._state = _ObjectCacheState(memo)
-        # Kept outside _state, so the at-fork hook keeps them: lifetime stats, and the generation
-        # counter stamped onto every stored entry. A generation is never reused across states, so a
-        # refresh started before a swap cannot land on an entry stored after it.
+        # Kept outside _state, so the at-fork hook keeps them: lifetime stats, the generation counter
+        # stamped onto every stored entry, and the invalidation epoch. A generation is never reused
+        # across states, so a refresh started before a swap cannot land on an entry stored after it.
+        # The epoch moves only under the lock, in delete() and clear().
         self._hits = 0
         self._misses = 0
         self._generation = 0
+        self._epochs = EpochStripes()
         _caches.add(self)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def get(self, key: str, memo_key: Any = None) -> tuple[bool, Any]:
+    def get(self, key: str, memo_key: Hashable | None = None) -> tuple[bool, Any]:
         """Retrieve a value from the cache.
 
         Expired entries are removed on read (lazy expiry).
@@ -408,6 +521,10 @@ class ObjectCache:
                 self._misses += 1
                 return False, None
 
+            # A read's bookkeeping, the same in get_with_swr: its recency (the store's order, or the
+            # stamp the memo cache's records read), its memo slot, and the hit. A read path that skips
+            # a part breaks LRU or the counts. Inline, not a helper: a call costs every @cache.local()
+            # hit about 9% more instructions.
             entry.used_at = now  # most recently used
             if s.memo is None:
                 s.store.move_to_end(key)
@@ -436,7 +553,7 @@ class ObjectCache:
                 return False, None
             return True, entry.value
 
-    def get_with_swr(self, key: str, ttl: float, memo_key: Any = None) -> tuple[bool, Any, bool, int]:
+    def get_with_swr(self, key: str, ttl: float, memo_key: Hashable | None = None) -> tuple[bool, Any, bool, int]:
         """Get value with stale-while-revalidate support.
 
         Once an entry is older than ``ttl * swr_threshold_ratio`` (±10% jitter
@@ -473,7 +590,7 @@ class ObjectCache:
                 self._misses += 1
                 return False, None, False, 0
 
-            entry.used_at = now
+            entry.used_at = now  # a read's bookkeeping, as in get
             if s.memo is None:
                 s.store.move_to_end(key)
             elif memo_key is not None:
@@ -482,14 +599,14 @@ class ObjectCache:
 
             version = entry.generation
             age = now - entry.cached_at
-            threshold = ttl * self._swr_threshold_ratio
-            # Not stale even at the jitter's low end (0.9), so no draw from random could flag it:
-            # the common hit returns here without one.
-            if age <= threshold * 0.9:
+            # Not stale even at the jitter's low end, so no draw from random could flag it: the
+            # common hit returns here without one.
+            if age <= ttl * self._swr_floor:
                 return True, entry.value, False, version
             needs_refresh = False
-            # ±10% jitter staggers refreshes when many keys cross the threshold together
-            jitter = random.uniform(0.9, 1.1)  # noqa: S311 - not cryptographic
+            threshold = ttl * self._swr_threshold_ratio
+            # The jitter staggers refreshes when many keys cross the threshold together
+            jitter = random.uniform(_JITTER_LOW, _JITTER_HIGH)  # noqa: S311 - not cryptographic
             backing_off = entry.refresh_failed_at is not None and now - entry.refresh_failed_at < self._swr_retry_interval
             if age > threshold * jitter and key not in s.refreshing and not backing_off:
                 s.refreshing[key] = entry.generation
@@ -555,14 +672,12 @@ class ObjectCache:
             entry.refresh_failed_at = None  # success ends any retry back-off
             stale = entry.hit
             if stale is not None:
-                # A HitEntry's value never changes, so the refresh gets a new one. Its memo slots
-                # point at the new one before the stale one is killed: a lock-free hit that finds
-                # either reads it alive or misses, and none serves the stale value after this returns.
+                # A HitEntry's value never changes, so the refresh gets a new one, and the memo
+                # repoints the stale one's slots at it, then kills the stale one (HitMemo.repoint).
                 memo = s.memo
                 assert memo is not None  # noqa: S101 - an entry has a hit only in a cache with a memo
                 fresh = entry.hit = HitEntry(value, now + ttl * self._fresh_ratio, now)
                 memo.repoint(stale, fresh)
-                stale.kill()
                 self._take_back_if_retired(s, fresh)
             else:
                 s.store.move_to_end(key)
@@ -608,7 +723,16 @@ class ObjectCache:
             entry = s.store[key]
             entry.refresh_failed_at = _monotonic()
 
-    def put(self, key: str, value: Any, ttl: int, memo_key: Any = None) -> None:
+    @property
+    def invalidation_epoch(self) -> int:
+        """The sequence number of the latest ``delete`` or ``clear``: a fill reads it before its source, for ``put``.
+
+        Read without the lock. A read that races a ``delete`` or ``clear`` returns the number before
+        or after it, and both are safe: the earlier one only makes ``put`` drop more stores.
+        """
+        return self._epochs.seq
+
+    def put(self, key: str, value: Any, ttl: int, memo_key: Hashable | None = None, epoch: int | None = None) -> None:
         """Store a value in the cache.
 
         When a bound is exceeded:
@@ -626,6 +750,9 @@ class ObjectCache:
             value: Python object to store (no serialisation performed).
             ttl: Time-to-live in seconds (must be >= 1).
             memo_key: As ``get`` takes it.
+            epoch: The ``invalidation_epoch`` the caller read before it read the value's source. If a
+                ``delete`` or ``clear`` has stamped the key's stripe since, the value may predate that
+                invalidation, and nothing is stored. None stores unconditionally.
 
         Raises:
             ValueError: If ttl is less than 1.
@@ -637,10 +764,13 @@ class ObjectCache:
         s = self._state
         if self._max_size_bytes is not None and size > self._max_size_bytes:
             with s.lock:
-                s.remove(key)
+                if epoch is None or not self._epochs.moved_since(key, epoch):  # else the entry is newer than the value
+                    s.remove(key)
             return
 
         with s.lock:
+            if epoch is not None and self._epochs.moved_since(key, epoch):
+                return  # read before an invalidation that has returned since: storing it would undo that
             # Replacing? Remove through remove() so byte accounting, any in-flight
             # refresh marker and the memo stay consistent. The fresh generation
             # below makes an older in-flight refresh unable to overwrite this newer value.
@@ -657,7 +787,7 @@ class ObjectCache:
                 used_at=now,
                 size_bytes=size,
                 generation=self._generation,
-                hit=None if self._memo is None else HitEntry(value, now + ttl * self._fresh_ratio, now),
+                hit=None if s.memo is None else HitEntry(value, now + ttl * self._fresh_ratio, now),
             )
             s.store[key] = entry
             s.size_bytes += size
@@ -669,7 +799,9 @@ class ObjectCache:
         """Remove a single entry from the cache.
 
         An in-flight SWR refresh cannot resurrect it: the refresh only lands
-        on the exact entry (generation) it was started against.
+        on the exact entry (generation) it was started against. A fill in flight
+        cannot either: this stamps the key's epoch stripe, also when the key holds
+        no entry, as it does while its fill runs.
 
         Args:
             key: Cache key to remove.
@@ -679,6 +811,7 @@ class ObjectCache:
         """
         s = self._state
         with s.lock:
+            self._epochs.stamp((key,))
             if key in s.store:
                 s.remove(key)
                 return True
@@ -689,10 +822,12 @@ class ObjectCache:
 
         Hit/miss counters are NOT reset; they represent lifetime statistics.
         In-flight SWR refreshes cannot resurrect cleared entries — their
-        target entries no longer exist.
+        target entries no longer exist. Fills in flight store nothing: this stamps
+        every epoch stripe.
         """
         s = self._state
         with s.lock:
+            self._epochs.stamp(None)
             s.kill_all()
             s.store.clear()
             s.size_bytes = 0
@@ -745,10 +880,14 @@ class ObjectCache:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _memoise(self, s: _ObjectCacheState, entry: _Entry, memo_key: Any) -> None:
-        """Point memo_key's memo slot at the entry, for the next such call's lock-free hit; call with s.lock held."""
+    def _memoise(self, s: _ObjectCacheState, entry: _Entry, memo_key: Hashable) -> None:
+        """Point memo_key's memo slot at the entry, for the next such call's lock-free hit; call with s.lock held.
+
+        Not for an entry of a state the at-fork reset retired: the reset killed it, and its slot would
+        only displace one the child set meanwhile.
+        """
         hit = entry.hit
-        if hit is None:
+        if hit is None or self._state is not s:
             return
         memo = s.memo
         assert memo is not None  # noqa: S101 - an entry has a hit only in a cache with a memo
@@ -760,10 +899,11 @@ class ObjectCache:
 
         A thread that forked inside its critical section, from a signal handler or a finalizer,
         returns there in the child on the state the at-fork hook retired, after the hook emptied the
-        memo. A slot it then set for an entry of that state would outlive every removal.
+        memo. A slot it then set for an entry of that state would outlive every removal. _memoise
+        sets none on a state already retired, but a fork during the memo write itself (a finalizer
+        that an allocation in it runs) retires the state after that check.
         """
         if self._state is not s:
-            hit.kill()
             cast("HitMemo", s.memo).forget(hit)
 
     def _evict(self, s: _ObjectCacheState, extra_bytes: int, need_slot: bool) -> None:

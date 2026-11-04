@@ -2,7 +2,7 @@
 
 # Backend Guide
 
-Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis, File (local), Memcached, and CachekitIO (managed SaaS). With no backend configured, a plaintext decorator runs in [L1-only mode](none.md), as `backend=None` does; encrypted and interop decorators still need a backend ([Nothing Configured](#4-nothing-configured-l1-only)). You can also implement custom backends for any key-value store.
+Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis, File (local), Memcached, and CacheKit Cloud (managed). With no backend configured, a plaintext decorator runs in [L1-only mode](none.md), as `backend=None` does; encrypted and interop decorators still need a backend ([Nothing Configured](#4-nothing-configured-l1-only)). You can also implement custom backends for any key-value store.
 
 ## Overview
 
@@ -54,7 +54,7 @@ class BaseBackend(Protocol):
             key: Cache key to delete
 
         Returns:
-            True if key was deleted, False if key didn't exist. CachekitIO returns
+            True if key was deleted, False if key didn't exist. CacheKit Cloud returns
             True on every successful delete, whether or not the key existed: the
             server does not report existence on DELETE.
 
@@ -94,16 +94,16 @@ class BaseBackend(Protocol):
 
 | Backend | Latency | Persistence | Cross-Process | TTL | Locking |
 |---------|---------|-------------|---------------|-----|---------|
-| **L1 (In-Memory)** | 0.31μs per `backend=None` hit with a scalar argument the memo answers ([measured](../performance.md#github-hosted-runner)); with a backend, a hit also deserializes | No | No | No | No |
+| **L1 (In-Memory)** | 0.34μs per `backend=None` hit with a scalar argument the memo answers ([measured](../performance.md#github-hosted-runner)); with a backend, a hit also deserializes | No | No | No | No |
 | **[File](file.md)** | set = fsync + a scan of every entry, so slow on a large cache; get waits on a concurrent set ([cost model](file.md#performance-characteristics)) | Yes (disk) | Format shared; one writer process | Yes | File locks |
 | **[Redis](redis.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Yes (RDB/AOF) | Yes | Yes | Yes |
 | **[Memcached](memcached.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | No | Yes | Yes (max 30d) | No |
-| **[CachekitIO](cachekitio.md)** | 42–45ms p50 hit, measured from MEL ([varies by vantage](cachekitio.md#characteristics)) | Yes | Yes | Yes | Yes |
+| **[CacheKit Cloud](cachekitio.md)** | 42–45ms p50 hit, measured from MEL ([varies by vantage](cachekitio.md#characteristics)) | Yes | Yes | Yes | Yes |
 | **[HTTP (custom)](custom.md)** | One HTTP request per operation ([not measured here](../performance.md#not-measured-here)) | Varies | Yes | Varies | Varies |
 | **[DynamoDB (custom)](custom.md)** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes | No |
 
 **TTL inspection/refresh** (`refresh_ttl_on_get` sliding expiration, via the
-`TTLInspectableBackend` protocol): supported by **File**, **Redis**, and **CachekitIO**.
+`TTLInspectableBackend` protocol): supported by **File**, **Redis**, and **CacheKit Cloud**.
 **Memcached** supports `refresh_ttl` (via `touch`) directly but not `get_ttl`, so
 `refresh_ttl_on_get` does not apply to it (see [Memcached](memcached.md#ttl-inspection--refresh)).
 
@@ -134,7 +134,7 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - Existing Memcached infrastructure you want to reuse
 - Read-heavy workloads where a network round trip on each L1 miss is acceptable ([not measured here](../performance.md#not-measured-here))
 
-**Use [CachekitIOBackend](cachekitio.md) when** *(closed beta — [request access](https://cachekit.io))*:
+**Use [CacheKit Cloud](cachekitio.md) (`CachekitIOBackend`) when** *(closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io))*:
 - You want managed, zero-ops distributed caching
 - Multi-region caching without operating Redis
 - Building zero-knowledge architecture with `@cache.secure`
@@ -204,7 +204,7 @@ assert fast_lookup(2) == 4 and critical_function(2) == 6
 set_default_backend(None)  # clear the default
 ```
 
-Call `set_default_backend(None)` to clear the default. Works with any backend (Redis, File, CachekitIO, custom).
+Call `set_default_backend(None)` to clear the default. Works with any backend (Redis, File, CacheKit Cloud, custom).
 
 **Import order does not matter, but configuration must happen before a decorated
 function's first call.** A decorator applied
@@ -213,7 +213,7 @@ already set, otherwise at first call — so the usual layout (business modules
 imported at the top of the file, `set_default_backend()` in `main()`) works.
 Later `set_default_backend()` calls do not re-point already-pinned functions.
 Exception: an explicit `stale_ttl` validates SWR capability at decoration, so set a
-CachekitIO default *before* importing modules that use it. `@cache.io` is not affected:
+`CachekitIOBackend` default *before* importing modules that use it. `@cache.io` is not affected:
 it builds its own `CachekitIOBackend` and never consults `set_default_backend()`.
 
 ### 3. Environment Variable Auto-Detection
@@ -225,7 +225,7 @@ set exactly one.
 
 | Environment variable        | Backend            |
 |-----------------------------|--------------------|
-| `CACHEKIT_API_KEY`          | `CachekitIOBackend` (SaaS) |
+| `CACHEKIT_API_KEY`          | `CachekitIOBackend` (CacheKit Cloud) |
 | `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
 | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
@@ -408,10 +408,10 @@ first call (and runs uncached if nothing listens there): give it `backend=RedisB
 
 | Backend | Latency | Use Case | Notes |
 |---------|---------|----------|-------|
-| **L1 (In-Memory)** | 0.31μs per `backend=None` hit with a scalar argument the memo answers ([measured](../performance.md#github-hosted-runner)) | Repeated calls in same process | Process-local only |
+| **L1 (In-Memory)** | 0.34μs per `backend=None` hit with a scalar argument the memo answers ([measured](../performance.md#github-hosted-runner)) | Repeated calls in same process | Process-local only |
 | **File** | set = fsync, flat in cache size, except eviction, rejection and the 30 s rescan, which scan the directory; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Shared cache across pods | Recommended production backend |
-| **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
+| **CacheKit Cloud** | 42–45ms p50 hit, measured from MEL | Managed, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
 | **HTTP API** | One HTTP request per operation ([not measured here](../performance.md#not-measured-here)) | Custom cloud services | Network dependent |
 | **DynamoDB** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Serverless, low-traffic | High availability |
 | **Memcached** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Alternative to Redis | No persistence |
@@ -420,10 +420,10 @@ first call (and runs uncached if nothing listens there): give it `backend=RedisB
 
 ## Backend Pages
 
-- [Redis Backend](redis.md) — Default, production-grade, shared cache
+- [Redis Backend](redis.md) — Production-grade, shared cache
 - [File Backend](file.md) — Local disk, single-process, no infrastructure
 - [Memcached Backend](memcached.md) — High-throughput, volatile, multi-process
-- [CachekitIO Backend](cachekitio.md) — Managed SaaS, zero-ops, zero-knowledge
+- [CacheKit Cloud Backend](cachekitio.md) — Managed, zero-ops, zero-knowledge
 - [Custom Backends](custom.md) — HTTP, DynamoDB, and your own implementations
 
 ## See Also

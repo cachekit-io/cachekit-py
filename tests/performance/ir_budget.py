@@ -9,7 +9,9 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   is not counted either: about half of the real-data Arrow round trip runs on pyarrow's threads.
 - Interpreter startup is ~2 billion instructions. Each path runs at two loop sizes and the
   per-op cost is the difference, ``(Ir[N_HI] - Ir[N_LO]) / (N_HI - N_LO)``, so startup and
-  warmup cancel. The real-data paths run at smaller sizes, and the cheapest paths at larger ones (``LOOPS``).
+  warmup cancel, as long as startup costs the same in every run: the environment keeps pyarrow's
+  allocators off real time (``measure``) and the OS entropy numpy draws at import is seeded
+  (``ir_workload.pin_os_entropy``). The real-data paths run at smaller sizes (``LOOPS``).
 - Code that observes its own wall-clock duration executes more instructions when it runs
   slower, so the measured process pins its main-thread clocks (``ir_workload.pin_main_thread_clocks``).
   Pinned clocks never let the metrics collector's 5 s mode check fire, so the collector stays
@@ -20,8 +22,8 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   cache is warmed first, and the heap layout is sampled (``ir_workload.run_workload``, ``measure``
   and ``LAYOUTS``).
 
-Two full runs agree within 0.08% per op (0.01% on 3.12; byte_storage_store_40b within 0.22%), against a
-1% fail threshold.
+Repeated runs agree within 0.04% per op on most paths, against a 1% fail threshold; docs/performance.md
+names the paths that keep more noise, and how much.
 
 The measured process is ``ir_workload.py``. Its text is compiled into every measured run, so
 editing it moves the heap layout the budgets were recorded at; this gate is kept out of that
@@ -69,16 +71,9 @@ from pathlib import Path
 N_LO, N_HI = 1000, 3000
 WARMUP = 50
 # The real-data paths cost about 60M main-thread Ir per op, 300 times a small path, so a run of
-# 3000 would take hours under callgrind. Fewer ops still cancel startup: it is a few hundred
-# thousand Ir of run-to-run spread against a difference of over a billion.
+# 3000 would take hours under callgrind. Fewer ops still resolve them: pyarrow's thread pool moves a
+# run by up to about 2.8M Ir, against a difference of over a billion.
 LOOPS = dict.fromkeys(("serializer_arrow_usgs", "serializer_auto_usgs"), (5, 10, 30))  # path: (warmup, n_lo, n_hi)
-# The cheapest paths run longer. Startup does not cancel exactly: importing pandas loads pyarrow's
-# jemalloc, which starts a background thread, and depending on how that thread is scheduled against
-# the main thread a run starts in one of two states, whose totals differ by up to about 1.2M Ir (with
-# the thread turned off, by under 5,000). Over 2,000 calls of a 2,600 Ir path that is up to 13% in one
-# layout, and such layouts moved byte_storage_store_40b's median by up to 8.4% in 8 of 80 gate runs.
-# Over 299,000 calls its figure held within 0.22% in 40 runs.
-LOOPS |= dict.fromkeys(("l1_hit", "minimal_l1_hit", "byte_storage_store_40b"), (WARMUP, N_LO, 300_000))
 # Heap layout moves per-op counts: the allocators take shorter or longer paths in some heap
 # states. Any code change shifts the layout, even an edit to ir_workload.py's comments, so a single
 # run can fail an untouched path or hide a real regression. Each path runs at these layout shifts
@@ -88,11 +83,6 @@ LOOPS |= dict.fromkeys(("l1_hit", "minimal_l1_hit", "byte_storage_store_40b"), (
 LAYOUTS = (0, 48, 80, 336, 880)
 FAIL_PCT = 1.0  # regression at or above this fails the gate
 WARN_PCT = 0.2  # above the A/A floor: report but pass
-# The exception: the orjson round trip's 1 KB output buffer goes to glibc malloc, whose path length
-# depends on heap state that no layout sample pins (longer warmups did not settle it). Its figure
-# moves by more than the 1% threshold between unrelated changes, so it is gated at what this
-# harness resolves for it.
-TOLERANCE_PCT = {"serializer_orjson": (2.0, 1.0)}  # path: (fail, warn)
 # Callgrind runs at a time by default. Each path peaks at 0.5 to 1.0 GiB per run (the L2, miss and
 # secure paths at the top), so the default stays small enough to share the machine with other work
 # rather than growing with its core count; --jobs overrides it. A workload that grows under callgrind
@@ -270,6 +260,15 @@ def measure(
         "PYTHONNOUSERSITE": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
+        # pyarrow's two allocators run on real time. Its bundled jemalloc starts a background thread at
+        # import, and how that thread is scheduled against the main thread puts startup in one of two
+        # states, up to 1.2M Ir apart: background_thread:false stops it. With the thread off, jemalloc
+        # would check its real-time purge deadlines on the allocating thread instead; the two decay
+        # settings stop it purging at all. pyarrow's default pool, mimalloc, purges freed memory after a
+        # real-time delay that the freeing thread checks (10 clock reads per real-data round trip); -1
+        # stops it purging.
+        "JE_ARROW_MALLOC_CONF": "background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1",
+        "MIMALLOC_PURGE_DELAY": "-1",
         # cachekit's L1 sweeper wakes every 30 s of real time. A woken thread takes the GIL at a
         # load-dependent moment, and the sweeper compares expiry times stamped by the pinned
         # main-thread clock against the real one, so it evicts live entries mid-run. A day-long
@@ -340,12 +339,11 @@ def judge(budgets: dict[str, int], measured: dict[str, int]) -> list[dict[str, o
             rows.append({"path": path, "verdict": "FAIL", "ir": ir, "budget": None, "pct": None})
             continue
         pct = (ir - budget) / budget * 100
-        fail_pct, warn_pct = TOLERANCE_PCT.get(path, (FAIL_PCT, WARN_PCT))
-        if pct >= fail_pct:
+        if pct >= FAIL_PCT:
             verdict = "FAIL"
-        elif pct >= warn_pct:
+        elif pct >= WARN_PCT:
             verdict = "WARN"
-        elif pct <= -fail_pct:
+        elif pct <= -FAIL_PCT:
             verdict = "LOWER"  # cheaper: ratchet it down with --update if the change touched this path
         else:
             verdict = "ok"

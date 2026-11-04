@@ -89,7 +89,7 @@ def render(reports: dict[int, dict | None], shards: int, jobs: dict[str, dict], 
         out.append(f"| {verdict} | `{row['path']}` | {_figure(row.get('ir'))} | {_figure(row.get('budget'))} | {pct} |")
     out += [
         "",
-        "A path fails at +1% or more against the base (+2% for `serializer_orjson`). This check is not required: "
+        "A path fails at +1% or more against the base. This check is not required: "
         "a deliberate cost increase is accepted at merge. Method: `docs/performance.md`, *Instruction budgets*.",
     ]
     return "\n".join(out) + "\n"

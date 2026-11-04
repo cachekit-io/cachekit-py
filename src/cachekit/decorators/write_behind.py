@@ -17,8 +17,10 @@ calls are already what invalidation uses off the loop.
   ``MAX_BYTES`` bytes, replacements included. Otherwise ``submit`` refuses, drops the entry's queued value
   (the refused one supersedes it), and the caller writes synchronously, as without the option. The one
   exception is a value for an entry being sent: it is always queued behind that send, since a caller write
-  could land before the older send and lose to it. Such values exceed the bounds by at most one per send
-  in flight, so by at most ``MAX_WORKERS`` values. At most ``MAX_WORKERS`` threads send, started on demand.
+  could land before the older send and lose to it. Neither bound is checked for such a value, so the queue
+  holds at most one entry more than ``MAX_ENTRIES`` per send in flight (``MAX_WORKERS`` at most), but its
+  bytes have no cap from those values: each can be any size, and they stay queued while older entries
+  are sent. At most ``MAX_WORKERS`` threads send, started on demand.
   The bounds are sized so a full queue drains within ``EXIT_FLUSH_SECONDS`` at half a second per write.
 - **Parking.** A thread whose queue is empty waits up to ``IDLE_S`` for the next write before it ends, and
   ``submit`` wakes it instead of starting a thread: ``Thread.start()`` waits for the new thread to run, which
@@ -149,7 +151,8 @@ class WriteBehind:
             old = s.pending.get(entry)
             old_size = old.size if old is not None else 0
             # A value behind its entry's own send is always taken: a caller write would race that older send
-            # and could lose to it. At most one such value per send in flight, so at most MAX_WORKERS.
+            # and could lose to it. At most one such entry per send in flight, so at most MAX_WORKERS extra
+            # entries; their bytes are not capped.
             if entry not in s.sending and (
                 len(s.pending) + (old is None) > MAX_ENTRIES or s.bytes - old_size + size > MAX_BYTES
             ):
