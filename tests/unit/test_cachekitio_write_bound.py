@@ -1407,3 +1407,88 @@ def test_a_later_shorter_report_revokes_a_copy_published_after_the_first(
         release.set()
         for writer in writers:
             writer.close(time.monotonic() + _GUARD_SECONDS)
+
+
+class TestWriteBehindDiscardsUnsentJobs:
+    """A queued job discarded without being sent (replaced by a newer value for its entry, or cancelled) runs
+    its ``on_drop`` once, outside the writer's lock; a job that is sent never does."""
+
+    def _blocked_writer(self) -> tuple[wb.WriteBehind, threading.Event, threading.Event]:
+        writer = wb.WriteBehind(on_error=lambda entry, exc: None)
+        started, release = threading.Event(), threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            assert release.wait(_GUARD_SECONDS)
+
+        assert writer.submit(("s", "k"), 1, blocking)
+        assert started.wait(_GUARD_SECONDS)  # the entry's send is in flight: later values queue behind it
+        return writer, started, release
+
+    def test_a_replaced_job_runs_on_drop(self) -> None:
+        writer, _, release = self._blocked_writer()
+        drops: list[str] = []
+        sent: list[str] = []
+        assert writer.submit(("s", "k"), 1, lambda: sent.append("a"), on_drop=lambda: drops.append("a"))
+        assert writer.submit(("s", "k"), 1, lambda: sent.append("b"), on_drop=lambda: drops.append("b"))
+        assert drops == ["a"]  # replaced before it was sent
+        release.set()
+        assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
+        assert sent == ["b"]
+        assert drops == ["a"]  # the sent job never drops
+
+    def test_a_cancelled_job_runs_on_drop(self) -> None:
+        writer, _, release = self._blocked_writer()
+        drops: list[str] = []
+        assert writer.submit(("s", "k"), 1, lambda: None, on_drop=lambda: drops.append("queued"))
+        writer.cancel(lambda entry: entry == ("s", "k"), wait=False)
+        assert drops == ["queued"]
+        release.set()
+        assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
+
+    def test_a_raising_on_drop_is_reported_not_raised(self) -> None:
+        errors: list[BaseException] = []
+        writer = wb.WriteBehind(on_error=lambda entry, exc: errors.append(exc))
+        started, release = threading.Event(), threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            assert release.wait(_GUARD_SECONDS)
+
+        def boom() -> None:
+            raise RuntimeError("drop hook failed")
+
+        assert writer.submit(("s", "k"), 1, blocking)
+        assert started.wait(_GUARD_SECONDS)
+        assert writer.submit(("s", "k"), 1, lambda: None, on_drop=boom)
+        assert writer.submit(("s", "k"), 1, lambda: None)  # replaces the job whose hook raises
+        assert [str(e) for e in errors] == ["drop hook failed"]
+        release.set()
+        assert writer.close(time.monotonic() + _GUARD_SECONDS) == []
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_deferred_write_dropped_unsent_keeps_no_copy(
+    saas: _FakeSaaS, backend: CachekitIOBackend, clock: _Clock, monkeypatch: pytest.MonkeyPatch, is_async: bool
+) -> None:
+    """Winston's case: a write-behind value whose job is discarded unsent never reaches L2, so its L1 copy must
+    not serve for its full ttl. The writer here takes the job and drops it, as a replacement or cancel would."""
+    dropped: list[Callable[[], None]] = []
+
+    def take_and_drop(self: wb.WriteBehind, entry: Any, size: int, send: Any, on_drop: Any = None) -> bool:
+        assert on_drop is not None
+        dropped.append(on_drop)
+        return True  # accepted, never sent
+
+    monkeypatch.setattr(wb.WriteBehind, "submit", take_and_drop)
+    saas.put_fresh_for = "5"
+    compute, _ = _decorated(backend, is_async=is_async, write_behind=True, distributed_lock=False)
+    assert compute() == 1
+    assert "PUT" not in saas.ops
+    assert len(dropped) == 1
+    dropped[0]()  # the job is discarded
+    gets = saas.gets()
+    # No L1 copy of the never-written value: the call reaches L2, misses (the value was never sent) and
+    # recomputes. A served copy would have returned 1 with no GET.
+    assert compute() == 2
+    assert saas.gets() == gets + 1

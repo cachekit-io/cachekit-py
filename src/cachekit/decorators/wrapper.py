@@ -1961,7 +1961,10 @@ def create_cache_wrapper(
         handler = operation_handler.cache_handler
         assert _write_behind is not None and handler is not None  # noqa: S101 - only on the miss path, write_behind on
         send = functools.partial(_send_deferred, cache_key, envelope, twin, handler, copy)
-        return _write_behind.submit((_l2_scope(), cache_key), len(envelope), send)
+        # Discarded unsent (replaced, superseded or cancelled): this value never reaches L2, so its copy must not
+        # serve on, whether it was put already or comes later (_put_deferred_copy then puts it bounded at 0).
+        never_sent = functools.partial(_drop_copy_outliving_write, cache_key, 0.0, copy)
+        return _write_behind.submit((_l2_scope(), cache_key), len(envelope), send, on_drop=never_sent)
 
     def _cancel_deferred(match: Callable[[Entry], bool], *, whole_function: bool, wait: bool = True) -> None:
         """Before an invalidation's deletes: drop matching queued writes and wait out matching sends.
