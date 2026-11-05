@@ -814,7 +814,7 @@ def my_function():
 
 ### Client error (4xx)
 
-**Message**: `Client error: HTTP 400` (or 404, etc.). A 413's message names `HTTP 413` and ends `value exceeds the server's maximum cache value size`.
+**Message**: `Client error: HTTP 400` (or 404, etc.). A 413 reads `Value too large for CacheKit Cloud (HTTP 413): value exceeds the server's maximum cache value size`.
 
 **Exception**: none — logged as `BackendError` (`BackendErrorType.PERMANENT`)
 

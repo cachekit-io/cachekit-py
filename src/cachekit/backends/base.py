@@ -75,7 +75,7 @@ class BaseBackend(Protocol):
             key: Cache key to delete
 
         Returns:
-            True if key was deleted, False if key didn't exist. CachekitIO returns
+            True if key was deleted, False if key didn't exist. CacheKit Cloud returns
             True on every successful delete, whether or not the key existed: the
             server does not report existence on DELETE.
 
