@@ -120,7 +120,7 @@ def classify_http_error(
         # value must shrink), so the decorator degrades: runs uncached, once.
         if status == 413:
             return BackendError(
-                "Value too large for cachekit.io backend (HTTP 413): value exceeds the server's maximum cache value size",
+                "Value too large for CacheKit Cloud (HTTP 413): value exceeds the server's maximum cache value size",
                 error_type=BackendErrorType.PERMANENT,
                 original_exception=exc,
                 operation=operation,

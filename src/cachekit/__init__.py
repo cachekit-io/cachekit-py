@@ -5,7 +5,7 @@ distributed locking, Prometheus metrics, and optional zero-knowledge
 AES-256-GCM encryption, on a Rust-powered core.
 
 Zero-config L1 in-memory by default; pluggable backends: Redis, Memcached,
-File, CachekitIO SaaS, and custom via the BaseBackend protocol.
+File, CacheKit Cloud, and custom via the BaseBackend protocol.
 
 Key Features:
 - **@cache decorator** with intent-based presets
@@ -22,7 +22,7 @@ cachekit provides a modular decorator architecture with intent-based presets:
 - FeatureOrchestrator: Manages enterprise-grade reliability and monitoring features
 - Flexible configuration interface with intent-based presets
 - Enhanced error handling with comprehensive safety checks
-- Pluggable backend abstraction (Redis, Memcached, File, CachekitIO, custom)
+- Pluggable backend abstraction (Redis, Memcached, File, CacheKit Cloud, custom)
 
 Born from production debugging of caching failures:
 - UTF-8 corruption prevention with intelligent binary data handling
@@ -53,7 +53,7 @@ Example Usage:
     def get_user_data(user_id: int) -> UserProfile:
         return db.fetch_user(user_id)
 
-    @cache.io()      # Managed SaaS backend (cachekit.io, closed beta)
+    @cache.io()      # CacheKit Cloud backend (closed beta)
     def get_remote_data(key: str):
         return fetch_remote(key)
 
@@ -76,7 +76,7 @@ from your own secret store before running one:
 - ``old_secret_key``: a retired master key, kept decrypt-only during key rotation.
 - ``secret_key_bytes`` and ``old_secret_key_bytes``: the same keys as raw bytes, as ``EncryptionWrapper``
   takes them, for example ``secret_key_bytes = bytes.fromhex(secret_key)``.
-- ``api_key``: a cachekit.io API key, for example ``api_key = os.environ["CACHEKIT_API_KEY"]``.
+- ``api_key``: a CacheKit Cloud API key, for example ``api_key = os.environ["CACHEKIT_API_KEY"]``.
 """
 
 __version__ = "0.25.1"
