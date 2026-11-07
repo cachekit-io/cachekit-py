@@ -226,10 +226,10 @@ class _Str(str):
 
 class TestAutoSerializerSetHashFloodBound:
     """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, at most
-    _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in a
-    tuple of the set). Each refusal
-    comes before set() builds the set, so a forged one never pays for a quadratic build. The writer refuses the same
-    sets, so an honest one fails at write, not on every read."""
+    _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in
+    a tuple of the set). Each refusal comes before set() builds the set, so a forged one never pays for a quadratic
+    build. The writer refuses the same sets, so an honest one fails at write, not on every read (unless its elements
+    only become equal when read back, as datetimes that differ below a microsecond do)."""
 
     @pytest.fixture
     def counts(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:

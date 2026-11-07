@@ -89,7 +89,8 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 # a frozenset sits anywhere inside a tuple of the set; a tuple holding no frozenset compares in time linear in its
 # size. At these bounds, the costliest forged set found (1024 ints on one merged chain) decodes in about 5x
 # the time of an honest set of the same size. _auto_default applies the same bounds to what it writes, so a refused
-# set fails loudly at write instead of missing on every read.
+# set fails loudly at write instead of missing on every read, unless its elements only become equal when read back
+# (datetimes that differ below a microsecond).
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
 _STR_TYPES = frozenset({str, bytes})
@@ -375,7 +376,10 @@ def _auto_default(obj: Any) -> Any:
 
 
 def _exposed_count(types: list[type]) -> int:
-    """How many of the values these are the types of are neither str nor bytes, counted in C by list.count."""
+    """Count of the types that are neither exactly str nor exactly bytes.
+
+    list.count runs in C: a Python loop over every element would slow honest sets several-fold.
+    """
     return len(types) - types.count(str) - types.count(bytes)
 
 
@@ -436,13 +440,13 @@ def _set_bound_error(values: list[Any], types: list[type], exposed: int) -> str 
 
 def _check_untrusted_set(values: list[Any]) -> None:
     """Refuse a stored set's elements if set() over them could be quadratic, before set() builds it."""
-    # Counted by list.count, which runs in C: a Python loop over every element would slow honest sets several-fold.
     types = list(map(type, values))
     reason = _set_bound_error(values, types, _exposed_count(types))
     if reason:
         raise SerializationError(
-            f"Invalid set format: {reason}: a hash-flood bound, not a framing error. Either the entry is forged, "
-            "or a cachekit version without this bound wrote it."
+            f"Invalid set format: {reason}: a hash-flood bound, not a framing error. Either the entry is forged, a "
+            "cachekit version without this bound wrote it, or its elements read back equal (such as datetimes that "
+            "differ below a microsecond)."
         )
 
 
