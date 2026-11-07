@@ -83,13 +83,34 @@ def interop_rust_reference(data: bytes) -> Any:
     return unpackb_bounded(data, raw=False, strict_map_key=False, object_pairs_hook=interop._build_map)
 
 
-def outcome(decode: Callable[[bytes], Any], data: bytes, *, message: bool = False) -> tuple[Any, ...]:
-    """What ``decode`` returned, as a repr, or the class it raised and its cause's. A bound's message is kept: it names
-    the bound. ``message`` keeps every message: interop's InteropDecodeError quotes the error it wraps."""
+def _canonical(value: Any) -> str:
+    """``repr(value)``, with each set's elements in sorted order. A NaN hashes by its identity, so two equal decodes can
+    iterate a set holding one in different orders."""
+    if type(value) in (set, frozenset):
+        return f"{type(value).__name__}({{{', '.join(sorted(map(_canonical, value)))}}})"
+    if type(value) is dict:
+        return "{" + ", ".join(f"{_canonical(k)}: {_canonical(v)}" for k, v in value.items()) + "}"
+    if type(value) in (list, tuple):
+        inner = ", ".join(map(_canonical, value))
+        return f"[{inner}]" if type(value) is list else f"({inner}{',' if len(value) == 1 else ''})"
+    return repr(value)
+
+
+def _shown(value: Any) -> str:
     try:
-        return ("value", repr(decode(data)))
+        return _canonical(value)
+    except RecursionError:  # only the explicit cases nest this deep, and they hold no set
+        return repr(value)
+
+
+def outcome(decode: Callable[[bytes], Any], data: bytes, *, message: bool = False) -> tuple[Any, ...]:
+    """What ``decode`` returned, as a repr (``_canonical``), or the class it raised and its cause's. A bound's message
+    is kept: it names the bound. ``message`` keeps every message: interop's InteropDecodeError quotes the error it
+    wraps."""
+    try:
+        return ("value", _shown(decode(data)))
     except msgpack.ExtraData as e:
-        return ("extra", repr(e.unpacked), e.extra)
+        return ("extra", _shown(e.unpacked), e.extra)
     except Exception as e:  # noqa: BLE001 - the outcome under comparison
         text = str(e)
         kept = text if message or text.startswith(GUARD_ERROR_PREFIX) else None
