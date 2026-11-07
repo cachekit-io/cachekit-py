@@ -8,6 +8,7 @@ of the writing thread, and the gaps between a reader thread's gets.
 from __future__ import annotations
 
 import gc
+import statistics
 import threading
 import time
 from collections import OrderedDict
@@ -48,7 +49,12 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
     oc.put("hot", "h", ttl=3600)
 
     state = oc._state
-    inner, holds, writer = state.lock, [], threading.get_ident()
+    inner, writer = state.lock, threading.get_ident()
+    holds: list[int] = []
+    compacted: list[bool] = []  # per hold, whether a compaction ran in it: one ran when it began or ended
+
+    def is_compacting() -> bool:
+        return getattr(state, "compacting", False)  # absent before compaction existed: the test also runs on that base
 
     class TimedLock:
         depth = 0
@@ -58,6 +64,7 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
             if threading.get_ident() == writer:
                 self.depth += 1
                 if self.depth == 1:
+                    self.compacted = is_compacting()
                     self.start = time.thread_time_ns()
             return self
 
@@ -66,17 +73,22 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
                 self.depth -= 1
                 if self.depth == 0:
                     holds.append(time.thread_time_ns() - self.start)
+                    compacted.append(self.compacted or is_compacting())
             inner.release()
 
     state.lock = TimedLock()
     starts: list[int] = []
+    failures: list[BaseException] = []
     done = threading.Event()
 
     def reader() -> None:
-        while not done.is_set():
-            starts.append(time.perf_counter_ns())
-            assert oc.get("hot") == (True, "h")
-            time.sleep(0)
+        try:
+            while not done.is_set():
+                starts.append(time.perf_counter_ns())
+                assert oc.get("hot") == (True, "h")
+                time.sleep(0)
+        except BaseException as exc:  # a thread's failure only warns: hand it to the test
+            failures.append(exc)
 
     thread = threading.Thread(target=reader)
     thread.start()
@@ -96,6 +108,7 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
         done.set()
         thread.join()
         gc.enable()
+    assert not failures, f"the reader failed during the writes: {failures[0]!r}"
 
     gaps = [b - a for a, b in pairwise(starts) if b >= begin and a <= end]
     label = f"{ENTRIES:,} entries, {'memo' if with_memo else 'no memo'}"
@@ -105,6 +118,14 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
     record_property("hold_max_ns", max(holds))
     record_property("gap_max_ns", max(gaps))
     print("longest holds, ms:", ", ".join(f"{h / 1e6:.3f}" for h in sorted(holds)[-5:]))
+    compacting = [h for h, c in zip(holds, compacted, strict=True) if c]
+    if compacting:
+        others = [h for h, c in zip(holds, compacted, strict=True) if not c]
+        print(
+            f"{len(compacting):,} holds ran a compaction: max {max(compacting) / 1e6:.3f} ms, "
+            f"median {statistics.median(compacting) / 1e3:.2f} us against {statistics.median(others) / 1e3:.2f} us"
+        )
+        record_property("compacting_hold_max_ns", max(compacting))
 
     # The store is a dict, which CPython resizes in one go as it grows or fills with deleted slots: the
     # same churn on a bare OrderedDict shows how much of the longest hold that resize alone takes.
@@ -124,5 +145,10 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
 
     assert oc.size == ENTRIES + 1
     assert oc.get("hot") == (True, "h")
-    # The dead records were dropped, a batch per write, so none is left over twice the entries.
-    assert len(state.expiry) + len(getattr(state, "old_expiry", ())) <= 2 * oc.size + 1 + 2 * oc.size // 16
+    # The dead records were dropped, a batch per write, so neither kind is left far over twice the entries:
+    # each write during a compaction adds at most one record of each kind.
+    bound = 2 * oc.size + 1 + 2 * oc.size // 16
+    assert len(state.expiry) + len(getattr(state, "old_expiry", ())) <= bound
+    if with_memo:
+        recency = (state.filed, state.refiled, getattr(state, "old_filed", ()), getattr(state, "old_refiled", ()))
+        assert sum(map(len, recency)) <= bound
