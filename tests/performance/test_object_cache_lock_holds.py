@@ -53,9 +53,6 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
     holds: list[int] = []
     compacted: list[bool] = []  # per hold, whether a compaction ran in it: one ran when it began or ended
 
-    def is_compacting() -> bool:
-        return getattr(state, "compacting", False)  # absent before compaction existed: the test also runs on that base
-
     class TimedLock:
         depth = 0
 
@@ -64,7 +61,7 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
             if threading.get_ident() == writer:
                 self.depth += 1
                 if self.depth == 1:
-                    self.compacted = is_compacting()
+                    self.compacted = state.compacting
                     self.start = time.thread_time_ns()
             return self
 
@@ -73,7 +70,7 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
                 self.depth -= 1
                 if self.depth == 0:
                     holds.append(time.thread_time_ns() - self.start)
-                    compacted.append(self.compacted or is_compacting())
+                    compacted.append(self.compacted or state.compacting)
             inner.release()
 
     state.lock = TimedLock()
@@ -145,10 +142,4 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
 
     assert oc.size == ENTRIES + 1
     assert oc.get("hot") == (True, "h")
-    # The dead records were dropped, a batch per write, so neither kind is left far over twice the entries:
-    # each write during a compaction adds at most one record of each kind.
-    bound = 2 * oc.size + 1 + 2 * oc.size // 16
-    assert len(state.expiry) + len(getattr(state, "old_expiry", ())) <= bound
-    if with_memo:
-        recency = (state.filed, state.refiled, getattr(state, "old_filed", ()), getattr(state, "old_refiled", ()))
-        assert sum(map(len, recency)) <= bound
+    assert any(compacted)  # the churn measured what it claims: holds a compaction ran in

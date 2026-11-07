@@ -36,6 +36,7 @@ from cachekit.config import L1CacheConfig
 from cachekit.decorators.wrapper import _memo_key
 from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
+from tests.unit.test_object_cache import deadlines_tracked
 from tests.utils.clock import fake_clock, shared_clock
 from tests.utils.fork_helpers import child_outcome, report
 
@@ -756,7 +757,7 @@ def _assert_records_consistent(oc: ObjectCache) -> None:
     """Every entry's deadline has a tuple, live or detached; with a memo, every entry has exactly one live
     recency record, and the filed records, the detached ones first, run in clock order."""
     s = oc._state
-    assert {(e.expires_at, k) for k, e in s.store.items()} <= set(s.expiry) | set(s.old_expiry)
+    assert deadlines_tracked(oc)
     if s.memo is None:
         assert not (s.filed or s.refiled or s.old_filed or s.old_refiled)
         return

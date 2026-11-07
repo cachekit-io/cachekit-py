@@ -352,6 +352,56 @@ class TestObjectCacheTTL:
         assert [k for k, e in oc._state.store.items() if e.expires_at <= 1015.0] == []
         assert _consistent(oc)
 
+    def test_a_store_that_compacts_during_an_lru_eviction_does_not_break_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A finalizer run inside evict_lru (a cycle collected at an allocation) deletes the entry being looked at and
+        stores until a compaction swaps and drains the recency lists; the eviction must read them afresh, not crash."""
+        from cachekit._rust_serializer import HitCounter, HitMemo
+
+        fake = _fake_clock(monkeypatch)
+        ticks = itertools.count()
+        fake.monotonic = lambda: 1000.0 + next(ticks)
+
+        def owner() -> None:
+            pass
+
+        oc = ObjectCache(max_entries=3, memo=HitMemo(owner, HitCounter(), owner.__module__, owner.__qualname__))
+        s = oc._state
+        for key in ("a", "b", "c"):
+            oc.put(key, key, ttl=600)
+        assert oc.get("a") == (True, "a")  # used since filed: the eviction re-files it, then goes on
+        used_at, fired = object_cache._used_at, []
+
+        def finalizer_runs_here(entry: Any) -> float:
+            if not fired:
+                fired.append(True)
+                oc.delete("a")
+                filed = s.filed
+                while s.filed is filed:  # stores until a compaction swaps the lists, and drains them
+                    oc.put("x", "x", ttl=600)
+            return used_at(entry)
+
+        monkeypatch.setattr(object_cache, "_used_at", finalizer_runs_here)
+        oc.put("d", "d", ttl=600)
+
+        assert fired
+        assert sorted(s.store) == ["c", "d", "x"]  # b, the least recently used left, went
+        assert _consistent(oc)
+
+    def test_a_finalizer_storing_during_clear_leaves_its_entry_recorded(self) -> None:
+        """clear() frees the values last, so an entry a finalizer stores then finds the bookkeeping already reset."""
+        oc = ObjectCache(max_entries=10, max_size_bytes=10_000)
+
+        class StoresWhenFreed:
+            def __del__(self) -> None:
+                oc.put("reborn", "r", ttl=600)
+
+        oc.put("k", StoresWhenFreed(), ttl=600)
+        oc.clear()
+
+        assert list(oc._state.store) == ["reborn"]
+        assert _consistent(oc)
+        assert oc.delete("reborn") and oc.size_bytes == 0
+
     def test_clear_during_a_compaction_leaves_nothing_to_compact(self) -> None:
         oc = ObjectCache(max_entries=100)
         s = oc._state
@@ -942,12 +992,26 @@ class TestObjectCacheRefreshRetryBackoff:
             ObjectCache(swr_retry_interval=bad)
 
 
+def deadlines_tracked(oc: ObjectCache) -> bool:
+    """Whether every entry's own deadline tuple sits in the live or the detached heap, and holds its deadline.
+
+    By identity, as the cache judges liveness: an equal tuple left by an earlier store of the key is dead,
+    so a compaction that kept it and dropped the live one must fail here.
+    """
+    s = oc._state
+    held = {id(t) for t in (*s.expiry, *s.old_expiry)}
+    return all(e.deadline is not None and id(e.deadline) in held and e.deadline == (e.expires_at, k) for k, e in s.store.items())
+
+
 def _consistent(oc: ObjectCache) -> bool:
     """Whether the byte total, the expiry heap and the in-flight refresh markers agree with the entries."""
     s = oc._state
     sized = s.size_bytes == sum(entry.size_bytes for entry in s.store.values())
-    tracked = {(e.expires_at, k) for k, e in s.store.items()} <= set(s.expiry) | set(s.old_expiry)
-    return sized and tracked and all(key in s.store and s.store[key].generation == g for key, g in s.refreshing.items())
+    return (
+        sized
+        and deadlines_tracked(oc)
+        and all(key in s.store and s.store[key].generation == g for key, g in s.refreshing.items())
+    )
 
 
 @pytest.mark.unit

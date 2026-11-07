@@ -228,7 +228,9 @@ class _ObjectCacheState:
         self.old_expiry: list[tuple[float, str]] = []
         self.old_filed: deque[tuple[float, int, str]] = deque()
         self.old_refiled: list[tuple[float, int, str]] = []
-        self.compacting = False  # whether a detached list still holds a record
+        # Set when a compaction starts; cleared by the compact_step that finds the detached lists empty.
+        # Readers pop from those lists too, so they can run empty while it is still set.
+        self.compacting = False
         # In-flight refresh ownership: key -> owning generation. A refresh captures the entry's
         # generation at read time and only lands — or clears/cancels its marker — for that exact
         # generation, so a stale refresh from a replaced entry can neither resurrect data nor
@@ -268,9 +270,7 @@ class _ObjectCacheState:
         Call after the store write. A refreshed entry (new=False) keeps its recency record, which is
         re-filed at the refresh when it is the oldest, as at any use. Once the dead deadline records,
         or the dead recency records, outnumber the live entries, this starts a compaction, and it and
-        each later push move _COMPACT_BATCH records until it ends (compact_step). A compaction handles
-        at most about twice as many records of each kind as there are entries, and the next cannot
-        start for about as many pushes again, so it amortises to O(1) records, at O(log n) each, per push.
+        each later push move at most _COMPACT_BATCH records until it ends (compact_step): O(log n) each.
         """
         expiry, memoised = self.expiry, self.memo is not None
         deadline = entry.deadline = (entry.expires_at, key)
@@ -348,18 +348,20 @@ class _ObjectCacheState:
         current recency record, the older of the first filed and the first re-filed, the detached
         lists included while a compaction runs: O(1) per record popped from `filed`, O(log n) per
         record re-filed or popped from `refiled`. Without concurrent lock-free hits each live record
-        is re-filed at most once per call, as its entry's use time holds still. Such hits can move it while this runs, so after as many re-files as there are
-        entries the oldest record's entry goes, re-filed or not: hits that race an eviction have no
-        order to keep, and the eviction ends.
+        is re-filed at most once per call, as its entry's use time holds still. Such hits can move it
+        while this runs, so after as many re-files as there are entries the oldest record's entry
+        goes, re-filed or not: hits that race an eviction have no order to keep, and the eviction ends.
         """
         if self.memo is None:
             self.remove(next(iter(self.store)))
             return
-        filed, refiled, store = self.filed, self.refiled, self.store
-        old_filed, old_refiled = self.old_filed, self.old_refiled  # empty unless a compaction runs
+        store = self.store
         refiles = len(store)
-        while True:
-            queue = old_filed or filed  # every record left in old_filed precedes every one in filed
+        while store:
+            # Read the lists afresh on every pass: an allocation here can collect a cycle whose finalizer
+            # stores into this cache, and that store's compaction swaps the lists or drains them.
+            filed, refiled, old_refiled = self.filed, self.refiled, self.old_refiled
+            queue = self.old_filed or filed  # every record left in old_filed precedes every one in filed
             heap = old_refiled if old_refiled and (not refiled or old_refiled[0] < refiled[0]) else refiled
             if heap and (not queue or heap[0] < queue[0]):
                 used_at, generation, key = heapq.heappop(heap)
@@ -369,9 +371,12 @@ class _ObjectCacheState:
             if entry is None or entry.generation != generation:
                 continue  # a removed or replaced entry's record
             last_used = _used_at(entry)
+            if store.get(key) is not entry:
+                continue  # a finalizer removed or replaced it meanwhile: its record is dead
             if last_used > used_at and refiles:
                 refiles -= 1
-                heapq.heappush(refiled, (last_used, generation, key))  # used since it was filed
+                record = (last_used, generation, key)  # built first: the list is read after the allocation
+                heapq.heappush(self.refiled, record)  # used since it was filed
                 continue
             self.remove(key)
             return
@@ -410,10 +415,9 @@ class ObjectCache:
     not count: on 64-bit CPython about 64 to 72 bytes per entry for the deadline
     record and, with a memo, 80 to 100 for the recency record (a tuple, its slot,
     and the time it was re-filed at), plus the records of removed or replaced
-    entries. Once those outnumber the live ones, a compaction drops them, 16
-    records per put until it is done, so no put holds the lock for a pass over
-    the cache: rebuilding them in one put held it for 65 to 300 ms at 100k
-    entries.
+    entries. Once those outnumber the live ones, a compaction drops them, a
+    few records per put until it is done, so no put holds the lock for a pass
+    over the cache.
 
     Bounds (at least one required):
     - max_entries: entry-count bound (default 256, pass None to disable)
@@ -906,6 +910,10 @@ class ObjectCache:
         with s.lock:
             self._epochs.stamp(None)
             s.kill_all()
+            # Freeing the values can run a finalizer that stores into this cache. They are held here and
+            # freed only once the store and its bookkeeping are reset: an OrderedDict's clear() drops an
+            # entry stored while it runs, and that entry's records and bytes would outlive it.
+            doomed = list(s.store.values())
             s.store.clear()
             s.size_bytes = 0
             s.expiry.clear()
@@ -916,6 +924,7 @@ class ObjectCache:
             s.old_refiled.clear()
             s.compacting = False
             s.refreshing.clear()
+            del doomed
 
     # ------------------------------------------------------------------
     # Properties
