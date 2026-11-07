@@ -225,9 +225,10 @@ class _Str(str):
 
 
 class TestAutoSerializerSetHashFloodBound:
-    """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, and at most
-    _MAX_SAME_HASH_SET_ELEMENTS on one hash; either refusal comes before set() builds the set, so a forged one never
-    pays for a quadratic build. The writer refuses the same sets, so an honest one fails at write, not every read."""
+    """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, at most
+    _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets (or tuples holding them) on one hash. Each refusal
+    comes before set() builds the set, so a forged one never pays for a quadratic build. The writer refuses the same
+    sets, so an honest one fails at write, not on every read."""
 
     @pytest.fixture
     def counts(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
@@ -301,18 +302,24 @@ class TestAutoSerializerSetHashFloodBound:
         same-hash frozensets one level down, so nested same-hash frozensets cost more with every level. Even two on
         one hash are refused, bare or in a tuple, before set() compares them."""
         inner = [{"__set__": True, "value": [_uuid_marker(i)], "frozen": True} for i in _SAME_HASH[:2]]
-        with pytest.raises(SerializationError, match="two frozensets, or two tuples beside a nested one, that share"):
+        with pytest.raises(SerializationError, match="two frozensets, or two tuples holding frozensets, that share"):
             AutoSerializer(enable_integrity_checking=False).deserialize(_set_doc([wrap(m) for m in inner], frozen))
         assert counts["eq"] == 0
 
-    def test_the_writer_refuses_frozensets_on_one_hash(self) -> None:
+    def test_the_writer_refuses_same_hash_frozensets_and_tuples_holding_them(self) -> None:
         assert hash(frozenset({-1})) == hash(frozenset({-2}))
-        flat_pair = {(-1,), (-2,)}  # flat tuples may share a hash, until one tuple in the set nests
-        assert AutoSerializer().deserialize(*AutoSerializer().serialize(flat_pair)) == flat_pair
-        nested = ({frozenset({-1}), frozenset({-2})}, {(frozenset({-1}),), (frozenset({-2}),)}, {((-1,),), ((-2,),)})
-        for value in (*nested, flat_pair | {((0,),)}):
-            with pytest.raises(TypeError, match="two frozensets, or two tuples beside a nested one, that share"):
-                AutoSerializer().serialize(value)
+        serializer = AutoSerializer()
+        # Tuples holding only tuples and scalars compare in linear time, so they may share a hash.
+        edges = {((0, -1), (0, -2)), ((0, -2), (0, -1)), (-1, ((1, 2),)), (-2, ((1, 2),))}
+        assert serializer.deserialize(*serializer.serialize(edges)) == edges
+        for value in (
+            {frozenset({-1}), frozenset({-2})},
+            {(-1, frozenset()), (-2, frozenset())},
+            {(((frozenset({-1}),),),), (((frozenset({-2}),),),)},  # however deep the frozenset sits
+            {(-1, "x"), (-2, "x"), (0, (frozenset(),))},  # once any tuple holds one, every tuple counts
+        ):
+            with pytest.raises(TypeError, match="two frozensets, or two tuples holding frozensets, that share"):
+                serializer.serialize(value)
 
     @pytest.mark.parametrize("frozen", [False, True])
     def test_a_set_over_the_bound_is_refused_before_any_hash(self, counts: dict[str, int], frozen: bool) -> None:
@@ -375,10 +382,13 @@ class TestAutoSerializerSetHashFloodBound:
         assert result == value
 
     @pytest.mark.parametrize("kind", [set, frozenset])
-    def test_the_writer_refuses_a_set_its_reader_would_refuse(self, kind: type) -> None:
+    def test_the_writer_refuses_a_set_over_the_count(self, kind: type) -> None:
         with pytest.raises(TypeError, match=rf"cannot store this {kind.__name__}: it holds more than 1024 elements"):
             AutoSerializer().serialize({"v": [kind(range(_MAX_NON_STRING_SET_ELEMENTS + 1))]})
-        # str and bytes subclasses read back as str and bytes, so the writer does not count them either.
+
+    @pytest.mark.parametrize("kind", [set, frozenset])
+    def test_the_writer_does_not_count_str_subclasses(self, kind: type) -> None:
+        """They read back as str, which the reader does not count."""
         value = kind({*range(_MAX_NON_STRING_SET_ELEMENTS), *(_Str(i) for i in range(5000))})
         serializer = AutoSerializer()
         assert serializer.deserialize(*serializer.serialize(value)) == value

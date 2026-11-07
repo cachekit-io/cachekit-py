@@ -86,14 +86,13 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 # hash(-2)). That bounds the number of __eq__ calls but not their cost: two frozensets compare by looking up each
 # element of one in the other, and each lookup can compare same-hash frozensets one level down, so the cost
 # multiplies with every level of nesting. Two frozensets may therefore never share a hash, nor may two tuples once
-# any tuple in the set holds a tuple or frozenset (the path to a nested one); a flat tuple compares in time linear
-# in its length. At these bounds, the costliest forged set found (1024 ints on one merged chain) decodes in about 5x
+# a frozenset sits anywhere inside a tuple of the set; a tuple holding no frozenset compares in time linear in its
+# size. At these bounds, the costliest forged set found (1024 ints on one merged chain) decodes in about 5x
 # the time of an honest set of the same size. _auto_default applies the same bounds to what it writes, so a refused
 # set fails loudly at write instead of missing on every read.
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
 _STR_TYPES = frozenset({str, bytes})
-_CONTAINERS = (tuple, frozenset)
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -375,6 +374,36 @@ def _auto_default(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not MessagePack serializable")
 
 
+def _frozenset_in_tuples(values: list[Any], types: list[type]) -> bool:
+    """Whether a frozenset sits at any depth inside a tuple among ``values``.
+
+    Walked a level at a time in C passes: linear in the tuples' size, and no recursion to overflow.
+    """
+    while True:
+        values = list(chain.from_iterable(compress(values, map(issubclass, types, repeat(tuple)))))
+        if not values:
+            return False
+        types = list(map(type, values))
+        if any(issubclass(t, frozenset) for t in set(types)):
+            return True
+
+
+def _frozenset_comparison(values: list[Any], types: list[type]) -> bool:
+    """Whether set() over ``values`` could compare two frozensets: two of them, or two tuples holding them, on one hash.
+
+    Distinct types are few, and a type hashes by identity, so set(types) is safe.
+    """
+    kinds = set(types)
+    checked: list[type] = [frozenset] if any(issubclass(t, frozenset) for t in kinds) else []
+    if any(issubclass(t, tuple) for t in kinds) and _frozenset_in_tuples(values, types):
+        checked.append(tuple)
+    for kind in checked:
+        hashes = sorted(map(hash, compress(values, map(issubclass, types, repeat(kind)))))
+        if any(map(operator.eq, hashes, hashes[1:])):
+            return True
+    return False
+
+
 def _set_bound_error(values: list[Any], types: list[type], exposed: int) -> str | None:
     """Why set() over ``values`` could be quadratic, or None (see _MAX_NON_STRING_SET_ELEMENTS).
 
@@ -386,15 +415,9 @@ def _set_bound_error(values: list[Any], types: list[type], exposed: int) -> str 
     # an all-int set needs no hash check, and sorting an honest one's hashes would cost more than building it.
     if types.count(int) == len(types):
         return None
-    # Sorted, not tallied in a dict or set: a table keyed by the hashes is the very build being bounded. Distinct
-    # types are few, and a type hashes by identity, so set(types) is safe.
-    if any(issubclass(t, _CONTAINERS) for t in set(types)):
-        held = set(map(type, chain.from_iterable(compress(values, map(issubclass, types, repeat(tuple))))))
-        # A tuple holding a tuple or frozenset is a path to a nested frozenset, so then every tuple counts too.
-        nesting = _CONTAINERS if any(issubclass(t, _CONTAINERS) for t in held) else frozenset
-        nested = sorted(map(hash, compress(values, map(issubclass, types, repeat(nesting)))))
-        if any(map(operator.eq, nested, nested[1:])):
-            return "two frozensets, or two tuples beside a nested one, that share one hash"
+    # Hashes are sorted, never tallied in a dict or set: a table keyed by them is the very build being bounded.
+    if _frozenset_comparison(values, types):
+        return "two frozensets, or two tuples holding frozensets, that share one hash"
     # Fewer exposed elements cannot fill one hash past the bound: a str or bytes hash is secret, so only the
     # others' hashes are sorted.
     if exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
@@ -412,7 +435,8 @@ def _check_untrusted_set(values: list[Any]) -> None:
     reason = _set_bound_error(values, types, len(types) - types.count(str) - types.count(bytes))
     if reason:
         raise SerializationError(
-            f"Invalid set format: {reason}: a hash-flood bound, not a framing error. The entry is likely forged."
+            f"Invalid set format: {reason}: a hash-flood bound, not a framing error. Either the entry is forged, "
+            "or a cachekit version without this bound wrote it."
         )
 
 
