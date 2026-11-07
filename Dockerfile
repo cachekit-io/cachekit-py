@@ -3,7 +3,7 @@
 # Usage: docker buildx build --platform linux/amd64,linux/arm64 --output type=local,dest=./dist-linux .
 
 # Stage 1: Builder
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:4840d514c583a4d3d8cad3940e68dee6f0f6f3635c12fcd0a3d74c21a5b93a54 AS builder
 
 WORKDIR /app
 
@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/root/.cargo \
     uv build
 
 # Stage 2: Extract wheels only (minimal filesystem for docker buildx output)
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:4840d514c583a4d3d8cad3940e68dee6f0f6f3635c12fcd0a3d74c21a5b93a54
 
 # Copy only the built wheels from builder stage
 COPY --from=builder /app/dist/*.whl /
