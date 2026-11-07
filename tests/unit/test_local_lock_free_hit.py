@@ -10,6 +10,7 @@ test_l1_lock_free_hit.py, for both decorators.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import signal
 import threading
@@ -136,6 +137,47 @@ class TestTheHit:
         first = fn(1)
         assert fn(1) is first and fn(1) is first
         assert (_cache(fn).hits, fn.cache_info().hits) == (2, 2)
+
+    @pytest.mark.parametrize("kind", ["partial", "async-partial", "callable-instance"])
+    def test_a_custom_key_callable_without_names_still_caches(self, kind: str) -> None:
+        """key= takes any callable, and one without __qualname__ (a functools.partial, an instance with
+        __call__) has no names to memoise by: it decorates, caches and invalidates on the locked path."""
+
+        def body(tag: str, x: int) -> _Value:
+            return _Value((tag, x))
+
+        async def abody(tag: str, x: int) -> _Value:
+            return _Value((tag, x))
+
+        class Service:
+            def __call__(self, x: int) -> _Value:
+                return _Value(("instance", x))
+
+        target: Any = {
+            "partial": functools.partial(body, "bound"),
+            "async-partial": functools.partial(abody, "bound"),
+            "callable-instance": Service(),
+        }[kind]
+        assert not hasattr(target, "__qualname__")
+        fn = cache.local(key=lambda x: f"k:{x}")(target)
+
+        def call(x: int) -> _Value:
+            result = fn(x)
+            return asyncio.run(result) if asyncio.iscoroutine(result) else result
+
+        assert _memo(fn) is None
+        first = call(1)
+        assert call(1) is first
+        fn.invalidate_cache(1)
+        assert call(1) is not first
+
+    def test_a_default_key_callable_without_names_fails_on_the_call_as_before(self) -> None:
+        """Without key=, the key generator needs the names: such a callable still decorates, and its call
+        raises the key generator's AttributeError, not the decorator."""
+        fn = cache.local()(functools.partial(lambda tag, x: x, "bound"))
+        assert _memo(fn) is None
+        with pytest.raises(AttributeError, match="__qualname__"):
+            fn(1)
 
     def test_names_that_are_not_exact_str_are_never_memoised(self) -> None:
         def fn(x: int) -> int:

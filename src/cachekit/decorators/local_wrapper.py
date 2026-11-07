@@ -91,8 +91,10 @@ def create_local_wrapper(
     # The memo answers only while func.__module__ and func.__qualname__ are the objects read here:
     # the key generator reads them on every call, so renaming the function re-keys it as before.
     # Exact str names only: the key generator formats them, and only an immutable name formats the
-    # same way every time it is the same object. __module__ can be any object.
-    names = func.__module__, func.__qualname__
+    # same way every time it is the same object. __module__ can be any object. A callable without
+    # names (a functools.partial, an instance with __call__) gets no memo and decorates as before:
+    # with key= it caches, without it the key generator refuses it on the call.
+    names = getattr(func, "__module__", None), getattr(func, "__qualname__", None)
     hit_counter = HitCounter()
     memo = HitMemo(func, hit_counter, *names) if key is None and type(names[0]) is str and type(names[1]) is str else None
     hit = None if memo is None else memo.get
