@@ -369,6 +369,54 @@ class TestKeyBytesUnchanged:
         assert reads[1:] == [renamed, moved, moved]
         assert ":elsewhere.renamed:" in moved
 
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    def test_a_rename_undone_while_the_key_is_built_memoises_no_other_identity(self, is_async: bool) -> None:
+        """A rename landing between the call's read of the names and its key build (another thread's), then
+        undone, must not leave the memo answering for an entry stored under the renamed identity: that
+        entry's key is not the one invalidate_cache() builds, so the stale value would outlive it."""
+        runs: list[int] = []
+        if is_async:
+
+            @cache(backend=None, ttl=300, namespace="memo", encryption=False)
+            async def afn(x: int) -> object:
+                runs.append(x)
+                return object()
+
+            fn: Any = afn
+
+            def call(x: int) -> object:
+                return asyncio.run(afn(x))
+
+            def invalidate(x: int) -> None:
+                asyncio.run(afn.ainvalidate_cache(x))
+
+        else:
+
+            @cache(backend=None, ttl=300, namespace="memo", encryption=False)
+            def sfn(x: int) -> object:
+                runs.append(x)
+                return object()
+
+            fn, call, invalidate = sfn, sfn, sfn.invalidate_cache
+        key_gen = _closure_cell(fn, "operation_handler").cell_contents.key_generator
+        generate = key_gen.generate_key
+        original = fn.__wrapped__.__qualname__
+
+        def renaming(*args: Any, **kwargs: Any) -> str:
+            fn.__wrapped__.__qualname__ = "renamed"
+            return generate(*args, **kwargs)
+
+        key_gen.generate_key = renaming
+        first = call(1)
+        del key_gen.generate_key
+        fn.__wrapped__.__qualname__ = original
+        store = _closure_cell(fn, "_object_cache").cell_contents._state.store
+        assert list(store) == [_key_now(fn, (1,), {}, "memo")]  # stored under the names it read
+        assert call(1) is first
+        invalidate(1)
+        assert call(1) is not first
+        assert runs == [1, 1]
+
     def test_a_rename_rekeys_a_callable_that_is_not_a_plain_function(self) -> None:
         """The memo reads every callable's names by attribute access, so a rename re-keys any callable,
         here a bound method reporting its function's names, as it re-keys a plain function."""

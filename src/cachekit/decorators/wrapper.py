@@ -648,6 +648,18 @@ def _record_l1_latency(report: L1LatencyReport, timed_from: int) -> None:
 _MISS = object()
 
 
+class _Names:
+    """A function's __module__ and __qualname__ as read once: what CacheKeyGenerator.generate_key reads off func.
+
+    Building a key from this rather than the function binds the key to one read of the names, so a
+    rename while the key is built cannot give it names other than the ones its memo admission checked.
+    """
+
+    def __init__(self, module: Any, qualname: Any) -> None:
+        self.__module__ = module
+        self.__qualname__ = qualname
+
+
 def _is_encrypting_serializer(serializer: object) -> bool:
     """An EncryptionWrapper instance (subclasses included) or a registry name that resolves to one."""
     return isinstance(serializer, EncryptionWrapper) or (
@@ -1986,12 +1998,20 @@ def create_cache_wrapper(
         entry under, or None.
 
         A call is memoised only when its key was built with the names the memo answers for (see
-        _enter_l1_only). They are read before the key is built, so a rename in between leaves the
-        call unmemoised."""
+        _enter_l1_only). The names are read once and the key is built from that read, so a rename
+        racing the call, even one undone before it returns, cannot leave an entry stored under other
+        names memoised under these. A memo exists only on generated keys, so this is _resolve_cache_key's
+        generated-key branch."""
         if _l1_memo is None:
             return _resolve_cache_key(call_args, call_kwargs), None
         module, qualname = func.__module__, func.__qualname__
-        cache_key = _resolve_cache_key(call_args, call_kwargs)
+        cache_key = operation_handler.get_cache_key(
+            _Names(module, qualname),  # pyright: ignore[reportArgumentType] — the key generator reads only the names
+            call_args,
+            call_kwargs,
+            namespace,
+            integrity_checking,
+        )
         if module is not _l1_memo_names[0] or qualname is not _l1_memo_names[1]:
             return cache_key, None
         return cache_key, _memo_key(call_args, call_kwargs)
