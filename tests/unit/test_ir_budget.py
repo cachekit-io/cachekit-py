@@ -482,6 +482,60 @@ def test_backed_l1_hit_path_is_a_plaintext_l1_hit_on_held_msgpack(monkeypatch, p
     assert backend_reads == []
 
 
+def test_interop_l1_hit_path_decodes_the_plain_value_l1_holds(monkeypatch) -> None:
+    """``l1_hit_interop`` budgets an interop L1 hit: after warmup, every call finds its key in L1, holding the value's
+    plain MessagePack, and decodes it with ``decode_interop_value``, never reaching L2."""
+    pytest.importorskip("pandas")  # the workload builder makes the Arrow path's DataFrame too
+    import cachekit
+    from cachekit.l1_cache import L1Cache
+    from cachekit.serializers import interop_serializer
+
+    entries: list[object] = []
+    real_get = L1Cache.get
+
+    def tracking_get(self, key):
+        found, entry = real_get(self, key)
+        entries.append(entry if found else None)
+        return found, entry
+
+    decoded: list[bytes] = []
+    real_decode = interop_serializer.decode_interop_value
+
+    def counting_decode(data):
+        decoded.append(data)
+        return real_decode(data)
+
+    backend_reads: list[str] = []
+    real_cache = cachekit.cache
+
+    def counting_cache(*args, backend, **kwargs):
+        real_backend_get = backend.get
+
+        def counting_get(key):
+            backend_reads.append(key)
+            return real_backend_get(key)
+
+        backend.get = counting_get
+        return real_cache(*args, backend=backend, **kwargs)
+
+    monkeypatch.setattr(L1Cache, "get", tracking_get)
+    monkeypatch.setattr(interop_serializer, "decode_interop_value", counting_decode)
+    monkeypatch.setattr(cachekit, "cache", counting_cache)
+    op = ir_workload.build_workload("l1_hit_interop")
+    for _ in range(3):  # warmup: the miss stores the value in L2 and L1
+        op()
+    assert backend_reads, "the warmup miss reads the backend, so the count reaches it"
+    entries.clear()
+    decoded.clear()
+    backend_reads.clear()
+    for _ in range(20):
+        assert op() == {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
+    assert len(entries) == 20
+    assert all(type(entry) is bytes for entry in entries)
+    assert decoded == entries
+    assert backend_reads == []
+
+
 def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> None:
     for name in ("time", "monotonic", "perf_counter"):
         monkeypatch.setattr(time, name, getattr(time, name))

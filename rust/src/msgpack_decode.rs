@@ -19,9 +19,9 @@
 //!
 //! Interop keys (IOP-18) may be of any type. A map's `str` and `bytes` keys go straight into its dict:
 //! they hash under the per-process secret, so no input can make that build quadratic. From its first
-//! key of another type, the map's pairs are held, in order, and handed with the ones before them to
-//! `_build_map` at its close, as msgpack-python's `object_pairs_hook` was handed them: it bounds how
-//! many such keys one map holds before it hashes any.
+//! key of another type, the map's pairs are held in read order after the dict's (`hold`), and
+//! `_build_map` makes the map from them at its close, as msgpack-python's `object_pairs_hook` did: it
+//! counts how many such keys the map holds before it hashes any.
 //!
 //! Safe Rust only (`SECURITY.md`): every object is a PyO3 `Bound`, so each reference is released
 //! by its owner on any exit. PyO3's plain constructors abort the process when CPython is out of
