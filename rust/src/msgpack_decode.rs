@@ -41,7 +41,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 /// The keys `_standard_object_hook` (`standard_serializer.py`) and `_revive_sentinels` (`interop.py`)
-/// test. Every marker key starts with `__` (`Decoder::is_marker`).
+/// test.
 const TEMPORAL_MARKERS: &[&[u8]] = &[b"__datetime__", b"__date__", b"__time__"];
 /// The keys `_auto_object_hook` (`auto_serializer.py`) tests.
 const AUTO_MARKERS: &[&[u8]] = &[
@@ -53,6 +53,19 @@ const AUTO_MARKERS: &[&[u8]] = &[
     b"__set__",
     b"__ndarray__",
 ];
+
+/// `Decoder::is_marker` tests `__` before the list, so every marker key must start with it.
+const fn dunder_prefixed(keys: &[&[u8]]) -> bool {
+    let mut i = 0;
+    while i < keys.len() {
+        if keys[i].len() < 2 || keys[i][0] != b'_' || keys[i][1] != b'_' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(dunder_prefixed(TEMPORAL_MARKERS) && dunder_prefixed(AUTO_MARKERS));
 
 /// Strings at most this long go through a per-decode cache, so a repeated one is one object: map
 /// keys in one table, values in another.
