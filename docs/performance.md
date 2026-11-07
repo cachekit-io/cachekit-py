@@ -323,6 +323,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `l1_hit` | `@cache(backend=None)` L1 hit | 2,936 | 2,765 |
 | `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CacheKit Cloud backend with telemetry on does, so each call pays the 1-in-256 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 81,354 | 81,592 |
 | `l1_hit_backed_auto` | `@cache` with `serializer="auto"` and a backend that keeps no hit-latency report, L1 hit (decodes the verified MessagePack the auto serializer keeps) | 92,337 | 93,325 |
+| `l1_hit_interop` | `@cache(interop=..., namespace=...)` with a backend that keeps no hit-latency report, L1 hit (builds its interop key, decodes the plain MessagePack value L1 holds) | 106,422 | 106,167 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,942 | 2,765 |
 | `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 163,783 | 158,141 |
 | `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 212,909 | 204,218 |
