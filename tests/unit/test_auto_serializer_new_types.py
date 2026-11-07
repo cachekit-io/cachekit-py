@@ -11,7 +11,9 @@ Tests:
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from uuid import UUID
 
 import msgpack
@@ -20,7 +22,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from cachekit._rust_serializer import ByteStorage
-from cachekit.serializers.auto_serializer import AutoSerializer
+from cachekit.serializers.auto_serializer import _MAX_NON_STRING_SET_ELEMENTS, AutoSerializer
 from cachekit.serializers.base import SerializationError
 from tests.utils.hypothesis_settings import slow_first_draw
 
@@ -204,6 +206,231 @@ class TestAutoSerializerFrozenset:
         assert isinstance(deserialized, frozenset)
         assert not isinstance(deserialized, set)
         assert deserialized == test_frozenset
+
+
+def _uuid_marker(i: int) -> dict:
+    return {"__uuid__": True, "value": str(UUID(int=i))}
+
+
+def _set_doc(values: list, frozen: bool) -> bytes:
+    return msgpack.packb({"__set__": True, "value": values, "frozen": frozen}, use_bin_type=True)
+
+
+# UUID.__hash__ is hash(self.int), and an int hashes mod 2**61 - 1: these all hash alike.
+_SAME_HASH = [12345 + k * (2**61 - 1) for k in range(40)]
+
+
+class _Str(str):
+    pass
+
+
+class TestAutoSerializerSetHashFloodBound:
+    """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, at most
+    _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in
+    a tuple of the set). Each refusal comes before set() builds the set, so a forged one never pays for a quadratic
+    build. The writer refuses the same sets, so an honest one fails at write, not on every read (unless its elements
+    only share a hash once read back, as pandas Timestamps that differ only in nanoseconds do)."""
+
+    @pytest.fixture
+    def counts(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+        counts = {"hash": 0, "eq": 0}
+        uuid_hash, uuid_eq = UUID.__hash__, UUID.__eq__
+
+        def counting_hash(self: UUID) -> int:
+            counts["hash"] += 1
+            return uuid_hash(self)
+
+        def counting_eq(self: UUID, other: object) -> bool:
+            counts["eq"] += 1
+            return uuid_eq(self, other)
+
+        monkeypatch.setattr(UUID, "__hash__", counting_hash)
+        monkeypatch.setattr(UUID, "__eq__", counting_eq)
+        return counts
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize(
+        "element",
+        [_uuid_marker, lambda i: {"__tuple__": True, "value": [_uuid_marker(i), 0]}],
+        ids=["uuid", "tuple"],
+    )
+    def test_a_same_hash_set_is_refused_before_any_comparison(
+        self, counts: dict[str, int], frozen: bool, element: Callable[[int], dict]
+    ) -> None:
+        data = _set_doc([element(i) for i in _SAME_HASH], frozen)
+        with pytest.raises(
+            SerializationError,
+            match="more than 8 elements that are neither str nor bytes and share one hash: a hash-flood bound",
+        ):
+            AutoSerializer(enable_integrity_checking=False).deserialize(data)
+        # Hashed once each, by the sort; set() would have compared each to every earlier one.
+        assert counts == {"hash": len(_SAME_HASH), "eq": 0}
+
+    def test_timestamps_that_read_back_equal_are_refused_on_read_past_the_bounds(self) -> None:
+        """The writer sees distinct nanosecond Timestamps; the reader sees equal datetimes, so equal hashes."""
+        pd = pytest.importorskip("pandas")
+        stamps = [pd.Timestamp("2026-01-01") + pd.Timedelta(i, "ns") for i in range(9)]
+        serializer = AutoSerializer()
+        for value in (set(stamps), {frozenset(stamps[:1]), frozenset(stamps[1:2])}):
+            with pytest.raises(SerializationError, match="for a shared hash, its elements read back equal"):
+                serializer.deserialize(*serializer.serialize(value))
+        assert serializer.deserialize(*serializer.serialize(set(stamps[:8]))) == {datetime(2026, 1, 1)}
+
+    def test_eight_elements_may_share_a_hash_but_not_nine(self) -> None:
+        """hash(-1) == hash(-2), so 3-D offsets over -1 and -2 put 8 honest tuples on one hash; 4-D offsets put 16."""
+        serializer = AutoSerializer()
+        offsets = set(itertools.product(range(-2, 3), repeat=3))
+        assert len({hash(t) for t in itertools.product((-1, -2), repeat=3)}) == 1
+        assert serializer.deserialize(*serializer.serialize(offsets)) == offsets
+        with pytest.raises(TypeError, match="it holds more than 8 elements that are neither str nor bytes and share one hash"):
+            serializer.serialize(set(itertools.product(range(-2, 3), repeat=4)))
+        with pytest.raises(SerializationError, match="more than 8 elements that are neither str nor bytes and share one hash"):
+            serializer.deserialize(_set_doc([_uuid_marker(i) for i in _SAME_HASH[:9]], False), None)
+        assert serializer.deserialize(_set_doc([_uuid_marker(i) for i in _SAME_HASH[:8]], False), None) == {
+            UUID(int=i) for i in _SAME_HASH[:8]
+        }
+
+    def test_ints_floats_and_other_types_on_one_hash_count_together(self) -> None:
+        """No type is exempt: 202 distinct floats can share one hash, and a UUID's Python __eq__ runs against each."""
+        p = 2**61 - 1
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        for mixed in (
+            [*(2.0 ** (61 * k) for k in range(9))],  # hash 1
+            [*(k * p for k in range(-4, 5))],  # hash 0
+            [*(2.0 ** (61 * k) for k in range(5)), *(_uuid_marker(1 + j * p) for j in range(4))],  # hash 1
+        ):
+            for frozen in (False, True):
+                with pytest.raises(
+                    SerializationError, match="more than 8 elements that are neither str nor bytes and share one hash"
+                ):
+                    serializer.deserialize(
+                        _set_doc([*mixed, "a"], frozen)
+                    )  # a str forces the branch that filters strings out before the sort
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_duplicates_count_toward_the_hash_bound(self, frozen: bool) -> None:
+        """A stored list can repeat an element, which the set dedups only after each copy has walked its probe path,
+        so copies count like any elements on one hash. An honest writer never repeats one."""
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="more than 8 elements that are neither str nor bytes and share one hash"):
+            serializer.deserialize(_set_doc([*range(100), *[25] * 8], frozen))
+        assert serializer.deserialize(_set_doc([*range(100), *[25] * 7], frozen)) == set(range(100))
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("empty", ["", b""])
+    def test_an_empty_str_or_bytes_may_appear_once(self, frozen: bool, empty: str | bytes) -> None:
+        """Both hash to 0 in every process, so copies of one would all walk hash 0's probe path, and they count
+        toward neither bound."""
+        assert hash(empty) == 0
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match=r"the empty str or bytes \(\"\" or b\"\"\) more than once"):
+            serializer.deserialize(_set_doc([0, empty, empty], frozen))
+        # All str or all bytes takes its own branch, which counts the empty value with list.count.
+        a, b = ("a", "b") if empty == "" else (b"a", b"b")
+        with pytest.raises(SerializationError, match="more than once"):
+            serializer.deserialize(_set_doc([a, empty, b, empty], frozen))
+        assert serializer.deserialize(_set_doc([a, empty, b], frozen)) == {a, empty, b}
+        honest = {0, "a", "", b""}
+        assert AutoSerializer().deserialize(*AutoSerializer().serialize(honest)) == honest
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("wrap", [lambda m: m, lambda m: {"__tuple__": True, "value": [m]}], ids=["bare", "in a tuple"])
+    def test_frozensets_on_one_hash_are_refused_before_any_comparison(
+        self, counts: dict[str, int], frozen: bool, wrap: Callable[[dict], dict]
+    ) -> None:
+        """Two frozensets compare by looking each element of one up in the other, and each lookup can compare
+        same-hash frozensets one level down, so nested same-hash frozensets cost more with every level. Even two on
+        one hash are refused, bare or in a tuple, before set() compares them."""
+        inner = [{"__set__": True, "value": [_uuid_marker(i)], "frozen": True} for i in _SAME_HASH[:2]]
+        with pytest.raises(
+            SerializationError, match="two frozensets, or two tuples in a set where a tuple holds a frozenset, that share"
+        ):
+            AutoSerializer(enable_integrity_checking=False).deserialize(_set_doc([wrap(m) for m in inner], frozen))
+        assert counts["eq"] == 0
+
+    def test_the_writer_refuses_same_hash_frozensets_and_tuples_holding_them(self) -> None:
+        assert hash(frozenset({-1})) == hash(frozenset({-2}))
+        serializer = AutoSerializer()
+        # Tuples holding only tuples and scalars compare in linear time, so they may share a hash.
+        edges = {((0, -1), (0, -2)), ((0, -2), (0, -1)), (-1, ((1, 2),)), (-2, ((1, 2),))}
+        assert serializer.deserialize(*serializer.serialize(edges)) == edges
+        for value in (
+            {frozenset({-1}), frozenset({-2})},
+            {(-1, frozenset()), (-2, frozenset())},
+            {(((frozenset({-1}),),),), (((frozenset({-2}),),),)},  # however deep the frozenset sits
+            {(-1, "x"), (-2, "x"), (0, (frozenset(),))},  # once any tuple holds one, every tuple counts
+        ):
+            with pytest.raises(
+                TypeError, match="two frozensets, or two tuples in a set where a tuple holds a frozenset, that share"
+            ):
+                serializer.serialize(value)
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_a_set_over_the_bound_is_refused_before_any_hash(self, counts: dict[str, int], frozen: bool) -> None:
+        data = _set_doc([_uuid_marker(i) for i in range(_MAX_NON_STRING_SET_ELEMENTS + 1)], frozen)
+        with pytest.raises(SerializationError, match="more than 1024 elements that are neither str nor bytes"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(data)
+        assert counts == {"hash": 0, "eq": 0}
+
+    def test_the_bound_counts_only_elements_that_are_neither_str_nor_bytes(self) -> None:
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        strings = [*map(str, range(2000)), *(b"%d" % i for i in range(2000))]
+        assert serializer.deserialize(_set_doc([*strings, *range(1024)], False)) == {*strings, *range(1024)}
+        with pytest.raises(SerializationError, match="more than 1024 elements"):
+            serializer.deserialize(_set_doc([*strings, *range(1025)], False))
+        only_bytes = [b"%d" % i for i in range(2000)]
+        assert serializer.deserialize(_set_doc([*only_bytes, *range(1024)], False)) == {*only_bytes, *range(1024)}
+
+    def test_a_set_at_the_bound_hashes_each_element_twice(self, counts: dict[str, int]) -> None:
+        value = frozenset(UUID(int=i) for i in range(_MAX_NON_STRING_SET_ELEMENTS))
+        serializer = AutoSerializer()
+        data, metadata = serializer.serialize(value)
+        counts.update(hash=0, eq=0)
+        result = serializer.deserialize(data, metadata)
+        # Once by the sort, once by frozenset(); no element shares a hash, so nothing is compared.
+        assert counts == {"hash": 2 * len(value), "eq": 0}
+        assert result == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            set(range(_MAX_NON_STRING_SET_ELEMENTS)),
+            frozenset(range(-(2**63), -(2**63) + _MAX_NON_STRING_SET_ELEMENTS)),
+            {i / 3 for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {UUID(int=i * 2**64) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {(i, str(i)) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {frozenset({i, -i - 10}) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {datetime(2026, 1, 1) + timedelta(seconds=i) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {*range(2, _MAX_NON_STRING_SET_ELEMENTS - 1), True, None, 1.5},  # True == 1, so no 1 here
+            {*range(_MAX_NON_STRING_SET_ELEMENTS), *map(str, range(5000)), *(b"%d" % i for i in range(5000))},
+            {*range(_MAX_NON_STRING_SET_ELEMENTS), *(_Str(i) for i in range(5000))},
+            {((i, -i), (frozenset({i}),), str(i)) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+        ],
+        ids=[
+            "ints",
+            "int64 floor",
+            "floats",
+            "uuids",
+            "tuples",
+            "frozensets",
+            "datetimes",
+            "mixed",
+            "strs",
+            "str subclass",
+            "nested tuples",
+        ],
+    )
+    @pytest.mark.parametrize("kind", [set, frozenset])
+    def test_every_set_shape_at_the_bound_round_trips(self, value: set, kind: type) -> None:
+        serializer = AutoSerializer()
+        result = serializer.deserialize(*serializer.serialize({"v": kind(value)}))["v"]
+        assert type(result) is kind
+        assert result == value
+
+    @pytest.mark.parametrize("kind", [set, frozenset])
+    def test_the_writer_refuses_a_set_over_the_count(self, kind: type) -> None:
+        with pytest.raises(TypeError, match=rf"cannot store this {kind.__name__}: it holds more than 1024 elements"):
+            AutoSerializer().serialize({"v": [kind(range(_MAX_NON_STRING_SET_ELEMENTS + 1))]})
 
 
 class TestAutoSerializerComplexNesting:

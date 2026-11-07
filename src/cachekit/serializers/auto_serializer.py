@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import importlib
 import logging
+import operator
 import sys
+from collections.abc import Iterable
 from datetime import date, datetime, time
 from functools import cached_property
 from importlib.util import find_spec
+from itertools import chain, compress, repeat
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, cast
 from uuid import UUID
 
@@ -72,6 +75,14 @@ _ENVELOPE_FORMATS = frozenset({"msgpack", "dataframe", "series"})
 # Every header `original_type` serialize() can write: the envelope formats plus the two that
 # never travel in an envelope. serialize() always writes the field, so an absent one is rot too.
 _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
+
+# Bounds on one stored set or frozenset, so a forged entry cannot make set() quadratic by choosing its elements'
+# hashes (why, and what each bound admits: docs/serializers/auto.md#set-size-bound). _set_bound_error applies them to
+# the reader's list and to what _auto_default writes.
+_MAX_NON_STRING_SET_ELEMENTS = 1024
+_MAX_SAME_HASH_SET_ELEMENTS = 8
+_STR_TYPES = frozenset({str, bytes})
+_EMPTY_TWICE = 'the empty str or bytes ("" or b"") more than once'
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -317,7 +328,20 @@ def _auto_default(obj: Any) -> Any:
 
     # NEW: set/frozenset support (type-safe roundtrip)
     if isinstance(obj, (set, frozenset)):
-        return {"__set__": True, "value": list(obj), "frozen": isinstance(obj, frozenset)}
+        value = list(obj)
+        types = list(map(type, value))
+        exposed = len(types) - types.count(str) - types.count(bytes)
+        if exposed > _MAX_NON_STRING_SET_ELEMENTS:
+            # A str or bytes subclass reads back as str or bytes: recount as the reader will see them. Below the
+            # bound a subclass counts as exposed, which can only make the writer stricter.
+            exposed = sum(not isinstance(x, (str, bytes)) for x in value)
+        reason = _set_bound_error(value, types, exposed)
+        if reason:
+            raise TypeError(
+                f"AutoSerializer cannot store this {type(obj).__name__}: it holds {reason}, which its reader refuses "
+                "as a hash-flood bound. Cache the elements as a list instead."
+            )
+        return {"__set__": True, "value": value, "frozen": isinstance(obj, frozenset)}
 
     # NumPy array support (nested in dicts/lists via msgpack custom encoder)
     np_loaded = sys.modules.get("numpy")
@@ -338,6 +362,89 @@ def _auto_default(obj: Any) -> Any:
 
     # Generic MessagePack error (fallback)
     raise TypeError(f"Object of type {type(obj).__name__} is not MessagePack serializable")
+
+
+def _frozenset_in_tuples(values: list[Any], types: list[type]) -> bool:
+    """Whether a frozenset sits at any depth inside a tuple among ``values``.
+
+    Walked a level at a time in C passes: linear in the tuples' size, and no recursion to overflow.
+    """
+    while True:
+        values = list(chain.from_iterable(compress(values, map(issubclass, types, repeat(tuple)))))
+        if not values:
+            return False
+        types = list(map(type, values))
+        if any(issubclass(t, frozenset) for t in set(types)):
+            return True
+
+
+def _hash_run_over(values: Iterable[Any], limit: int) -> bool:
+    """Whether more than ``limit`` of ``values`` share one hash.
+
+    The hashes are sorted, never tallied in a dict or set: a table keyed by them is the very build being bounded.
+    """
+    hashes = sorted(map(hash, values))
+    return any(map(operator.eq, hashes, hashes[limit:]))
+
+
+def _empty_count(values: list[Any], types: list[type], kind: type) -> int:
+    """How many of ``values`` are an empty ``kind`` (str or bytes), counted in C passes."""
+    return sum(map(operator.not_, compress(values, map(operator.is_, types, repeat(kind)))))
+
+
+def _may_compare_frozensets(values: list[Any], types: list[type], kinds: set[type]) -> bool:
+    """Whether set() over ``values`` could compare two frozensets: two of them share a hash, or two tuples do while a
+    frozenset sits inside one of the set's tuples. ``kinds`` is set(types).
+    """
+    checked: list[type] = [frozenset] if any(issubclass(t, frozenset) for t in kinds) else []
+    if any(issubclass(t, tuple) for t in kinds) and _frozenset_in_tuples(values, types):
+        checked.append(tuple)
+    return any(_hash_run_over(compress(values, map(issubclass, types, repeat(kind))), 1) for kind in checked)
+
+
+def _set_bound_error(values: list[Any], types: list[type], exposed: int | None = None) -> str | None:
+    """Why set() over ``values`` could be quadratic, or None (see docs/serializers/auto.md#set-size-bound).
+
+    ``types`` holds each value's type. ``exposed`` is how many values are neither str nor bytes, by default counted
+    from ``types``. Every pass runs in C, and a pass only runs when its types are present: a Python loop over every
+    element would slow honest sets several-fold.
+    """
+    # Distinct types are few, and a type hashes by identity, so this set is safe to build.
+    kinds = set(types)
+    if len(kinds) == 1 and kinds <= _STR_TYPES:
+        # All str or all bytes, the most common large set: nothing is exposed, and list.count finds the empty value.
+        return _EMPTY_TWICE if values.count(types[0]()) > 1 else None
+    strings = str in kinds or bytes in kinds
+    if exposed is None:
+        exposed = len(types) - types.count(str) - types.count(bytes) if strings else len(types)
+    if exposed > _MAX_NON_STRING_SET_ELEMENTS:
+        return f"more than {_MAX_NON_STRING_SET_ELEMENTS} elements that are neither str nor bytes"
+    # Every other str and bytes hashes under a per-process secret, but "" and b"" hash to 0 in every process, and a
+    # stored list can repeat them for 1 or 2 bytes a copy: each copy would walk whatever forged elements pile on hash
+    # 0's probe path. An honest set holds each at most once.
+    if any(kind in kinds and _empty_count(values, types, kind) > 1 for kind in (str, bytes)):
+        return _EMPTY_TWICE
+    if _may_compare_frozensets(values, types, kinds):
+        return "two frozensets, or two tuples in a set where a tuple holds a frozenset, that share one hash"
+    # The per-hash bound counts the elements that are neither str nor bytes (only one "" and one b"" can join their
+    # run on hash 0), so fewer of them than the bound cannot exceed it.
+    if exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
+        return None
+    others = compress(values, map(operator.not_, map(_STR_TYPES.__contains__, types))) if strings else values
+    if _hash_run_over(others, _MAX_SAME_HASH_SET_ELEMENTS):
+        return f"more than {_MAX_SAME_HASH_SET_ELEMENTS} elements that are neither str nor bytes and share one hash"
+    return None
+
+
+def _check_untrusted_set(values: list[Any]) -> None:
+    """Refuse a stored set's elements if set() over them could be quadratic, before set() builds it."""
+    reason = _set_bound_error(values, list(map(type, values)))
+    if reason:
+        raise SerializationError(
+            f"Invalid set format: {reason}: a hash-flood bound, not a framing error. Either the entry is forged, a "
+            "cachekit version without this bound wrote it, or, for a shared hash, its elements read back equal (such "
+            "as pandas Timestamps that differ only in nanoseconds)."
+        )
 
 
 def _auto_object_hook(obj: Any) -> Any:
@@ -401,6 +508,7 @@ def _auto_object_hook(obj: Any) -> Any:
             value_list = obj["value"]
             if not isinstance(value_list, list):
                 raise SerializationError(f"Invalid set format: expected list, got {type(value_list).__name__}")
+            _check_untrusted_set(value_list)
 
             if obj.get("frozen"):
                 return frozenset(value_list)

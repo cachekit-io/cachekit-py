@@ -493,7 +493,7 @@ export CACHEKIT_CONNECTION_POOL_SIZE=100
 
 **Exception**: none raised to a `@cache`-decorated caller: the result is returned but not stored in the backend. The exception is `@cache(interop=...)`: there an unsupported return value raises `InteropError` (a `ValueError` subclass, `from cachekit.interop import InteropError`) by design, so a cross-SDK entry is never silently skipped. Calling the serializer directly raises `TypeError`, e.g. `StandardSerializer does not support custom classes (Python-specific types). ...` or `StandardSerializer does not support pandas DataFrames or Series (Python-specific types). ...`
 
-**Cause**: The default serializer handles `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`. Custom classes, dataclasses and DataFrames are not supported.
+**Cause**: The default serializer handles `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`. Custom classes, dataclasses and DataFrames are not supported. `serializer='auto'` also refuses a set or frozenset holding more than 1,024 elements that are neither strings nor bytes, or more than 8 of those that share one hash value, or two frozensets that share one, or two tuples that share one in a set where a tuple holds a frozenset (`AutoSerializer cannot store this set: it holds ...`): see [Set Size Bound](serializers/auto.md#set-size-bound).
 
 **When it occurs**:
 ```python
@@ -548,6 +548,8 @@ def get_json_data():
 **Error text**: `Cache entry failed envelope verification (corrupted cache entry): ...`, `Cache entry failed envelope verification: decoded to a ByteStorage envelope shape ...`, `Cache entry was written with integrity checking on but this reader has integrity checking disabled ...`, `Cache entry is not a decodable MessagePack payload ...`, `NumPy payload disagrees with header format '...'`, `Cache entry header claims a <type> format, not a string`, or `Cache entry header claims format '...', which no writer emits`
 
 **Message** (logged): `L2 cache decrypt/integrity failure (corruption) for ...: ...`, or `(envelope_shape)` in place of `(corruption)` for the envelope-shape refusal described below
+
+With `serializer='auto'`, a stored set or frozenset over the [Set Size Bound](serializers/auto.md#set-size-bound) is handled the same way. Under `@cache` the log line ends in `SerializationError` and names no bound, because the log carries only the exception's class; the full text, `Invalid set format: ... a hash-flood bound, not a framing error. ...`, appears only when you call `deserialize()` directly. A forged entry, an entry written by a cachekit version without the bound, or a set whose elements read back equal (pandas `Timestamp`s that differ only in nanoseconds, or an aware `datetime` at `fold=1`) causes it; the function recomputes as for any corrupt entry.
 
 **Exception**: none under `@cache` — cachekit attempts to evict the entry (best effort; a failed delete is logged and the entry stays) and the function recomputes. Calling a serializer's `deserialize()` directly raises `SerializationError` (there is no separate `DeserializationError` class).
 

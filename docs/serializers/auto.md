@@ -67,6 +67,18 @@ These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP
 
 Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is installed but fails to import, the first DataFrame write or Arrow read on each `AutoSerializer` logs a warning on the `cachekit.serializers.auto_serializer` logger. New DataFrames are then written in the columnar format, and reading an Arrow entry raises `SerializationError`.
 
+## Set Size Bound
+
+A set or frozenset holds at most 1,024 elements that are neither strings nor bytes, at most 8 of those that share one hash value, and the empty string `""` and empty bytes `b""` at most once each. No two of its frozensets may share a hash, and no two of its tuples may once a frozenset sits anywhere inside one of its tuples. Writing a set over any of these bounds raises `TypeError`; under `@cache` the result is returned but not cached, and the failure is logged (see [Serialization unsupported type](../error-codes.md#serialization-unsupported-type)). Reading one, which a forged entry or an earlier cachekit version can hold, raises `SerializationError`, which a cached read treats as a miss.
+
+A set whose elements change their hash on the round trip can cross these bounds only once read back, so the writer accepts it and every read refuses it. pandas `Timestamp`s that differ only in nanoseconds read back as one `datetime`, so more than 8 of them, or two frozensets of them, are refused, while up to 8 bare ones collapse into one element without an error. An aware `datetime` at `fold=1` reads back with its offset but without `fold`, so it can come back equal to another element of the set.
+
+The count takes every element that is not a string or bytes, whatever its type: an int, a float, a bool, `None`, a UUID, a tuple, a frozenset or a datetime. Ints, floats, UUIDs and tuples hash without a random seed, so a forged entry could choose colliding element hashes that make one read quadratic in the set's size. A stored set is a list, so it can also repeat an element, and every copy counts toward both bounds. Strings and bytes hash under a per-process secret, so a set of them is bounded only by the size bounds every read applies, except `""` and `b""`, which hash to 0 in every process. The secret holds while Python's hash randomization is on, its default: a process run with `PYTHONHASHSEED` set to a fixed value hashes strings and bytes predictably, so a forged entry could then flood a set of them too.
+
+Honest elements can share a hash: `hash(-1) == hash(-2)`, so the 3-D offsets over -1 and -2, such as `(-1, -2, -1)`, put 8 tuples on one hash, the most the bound admits; 4-D offsets put 16 there and are refused. Frozensets get no such allowance, because comparing two of them costs more with every level they nest. So `{frozenset({-1}), frozenset({-2})}` is refused, and so is `{(-1, frozenset()), (-2, frozenset())}`, two tuples on one hash in a set whose tuples hold a frozenset. Tuples that hold only tuples and scalars keep the allowance: `{((0, -1), (0, -2)), ((0, -2), (0, -1))}` round-trips.
+
+Checking a set adds cost to every read and every write of it. For a set of more than 8 ints, floats, UUIDs or other elements that are not strings, sorting their hashes dominates, and it can make decoding a large set several times slower. A set of only strings or only bytes pays a smaller per-element check. To cache more elements than the bounds admit, cache them as a list.
+
 ## When to Use
 
 **Use `serializer='auto'` when:**
