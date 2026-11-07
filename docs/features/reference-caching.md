@@ -136,6 +136,14 @@ Calls that miss the same key at the same time (a cold key, or one past its `ttl`
 
 Failure, cancellation, invalidation, `cache_info()` counting and the caveats work as described in [in-process single-flight](distributed-locking.md#in-process-single-flight-before-the-lock).
 
+### Hits take no lock
+
+On a function without `key=`, a hit is one call into the Rust extension: it builds no cache key and takes no lock, as on `@cache(backend=None)` ([Decorator + L1 Hit](../performance.md#decorator--l1-hit-hot-path)). The function keeps a memo from each call's arguments to the entry it stored or found for them. Only calls whose arguments are all exact `int`, `float`, `bool`, `None`, `str` or `bytes`, at most 8 of them and 256 characters or bytes between the strings and keyword names, are memoised; any other call builds its key and takes the lock, as before. `cache_info()` counts a memoised hit in `hits` and `l1_hits`.
+
+The memo keeps a call's arguments while its slot lasts, and at most 1,024 slots per function. Every removal (expiry, eviction, `invalidate_cache()`, `cache_clear()`, the reset in a forked child) ends the entry's memoised hits and drops its slots before it returns, so a call made after the removal never gets the removed object, and the memo keeps no removed object alive.
+
+A function with `key=` builds its key and takes the lock on every call: its key can depend on more than the call's arguments, such as a context variable.
+
 ---
 
 ## Object Lifecycle

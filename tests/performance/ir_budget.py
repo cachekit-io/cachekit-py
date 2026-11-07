@@ -97,6 +97,7 @@ PATHS = (
     "l1_hit_backed",
     "l1_hit_backed_auto",
     "minimal_l1_hit",
+    "local_hit",
     "l2_hit",
     "miss",
     "secure_l1_hit",
