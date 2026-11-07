@@ -352,7 +352,8 @@ def _auto_default(obj: Any) -> Any:
                 f"AutoSerializer cannot store this {type(obj).__name__}: it holds {reason}, which its reader refuses "
                 "as a hash-flood bound. Cache the elements as a list instead."
             )
-        if _fold_shifts_offset(value, types):
+        # exposed is 0 only when every element is an exact str or bytes, which holds no datetime.
+        if exposed and _fold_shifts_offset(value, types):
             raise TypeError(
                 f"AutoSerializer cannot store this {type(obj).__name__}: it holds an aware datetime at fold=1, which is "
                 "stored with its UTC offset but not fold, so it can read back equal to another element. Convert it to "
