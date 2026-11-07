@@ -287,6 +287,24 @@ class TestObjectCacheTTL:
         assert oc.peek("lru") == (True, "l")  # not the LRU head
         assert _consistent(oc)
 
+    @pytest.mark.parametrize("refresh", [False, True], ids=["put", "refresh"])
+    def test_stores_at_one_clock_reading_leave_one_live_tuple(self, monkeypatch: pytest.MonkeyPatch, refresh: bool) -> None:
+        """A key stored or refreshed again at the same clock reading leaves an equal tuple behind; a compaction drops it.
+
+        Were equality what made a tuple live, every copy would survive compaction and the heap would grow per store.
+        """
+        _fake_clock(monkeypatch)  # frozen: every store reads the same time
+        oc = ObjectCache(max_entries=10)
+        s = oc._state
+        oc.put("k", 0, ttl=60)
+        for i in range(1, 1000):
+            if refresh:  # a refresh landing on the entry, at the version get_with_swr would have returned
+                assert oc.complete_refresh("k", s.store["k"].generation, i, ttl=60)
+            else:
+                oc.put("k", i, ttl=60)
+            assert len(s.expiry) + len(s.old_expiry) <= 4
+        assert oc.get("k") == (True, 999) and _consistent(oc)
+
     def test_clear_during_a_compaction_leaves_nothing_to_compact(self) -> None:
         oc = ObjectCache(max_entries=100)
         s = oc._state
