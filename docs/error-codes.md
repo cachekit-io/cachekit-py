@@ -549,6 +549,8 @@ def get_json_data():
 
 **Message** (logged): `L2 cache decrypt/integrity failure (corruption) for ...: ...`, or `(envelope_shape)` in place of `(corruption)` for the envelope-shape refusal described below
 
+With `serializer='auto'`, `Invalid set format: ... a hash-flood bound, not a framing error.` is logged the same way: a stored set or frozenset is over the [Set Size Bound](serializers/auto.md#set-size-bound). A forged entry, an entry written by a cachekit version without the bound, or a set whose elements read back equal (pandas `Timestamp`s that differ only in nanoseconds) causes it; the function recomputes as for any corrupt entry.
+
 **Exception**: none under `@cache` — cachekit attempts to evict the entry (best effort; a failed delete is logged and the entry stays) and the function recomputes. Calling a serializer's `deserialize()` directly raises `SerializationError` (there is no separate `DeserializationError` class).
 
 **Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see *Decryption failed* above.

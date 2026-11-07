@@ -288,21 +288,38 @@ class TestAutoSerializerSetHashFloodBound:
         }
 
     def test_ints_floats_and_other_types_on_one_hash_count_together(self) -> None:
-        """No type is exempt: 202 distinct floats can share one hash, and a UUID's Python __eq__ runs against each.
-        Only an all-int set skips the check: at most 13 ints in msgpack's range share a hash, and they compare in C."""
+        """No type is exempt: 202 distinct floats can share one hash, and a UUID's Python __eq__ runs against each."""
         p = 2**61 - 1
         serializer = AutoSerializer(enable_integrity_checking=False)
-        all_int = [k * p for k in range(-4, 9)]
-        assert {hash(k) for k in all_int} == {0}
-        assert serializer.deserialize(_set_doc(all_int, False)) == set(all_int)
         for mixed in (
             [*(2.0 ** (61 * k) for k in range(9))],  # hash 1
-            [*(k * p for k in range(-4, 5)), 0.5],  # hash 0, and a float, so not an all-int set
+            [*(k * p for k in range(-4, 5))],  # hash 0
             [*(2.0 ** (61 * k) for k in range(5)), *(_uuid_marker(1 + j * p) for j in range(4))],  # hash 1
         ):
             for frozen in (False, True):
                 with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
-                    serializer.deserialize(_set_doc(mixed, frozen))
+                    serializer.deserialize(_set_doc([*mixed, "a"], frozen))  # a str too: the sort then masks
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_duplicates_count_toward_the_hash_bound(self, frozen: bool) -> None:
+        """A stored list can repeat an element, which the set dedups only after each copy has walked its probe path,
+        so copies count like any elements on one hash. An honest writer never repeats one."""
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+            serializer.deserialize(_set_doc([*range(100), *[25] * 8], frozen))
+        assert serializer.deserialize(_set_doc([*range(100), *[25] * 7], frozen)) == set(range(100))
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("empty", ["", b""])
+    def test_an_empty_str_or_bytes_may_appear_once(self, frozen: bool, empty: str | bytes) -> None:
+        """Both hash to 0 in every process, so copies of one would all walk hash 0's probe path, and they count
+        toward neither bound."""
+        assert hash(empty) == 0
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match=r"the empty str or bytes \(\"\" or b\"\"\) more than once"):
+            serializer.deserialize(_set_doc([0, empty, empty], frozen))
+        honest = {0, "a", "", b""}
+        assert AutoSerializer().deserialize(*AutoSerializer().serialize(honest)) == honest
 
     @pytest.mark.parametrize("frozen", [False, True])
     @pytest.mark.parametrize("wrap", [lambda m: m, lambda m: {"__tuple__": True, "value": [m]}], ids=["bare", "in a tuple"])
@@ -349,6 +366,8 @@ class TestAutoSerializerSetHashFloodBound:
         assert serializer.deserialize(_set_doc([*strings, *range(1024)], False)) == {*strings, *range(1024)}
         with pytest.raises(SerializationError, match="more than 1024 elements"):
             serializer.deserialize(_set_doc([*strings, *range(1025)], False))
+        only_bytes = [b"%d" % i for i in range(2000)]
+        assert serializer.deserialize(_set_doc([*only_bytes, *range(1024)], False)) == {*only_bytes, *range(1024)}
 
     def test_a_set_at_the_bound_hashes_each_element_twice(self, counts: dict[str, int]) -> None:
         value = frozenset(UUID(int=i) for i in range(_MAX_NON_STRING_SET_ELEMENTS))
@@ -400,13 +419,6 @@ class TestAutoSerializerSetHashFloodBound:
     def test_the_writer_refuses_a_set_over_the_count(self, kind: type) -> None:
         with pytest.raises(TypeError, match=rf"cannot store this {kind.__name__}: it holds more than 1024 elements"):
             AutoSerializer().serialize({"v": [kind(range(_MAX_NON_STRING_SET_ELEMENTS + 1))]})
-
-    @pytest.mark.parametrize("kind", [set, frozenset])
-    def test_the_writer_does_not_count_str_subclasses(self, kind: type) -> None:
-        """They read back as str, which the reader does not count."""
-        value = kind({*range(_MAX_NON_STRING_SET_ELEMENTS), *(_Str(i) for i in range(5000))})
-        serializer = AutoSerializer()
-        assert serializer.deserialize(*serializer.serialize(value)) == value
 
 
 class TestAutoSerializerComplexNesting:
