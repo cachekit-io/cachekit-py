@@ -258,7 +258,10 @@ class TestAutoSerializerSetHashFloodBound:
         self, counts: dict[str, int], frozen: bool, element: Callable[[int], dict]
     ) -> None:
         data = _set_doc([element(i) for i in _SAME_HASH], frozen)
-        with pytest.raises(SerializationError, match="more than 8 elements that share one hash: a hash-flood bound"):
+        with pytest.raises(
+            SerializationError,
+            match="more than 8 elements that are neither str nor bytes and share one hash: a hash-flood bound",
+        ):
             AutoSerializer(enable_integrity_checking=False).deserialize(data)
         # Hashed once each, by the sort; set() would have compared each to every earlier one.
         assert counts == {"hash": len(_SAME_HASH), "eq": 0}
@@ -279,9 +282,9 @@ class TestAutoSerializerSetHashFloodBound:
         offsets = set(itertools.product(range(-2, 3), repeat=3))
         assert len({hash(t) for t in itertools.product((-1, -2), repeat=3)}) == 1
         assert serializer.deserialize(*serializer.serialize(offsets)) == offsets
-        with pytest.raises(TypeError, match="it holds more than 8 elements that share one hash"):
+        with pytest.raises(TypeError, match="it holds more than 8 elements that are neither str nor bytes and share one hash"):
             serializer.serialize(set(itertools.product(range(-2, 3), repeat=4)))
-        with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+        with pytest.raises(SerializationError, match="more than 8 elements that are neither str nor bytes and share one hash"):
             serializer.deserialize(_set_doc([_uuid_marker(i) for i in _SAME_HASH[:9]], False), None)
         assert serializer.deserialize(_set_doc([_uuid_marker(i) for i in _SAME_HASH[:8]], False), None) == {
             UUID(int=i) for i in _SAME_HASH[:8]
@@ -297,15 +300,19 @@ class TestAutoSerializerSetHashFloodBound:
             [*(2.0 ** (61 * k) for k in range(5)), *(_uuid_marker(1 + j * p) for j in range(4))],  # hash 1
         ):
             for frozen in (False, True):
-                with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
-                    serializer.deserialize(_set_doc([*mixed, "a"], frozen))  # a str too: the sort then masks
+                with pytest.raises(
+                    SerializationError, match="more than 8 elements that are neither str nor bytes and share one hash"
+                ):
+                    serializer.deserialize(
+                        _set_doc([*mixed, "a"], frozen)
+                    )  # a str forces the branch that filters strings out before the sort
 
     @pytest.mark.parametrize("frozen", [False, True])
     def test_duplicates_count_toward_the_hash_bound(self, frozen: bool) -> None:
         """A stored list can repeat an element, which the set dedups only after each copy has walked its probe path,
         so copies count like any elements on one hash. An honest writer never repeats one."""
         serializer = AutoSerializer(enable_integrity_checking=False)
-        with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+        with pytest.raises(SerializationError, match="more than 8 elements that are neither str nor bytes and share one hash"):
             serializer.deserialize(_set_doc([*range(100), *[25] * 8], frozen))
         assert serializer.deserialize(_set_doc([*range(100), *[25] * 7], frozen)) == set(range(100))
 
@@ -318,6 +325,11 @@ class TestAutoSerializerSetHashFloodBound:
         serializer = AutoSerializer(enable_integrity_checking=False)
         with pytest.raises(SerializationError, match=r"the empty str or bytes \(\"\" or b\"\"\) more than once"):
             serializer.deserialize(_set_doc([0, empty, empty], frozen))
+        # All str or all bytes takes its own branch, which counts the empty value with list.count.
+        a, b = ("a", "b") if empty == "" else (b"a", b"b")
+        with pytest.raises(SerializationError, match="more than once"):
+            serializer.deserialize(_set_doc([a, empty, b, empty], frozen))
+        assert serializer.deserialize(_set_doc([a, empty, b], frozen)) == {a, empty, b}
         honest = {0, "a", "", b""}
         assert AutoSerializer().deserialize(*AutoSerializer().serialize(honest)) == honest
 

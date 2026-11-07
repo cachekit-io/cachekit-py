@@ -82,7 +82,7 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
 _STR_TYPES = frozenset({str, bytes})
-_CONTAINERS = (tuple, frozenset)
+_EMPTY_TWICE = 'the empty str or bytes ("" or b"") more than once'
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -329,10 +329,13 @@ def _auto_default(obj: Any) -> Any:
     # NEW: set/frozenset support (type-safe roundtrip)
     if isinstance(obj, (set, frozenset)):
         value = list(obj)
-        # Counted as the reader will see them (a str or bytes subclass reads back as str or bytes) only when the count
-        # could matter. Below it a str subclass counts as exposed, which can only make the writer stricter.
-        recount = sum(not isinstance(x, (str, bytes)) for x in value) if len(value) > _MAX_NON_STRING_SET_ELEMENTS else None
-        reason = _set_bound_error(value, list(map(type, value)), recount)
+        types = list(map(type, value))
+        exposed = len(types) - types.count(str) - types.count(bytes)
+        if exposed > _MAX_NON_STRING_SET_ELEMENTS:
+            # A str or bytes subclass reads back as str or bytes: recount as the reader will see them. Below the
+            # bound a subclass counts as exposed, which can only make the writer stricter.
+            exposed = sum(not isinstance(x, (str, bytes)) for x in value)
+        reason = _set_bound_error(value, types, exposed)
         if reason:
             raise TypeError(
                 f"AutoSerializer cannot store this {type(obj).__name__}: it holds {reason}, which its reader refuses "
@@ -384,7 +387,7 @@ def _hash_run_over(values: Iterable[Any], limit: int) -> bool:
     return any(map(operator.eq, hashes, hashes[limit:]))
 
 
-def _empties(values: list[Any], types: list[type], kind: type) -> int:
+def _empty_count(values: list[Any], types: list[type], kind: type) -> int:
     """How many of ``values`` are an empty ``kind`` (str or bytes), counted in C passes."""
     return sum(map(operator.not_, compress(values, map(operator.is_, types, repeat(kind)))))
 
@@ -408,24 +411,28 @@ def _set_bound_error(values: list[Any], types: list[type], exposed: int | None =
     """
     # Distinct types are few, and a type hashes by identity, so this set is safe to build.
     kinds = set(types)
+    if len(kinds) == 1 and kinds <= _STR_TYPES:
+        # All str or all bytes, the most common large set: nothing is exposed, and list.count finds the empty value.
+        return _EMPTY_TWICE if values.count(types[0]()) > 1 else None
     strings = str in kinds or bytes in kinds
     if exposed is None:
         exposed = len(types) - types.count(str) - types.count(bytes) if strings else len(types)
     if exposed > _MAX_NON_STRING_SET_ELEMENTS:
         return f"more than {_MAX_NON_STRING_SET_ELEMENTS} elements that are neither str nor bytes"
     # Every other str and bytes hashes under a per-process secret, but "" and b"" hash to 0 in every process, and a
-    # stored list can repeat them for 1 byte a copy: each copy would walk whatever forged elements pile on hash 0's
-    # probe path. An honest set holds each at most once.
-    if any(kind in kinds and _empties(values, types, kind) > 1 for kind in (str, bytes)):
-        return 'the empty str or bytes ("" or b"") more than once'
-    if any(issubclass(t, _CONTAINERS) for t in kinds) and _may_compare_frozensets(values, types, kinds):
+    # stored list can repeat them for 1 or 2 bytes a copy: each copy would walk whatever forged elements pile on hash
+    # 0's probe path. An honest set holds each at most once.
+    if any(kind in kinds and _empty_count(values, types, kind) > 1 for kind in (str, bytes)):
+        return _EMPTY_TWICE
+    if _may_compare_frozensets(values, types, kinds):
         return "two frozensets, or two tuples in a set where a tuple holds a frozenset, that share one hash"
-    # Fewer exposed elements cannot put more than the bound on one hash (at most one "" and one b"" join them).
+    # The per-hash bound counts the elements that are neither str nor bytes (only one "" and one b"" can join their
+    # run on hash 0), so fewer of them than the bound cannot exceed it.
     if exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
         return None
     others = compress(values, map(operator.not_, map(_STR_TYPES.__contains__, types))) if strings else values
     if _hash_run_over(others, _MAX_SAME_HASH_SET_ELEMENTS):
-        return f"more than {_MAX_SAME_HASH_SET_ELEMENTS} elements that share one hash"
+        return f"more than {_MAX_SAME_HASH_SET_ELEMENTS} elements that are neither str nor bytes and share one hash"
     return None
 
 
