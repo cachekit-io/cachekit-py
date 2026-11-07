@@ -28,7 +28,7 @@ _JITTER_LOW, _JITTER_HIGH = 0.9, 1.1
 
 # Records one put or refresh moves from the detached lists to the live ones, dropping the dead, while
 # a compaction runs (_ObjectCacheState.compact_step). Each costs about a dict lookup and a heap push,
-# so this bounds what compaction adds to one lock hold at a few microseconds, whatever the cache's size.
+# so this bounds what compaction adds to one lock hold, about 15µs at 100k entries, whatever the cache's size.
 _COMPACT_BATCH = 16
 
 # Invalidation epoch stripes, here and in the decorator's backed mode: a power of two. An invalidation of

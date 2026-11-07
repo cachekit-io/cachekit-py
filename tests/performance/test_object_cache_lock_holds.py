@@ -13,11 +13,12 @@ import threading
 import time
 from collections import OrderedDict
 from itertools import pairwise
+from typing import Any
 
 import pytest
 
 from cachekit._rust_serializer import HitCounter, HitMemo
-from cachekit.object_cache import ObjectCache
+from cachekit.object_cache import ObjectCache, _ObjectCacheState
 
 from .stats_utils import report
 
@@ -34,7 +35,7 @@ def _memo() -> HitMemo:
 @pytest.mark.performance
 @pytest.mark.usefixtures("nothing_configured")  # an L1-only cache: no Redis
 @pytest.mark.parametrize("with_memo", [True, False], ids=["memo", "no-memo"])
-def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None:
+def test_object_cache_store_lock_holds(record_property, monkeypatch: pytest.MonkeyPatch, with_memo: bool) -> None:
     """Delete the oldest entry and store a new one, 2.5 times as often as there are entries.
 
     Each pair leaves a dead deadline record and, with a memo, a dead LRU record, so the dead records
@@ -51,7 +52,23 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
     state = oc._state
     inner, writer = state.lock, threading.get_ident()
     holds: list[int] = []
-    compacted: list[bool] = []  # per hold, whether a compaction ran in it: one ran when it began or ended
+    kinds: list[str] = []  # per hold: "step" if it ran a compaction step, else "store" if it stored, else "other"
+
+    # Count the calls themselves, not whether a compaction was in progress: a delete during one runs no
+    # step, and a store outside one runs no step either, so each population is what its label says.
+    calls = {"push": 0, "compact_step": 0}
+
+    def counted(name: str) -> Any:
+        method = getattr(_ObjectCacheState, name)
+
+        def call(self: _ObjectCacheState, *args: Any, **kwargs: Any) -> None:
+            calls[name] += 1
+            method(self, *args, **kwargs)
+
+        return call
+
+    for name in calls:
+        monkeypatch.setattr(_ObjectCacheState, name, counted(name))
 
     class TimedLock:
         depth = 0
@@ -61,7 +78,7 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
             if threading.get_ident() == writer:
                 self.depth += 1
                 if self.depth == 1:
-                    self.compacted = state.compacting
+                    self.calls = dict(calls)
                     self.start = time.thread_time_ns()
             return self
 
@@ -70,7 +87,10 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
                 self.depth -= 1
                 if self.depth == 0:
                     holds.append(time.thread_time_ns() - self.start)
-                    compacted.append(self.compacted or state.compacting)
+                    if calls["compact_step"] != self.calls["compact_step"]:
+                        kinds.append("step")
+                    else:
+                        kinds.append("store" if calls["push"] != self.calls["push"] else "other")
             inner.release()
 
     state.lock = TimedLock()
@@ -115,14 +135,15 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
     record_property("hold_max_ns", max(holds))
     record_property("gap_max_ns", max(gaps))
     print("longest holds, ms:", ", ".join(f"{h / 1e6:.3f}" for h in sorted(holds)[-5:]))
-    compacting = [h for h, c in zip(holds, compacted, strict=True) if c]
-    if compacting:
-        others = [h for h, c in zip(holds, compacted, strict=True) if not c]
+    stepped = [h for h, k in zip(holds, kinds, strict=True) if k == "step"]
+    stores = [h for h, k in zip(holds, kinds, strict=True) if k == "store"]
+    if stepped:
         print(
-            f"{len(compacting):,} holds ran a compaction: max {max(compacting) / 1e6:.3f} ms, "
-            f"median {statistics.median(compacting) / 1e3:.2f} us against {statistics.median(others) / 1e3:.2f} us"
+            f"{len(stepped):,} stores ran a compaction step: max {max(stepped) / 1e6:.3f} ms, median "
+            f"{statistics.median(stepped) / 1e3:.2f} us; {len(stores):,} stores ran none: median "
+            f"{statistics.median(stores) / 1e3:.2f} us"
         )
-        record_property("compacting_hold_max_ns", max(compacting))
+        record_property("step_hold_max_ns", max(stepped))
 
     # The store is a dict, which CPython resizes in one go as it grows or fills with deleted slots: the
     # same churn on a bare OrderedDict shows how much of the longest hold that resize alone takes.
@@ -142,4 +163,4 @@ def test_object_cache_store_lock_holds(record_property, with_memo: bool) -> None
 
     assert oc.size == ENTRIES + 1
     assert oc.get("hot") == (True, "h")
-    assert any(compacted)  # the churn measured what it claims: holds a compaction ran in
+    assert stepped  # the churn measured what it claims: stores that ran a compaction step
