@@ -6,6 +6,7 @@ All tests are isolated; no Redis or external services required.
 from __future__ import annotations
 
 import gc
+import itertools
 import os
 import signal
 import threading
@@ -220,24 +221,83 @@ class TestObjectCacheTTL:
         assert oc.size_bytes <= budget
 
     def test_expiry_heap_stays_bounded_at_capacity(self) -> None:
-        """Every put at capacity leaves a dead heap tuple; the heap is rebuilt before it outgrows the entries twice over.
+        """Every put at capacity leaves a dead heap tuple; a compaction drops them once they outnumber the entries.
 
         The hot entry is read after every put, so it stays out of LRU reach while its tuple, the
-        earliest deadline, holds the heap top: dead tuples pile up behind it until a rebuild.
+        earliest deadline, holds the heap top: dead tuples pile up behind it until a compaction.
         """
         oc = ObjectCache(max_entries=50)
+        s = oc._state
         oc.put("hot", "h", ttl=600)
-        longest = 0
+        longest, compactions = 0, 0
         for i in range(1000):
+            was_compacting = s.compacting
             oc.put(f"k{i}", i, ttl=600)
+            compactions += s.compacting and not was_compacting
             assert oc.get("hot")[0] is True
-            longest = max(longest, len(oc._state.expiry))
-            assert len(oc._state.expiry) <= 2 * oc.size
-        assert longest == 2 * oc.size  # the heap reached its bound and was rebuilt there, never passing it
-        assert _consistent(oc)
+            held = len(s.expiry) + len(s.old_expiry)
+            longest = max(longest, held)
+            # A put during a compaction may add a dead tuple while its batch drops none, for as many puts as
+            # the detached heap takes in batches.
+            assert held <= 2 * oc.size + 1 + -(-(2 * oc.size + 1) // object_cache._COMPACT_BATCH)
+            assert _consistent(oc)
+        assert longest >= 2 * oc.size + 1  # the heap reached its bound and was compacted there
+        assert compactions >= 10  # one about every 50 puts
 
         oc.clear()
-        assert oc._state.expiry == []
+        assert (s.expiry, s.old_expiry, s.compacting) == ([], [], False)
+
+    def test_no_put_compacts_more_than_one_batch(self) -> None:
+        """A compaction moves at most _COMPACT_BATCH records per put, and never rebuilds the heap from the store."""
+        oc = ObjectCache(max_entries=1000)
+        s = oc._state
+        for i in range(1000):
+            oc.put(f"k{i}", i, ttl=600)
+        for i in range(1001):
+            oc.put(f"k{i % 1000}", i, ttl=600)  # a replace: the old entry's tuple is dead
+        assert s.compacting
+        steps = 0
+        while s.compacting:
+            before = len(s.old_expiry)
+            oc.put(f"k{steps}", steps, ttl=600)
+            assert before - len(s.old_expiry) <= object_cache._COMPACT_BATCH
+            steps += 1
+            assert _consistent(oc)
+        assert steps >= 2001 // object_cache._COMPACT_BATCH  # it took that many puts, so no put did it all
+        assert len(s.expiry) <= oc.size + steps + 1  # the live tuples, and at most one dead per replace since
+
+    def test_an_expired_entry_whose_tuple_waits_in_the_detached_heap_still_goes_before_lru(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """While a compaction runs, a live tuple may sit in the detached heap; an over-bound put must still find it."""
+        fake = _fake_clock(monkeypatch)
+        monkeypatch.setattr(object_cache, "_COMPACT_BATCH", 1)
+        oc = ObjectCache(max_entries=3)
+        s = oc._state
+        oc.put("lru", "l", ttl=100)
+        oc.put("short", "s", ttl=10)  # expires at 1010
+        for _ in range(5):
+            oc.put("mru", "m", ttl=100)  # replaces: dead tuples, until a compaction starts
+        assert s.compacting and (1010.0, "short") in s.old_expiry
+
+        fake.monotonic = lambda: 1015.0
+        oc.put("new", "n", ttl=100)
+
+        assert oc.peek("short")[0] is False  # the expired entry went
+        assert oc.peek("lru") == (True, "l")  # not the LRU head
+        assert _consistent(oc)
+
+    def test_clear_during_a_compaction_leaves_nothing_to_compact(self) -> None:
+        oc = ObjectCache(max_entries=100)
+        s = oc._state
+        for i in itertools.count():
+            oc.put(f"k{i % 100}", i, ttl=600)
+            if s.compacting:
+                break
+        oc.clear()
+        assert (s.old_expiry, s.compacting, oc.size) == ([], False, 0)
+        oc.put("k", 1, ttl=600)
+        assert oc.get("k") == (True, 1) and _consistent(oc)
 
 
 @pytest.mark.unit
@@ -821,7 +881,7 @@ def _consistent(oc: ObjectCache) -> bool:
     """Whether the byte total, the expiry heap and the in-flight refresh markers agree with the entries."""
     s = oc._state
     sized = s.size_bytes == sum(entry.size_bytes for entry in s.store.values())
-    tracked = {(e.expires_at, k) for k, e in s.store.items()} <= set(s.expiry)
+    tracked = {(e.expires_at, k) for k, e in s.store.items()} <= set(s.expiry) | set(s.old_expiry)
     return sized and tracked and all(key in s.store and s.store[key].generation == g for key, g in s.refreshing.items())
 
 

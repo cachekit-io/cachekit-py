@@ -26,6 +26,11 @@ from cachekit._rust_serializer import monotonic as _monotonic
 # flag a refresh, so the hit may serve an entry up to there without the lock.
 _JITTER_LOW, _JITTER_HIGH = 0.9, 1.1
 
+# Records one put or refresh moves from the detached lists to the live ones, dropping the dead, while
+# a compaction runs (_ObjectCacheState.compact_step). Each costs about a dict lookup and a heap push,
+# so this bounds what compaction adds to one lock hold at a few microseconds, whatever the cache's size.
+_COMPACT_BATCH = 16
+
 # Invalidation epoch stripes, here and in the decorator's backed mode: a power of two. An invalidation of
 # one key also drops the overlapping fills of the other keys in its stripe, about one in this many.
 EPOCH_STRIPES = 64
@@ -173,7 +178,20 @@ class _ObjectCacheState:
     counter and the memo stay with the cache, so a swap keeps them.
     """
 
-    __slots__ = ("expiry", "filed", "lock", "memo", "refiled", "refreshing", "size_bytes", "store")
+    __slots__ = (
+        "compacting",
+        "expiry",
+        "filed",
+        "lock",
+        "memo",
+        "old_expiry",
+        "old_filed",
+        "old_refiled",
+        "refiled",
+        "refreshing",
+        "size_bytes",
+        "store",
+    )
 
     def __init__(self, memo: HitMemo | None) -> None:
         # Without a memo every read takes the lock, so the store's order is the LRU order: a put
@@ -184,7 +202,7 @@ class _ObjectCacheState:
         # eviction finds expired entries without scanning the store. Deletion is lazy: a removal or a
         # refresh leaves the old tuple behind. A tuple is live while its key holds an entry with that
         # deadline, and every entry's current deadline has one, so a dead tuple is safe to drop.
-        # push() rebuilds the heap from the store once dead tuples outnumber live entries.
+        # Once dead tuples outnumber live entries, push() compacts them (see old_expiry below).
         self.expiry: list[tuple[float, str]] = []
         # With a memo, a lock-free hit stamps its entry's HitEntry but cannot move the entry in the
         # store, so recency records hold the LRU order instead: (used_at, generation, key), exactly one
@@ -194,10 +212,20 @@ class _ObjectCacheState:
         # the min-heap `refiled`, and evicts the first entry whose record is current. Every other entry
         # was used at or after its own record's time, which is no earlier than that one's, so that
         # entry is the least recently used. A removed or replaced entry's record is dead (its key holds
-        # no entry of its generation) and is dropped where it surfaces; push() rebuilds the records as
-        # it does the expiry heap.
+        # no entry of its generation) and is dropped where it surfaces, or by a compaction.
         self.filed: deque[tuple[float, int, str]] = deque()
         self.refiled: list[tuple[float, int, str]] = []
+        # A compaction detaches the three lists above into these and starts empty ones; each later
+        # push() moves _COMPACT_BATCH of the detached records back, dropping the dead, until none is
+        # left. Rebuilding them from the store in one go held the lock for 0.1 to 0.3 s at 100k
+        # entries, and freeing the old lists stalled every thread waiting for the GIL. Until then a
+        # live record sits in a detached list or a live one, never both, so readers look at both:
+        # old_expiry and old_refiled are popped from the end, which leaves a heap a heap, and old_filed
+        # from its newest end, so every record left in it still precedes every record in filed.
+        self.old_expiry: list[tuple[float, str]] = []
+        self.old_filed: deque[tuple[float, int, str]] = deque()
+        self.old_refiled: list[tuple[float, int, str]] = []
+        self.compacting = False  # whether a detached list still holds a record
         # In-flight refresh ownership: key -> owning generation. A refresh captures the entry's
         # generation at read time and only lands — or clears/cancels its marker — for that exact
         # generation, so a stale refresh from a replaced entry can neither resurrect data nor
@@ -235,46 +263,82 @@ class _ObjectCacheState:
         """Record an entry's deadline and, when it is new and the cache has a memo, its recency; call with lock held.
 
         Call after the store write. A refreshed entry (new=False) keeps its recency record, which is
-        re-filed at the refresh when it is the oldest, as at any use. A rebuild from the store drops
-        the dead records once they outnumber the live entries. It costs O(n) in the entries left for
-        the deadlines and O(n log n) for the recency records, which it sorts back into clock order, and
-        it at least halves the records, so it amortises to O(1) or O(log n) per push.
+        re-filed at the refresh when it is the oldest, as at any use. Once the dead deadline records,
+        or the dead recency records, outnumber the live entries, this starts a compaction, and it and
+        each later push move _COMPACT_BATCH records until it ends (compact_step). A compaction handles
+        at most about twice as many records of each kind as there are entries, and the next cannot
+        start for about as many pushes again, so it amortises to O(1) records, at O(log n) each, per push.
         """
-        if len(self.expiry) >= 2 * len(self.store):
-            self.expiry = [(e.expires_at, k) for k, e in self.store.items()]
-            heapq.heapify(self.expiry)
-        else:
-            heapq.heappush(self.expiry, (entry.expires_at, key))
-        if self.memo is None or not new:
-            return
-        if len(self.filed) + len(self.refiled) >= 2 * len(self.store):
-            self.filed = deque(sorted((_used_at(e), e.generation, k) for k, e in self.store.items()))
-            self.refiled = []
-        else:
+        expiry, memoised = self.expiry, self.memo is not None
+        heapq.heappush(expiry, (entry.expires_at, key))
+        if memoised and new:
             self.filed.append((entry.used_at, entry.generation, key))
+        if not self.compacting:
+            live = 2 * len(self.store)
+            if len(expiry) <= live and (not memoised or len(self.filed) + len(self.refiled) <= live):
+                return
+            self.old_expiry, self.expiry = expiry, []
+            self.old_filed, self.filed = self.filed, deque()
+            self.old_refiled, self.refiled = self.refiled, []
+            self.compacting = True
+        self.compact_step()
+
+    def compact_step(self) -> None:
+        """Move up to _COMPACT_BATCH records from the detached lists to the live ones, dropping the dead; call with lock held.
+
+        Each dead record is freed as it is popped, so no list of them is freed in one go.
+        """
+        store, budget = self.store, _COMPACT_BATCH
+        old_expiry = self.old_expiry
+        while old_expiry and budget:
+            budget -= 1
+            deadline = old_expiry.pop()
+            entry = store.get(deadline[1])
+            if entry is not None and entry.expires_at == deadline[0]:
+                heapq.heappush(self.expiry, deadline)
+        old_refiled = self.old_refiled
+        while old_refiled and budget:
+            budget -= 1
+            record = old_refiled.pop()
+            entry = store.get(record[2])
+            if entry is not None and entry.generation == record[1]:
+                heapq.heappush(self.refiled, record)
+        old_filed = self.old_filed
+        while old_filed and budget:
+            budget -= 1
+            record = old_filed.pop()  # the newest left, so it precedes every record in filed
+            entry = store.get(record[2])
+            if entry is not None and entry.generation == record[1]:
+                self.filed.appendleft(record)
+        self.compacting = bool(old_expiry or old_refiled or old_filed)
 
     def remove_expired(self, now: float) -> None:
         """Remove every entry whose deadline has passed; call with lock held.
 
         Pops heap tuples only while the earliest deadline is due, so when nothing has expired it
-        returns after one comparison. Each due tuple costs O(log n). A due tuple is dead when its key
-        holds no entry with that deadline, as a replaced or refreshed entry leaves behind; it is dropped.
+        returns after one comparison per heap: the live one and, while a compaction runs, the detached
+        one. Each due tuple costs O(log n). A due tuple is dead when its key holds no entry with that
+        deadline, as a replaced or refreshed entry leaves behind; it is dropped.
         """
         heap = self.expiry
-        while heap and heap[0][0] <= now:
-            expires_at, key = heapq.heappop(heap)
-            entry = self.store.get(key)
-            if entry is not None and entry.expires_at == expires_at:
-                self.remove(key)
+        while True:
+            while heap and heap[0][0] <= now:
+                expires_at, key = heapq.heappop(heap)
+                entry = self.store.get(key)
+                if entry is not None and entry.expires_at == expires_at:
+                    self.remove(key)
+            if heap is self.old_expiry or not self.compacting:
+                return
+            heap = self.old_expiry
 
     def evict_lru(self) -> None:
         """Remove the least recently used entry; call with lock held and at least one entry stored.
 
         Without a memo that is the store's first entry. With one it is the entry of the oldest
-        current recency record, the older of the first filed and the first re-filed: O(1) per record
-        popped from `filed`, O(log n) per record re-filed or popped from `refiled`. Without concurrent
-        lock-free hits each live record is re-filed at most once per call, as its entry's use time
-        holds still. Such hits can move it while this runs, so after as many re-files as there are
+        current recency record, the older of the first filed and the first re-filed, the detached
+        lists included while a compaction runs: O(1) per record popped from `filed`, O(log n) per
+        record re-filed or popped from `refiled`. Without concurrent lock-free hits each live record
+        is re-filed at most once per call, as its entry's use time holds still. Such hits can move it while this runs, so after as many re-files as there are
         entries the oldest record's entry goes, re-filed or not: hits that race an eviction have no
         order to keep, and the eviction ends.
         """
@@ -282,12 +346,15 @@ class _ObjectCacheState:
             self.remove(next(iter(self.store)))
             return
         filed, refiled, store = self.filed, self.refiled, self.store
+        old_filed, old_refiled = self.old_filed, self.old_refiled  # empty unless a compaction runs
         refiles = len(store)
         while True:
-            if refiled and (not filed or refiled[0] < filed[0]):
-                used_at, generation, key = heapq.heappop(refiled)
+            queue = old_filed or filed  # every record left in old_filed precedes every one in filed
+            heap = old_refiled if old_refiled and (not refiled or old_refiled[0] < refiled[0]) else refiled
+            if heap and (not queue or heap[0] < queue[0]):
+                used_at, generation, key = heapq.heappop(heap)
             else:
-                used_at, generation, key = filed.popleft()
+                used_at, generation, key = queue.popleft()
             entry = store.get(key)
             if entry is None or entry.generation != generation:
                 continue  # a removed or replaced entry's record
@@ -333,9 +400,10 @@ class ObjectCache:
     not count: on 64-bit CPython about 64 to 72 bytes per entry for the deadline
     record and, with a memo, 80 to 100 for the recency record (a tuple, its slot,
     and the time it was re-filed at), plus the records of removed or replaced
-    entries. Once those outnumber the live ones, the put that finds it rebuilds
-    them: an O(n) pause once per about n puts at capacity (O(n log n) for the
-    recency records), against a full scan on every one before the heap.
+    entries. Once those outnumber the live ones, a compaction drops them, 16
+    records per put until it is done, so no put holds the lock for a pass over
+    the cache: rebuilding them in one put held it for 0.1 to 0.3 s at 100k
+    entries.
 
     Bounds (at least one required):
     - max_entries: entry-count bound (default 256, pass None to disable)
@@ -737,8 +805,7 @@ class ObjectCache:
 
         When a bound is exceeded:
         1. Expired entries are removed first, wherever they sit in LRU order.
-           The expiry heap finds them, so no entry is scanned to look for them; the one
-           put in about n that rebuilds the heap makes one pass over the entries.
+           The expiry heap finds them, so no entry is scanned to look for them.
         2. If still over, the least recently used fresh entries are evicted.
 
         A value whose estimated size exceeds the entire byte budget is never
@@ -834,6 +901,10 @@ class ObjectCache:
             s.expiry.clear()
             s.filed.clear()
             s.refiled.clear()
+            s.old_expiry.clear()
+            s.old_filed.clear()
+            s.old_refiled.clear()
+            s.compacting = False
             s.refreshing.clear()
 
     # ------------------------------------------------------------------
