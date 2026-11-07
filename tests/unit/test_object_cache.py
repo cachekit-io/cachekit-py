@@ -352,6 +352,37 @@ class TestObjectCacheTTL:
         assert [k for k, e in oc._state.store.items() if e.expires_at <= 1015.0] == []
         assert _consistent(oc)
 
+    @pytest.mark.parametrize("with_memo", [False, True], ids=["no-memo", "memo"])
+    def test_a_finalizer_replacing_the_next_expired_key_keeps_its_replacement(
+        self, monkeypatch: pytest.MonkeyPatch, with_memo: bool
+    ) -> None:
+        """An expired value's finalizer stores a fresh value under the key expiry looks up next; expiry must not then
+        remove the fresh one as if it were the expired entry it looked up."""
+        from cachekit._rust_serializer import HitCounter, HitMemo
+
+        fake = _fake_clock(monkeypatch)
+
+        def owner() -> None:
+            pass
+
+        memo = HitMemo(owner, HitCounter(), owner.__module__, owner.__qualname__) if with_memo else None
+        oc = ObjectCache(max_entries=3, memo=memo)
+
+        class StoresWhenFreed:
+            def __del__(self) -> None:
+                oc.put("b", "fresh", ttl=600)
+
+        oc.put("a", StoresWhenFreed(), ttl=10)  # ties pop by key: a's tuple first, then b's
+        oc.put("b", "stale", ttl=10)
+        oc.put("c", "c", ttl=600)
+
+        fake.monotonic = lambda: 1015.0
+        oc.put("d", "d", ttl=600)  # full: expiry removes a, whose finalizer stores b afresh, then reaches b
+
+        assert oc.peek("b") == (True, "fresh")
+        assert sorted(oc._state.store) == ["b", "c", "d"]
+        assert _consistent(oc)
+
     def test_a_store_that_compacts_during_an_lru_eviction_does_not_break_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A finalizer run inside evict_lru (a cycle collected at an allocation) deletes the entry being looked at and
         stores until a compaction swaps and drains the recency lists; the eviction must read them afresh, not crash."""

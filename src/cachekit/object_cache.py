@@ -340,6 +340,9 @@ class _ObjectCacheState:
             entry = store.get(key)
             if entry is not None and entry.deadline is deadline:
                 self.remove(key)
+                # Free it here, not when the next lookup rebinds the name: its value's finalizer may store
+                # into this cache, and must not replace a key between that lookup and its deadline check.
+                entry = None
 
     def evict_lru(self) -> None:
         """Remove the least recently used entry; call with lock held and at least one entry stored.
