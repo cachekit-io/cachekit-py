@@ -30,7 +30,7 @@ import logging
 import operator
 import sys
 from collections.abc import Iterable
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from functools import cached_property
 from importlib.util import find_spec
 from itertools import chain, compress, repeat
@@ -82,7 +82,9 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
 _STR_TYPES = frozenset({str, bytes})
-_FOLD = operator.attrgetter("fold")
+_TZINFO = operator.attrgetter("tzinfo")
+# Naive, or a fixed offset: no tzinfo of these types makes a datetime's UTC offset depend on fold.
+_FIXED_ZONES = frozenset({type(None), timezone})
 _EMPTY_TWICE = 'the empty str or bytes ("" or b"") more than once'
 
 # Error message constants for unsupported types
@@ -355,9 +357,10 @@ def _auto_default(obj: Any) -> Any:
         # exposed is 0 only when every element is an exact str or bytes, which holds no datetime.
         if exposed and _fold_shifts_offset(value, types):
             raise TypeError(
-                f"AutoSerializer cannot store this {type(obj).__name__}: it holds an aware datetime at fold=1, which is "
-                "stored with its UTC offset but not fold, so it can read back equal to another element. Convert it to "
-                "UTC first (dt.astimezone(timezone.utc)) or cache the elements as a list."
+                f"AutoSerializer cannot store this {type(obj).__name__}: it holds an aware datetime in a wall-clock "
+                "hour its zone repeats or skips, which is stored with its UTC offset but not fold, so it can read back "
+                "equal to another element. Convert it to UTC first (dt.astimezone(timezone.utc)) or cache the elements "
+                "as a list."
             )
         return {"__set__": True, "value": value, "frozen": isinstance(obj, frozenset)}
 
@@ -397,19 +400,21 @@ def _frozenset_in_tuples(values: list[Any], types: list[type]) -> bool:
 
 
 def _fold_shifts_offset(values: list[Any], types: list[type]) -> bool:
-    """Whether an aware datetime at fold=1 whose offset differs at fold=0 sits among ``values`` or at any depth inside a
-    tuple among them. ``types`` holds each value's type.
+    """Whether an aware datetime whose UTC offset depends on fold (a wall time its zone repeats or skips) sits among
+    ``values`` or at any depth inside a tuple among them. ``types`` holds each value's type.
 
-    Such a datetime never equals one in another zone (PEP 495), but it reads back at a fixed offset, without fold, and
-    can then equal one. A frozenset among ``values`` is checked when its own encode runs. Walked a level at a time in C
-    passes, as _frozenset_in_tuples is: only the datetimes at fold=1 reach a Python check.
+    At either fold, such a datetime never equals one in another zone (PEP 495), but it reads back at a fixed offset,
+    without fold, and can then equal one. A frozenset among ``values`` is checked when its own encode runs. Walked a
+    level at a time in C passes, as _frozenset_in_tuples is: only the datetimes outside a fixed-offset zone (UTC
+    included) reach a Python check.
     """
     while values:
         kinds = set(types)
         if any(issubclass(t, datetime) for t in kinds):
             stamps = list(compress(values, map(issubclass, types, repeat(datetime))))
-            folded = compress(stamps, map(_FOLD, stamps))
-            if any(d.utcoffset() != d.replace(fold=0).utcoffset() for d in folded):
+            zones = list(map(type, map(_TZINFO, stamps)))
+            zoned = compress(stamps, map(operator.not_, map(_FIXED_ZONES.__contains__, zones)))
+            if any(d.utcoffset() != d.replace(fold=1 - d.fold).utcoffset() for d in zoned):
                 return True
         if not any(issubclass(t, tuple) for t in kinds):
             return False

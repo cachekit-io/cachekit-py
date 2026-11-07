@@ -231,7 +231,7 @@ class TestAutoSerializerSetHashFloodBound:
     _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in
     a tuple of the set). Each refusal comes before set() builds the set, so a forged one never pays for a quadratic
     build. The writer refuses the same sets, so an honest one fails at write, not on every read. It also refuses the
-    elements whose hash the round trip changes (TestAutoSerializerDatetimeRoundTrip), so no set it writes crosses a
+    elements the round trip could make equal (TestAutoSerializerDatetimeRoundTrip), so no set it writes crosses a
     bound only once read back."""
 
     @pytest.fixture
@@ -440,6 +440,9 @@ _NEW_YORK = ZoneInfo("America/New_York")
 # 01:30 happens twice in New York on 2025-11-02: fold=1 is the second, at -05:00, the same instant as _UTC_TWIN.
 _FOLDED = datetime(2025, 11, 2, 1, 30, fold=1, tzinfo=_NEW_YORK)
 _UTC_TWIN = datetime(2025, 11, 2, 6, 30, tzinfo=UTC)
+# The first 01:30 that day, fold=0, at -04:00; and 02:30 on 2025-03-09, a wall time New York skips.
+_AMBIGUOUS = datetime(2025, 11, 2, 1, 30, tzinfo=_NEW_YORK)
+_SKIPPED = datetime(2025, 3, 9, 2, 30, tzinfo=_NEW_YORK)
 _FOLDED_MARKER = b"\x82\xac__datetime__\xc3\xa5value\xb92025-11-02T01:30:00-05:00"
 _MICRO_MARKER = b"\x82\xac__datetime__\xc3\xa5value\xba2026-01-01T12:00:00.123456"
 
@@ -480,13 +483,20 @@ class TestAutoSerializerDatetimeRoundTrip:
             {_FOLDED, _UTC_TWIN},
             {(_FOLDED,), (_UTC_TWIN,)},
             {(1, ((_FOLDED, "x"),))},  # however deep in its tuples
+            {_AMBIGUOUS, _AMBIGUOUS.astimezone(UTC)},  # fold=0 in a repeated hour
+            {(_AMBIGUOUS,), (_AMBIGUOUS.astimezone(UTC),)},
+            {_SKIPPED, _SKIPPED.astimezone(UTC)},  # either fold of a skipped hour
+            {_SKIPPED.replace(fold=1), _SKIPPED.replace(fold=1).astimezone(UTC)},
         ],
-        ids=["frozensets", "set", "tuples", "deep-tuple"],
+        ids=["frozensets", "set", "tuples", "deep-tuple", "fold0", "fold0-tuples", "gap", "gap-fold1"],
     )
-    def test_a_set_holding_a_folded_datetime_is_refused_at_write(self, value: set) -> None:
-        """Written, these read back with fewer elements, or as two equal frozensets that every read refuses."""
+    def test_a_set_holding_a_fold_dependent_datetime_is_refused_at_write(self, value: set) -> None:
+        """Written, these read back with fewer elements, or as two equal frozensets that every read refuses: PEP 495
+        makes a datetime whose offset depends on fold unequal to any datetime in another zone, at either fold, and the
+        stored text keeps the offset but not fold."""
         assert _FOLDED != _UTC_TWIN and _FOLDED.isoformat() == _UTC_TWIN.astimezone(_NEW_YORK).isoformat()
-        with pytest.raises(TypeError, match="it holds an aware datetime at fold=1"):
+        assert _AMBIGUOUS != _AMBIGUOUS.astimezone(UTC) and _SKIPPED != _SKIPPED.astimezone(UTC)
+        with pytest.raises(TypeError, match="it holds an aware datetime in a wall-clock hour its zone repeats or skips"):
             AutoSerializer().serialize(value)
 
     def test_a_folded_datetime_outside_a_set_writes_the_bytes_it_always_has(self) -> None:
@@ -496,12 +506,14 @@ class TestAutoSerializerDatetimeRoundTrip:
         assert serializer.serialize({"k": _FOLDED})[0] == b"\x81\xa1k" + _FOLDED_MARKER
 
     def test_fold_that_does_not_move_the_offset_is_not_refused(self) -> None:
-        """Naive, or in a zone with one offset, fold=1 is equal to and hashes as fold=0, so it reads back equal."""
+        """Naive, at a fixed offset, or at a wall time its zone neither repeats nor skips, fold leaves the offset alone,
+        so the datetime reads back equal, at the same hash."""
         serializer = AutoSerializer()
         for value in (
             {datetime(2025, 11, 2, 1, 30, fold=1)},
             {datetime(2025, 11, 2, 1, 30, fold=1, tzinfo=UTC)},
             {datetime(2025, 7, 1, 1, 30, fold=1, tzinfo=_NEW_YORK)},
+            {datetime(2025, 7, 1, 1, 30, tzinfo=_NEW_YORK), datetime(2025, 7, 1, 5, 30, tzinfo=UTC)},
         ):
             assert serializer.deserialize(*serializer.serialize(value)) == value
 
