@@ -414,7 +414,7 @@ def test_buffer_inputs_decode_like_bytes() -> None:
 
 def _keys_tested_by(hook: Callable[..., Any]) -> set[str]:
     """The marker keys ``hook`` tests: the dunder string literals in its source."""
-    return set(re.findall(r'"(__[a-z]+__)"', inspect.getsource(hook)))
+    return set(re.findall(r'"(__\w+__)"', inspect.getsource(hook)))
 
 
 def test_each_readers_rust_marker_keys_are_its_hooks() -> None:

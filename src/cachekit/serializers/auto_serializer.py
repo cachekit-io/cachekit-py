@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import operator
 import sys
 from datetime import date, datetime, time
 from functools import cached_property
@@ -72,6 +73,20 @@ _ENVELOPE_FORMATS = frozenset({"msgpack", "dataframe", "series"})
 # Every header `original_type` serialize() can write: the envelope formats plus the two that
 # never travel in an envelope. serialize() always writes the field, so an absent one is rot too.
 _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
+
+# Bounds on one set or frozenset, so a forged entry cannot make set() quadratic. str and bytes hash under a
+# per-process secret; an int, float, UUID or tuple hashes without one, so a forged entry can choose its elements'
+# hashes, in two ways (interop.py's _MAX_NON_STRING_KEYS explains both for dicts; sets probe the same way).
+# Sharing one hash makes each insert call __eq__ on every earlier element of that hash, and that __eq__ can be
+# dear (a UUID's runs in Python; a tuple's compares a long shared prefix): _set_bound_error refuses more than
+# _MAX_SAME_HASH_SET_ELEMENTS on one hash, so an insert makes at most that many __eq__ calls. 8 admits honest
+# collisions such as 3-D offset tuples over -1 and -2 (hash(-1) == hash(-2)). Distinct hashes whose probe
+# sequences merge make each insert walk one shared chain with no __eq__ at all; the count of elements that are
+# neither str nor bytes bounds that. At these bounds, the costliest forged set found (1024 ints on one merged
+# chain) decodes in about 4x the time of an honest set of the same size. _auto_default applies the same bounds,
+# so a refused set fails loudly at write instead of missing on every read.
+_MAX_NON_STRING_SET_ELEMENTS = 1024
+_MAX_SAME_HASH_SET_ELEMENTS = 8
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -317,7 +332,19 @@ def _auto_default(obj: Any) -> Any:
 
     # NEW: set/frozenset support (type-safe roundtrip)
     if isinstance(obj, (set, frozenset)):
-        return {"__set__": True, "value": list(obj), "frozen": isinstance(obj, frozenset)}
+        value = list(obj)
+        # Counted as the reader will see them (a str or bytes subclass reads back as str or bytes), but only when the
+        # count could matter: below it every element is taken as exposed, which at worst sorts a few str hashes too.
+        exposed = len(value)
+        if exposed > _MAX_NON_STRING_SET_ELEMENTS:
+            exposed = sum(not isinstance(x, (str, bytes)) for x in value)
+        reason = _set_bound_error(value, exposed)
+        if reason:
+            raise TypeError(
+                f"AutoSerializer cannot store this {type(obj).__name__}: it holds {reason}, which its reader refuses "
+                "as a hash-flood bound. Cache the elements as a list instead."
+            )
+        return {"__set__": True, "value": value, "frozen": isinstance(obj, frozenset)}
 
     # NumPy array support (nested in dicts/lists via msgpack custom encoder)
     np_loaded = sys.modules.get("numpy")
@@ -338,6 +365,38 @@ def _auto_default(obj: Any) -> Any:
 
     # Generic MessagePack error (fallback)
     raise TypeError(f"Object of type {type(obj).__name__} is not MessagePack serializable")
+
+
+def _set_bound_error(values: list[Any], exposed: int, *, ints_only: bool = False) -> str | None:
+    """Why set() over ``values`` could be quadratic, or None (see _MAX_NON_STRING_SET_ELEMENTS).
+
+    ``exposed`` is how many of them are neither str nor bytes; ``ints_only`` says every one is an exact int.
+    """
+    if exposed > _MAX_NON_STRING_SET_ELEMENTS:
+        return f"more than {_MAX_NON_STRING_SET_ELEMENTS} elements that are neither str nor bytes"
+    # Fewer exposed elements cannot fill one hash past the bound: a str or bytes hash is secret. Nor can ints alone
+    # cost much on one hash: at most 13 in msgpack's int range share one (k * (2**61 - 1) for k in -4..8), and they
+    # compare in C. Sorting an honest int set's hashes would cost more than building it.
+    if ints_only or exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
+        return None
+    # Sorted, not tallied in a dict or set: a table keyed by the hashes is the very build being bounded.
+    hashes = sorted(map(hash, values))
+    if any(map(operator.eq, hashes, hashes[_MAX_SAME_HASH_SET_ELEMENTS:])):
+        return f"more than {_MAX_SAME_HASH_SET_ELEMENTS} elements that share one hash"
+    return None
+
+
+def _check_untrusted_set(values: list[Any]) -> None:
+    """Refuse a stored set's elements if set() over them could be quadratic, before set() builds it."""
+    # Counted by list.count, which runs in C: a Python loop over every element would slow honest sets several-fold.
+    types = list(map(type, values))
+    reason = _set_bound_error(
+        values, len(types) - types.count(str) - types.count(bytes), ints_only=types.count(int) == len(types)
+    )
+    if reason:
+        raise SerializationError(
+            f"Invalid set format: {reason}: a hash-flood bound, not a framing error. The entry is likely forged."
+        )
 
 
 def _auto_object_hook(obj: Any) -> Any:
@@ -401,6 +460,7 @@ def _auto_object_hook(obj: Any) -> Any:
             value_list = obj["value"]
             if not isinstance(value_list, list):
                 raise SerializationError(f"Invalid set format: expected list, got {type(value_list).__name__}")
+            _check_untrusted_set(value_list)
 
             if obj.get("frozen"):
                 return frozenset(value_list)

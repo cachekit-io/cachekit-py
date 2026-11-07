@@ -67,6 +67,16 @@ These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP
 
 Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is installed but fails to import, the first DataFrame write or Arrow read on each `AutoSerializer` logs a warning on the `cachekit.serializers.auto_serializer` logger. New DataFrames are then written in the columnar format, and reading an Arrow entry raises `SerializationError`.
 
+## Set Size Bound
+
+A set or frozenset holds at most 1,024 elements that are neither strings nor bytes, and at most 8 elements that share one hash value. Writing a set over either bound raises `TypeError`; under `@cache` the result is returned but not cached, and the failure is logged (see [Serialization unsupported type](../error-codes.md#serialization-unsupported-type)). Reading one, which a forged entry or an earlier cachekit version can hold, raises `SerializationError`, which a cached read treats as a miss.
+
+The count takes every element that is not a string or bytes, whatever its type: an int, a float, a bool, `None`, a UUID, a tuple, a frozenset or a datetime. Ints, floats, UUIDs and tuples hash without a random seed, so a forged entry could choose element hashes that make one read quadratic in the set's size, either by giving many elements one hash or by giving them distinct hashes whose probe sequences in the set's table merge. Strings and bytes hash under a per-process secret, so a set of them is bounded only by the size bounds every read applies.
+
+Honest elements can share a hash: `hash(-1) == hash(-2)`, so the 3-D offsets over -1 and -2, such as `(-1, -2, -1)`, put 8 tuples on one hash, the most the bound admits; 4-D offsets put 16 there and are refused.
+
+The reader counts the elements and sorts their hashes before it builds the set, so a refused set is never built. A set of ints alone skips the hash sort: at most 13 ints in MessagePack's integer range share a hash, and they compare cheaply. Within the bounds, the costliest forged set found, 1,024 ints whose probe sequences merge, decodes in about 4x the time of an honest set of the same size. To cache more elements, cache them as a list.
+
 ## When to Use
 
 **Use `serializer='auto'` when:**

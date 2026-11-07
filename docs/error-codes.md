@@ -493,7 +493,7 @@ export CACHEKIT_CONNECTION_POOL_SIZE=100
 
 **Exception**: none raised to a `@cache`-decorated caller: the result is returned but not stored in the backend. The exception is `@cache(interop=...)`: there an unsupported return value raises `InteropError` (a `ValueError` subclass, `from cachekit.interop import InteropError`) by design, so a cross-SDK entry is never silently skipped. Calling the serializer directly raises `TypeError`, e.g. `StandardSerializer does not support custom classes (Python-specific types). ...` or `StandardSerializer does not support pandas DataFrames or Series (Python-specific types). ...`
 
-**Cause**: The default serializer handles `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`. Custom classes, dataclasses and DataFrames are not supported.
+**Cause**: The default serializer handles `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`. Custom classes, dataclasses and DataFrames are not supported. `serializer='auto'` also refuses a set or frozenset holding more than 1,024 elements that are neither strings nor bytes, or more than 8 that share one hash value (`AutoSerializer cannot store this set: it holds more than ...`): see [Set Size Bound](serializers/auto.md#set-size-bound).
 
 **When it occurs**:
 ```python

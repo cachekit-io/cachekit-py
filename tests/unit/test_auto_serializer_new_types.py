@@ -11,7 +11,9 @@ Tests:
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from uuid import UUID
 
 import msgpack
@@ -20,7 +22,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from cachekit._rust_serializer import ByteStorage
-from cachekit.serializers.auto_serializer import AutoSerializer
+from cachekit.serializers.auto_serializer import _MAX_NON_STRING_SET_ELEMENTS, AutoSerializer
 from cachekit.serializers.base import SerializationError
 from tests.utils.hypothesis_settings import slow_first_draw
 
@@ -204,6 +206,161 @@ class TestAutoSerializerFrozenset:
         assert isinstance(deserialized, frozenset)
         assert not isinstance(deserialized, set)
         assert deserialized == test_frozenset
+
+
+def _uuid_marker(i: int) -> dict:
+    return {"__uuid__": True, "value": str(UUID(int=i))}
+
+
+def _set_doc(values: list, frozen: bool) -> bytes:
+    return msgpack.packb({"__set__": True, "value": values, "frozen": frozen}, use_bin_type=True)
+
+
+# UUID.__hash__ is hash(self.int), and an int hashes mod 2**61 - 1: these all hash alike.
+_SAME_HASH = [12345 + k * (2**61 - 1) for k in range(40)]
+
+
+class _Str(str):
+    pass
+
+
+class TestAutoSerializerSetHashFloodBound:
+    """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, and at most
+    _MAX_SAME_HASH_SET_ELEMENTS on one hash; either refusal comes before set() builds the set, so a forged one never
+    pays for a quadratic build. The writer refuses the same sets, so an honest one fails at write, not every read."""
+
+    @pytest.fixture
+    def counts(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+        counts = {"hash": 0, "eq": 0}
+        uuid_hash, uuid_eq = UUID.__hash__, UUID.__eq__
+
+        def counting_hash(self: UUID) -> int:
+            counts["hash"] += 1
+            return uuid_hash(self)
+
+        def counting_eq(self: UUID, other: object) -> bool:
+            counts["eq"] += 1
+            return uuid_eq(self, other)
+
+        monkeypatch.setattr(UUID, "__hash__", counting_hash)
+        monkeypatch.setattr(UUID, "__eq__", counting_eq)
+        return counts
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize(
+        "element",
+        [_uuid_marker, lambda i: {"__tuple__": True, "value": [_uuid_marker(i), 0]}],
+        ids=["uuid", "tuple"],
+    )
+    def test_a_same_hash_set_is_refused_before_any_comparison(
+        self, counts: dict[str, int], frozen: bool, element: Callable[[int], dict]
+    ) -> None:
+        data = _set_doc([element(i) for i in _SAME_HASH], frozen)
+        with pytest.raises(SerializationError, match="more than 8 elements that share one hash: a hash-flood bound"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(data)
+        # Hashed once each, by the sort; set() would have compared each to every earlier one.
+        assert counts == {"hash": len(_SAME_HASH), "eq": 0}
+
+    def test_eight_elements_may_share_a_hash_but_not_nine(self) -> None:
+        """hash(-1) == hash(-2), so 3-D offsets over -1 and -2 put 8 honest tuples on one hash; 4-D offsets put 16."""
+        serializer = AutoSerializer()
+        offsets = set(itertools.product(range(-2, 3), repeat=3))
+        assert len({hash(t) for t in itertools.product((-1, -2), repeat=3)}) == 1
+        assert serializer.deserialize(*serializer.serialize(offsets)) == offsets
+        with pytest.raises(TypeError, match="it holds more than 8 elements that share one hash"):
+            serializer.serialize(set(itertools.product(range(-2, 3), repeat=4)))
+        with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+            serializer.deserialize(_set_doc([_uuid_marker(i) for i in _SAME_HASH[:9]], False), None)
+        assert serializer.deserialize(_set_doc([_uuid_marker(i) for i in _SAME_HASH[:8]], False), None) == {
+            UUID(int=i) for i in _SAME_HASH[:8]
+        }
+
+    def test_ints_floats_and_other_types_on_one_hash_count_together(self) -> None:
+        """No type is exempt: 202 distinct floats can share one hash, and a UUID's Python __eq__ runs against each.
+        Only an all-int set skips the check: at most 13 ints in msgpack's range share a hash, and they compare in C."""
+        p = 2**61 - 1
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        all_int = [k * p for k in range(-4, 9)]
+        assert {hash(k) for k in all_int} == {0}
+        assert serializer.deserialize(_set_doc(all_int, False)) == set(all_int)
+        for mixed in (
+            [*(2.0 ** (61 * k) for k in range(9))],  # hash 1
+            [*(k * p for k in range(-4, 5)), 0.5],  # hash 0, and a float, so not an all-int set
+            [*(2.0 ** (61 * k) for k in range(5)), *(_uuid_marker(1 + j * p) for j in range(4))],  # hash 1
+        ):
+            with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+                serializer.deserialize(_set_doc([*mixed, *range(10**6, 10**6 + 100)], False))
+            with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+                serializer.deserialize(_set_doc([*mixed, *range(10**6, 10**6 + 100)], True))
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_a_set_over_the_bound_is_refused_before_any_hash(self, counts: dict[str, int], frozen: bool) -> None:
+        data = _set_doc([_uuid_marker(i) for i in range(_MAX_NON_STRING_SET_ELEMENTS + 1)], frozen)
+        with pytest.raises(SerializationError, match="more than 1024 elements that are neither str nor bytes"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(data)
+        assert counts == {"hash": 0, "eq": 0}
+
+    def test_the_bound_counts_only_elements_that_are_neither_str_nor_bytes(self) -> None:
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        strings = [*map(str, range(2000)), *(b"%d" % i for i in range(2000))]
+        assert serializer.deserialize(_set_doc([*strings, *range(1024)], False)) == {*strings, *range(1024)}
+        with pytest.raises(SerializationError, match="more than 1024 elements"):
+            serializer.deserialize(_set_doc([*strings, *range(1025)], False))
+
+    def test_a_set_at_the_bound_hashes_each_element_twice(self, counts: dict[str, int]) -> None:
+        value = frozenset(UUID(int=i) for i in range(_MAX_NON_STRING_SET_ELEMENTS))
+        serializer = AutoSerializer()
+        data, metadata = serializer.serialize(value)
+        counts.update(hash=0, eq=0)
+        result = serializer.deserialize(data, metadata)
+        # Once by the sort, once by frozenset(); no element shares a hash, so nothing is compared.
+        assert counts == {"hash": 2 * len(value), "eq": 0}
+        assert result == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            set(range(_MAX_NON_STRING_SET_ELEMENTS)),
+            frozenset(range(-(2**63), -(2**63) + _MAX_NON_STRING_SET_ELEMENTS)),
+            {i / 3 for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {UUID(int=i * 2**64) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {(i, str(i)) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {frozenset({i, -i - 10}) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {datetime(2026, 1, 1) + timedelta(seconds=i) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
+            {*range(_MAX_NON_STRING_SET_ELEMENTS - 3), True, None, 1.5},
+            {*range(_MAX_NON_STRING_SET_ELEMENTS), *map(str, range(5000)), *(b"%d" % i for i in range(5000))},
+            {*range(_MAX_NON_STRING_SET_ELEMENTS), *(_Str(i) for i in range(5000))},
+            set(itertools.product(range(-2, 3), repeat=3)),
+        ],
+        ids=[
+            "ints",
+            "int64 floor",
+            "floats",
+            "uuids",
+            "tuples",
+            "frozensets",
+            "datetimes",
+            "mixed",
+            "strs",
+            "str subclass",
+            "offset tuples",
+        ],
+    )
+    @pytest.mark.parametrize("kind", [set, frozenset])
+    def test_every_set_shape_at_the_bound_round_trips(self, value: set, kind: type) -> None:
+        serializer = AutoSerializer()
+        result = serializer.deserialize(*serializer.serialize({"v": kind(value)}))["v"]
+        assert type(result) is kind
+        assert result == value
+
+    @pytest.mark.parametrize("kind", [set, frozenset])
+    def test_the_writer_refuses_a_set_its_reader_would_refuse(self, kind: type) -> None:
+        with pytest.raises(TypeError, match=rf"cannot store this {kind.__name__}: it holds more than 1024 elements"):
+            AutoSerializer().serialize({"v": [kind(range(_MAX_NON_STRING_SET_ELEMENTS + 1))]})
+        # str and bytes subclasses read back as str and bytes, so the writer does not count them either.
+        value = kind({*range(_MAX_NON_STRING_SET_ELEMENTS), *(_Str(i) for i in range(5000))})
+        serializer = AutoSerializer()
+        assert serializer.deserialize(*serializer.serialize(value)) == value
 
 
 class TestAutoSerializerComplexNesting:
