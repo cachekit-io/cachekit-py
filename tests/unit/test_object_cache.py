@@ -305,6 +305,53 @@ class TestObjectCacheTTL:
             assert len(s.expiry) + len(s.old_expiry) <= 4
         assert oc.get("k") == (True, 999) and _consistent(oc)
 
+    @pytest.mark.parametrize("with_memo", [False, True], ids=["no-memo", "memo"])
+    def test_a_finalizer_storing_during_expiry_leaves_no_expired_entry(
+        self, monkeypatch: pytest.MonkeyPatch, with_memo: bool
+    ) -> None:
+        """An expired value's finalizer stores into the cache mid-expiry; its compaction steps move due tuples
+        from the detached heap into the live one, and the expiry must still find them, not evict a fresh entry."""
+        from cachekit._rust_serializer import HitCounter, HitMemo
+
+        fake = _fake_clock(monkeypatch)
+
+        class Sized:
+            def __init__(self, n: int = 1000) -> None:
+                self.n = n
+
+            def __sizeof__(self) -> int:
+                return self.n
+
+        unit = _estimate_object_size(Sized())
+
+        def owner() -> None:
+            pass
+
+        memo = HitMemo(owner, HitCounter(), owner.__module__, owner.__qualname__) if with_memo else None
+        oc = ObjectCache(max_entries=100, max_size_bytes=100 * unit, memo=memo)
+
+        class StoresWhenFreed(Sized):
+            def __del__(self) -> None:
+                for _ in range(25):
+                    oc.put("hot", Sized(), ttl=600)  # replaces: no new slot, so no nested expiry
+
+        oc.put("fresh-head", Sized(), ttl=600)
+        oc.put("aaa-finalizer", StoresWhenFreed(), ttl=10)  # ties pop by key: first, so its stores land mid-expiry
+        for i in range(79):
+            oc.put(f"expired:{i}", Sized(), ttl=10)
+        for i in range(18):
+            oc.put(f"fresh:{i}", Sized(), ttl=600)
+        for _ in range(102):
+            oc.put("hot", Sized(), ttl=600)
+        assert oc._state.compacting
+
+        fake.monotonic = lambda: 1015.0
+        oc.put("large", Sized(20 * unit), ttl=600)
+
+        assert oc.peek("fresh-head")[0] is True  # the expired entries made the room, not the LRU head
+        assert [k for k, e in oc._state.store.items() if e.expires_at <= 1015.0] == []
+        assert _consistent(oc)
+
     def test_clear_during_a_compaction_leaves_nothing_to_compact(self) -> None:
         oc = ObjectCache(max_entries=100)
         s = oc._state

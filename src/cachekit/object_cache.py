@@ -323,18 +323,23 @@ class _ObjectCacheState:
         returns after one comparison per heap: the live one and, while a compaction runs, the detached
         one. Each due tuple costs O(log n). A due tuple is dead unless its key's entry points at it,
         as a replaced or refreshed entry leaves behind; it is dropped.
+
+        Both heaps are read afresh before every pop: a removal can run a finalizer that stores into
+        this cache, and that store's compaction step moves due tuples from the detached heap into the
+        live one, or starts a compaction that swaps them.
         """
-        heap = self.expiry
+        store = self.store
         while True:
-            while heap and heap[0][0] <= now:
-                deadline = heapq.heappop(heap)
-                key = deadline[1]
-                entry = self.store.get(key)
-                if entry is not None and entry.deadline is deadline:
-                    self.remove(key)
-            if heap is self.old_expiry or not self.compacting:
-                return
-            heap = self.old_expiry
+            heap = self.expiry
+            if not heap or heap[0][0] > now:
+                heap = self.old_expiry
+                if not heap or heap[0][0] > now:
+                    return
+            deadline = heapq.heappop(heap)
+            key = deadline[1]
+            entry = store.get(key)
+            if entry is not None and entry.deadline is deadline:
+                self.remove(key)
 
     def evict_lru(self) -> None:
         """Remove the least recently used entry; call with lock held and at least one entry stored.
