@@ -43,10 +43,11 @@ if TYPE_CHECKING:
 
     from .arrow_serializer import ArrowSerializer
 
-from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
+from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError, unpackb_auto
 from cachekit.hash_utils import redact_error_for_log
 
 from .base import (
+    MSGPACK_MAX_NESTING,
     PAYLOAD_DECODE_ERRORS,
     EnvelopeShapeError,
     SerializationError,
@@ -55,7 +56,6 @@ from .base import (
     VerifiedPayload,
     bounded_error,
     immutable_buffer,
-    unpackb_bounded,
 )
 
 logger = logging.getLogger(__name__)
@@ -355,6 +355,9 @@ def _auto_object_hook(obj: Any) -> Any:
     Returns:
         Restored Python object or original obj if not a special marker
     """
+    # The Rust decode (unpackb_auto) calls this only for a map holding one of the str keys tested below: any
+    # other map it would return unchanged, as each test reads its key with .get(). A new marker key here needs
+    # adding to AUTO_MARKERS in rust/src/msgpack_decode.rs, or its maps decode as plain dicts.
     if isinstance(obj, dict):
         # Strict validation to prevent collision with user dicts like {'__time__': UUID(...)}
         # Only decode if marker is exactly True (not any truthy value)
@@ -545,11 +548,8 @@ class AutoSerializer:
         # tuple in an index, a name or a column label packs as an array. They keep the non-strict
         # packer, under which the default never sees a tuple, so their bytes stay as they were.
         self._columnar_pack_opts = {**self._msgpack_pack_opts, "strict_types": False}
-        self._msgpack_unpack_opts = {
-            "use_list": True,  # Need lists for DataFrame serialization format
-            "raw": False,  # Decode strings properly
-            "object_hook": _auto_object_hook,  # Restore datetime, UUID, set, frozenset
-        }
+        # Every read decodes with unpackb_auto: msgpack.unpackb's raw=False, use_list=True (the columnar
+        # documents need lists) and object_hook=_auto_object_hook, under the untrusted-decode bounds.
 
     @cached_property
     def _arrow_serializer(self) -> ArrowSerializer | None:
@@ -687,7 +687,7 @@ class AutoSerializer:
                 * both ``NUMPY_RAW`` routes additionally require the header to AGREE (absent or
                   ``"numpy"``) and RAISE on a disagreement, where the Arrow gate below only skips.
                   Skipping also fails closed — on the envelope gate for an integrity-on reader, on
-                  ``unpackb_bounded`` refusing the payload for an integrity-off one — but each
+                  the bounded decode refusing the payload for an integrity-off one — but each
                   names a cause that is not the disagreement, and the cross-config gate cannot
                   rescue the second: it reads ``metadata.compressed``, which is ``False`` for
                   every numpy entry (#166, it feeds the AAD) and for an Arrow entry too whenever
@@ -925,7 +925,7 @@ class AutoSerializer:
 
         # Python-only path (no Rust compression) - direct msgpack deserialization
         try:
-            value = unpackb_bounded(data, **self._msgpack_unpack_opts)
+            value = unpackb_auto(data, MSGPACK_MAX_NESTING, _auto_object_hook)
         except PAYLOAD_DECODE_ERRORS as msgpack_error:
             # NUMPY_RAW entries were routed structurally at the top, so nothing reaching here can be
             # a NumPy payload (and a NumPy attempt would fail without the [data] extra). Report every
@@ -973,7 +973,7 @@ class AutoSerializer:
         try:
             if format_id in ("dataframe", "series"):
                 return self._decode_columnar(original_data, format_id)
-            return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
+            return unpackb_auto(original_data, MSGPACK_MAX_NESTING, _auto_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(
                 f"Cache entry payload failed to decode inside a verified envelope (format={format_id!r:.40}): {bounded_error(e)}"
@@ -1012,7 +1012,7 @@ class AutoSerializer:
         """Decode MessagePack a decode in this process already verified (:meth:`_deserialize_keeping`), without
         retrieve(). Still the bounded decode. Raises SerializationError as deserialize does."""
         try:
-            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+            return unpackb_auto(msgpack_data, MSGPACK_MAX_NESTING, _auto_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(
                 f"Cache entry payload failed to decode inside a verified envelope (format='msgpack'): {bounded_error(e)}"
@@ -1170,8 +1170,8 @@ class AutoSerializer:
         """Rebuild a DataFrame from the already-decoded columnar ``document``.
 
         ``document`` is the msgpack-decoded body — every production caller (the verified-envelope
-        route in :meth:`deserialize` and :meth:`_decode_columnar`) decodes under
-        ``unpackb_bounded`` first, so this method never touches the wire bytes and never re-runs
+        route in :meth:`deserialize` and :meth:`_decode_columnar`) decodes with the bounded
+        ``unpackb_auto`` first, so this method never touches the wire bytes and never re-runs
         the decode bound. A forged non-dict body is refused by the ``_expect`` shape gate.
 
         Raises:
@@ -1224,7 +1224,7 @@ class AutoSerializer:
         """Rebuild a Series from the already-decoded columnar ``document``.
 
         ``document`` is the msgpack-decoded body; the same decoded-only contract as
-        :meth:`_deserialize_dataframe` (its callers run ``unpackb_bounded`` first). A forged
+        :meth:`_deserialize_dataframe` (its callers run ``unpackb_auto`` first). A forged
         non-dict body is refused by the ``_expect`` shape gate.
 
         Raises:
@@ -1321,7 +1321,7 @@ class AutoSerializer:
         """
         build = self._deserialize_dataframe if kind == "dataframe" else self._deserialize_series
         try:
-            return build(unpackb_bounded(payload, **self._msgpack_unpack_opts))
+            return build(unpackb_auto(payload, MSGPACK_MAX_NESTING, _auto_object_hook))
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Cache entry payload failed to decode as {kind}: {bounded_error(e)}") from e
 
@@ -1345,7 +1345,7 @@ class AutoSerializer:
         if msgpack_data[:1] != b"\x94":
             return msgpack_data
         try:
-            decoded = unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+            decoded = unpackb_auto(msgpack_data, MSGPACK_MAX_NESTING, _auto_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(
                 f"Value cannot be cached by an AutoSerializer with integrity checking off: its reader cannot decode it "
@@ -1398,7 +1398,8 @@ class AutoSerializer:
         else:
             # Python-only mode validation
             try:
-                unpackb_bounded(data, **self._msgpack_unpack_opts)
+                # The Rust decode reads a flat byte buffer: normalise any other view, as deserialize does.
+                unpackb_auto(data if type(data) is bytes else immutable_buffer(data), MSGPACK_MAX_NESTING, _auto_object_hook)
                 return True
             except PAYLOAD_DECODE_ERRORS:
                 return False

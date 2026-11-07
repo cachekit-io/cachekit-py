@@ -22,7 +22,7 @@ pub use cachekit_core::{
 #[cfg(feature = "python")]
 pub mod python_bindings;
 
-// StandardSerializer's one-pass bounded MessagePack decode
+// The one-pass bounded MessagePack decode of StandardSerializer, AutoSerializer and interop reads
 #[cfg(feature = "python")]
 pub mod msgpack_decode;
 
@@ -96,8 +96,11 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_bindings::check_msgpack_structure_py,
         m
     )?)?;
-    // StandardSerializer's read decode: the walk above and msgpack.unpackb in one pass
+    // The read decodes of StandardSerializer, AutoSerializer and interop: the walk above and
+    // msgpack.unpackb in one pass
     m.add_function(wrap_pyfunction!(python_bindings::unpackb_standard_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_auto_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_interop_py, m)?)?;
     // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
     m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 

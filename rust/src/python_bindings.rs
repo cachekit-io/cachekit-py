@@ -171,6 +171,44 @@ pub fn unpackb_standard_py(
     crate::msgpack_decode::unpackb_standard(py, view.as_slice(), max_depth, object_hook)
 }
 
+/// `unpackb_standard` for AutoSerializer: `object_hook` runs only on maps holding a `__datetime__`,
+/// `__date__`, `__time__`, `__uuid__`, `__tuple__`, `__set__` or `__ndarray__` str key. `data` as for
+/// `unpackb_standard`.
+#[pyfunction]
+#[pyo3(name = "unpackb_auto")]
+pub fn unpackb_auto_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    max_depth: usize,
+    object_hook: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let view = bytes_view(py, data)?;
+    crate::msgpack_decode::unpackb_auto(py, view.as_slice(), max_depth, object_hook)
+}
+
+/// Decode one untrusted interop value document under the same bounds, in one pass. Map keys may be
+/// of any type (IOP-18): a map holding a key neither `str` nor `bytes` is made by
+/// `object_pairs_hook` from its `(key, value)` pairs; any other by this decode, then `object_hook`
+/// if it holds a `__datetime__`, `__date__` or `__time__` str key. `data` as for `unpackb_standard`.
+#[pyfunction]
+#[pyo3(name = "unpackb_interop")]
+pub fn unpackb_interop_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    max_depth: usize,
+    object_hook: &Bound<'_, PyAny>,
+    object_pairs_hook: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let view = bytes_view(py, data)?;
+    crate::msgpack_decode::unpackb_interop(
+        py,
+        view.as_slice(),
+        max_depth,
+        object_hook,
+        object_pairs_hook,
+    )
+}
+
 /// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
 /// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
 /// touches the Python heap). It covers `retrieve`, `check_msgpack_structure` and `unpackb_standard`, and the exact
