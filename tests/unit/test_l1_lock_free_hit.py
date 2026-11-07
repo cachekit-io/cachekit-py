@@ -36,6 +36,7 @@ from cachekit.config import L1CacheConfig
 from cachekit.decorators.wrapper import _memo_key
 from cachekit.object_cache import ObjectCache
 from tests.unit.test_key_registry import _closure_cell
+from tests.unit.test_object_cache import deadlines_tracked
 from tests.utils.clock import fake_clock, shared_clock
 from tests.utils.fork_helpers import child_outcome, report
 
@@ -675,14 +676,19 @@ class TestExactLRU:
     (HitMemo.get, with a memo), refreshes landed some operations after they were flagged, and deletes,
     against an OrderedDict LRU. Every access must hit or miss as the reference does, and the same keys
     must stay stored: no trace loses a hit to exact LRU. Deletes, replacements and refreshes leave
-    dead records behind, so traces also run their rebuild. The clock advances on every read, as the OS
-    monotonic clock does between two accesses."""
+    dead records behind, so traces also run their compaction: in one batch, and one record per operation,
+    so a compaction straddles the evictions and reads that follow it. The clock advances on every read, as
+    the OS monotonic clock does between two accesses."""
 
+    @pytest.mark.parametrize("batch", [1, object_cache._COMPACT_BATCH], ids=["batch-1", "batch-default"])
     @pytest.mark.parametrize("with_memo", [True, False], ids=["memo", "no-memo"])
     @pytest.mark.parametrize("budget", [1 << 20, 100 << 20], ids=["1MiB", "default-100MiB"])
     @settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(ops=_LRU_OPS)
-    def test_every_trace_matches_exact_lru(self, with_memo: bool, budget: int, ops: list[tuple[str, str, int]]) -> None:
+    def test_every_trace_matches_exact_lru(
+        self, monkeypatch: pytest.MonkeyPatch, batch: int, with_memo: bool, budget: int, ops: list[tuple[str, str, int]]
+    ) -> None:
+        monkeypatch.setattr(object_cache, "_COMPACT_BATCH", batch)
         ticks = itertools.count()
         shared_clock.fake = lambda: 1000.0 + next(ticks) * 1e-6
         try:
@@ -740,10 +746,26 @@ class TestExactLRU:
                     if found:
                         assert got is values[k]
                 assert set(oc._state.store) == {f"key:{key}" for key in reference}
+                _assert_records_consistent(oc)
                 if memo is not None:
                     assert _keys_held_by_entries(oc) == Counter(memo.keys())
         finally:
             shared_clock.fake = None
+
+
+def _assert_records_consistent(oc: ObjectCache) -> None:
+    """Every entry's deadline has a tuple, live or detached; with a memo, every entry has exactly one live
+    recency record, and the filed records, the detached ones first, run in clock order."""
+    s = oc._state
+    assert deadlines_tracked(oc)
+    if s.memo is None:
+        assert not (s.filed or s.refiled or s.old_filed or s.old_refiled)
+        return
+    records = [*s.old_filed, *s.filed, *s.old_refiled, *s.refiled]
+    live = Counter(key for _, generation, key in records if key in s.store and s.store[key].generation == generation)
+    assert live == Counter(s.store.keys())
+    filed = [*s.old_filed, *s.filed]
+    assert filed == sorted(filed)
 
 
 def _sized(value: _Sized) -> int:
@@ -756,9 +778,10 @@ def _sized(value: _Sized) -> int:
 
 
 @pytest.mark.unit
-def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Threads hit, fill, invalidate and clear a small key range whose values overflow the byte budget,
-    so entries are also evicted all along. Every removal is stamped once it is done, on a counter each
+@pytest.mark.parametrize("local", [False, True], ids=["backend-none", "local"])
+def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.MonkeyPatch, local: bool) -> None:
+    """Threads hit, fill, invalidate and clear a small key range whose values overflow the byte budget
+    (@cache.local(): its entry bound), so entries are also evicted all along. Every removal is stamped once it is done, on a counter each
     call reads before it starts: a hit that returns a value whose removal was stamped before the call
     started was served it after the removal returned. A call that joined a concurrent miss gets that
     miss's value, removed or not, by the single-flight contract, so it is not a hit and is not checked.
@@ -794,13 +817,17 @@ def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.Monke
     payload = b"x" * 150_000  # about 7 fit the 1 MiB budget, of 16 keys
     created: list[Any] = []  # keeps every value alive, so no id() is reused
 
-    @cache(backend=None, ttl=300, l1=L1CacheConfig(max_size_mb=1))
-    def fn(k: int) -> tuple[int, bytes]:
+    def body(k: int) -> tuple[int, bytes]:
         value = (k, payload)
         created.append(value)
         return value
 
-    oc, _ = _cache_and_memo(fn)
+    if local:
+        fn = cache.local(ttl=300, max_entries=7)(body)
+        oc = _closure_cell(fn, "object_cache").cell_contents
+    else:
+        fn = cache(backend=None, ttl=300, l1=L1CacheConfig(max_size_mb=1))(body)
+        oc, _ = _cache_and_memo(fn)
 
     def cleared() -> None:
         """fn.cache_clear(), then every entry stored before it began is stamped removed: whatever way

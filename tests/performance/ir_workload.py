@@ -135,6 +135,7 @@ def build_workload(path: str) -> Callable[[], object]:
         "l1_hit_backed_auto": lambda: cache(backend=DictBackend(), ttl=300, serializer="auto")(body),
         "l1_hit_interop": lambda: cache(backend=DictBackend(), ttl=300, interop="profile", namespace="bench")(body),
         "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
+        "local_hit": lambda: cache.local(ttl=300)(body),
         "l2_hit": l2,
         "miss": lambda: cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body),
         "secure_l1_hit": lambda: cache.secure(master_key=master_key, backend=DictBackend(), ttl=300)(body),
