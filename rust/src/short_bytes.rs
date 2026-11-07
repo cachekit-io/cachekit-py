@@ -3,11 +3,10 @@
 //! The cache hashes and compares each short string it reads. Copying a slice of run-time length
 //! into a word, or comparing two with `==`, compiles to a call to `memcpy` or `memcmp`: together
 //! about 35 instructions per string. These read the bytes with fixed-width loads that overlap
-//! instead, so they make no call. Each is `#[inline(always)]`: under plain `#[inline]`, decoding 100
-//! records ran 3.8% more instructions.
+//! instead, so they make no call.
 
 /// The four bytes of `s` at `at`, as one load.
-#[inline(always)]
+#[inline]
 pub(crate) fn load4(s: &[u8], at: usize) -> u32 {
     let mut w = [0u8; 4];
     w.copy_from_slice(&s[at..at + 4]);
@@ -15,7 +14,7 @@ pub(crate) fn load4(s: &[u8], at: usize) -> u32 {
 }
 
 /// The eight bytes of `s` at `at`, as one load.
-#[inline(always)]
+#[inline]
 pub(crate) fn load8(s: &[u8], at: usize) -> u64 {
     let mut w = [0u8; 8];
     w.copy_from_slice(&s[at..at + 8]);
@@ -24,7 +23,7 @@ pub(crate) fn load8(s: &[u8], at: usize) -> u64 {
 
 /// `b`, at most eight bytes, as a little-endian word padded with zeros. From four bytes on, two
 /// loads that overlap where `b` is shorter than eight; under four, its first, middle and last byte.
-#[inline(always)]
+#[inline]
 pub(crate) fn word(b: &[u8]) -> u64 {
     let n = b.len();
     if n >= 4 {
@@ -39,7 +38,7 @@ pub(crate) fn word(b: &[u8]) -> u64 {
 /// Whether `a` and `b`, which are one length, hold the same bytes. Up to 16 bytes, by two loads
 /// that overlap and together cover every byte (under four, its first, middle and last byte); past
 /// that, `==`.
-#[inline(always)]
+#[inline]
 pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();

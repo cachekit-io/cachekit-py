@@ -357,7 +357,7 @@ def _auto_object_hook(obj: Any) -> Any:
     """
     # The Rust decode (unpackb_auto) calls this only for a map holding one of the str keys tested below: any
     # other map it would return unchanged, as each test reads its key with .get(). A new marker key here needs
-    # adding to Auto::MARKERS in rust/src/msgpack_decode.rs, or its maps decode as plain dicts.
+    # adding to AUTO_MARKERS in rust/src/msgpack_decode.rs, or its maps decode as plain dicts.
     if isinstance(obj, dict):
         # Strict validation to prevent collision with user dicts like {'__time__': UUID(...)}
         # Only decode if marker is exactly True (not any truthy value)

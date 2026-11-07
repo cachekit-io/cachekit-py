@@ -33,7 +33,6 @@
 //! process, where msgpack-python raises MemoryError.
 
 use std::convert::Infallible;
-use std::marker::PhantomData;
 
 use cachekit_core::check_msgpack_structure;
 use pyo3::exceptions::PyValueError;
@@ -43,45 +42,32 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 
 use crate::short_bytes::{load8, same, word};
 
-/// What one caller's decode reads its own way. A compile-time parameter, so each caller's decode
-/// carries none of another's checks.
-trait Profile {
-    /// The keys its hook tests: a map holding one as a `str` key goes to the hook.
-    const MARKERS: &'static [&'static [u8]];
-    /// `strict_map_key=False` (IOP-18): a map key may be of any type, and a map holding one neither
-    /// `str` nor `bytes` is made by the pairs hook (see the module docs).
-    const ANY_KEYS: bool;
-}
+/// The keys `_standard_object_hook` (`standard_serializer.py`) and `_revive_sentinels` (`interop.py`)
+/// test.
+const TEMPORAL_MARKERS: &[&[u8]] = &[b"__datetime__", b"__date__", b"__time__"];
+/// The keys `_auto_object_hook` (`auto_serializer.py`) tests.
+const AUTO_MARKERS: &[&[u8]] = &[
+    b"__datetime__",
+    b"__date__",
+    b"__time__",
+    b"__uuid__",
+    b"__tuple__",
+    b"__set__",
+    b"__ndarray__",
+];
 
-/// StandardSerializer: `_standard_object_hook` (`standard_serializer.py`), `strict_map_key=True`.
-struct Standard;
-impl Profile for Standard {
-    const MARKERS: &'static [&'static [u8]] = &[b"__datetime__", b"__date__", b"__time__"];
-    const ANY_KEYS: bool = false;
+/// `Decoder::is_marker` tests `__` before the list, so every marker key must start with it.
+const fn dunder_prefixed(keys: &[&[u8]]) -> bool {
+    let mut i = 0;
+    while i < keys.len() {
+        if keys[i].len() < 2 || keys[i][0] != b'_' || keys[i][1] != b'_' {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
-
-/// AutoSerializer: `_auto_object_hook` (`auto_serializer.py`), `strict_map_key=True`.
-struct Auto;
-impl Profile for Auto {
-    const MARKERS: &'static [&'static [u8]] = &[
-        b"__datetime__",
-        b"__date__",
-        b"__time__",
-        b"__uuid__",
-        b"__tuple__",
-        b"__set__",
-        b"__ndarray__",
-    ];
-    const ANY_KEYS: bool = false;
-}
-
-/// Interop reads: `_revive_sentinels`, which tests StandardSerializer's keys, and `_build_map` as the
-/// pairs hook (`interop.py`).
-struct Interop;
-impl Profile for Interop {
-    const MARKERS: &'static [&'static [u8]] = Standard::MARKERS;
-    const ANY_KEYS: bool = true;
-}
+const _: () = assert!(dunder_prefixed(TEMPORAL_MARKERS) && dunder_prefixed(AUTO_MARKERS));
 
 /// Strings at most this long go through a per-decode cache, so a repeated one is one object: map
 /// keys in one table, values in another.
@@ -101,14 +87,18 @@ enum Fail {
 }
 
 /// An open container, filled as each element arrives.
-enum Open<'py> {
+enum Open<'a, 'py> {
     /// An array: its list, made with `None` in every slot, and the next index to fill.
     List(Bound<'py, PyList>, usize),
-    /// A map: its dict, and the key read, awaiting its value.
-    Map(Bound<'py, PyDict>, Option<Bound<'py, PyAny>>),
+    /// A map: its dict, the key read, awaiting its value, and its held pairs once it has any.
+    Map(
+        Bound<'py, PyDict>,
+        Option<Bound<'py, PyAny>>,
+        Option<Held<'a, 'py>>,
+    ),
 }
 
-/// A held map's pairs from its first key neither `str` nor `bytes` on (interop only), for `build`.
+/// A map's pairs from its first key neither `str` nor `bytes` on (interop only), for `build`.
 struct Held<'a, 'py> {
     /// `(key, value)` tuples in read order, one slot per pair the map has left (`hold`): the
     /// dict's pairs, then every pair read since. Full when the map closes.
@@ -120,14 +110,12 @@ struct Held<'a, 'py> {
 }
 
 /// An open array or map.
-struct Frame<'py> {
-    open: Open<'py>,
+struct Frame<'a, 'py> {
+    open: Open<'a, 'py>,
     /// Elements still to read: items for an array, keys plus values for a map.
     owed: u64,
     /// Map: a `str` key equal to a marker key was read.
     marker: bool,
-    /// Map: its pairs are held, on top of `Decoder::held` while it is the innermost held map.
-    held: bool,
 }
 
 /// One cached string: its bytes' position in the input, and the `str`.
@@ -137,24 +125,24 @@ struct StrSlot<'py> {
     obj: Bound<'py, PyAny>,
 }
 
-struct Decoder<'a, 'py, P: Profile> {
+struct Decoder<'a, 'py> {
     py: Python<'py>,
     data: &'a [u8],
     pos: usize,
     max_depth: usize,
-    /// The pairs hook, under `P::ANY_KEYS` only.
+    /// The keys the hook tests.
+    markers: &'static [&'static [u8]],
+    /// None: `strict_map_key=True`, a key must be exactly `str` or `bytes`. Some: any key, and a map
+    /// holding one of another type is made by this pairs hook (see the module docs).
     pairs_hook: Option<&'a Bound<'py, PyAny>>,
     /// Elements owed across every open container, the root included (the walk's `pending`).
     pending: u64,
-    stack: Vec<Frame<'py>>,
-    /// The pairs of every open held map, innermost last. Apart from the stack so a frame stays small.
-    held: Vec<Held<'a, 'py>>,
+    stack: Vec<Frame<'a, 'py>>,
     /// Cached strings; a table slot holds an index into it plus one, or 0 when empty. A slot holds
     /// one string at a time, a colliding one replacing it, so this never exceeds `2 * CACHE_SLOTS`.
     cached: Vec<StrSlot<'py>>,
     keys: [u16; CACHE_SLOTS],
     values: [u16; CACHE_SLOTS],
-    profile: PhantomData<P>,
 }
 
 /// The cache slot for `bytes`: its first and last eight bytes, multiplied and shifted.
@@ -167,11 +155,12 @@ fn slot_of(bytes: &[u8]) -> usize {
     (h >> (64 - CACHE_BITS)) as usize
 }
 
-impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
+impl<'a, 'py> Decoder<'a, 'py> {
     fn new(
         py: Python<'py>,
         data: &'a [u8],
         max_depth: usize,
+        markers: &'static [&'static [u8]],
         pairs_hook: Option<&'a Bound<'py, PyAny>>,
     ) -> Self {
         Self {
@@ -179,14 +168,13 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
             data,
             pos: 0,
             max_depth,
+            markers,
             pairs_hook,
             pending: 1,
             stack: Vec::new(),
-            held: Vec::new(),
             cached: Vec::new(),
             keys: [0; CACHE_SLOTS],
             values: [0; CACHE_SLOTS],
-            profile: PhantomData,
         }
     }
 
@@ -220,7 +208,7 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
         matches!(
             self.stack.last(),
             Some(Frame {
-                open: Open::Map(_, None),
+                open: Open::Map(_, None, _),
                 ..
             })
         )
@@ -228,8 +216,8 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
 
     /// Whether `key`, a `str` key's bytes, is one of the keys the hook tests.
     #[inline]
-    fn is_marker(key: &[u8]) -> bool {
-        P::MARKERS.contains(&key)
+    fn is_marker(&self, key: &[u8]) -> bool {
+        key.starts_with(b"__") && self.markers.contains(&key)
     }
 
     fn decode(&mut self, hook: &Bound<'py, PyAny>) -> Result<Bound<'py, PyAny>, Fail> {
@@ -281,30 +269,30 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
                         list.set_item(*index, value).map_err(|e| restore(py, e))?;
                         *index += 1;
                     }
-                    Open::Map(dict, awaiting_key) => match awaiting_key.take() {
+                    Open::Map(dict, awaiting_key, held) => match awaiting_key.take() {
                         None => {
                             *awaiting_key = Some(value);
                             break;
                         }
                         Some(key) => {
-                            // Both arms take the pair, so the loop tracks no drop state for it.
-                            if (P::ANY_KEYS && f.held)
-                                || !(key.is_exact_instance_of::<PyString>()
-                                    || key.is_exact_instance_of::<PyBytes>())
+                            if let Some(held) = held {
+                                // Through the sequence protocol, as in `hold`.
+                                pair(py, key, value)
+                                    .and_then(|p| held.pairs.as_sequence().set_item(held.next, p))
+                                    .map_err(|e| restore(py, e))?;
+                                held.next += 1;
+                            } else if key.is_exact_instance_of::<PyString>()
+                                || key.is_exact_instance_of::<PyBytes>()
                             {
-                                // `owed` counts the keys and values of the pairs still to read.
-                                odd_pair::<P>(
-                                    py,
-                                    dict,
-                                    &mut f.held,
-                                    f.owed / 2,
-                                    &mut self.held,
-                                    self.pairs_hook,
-                                    key,
-                                    value,
-                                )?;
-                            } else {
                                 dict.set_item(key, value).map_err(|e| restore(py, e))?;
+                            } else if let Some(build) = self.pairs_hook {
+                                // `owed` counts the keys and values of the pairs still to read.
+                                let (pairs, next) = hold(py, dict, key, value, f.owed / 2)
+                                    .map_err(|e| restore(py, e))?;
+                                *held = Some(Held { pairs, next, build });
+                            } else {
+                                // strict_map_key=True: a map key must be exactly `str` or `bytes`.
+                                return Err(restore(py, key_error(&key)));
                             }
                         }
                     },
@@ -315,22 +303,18 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
                 let done = self.stack.pop().expect("a frame was just read");
                 value = match done.open {
                     Open::List(list, _) => list.into_any(),
-                    // The pairs hook makes the map from its held pairs, on top since every map inside
-                    // it has closed, and revives it as it would (`_build_map`): the hook does not run.
-                    Open::Map(_, _) if P::ANY_KEYS && done.held => self.build_held(py)?,
-                    Open::Map(dict, _) => dict.into_any(),
+                    // The pairs hook makes the map, revived as it is (`_build_map`), so the hook does not run.
+                    Open::Map(_, _, Some(held)) => held
+                        .build
+                        .call1((held.pairs,))
+                        .map_err(|e| restore(py, e))?,
+                    Open::Map(dict, _, None) if done.marker => {
+                        hook.call1((dict,)).map_err(|e| restore(py, e))?
+                    }
+                    Open::Map(dict, _, None) => dict.into_any(),
                 };
-                if done.marker && !(P::ANY_KEYS && done.held) {
-                    value = hook.call1((value,)).map_err(|e| restore(py, e))?;
-                }
             }
         }
-    }
-
-    /// The innermost held map, made by its pairs hook from its pairs.
-    fn build_held(&mut self, py: Python<'py>) -> Result<Bound<'py, PyAny>, Fail> {
-        let held = self.held.pop().ok_or(Fail::Bound)?;
-        held.build.call1((held.pairs,)).map_err(|e| restore(py, e))
     }
 
     /// A `width`-byte big-endian length prefix.
@@ -358,7 +342,7 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
         let at_key = self.at_key();
         let start = self.pos;
         let bytes = self.take(len);
-        if at_key && Self::is_marker(bytes) {
+        if at_key && self.is_marker(bytes) {
             if let Some(f) = self.stack.last_mut() {
                 f.marker = true;
             }
@@ -467,7 +451,7 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
             }));
         }
         let open = if is_map {
-            Open::Map(PyDict::new(self.py), None)
+            Open::Map(PyDict::new(self.py), None, None)
         } else {
             Open::List(nones(self.py, n).map_err(|e| restore(self.py, e))?, 0)
         };
@@ -475,7 +459,6 @@ impl<'a, 'py, P: Profile> Decoder<'a, 'py, P> {
             open,
             owed,
             marker: false,
-            held: false,
         });
         Ok(None)
     }
@@ -574,47 +557,14 @@ fn pair<'py>(
     PyTuple::new(py, [key, value])
 }
 
-/// A pair a map's dict does not take as it is read: a key neither `str` nor `bytes`, or a map that
-/// holds its pairs already. Under `strict_map_key=True` that key is refused. Otherwise the pair
-/// joins the map's held pairs, which the first such key starts (`hold`, `held` then set).
-#[allow(clippy::too_many_arguments)]
-fn odd_pair<'a, 'py, P: Profile>(
-    py: Python<'py>,
-    dict: &Bound<'py, PyDict>,
-    held: &mut bool,
-    rest: u64,
-    stack: &mut Vec<Held<'a, 'py>>,
-    pairs_hook: Option<&'a Bound<'py, PyAny>>,
-    key: Bound<'py, PyAny>,
-    value: Bound<'py, PyAny>,
-) -> Result<(), Fail> {
-    if !P::ANY_KEYS {
-        // strict_map_key=True: a map key must be exactly `str` or `bytes`.
-        return Err(restore(py, key_error(&key)));
-    }
-    if *held {
-        let top = stack.last_mut().ok_or(Fail::Bound)?;
-        pair(py, key, value)
-            .and_then(|p| top.pairs.set_item(top.next, p))
-            .map_err(|e| restore(py, e))?;
-        top.next += 1;
-    } else {
-        // `unpackb_interop` always passes the pairs hook.
-        let build = pairs_hook.ok_or(Fail::Bound)?;
-        let (pairs, next) = hold(py, dict, key, value, rest).map_err(|e| restore(py, e))?;
-        stack.push(Held { pairs, next, build });
-        *held = true;
-    }
-    Ok(())
-}
-
 /// A map's held pairs as it reads its first key neither `str` nor `bytes`, and the next slot to
 /// fill: `dict`'s pairs, in the order they were read, then that one, in a list with a slot for
 /// each of the `rest` pairs still to read. A `dict` keeps a repeated key where it was first read,
 /// with its last value, as `dict(pairs)` would. `dict` is emptied, so it holds no second copy.
-/// Out of line: inlined into the decode loop, it added 0.6% to an interop decode of string-keyed
-/// records, which never call it.
-#[inline(never)]
+///
+/// The slots are set through the sequence protocol, not `PyList::set_item`: with a second caller,
+/// LLVM stops inlining that into the decode loop, and a 79-byte StandardSerializer decode ran 3.5%
+/// more instructions on CPython 3.12.
 fn hold<'py>(
     py: Python<'py>,
     dict: &Bound<'py, PyDict>,
@@ -624,12 +574,13 @@ fn hold<'py>(
 ) -> PyResult<(Bound<'py, PyList>, usize)> {
     // At most the map's pairs, so at most the input length.
     let pairs = nones(py, dict.len() as u64 + 1 + rest)?;
+    let slots = pairs.as_sequence();
     let mut next = 0;
     for (k, v) in dict.iter() {
-        pairs.set_item(next, pair(py, k, v)?)?;
+        slots.set_item(next, pair(py, k, v)?)?;
         next += 1;
     }
-    pairs.set_item(next, pair(py, key, value)?)?;
+    slots.set_item(next, pair(py, key, value)?)?;
     dict.clear();
     Ok((pairs, next + 1))
 }
@@ -651,7 +602,7 @@ pub fn unpackb_standard(
     max_depth: usize,
     hook: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    unpackb::<Standard>(py, data, max_depth, hook, None)
+    unpackb(py, data, max_depth, TEMPORAL_MARKERS, hook, None)
 }
 
 /// [`unpackb_standard`] for AutoSerializer, whose hook also tests `__uuid__`, `__tuple__`, `__set__`
@@ -662,7 +613,7 @@ pub fn unpackb_auto(
     max_depth: usize,
     hook: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    unpackb::<Auto>(py, data, max_depth, hook, None)
+    unpackb(py, data, max_depth, AUTO_MARKERS, hook, None)
 }
 
 /// Decode `data` as `unpackb_bounded(data, raw=False, strict_map_key=False,
@@ -677,17 +628,25 @@ pub fn unpackb_interop(
     hook: &Bound<'_, PyAny>,
     pairs_hook: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    unpackb::<Interop>(py, data, max_depth, hook, Some(pairs_hook))
+    unpackb(
+        py,
+        data,
+        max_depth,
+        TEMPORAL_MARKERS,
+        hook,
+        Some(pairs_hook),
+    )
 }
 
-fn unpackb<'py, P: Profile>(
+fn unpackb<'py>(
     py: Python<'py>,
     data: &[u8],
     max_depth: usize,
+    markers: &'static [&'static [u8]],
     hook: &Bound<'py, PyAny>,
     pairs_hook: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
-    let mut decoder = Decoder::<P>::new(py, data, max_depth, pairs_hook);
+    let mut decoder = Decoder::new(py, data, max_depth, markers, pairs_hook);
     let outcome = decoder.decode(hook);
     let consumed = decoder.pos;
     drop(decoder);
