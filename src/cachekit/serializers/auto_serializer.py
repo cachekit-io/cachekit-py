@@ -32,6 +32,7 @@ import sys
 from datetime import date, datetime, time
 from functools import cached_property
 from importlib.util import find_spec
+from itertools import chain, compress, repeat
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, cast
 from uuid import UUID
 
@@ -77,16 +78,22 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 # Bounds on one set or frozenset, so a forged entry cannot make set() quadratic. str and bytes hash under a
 # per-process secret; an int, float, UUID or tuple hashes without one, so a forged entry can choose its elements'
 # hashes, in two ways (interop.py's _MAX_NON_STRING_KEYS explains both for dicts; sets probe the same way).
-# Sharing one hash makes each insert call __eq__ on every earlier element of that hash, and that __eq__ can be
-# dear (a UUID's runs in Python; a tuple's compares a long shared prefix): _set_bound_error refuses more than
-# _MAX_SAME_HASH_SET_ELEMENTS on one hash, so an insert makes at most that many __eq__ calls. 8 admits honest
-# collisions such as 3-D offset tuples over -1 and -2 (hash(-1) == hash(-2)). Distinct hashes whose probe
-# sequences merge make each insert walk one shared chain with no __eq__ at all; the count of elements that are
-# neither str nor bytes bounds that. At these bounds, the costliest forged set found (1024 ints on one merged
-# chain) decodes in about 4x the time of an honest set of the same size. _auto_default applies the same bounds,
-# so a refused set fails loudly at write instead of missing on every read.
+# Distinct hashes whose probe sequences merge make each insert walk one shared chain with no __eq__ at all; the
+# count of elements that are neither str nor bytes bounds that. Sharing one hash makes each insert call __eq__ on
+# every earlier element of that hash: _set_bound_error refuses more than _MAX_SAME_HASH_SET_ELEMENTS elements on
+# one hash, so an insert makes fewer __eq__ calls than that (an all-int set is exempt: at most 13 ints share a hash
+# and they compare in C). 8 admits honest collisions such as 3-D offset tuples over -1 and -2 (hash(-1) ==
+# hash(-2)). That bounds the number of __eq__ calls but not their cost: two frozensets compare by looking up each
+# element of one in the other, and each lookup can compare same-hash frozensets one level down, so the cost
+# multiplies with every level of nesting. Two frozensets may therefore never share a hash, nor may two tuples once
+# any tuple in the set holds a tuple or frozenset (the path to a nested one); a flat tuple compares in time linear
+# in its length. At these bounds, the costliest forged set found (1024 ints on one merged chain) decodes in about 5x
+# the time of an honest set of the same size. _auto_default applies the same bounds to what it writes, so a refused
+# set fails loudly at write instead of missing on every read.
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
+_STR_TYPES = frozenset({str, bytes})
+_CONTAINERS = (tuple, frozenset)
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -333,12 +340,13 @@ def _auto_default(obj: Any) -> Any:
     # NEW: set/frozenset support (type-safe roundtrip)
     if isinstance(obj, (set, frozenset)):
         value = list(obj)
+        types = list(map(type, value))
         # Counted as the reader will see them (a str or bytes subclass reads back as str or bytes), but only when the
-        # count could matter: below it every element is taken as exposed, which at worst sorts a few str hashes too.
-        exposed = len(value)
+        # count could matter: below it a str subclass counts as exposed, which can only make the writer stricter.
+        exposed = len(types) - types.count(str) - types.count(bytes)
         if exposed > _MAX_NON_STRING_SET_ELEMENTS:
             exposed = sum(not isinstance(x, (str, bytes)) for x in value)
-        reason = _set_bound_error(value, exposed)
+        reason = _set_bound_error(value, types, exposed)
         if reason:
             raise TypeError(
                 f"AutoSerializer cannot store this {type(obj).__name__}: it holds {reason}, which its reader refuses "
@@ -367,20 +375,31 @@ def _auto_default(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not MessagePack serializable")
 
 
-def _set_bound_error(values: list[Any], exposed: int, *, ints_only: bool = False) -> str | None:
+def _set_bound_error(values: list[Any], types: list[type], exposed: int) -> str | None:
     """Why set() over ``values`` could be quadratic, or None (see _MAX_NON_STRING_SET_ELEMENTS).
 
-    ``exposed`` is how many of them are neither str nor bytes; ``ints_only`` says every one is an exact int.
+    ``types`` holds each value's type; ``exposed`` is how many values are neither str nor bytes.
     """
     if exposed > _MAX_NON_STRING_SET_ELEMENTS:
         return f"more than {_MAX_NON_STRING_SET_ELEMENTS} elements that are neither str nor bytes"
-    # Fewer exposed elements cannot fill one hash past the bound: a str or bytes hash is secret. Nor can ints alone
-    # cost much on one hash: at most 13 in msgpack's int range share one (k * (2**61 - 1) for k in -4..8), and they
-    # compare in C. Sorting an honest int set's hashes would cost more than building it.
-    if ints_only or exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
+    # At most 13 ints in msgpack's int range share a hash (k * (2**61 - 1) for k in -4..8), and they compare in C:
+    # an all-int set needs no hash check, and sorting an honest one's hashes would cost more than building it.
+    if types.count(int) == len(types):
         return None
-    # Sorted, not tallied in a dict or set: a table keyed by the hashes is the very build being bounded.
-    hashes = sorted(map(hash, values))
+    # Sorted, not tallied in a dict or set: a table keyed by the hashes is the very build being bounded. Distinct
+    # types are few, and a type hashes by identity, so set(types) is safe.
+    if any(issubclass(t, _CONTAINERS) for t in set(types)):
+        held = set(map(type, chain.from_iterable(compress(values, map(issubclass, types, repeat(tuple))))))
+        # A tuple holding a tuple or frozenset is a path to a nested frozenset, so then every tuple counts too.
+        nesting = _CONTAINERS if any(issubclass(t, _CONTAINERS) for t in held) else frozenset
+        nested = sorted(map(hash, compress(values, map(issubclass, types, repeat(nesting)))))
+        if any(map(operator.eq, nested, nested[1:])):
+            return "two frozensets, or two tuples beside a nested one, that share one hash"
+    # Fewer exposed elements cannot fill one hash past the bound: a str or bytes hash is secret, so only the
+    # others' hashes are sorted.
+    if exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
+        return None
+    hashes = sorted(map(hash, compress(values, map(operator.not_, map(_STR_TYPES.__contains__, types)))))
     if any(map(operator.eq, hashes, hashes[_MAX_SAME_HASH_SET_ELEMENTS:])):
         return f"more than {_MAX_SAME_HASH_SET_ELEMENTS} elements that share one hash"
     return None
@@ -390,9 +409,7 @@ def _check_untrusted_set(values: list[Any]) -> None:
     """Refuse a stored set's elements if set() over them could be quadratic, before set() builds it."""
     # Counted by list.count, which runs in C: a Python loop over every element would slow honest sets several-fold.
     types = list(map(type, values))
-    reason = _set_bound_error(
-        values, len(types) - types.count(str) - types.count(bytes), ints_only=types.count(int) == len(types)
-    )
+    reason = _set_bound_error(values, types, len(types) - types.count(str) - types.count(bytes))
     if reason:
         raise SerializationError(
             f"Invalid set format: {reason}: a hash-flood bound, not a framing error. The entry is likely forged."

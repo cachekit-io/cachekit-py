@@ -288,10 +288,31 @@ class TestAutoSerializerSetHashFloodBound:
             [*(k * p for k in range(-4, 5)), 0.5],  # hash 0, and a float, so not an all-int set
             [*(2.0 ** (61 * k) for k in range(5)), *(_uuid_marker(1 + j * p) for j in range(4))],  # hash 1
         ):
-            with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
-                serializer.deserialize(_set_doc([*mixed, *range(10**6, 10**6 + 100)], False))
-            with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
-                serializer.deserialize(_set_doc([*mixed, *range(10**6, 10**6 + 100)], True))
+            for frozen in (False, True):
+                with pytest.raises(SerializationError, match="more than 8 elements that share one hash"):
+                    serializer.deserialize(_set_doc(mixed, frozen))
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    @pytest.mark.parametrize("wrap", [lambda m: m, lambda m: {"__tuple__": True, "value": [m]}], ids=["bare", "in a tuple"])
+    def test_frozensets_on_one_hash_are_refused_before_any_comparison(
+        self, counts: dict[str, int], frozen: bool, wrap: Callable[[dict], dict]
+    ) -> None:
+        """Two frozensets compare by looking each element of one up in the other, and each lookup can compare
+        same-hash frozensets one level down, so nested same-hash frozensets cost more with every level. Even two on
+        one hash are refused, bare or in a tuple, before set() compares them."""
+        inner = [{"__set__": True, "value": [_uuid_marker(i)], "frozen": True} for i in _SAME_HASH[:2]]
+        with pytest.raises(SerializationError, match="two frozensets, or two tuples beside a nested one, that share"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(_set_doc([wrap(m) for m in inner], frozen))
+        assert counts["eq"] == 0
+
+    def test_the_writer_refuses_frozensets_on_one_hash(self) -> None:
+        assert hash(frozenset({-1})) == hash(frozenset({-2}))
+        flat_pair = {(-1,), (-2,)}  # flat tuples may share a hash, until one tuple in the set nests
+        assert AutoSerializer().deserialize(*AutoSerializer().serialize(flat_pair)) == flat_pair
+        nested = ({frozenset({-1}), frozenset({-2})}, {(frozenset({-1}),), (frozenset({-2}),)}, {((-1,),), ((-2,),)})
+        for value in (*nested, flat_pair | {((0,),)}):
+            with pytest.raises(TypeError, match="two frozensets, or two tuples beside a nested one, that share"):
+                AutoSerializer().serialize(value)
 
     @pytest.mark.parametrize("frozen", [False, True])
     def test_a_set_over_the_bound_is_refused_before_any_hash(self, counts: dict[str, int], frozen: bool) -> None:
@@ -327,10 +348,10 @@ class TestAutoSerializerSetHashFloodBound:
             {(i, str(i)) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
             {frozenset({i, -i - 10}) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
             {datetime(2026, 1, 1) + timedelta(seconds=i) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
-            {*range(_MAX_NON_STRING_SET_ELEMENTS - 3), True, None, 1.5},
+            {*range(2, _MAX_NON_STRING_SET_ELEMENTS - 1), True, None, 1.5},  # True == 1, so no 1 here
             {*range(_MAX_NON_STRING_SET_ELEMENTS), *map(str, range(5000)), *(b"%d" % i for i in range(5000))},
             {*range(_MAX_NON_STRING_SET_ELEMENTS), *(_Str(i) for i in range(5000))},
-            set(itertools.product(range(-2, 3), repeat=3)),
+            {((i, -i), (frozenset({i}),), str(i)) for i in range(_MAX_NON_STRING_SET_ELEMENTS)},
         ],
         ids=[
             "ints",
@@ -343,7 +364,7 @@ class TestAutoSerializerSetHashFloodBound:
             "mixed",
             "strs",
             "str subclass",
-            "offset tuples",
+            "nested tuples",
         ],
     )
     @pytest.mark.parametrize("kind", [set, frozenset])
