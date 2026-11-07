@@ -473,7 +473,8 @@ def _revive_sentinels(obj: dict[Any, Any]) -> Any:
     """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is.
 
     The Rust decode (unpackb_interop) calls this only for a map holding one of the str keys tested below, as
-    each test reads its key with .get(); _build_map calls it for the maps it builds.
+    each test reads its key with .get(); _build_map calls it for the maps it builds. A new sentinel key here
+    needs adding to Interop::MARKERS in rust/src/msgpack_decode.rs, or its maps decode as plain dicts.
     """
     if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
         return datetime.fromisoformat(obj["value"])

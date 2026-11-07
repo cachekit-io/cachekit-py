@@ -26,6 +26,11 @@ pub mod python_bindings;
 #[cfg(feature = "python")]
 pub mod msgpack_decode;
 
+// Short byte slices read without a call to memcpy or memcmp, for that decode's string cache.
+// Built for its tests too, so they run in the pure-Rust test build.
+#[cfg(any(feature = "python", test))]
+mod short_bytes;
+
 // The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's
 // own tests run in the pure-Rust test build too.
 pub mod hit_counter;
