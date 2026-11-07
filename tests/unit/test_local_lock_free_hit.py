@@ -161,6 +161,33 @@ class TestTheHit:
         assert reads[1:] == [renamed, moved, moved]
         assert ":elsewhere.renamed:" in moved
 
+    @_SYNC_ASYNC
+    def test_a_rename_undone_while_the_key_is_built_memoises_no_other_identity(self, is_async: bool) -> None:
+        """A rename landing between the call's read of the names and its key build (another thread's), then
+        undone, must not leave the memo answering for an entry stored under the renamed identity: that
+        entry's key is not the one invalidate_cache() builds, so the stale value would outlive it."""
+        fn, call, runs = _local(is_async)
+        key_gen = _closure_cell(fn, "key_gen").cell_contents
+        generate = key_gen.generate_key
+        original = fn.__wrapped__.__qualname__
+
+        def renaming(*args: Any, **kwargs: Any) -> str:
+            fn.__wrapped__.__qualname__ = "renamed"
+            return generate(*args, **kwargs)
+
+        key_gen.generate_key = renaming
+        first = call(1)
+        del key_gen.generate_key
+        fn.__wrapped__.__qualname__ = original
+        assert list(_cache(fn)._state.store) == [_key_now(fn, (1,), {})]  # stored under the names it read
+        assert call(1) is first
+        if is_async:
+            asyncio.run(fn.ainvalidate_cache(1))
+        else:
+            fn.invalidate_cache(1)
+        assert call(1) is not first
+        assert runs == [1, 1]
+
     # Values that compare equal across types (1, 1.0, True; 0, 0.0, -0.0, False), values just past
     # the length cap, and a few the memo never takes, so equal-but-different calls interleave.
     _ARGS = st.sampled_from(

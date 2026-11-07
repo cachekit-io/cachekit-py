@@ -25,6 +25,18 @@ _ALLOWED_PARAMS: frozenset[str] = frozenset({"ttl", "max_entries", "namespace", 
 _MISS = object()
 
 
+class _Names:
+    """A function's __module__ and __qualname__ as read once: what CacheKeyGenerator.generate_key reads off func.
+
+    Building a key from this rather than the function binds the key to one read of the names, so a
+    rename while the key is built cannot give it names other than the ones its memo admission checked.
+    """
+
+    def __init__(self, module: Any, qualname: Any) -> None:
+        self.__module__ = module
+        self.__qualname__ = qualname
+
+
 def create_local_wrapper(
     func: Callable[..., Any],
     **kwargs: Any,
@@ -102,11 +114,11 @@ def create_local_wrapper(
             else:
                 shared += 1
 
-    def _make_key(args: tuple[Any, ...], kw: dict[str, Any]) -> str:
+    def _make_key(args: tuple[Any, ...], kw: dict[str, Any], named: Any = func) -> str:
         if key is not None:
             return key(*args, **kw)
         return key_gen.generate_key(
-            func=func,
+            func=named,
             args=args,
             kwargs=kw,
             namespace=namespace,
@@ -117,12 +129,13 @@ def create_local_wrapper(
     def _call_key(args: tuple[Any, ...], kw: dict[str, Any]) -> tuple[str, Hashable | None]:
         """A call's cache key, and with a memo the memo key to memoise its entry under, or None.
 
-        A call is memoised only when its key was built with the names the memo answers for. They are
-        read before the key is built, so a rename in between leaves the call unmemoised."""
+        A call is memoised only when its key was built with the names the memo answers for. The names
+        are read once and the key is built from that read, so a rename racing the call, even one undone
+        before it returns, cannot leave an entry stored under other names memoised under these."""
         if memo is None:
             return _make_key(args, kw), None
         module, qualname = func.__module__, func.__qualname__
-        cache_key = _make_key(args, kw)
+        cache_key = _make_key(args, kw, _Names(module, qualname))
         if module is not names[0] or qualname is not names[1]:
             return cache_key, None
         return cache_key, _memo_key(args, kw)
