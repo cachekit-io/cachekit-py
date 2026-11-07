@@ -67,6 +67,10 @@ These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP
 
 Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is installed but fails to import, the first DataFrame write or Arrow read on each `AutoSerializer` logs a warning on the `cachekit.serializers.auto_serializer` logger. New DataFrames are then written in the columnar format, and reading an Arrow entry raises `SerializationError`.
 
+## Set Size Bound
+
+A set or frozenset holds at most 1,024 elements that are neither strings nor bytes, and no three of its elements share a hash value. Writing a larger set raises `TypeError`; under `@cache` the result is returned but not cached, and the failure is logged (see [Serialization unsupported type](../error-codes.md#serialization-unsupported-type)). A stored set over either bound, which only a forged entry or another writer can hold, raises `SerializationError`, which a cached read treats as a miss. The count takes every element that is not a string or bytes, whatever its type: an int, a float, a bool, `None`, a UUID, a tuple, a frozenset or a datetime. Ints, floats, UUIDs and tuples hash without a random seed, so a forged entry could choose element hashes that make one read quadratic in the set's size, either by giving many elements one hash or by giving them distinct hashes whose probe sequences in the set's table merge. Strings and bytes hash under a per-process secret, so a set of them is bounded only by the size bounds every read applies. Two elements can share a hash honestly (`hash((-1,)) == hash((-2,))`), but three in one set only by construction. Ints and floats are exempt from that check: they compare in C, and few share a hash within MessagePack's integer range. The reader counts the elements and sorts their hashes before it builds the set, so a refused set is never built. Within the bound, the costliest forged set found, 1,024 ints whose probe sequences merge, decodes in about 4x the time of an honest set of the same size. To cache more elements, cache them as a list.
+
 ## When to Use
 
 **Use `serializer='auto'` when:**
