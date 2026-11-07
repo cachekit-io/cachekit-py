@@ -95,8 +95,8 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::verify_checksum_py, m)?)?;
 
-    // Untrusted-decode structural bound — zero-copy header walk that
-    // serializers/base.py::unpackb_bounded runs before every msgpack.unpackb
+    // Untrusted-decode structural bound — the zero-copy header walk. The decodes below apply it
+    // inline; serializers/base.py::unpackb_bounded, the decode they reproduce, runs it first
     m.add_function(wrap_pyfunction!(
         python_bindings::check_msgpack_structure_py,
         m
@@ -106,6 +106,7 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_bindings::unpackb_standard_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::unpackb_auto_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::unpackb_interop_py, m)?)?;
+    m.add("MARKER_KEYS", msgpack_decode::marker_keys(m.py())?)?;
     // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
     m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 

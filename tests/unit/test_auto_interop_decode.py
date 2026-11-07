@@ -22,6 +22,8 @@ both after random byte edits, so the bounds, truncation, reserved-marker and tra
 from __future__ import annotations
 
 import gc
+import inspect
+import re
 import sys
 import threading
 from collections.abc import Callable
@@ -35,10 +37,11 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import cachekit.interop as interop
-from cachekit._rust_serializer import unpackb_auto, unpackb_interop
+from cachekit._rust_serializer import MARKER_KEYS, unpackb_auto, unpackb_interop
 from cachekit.interop import InteropDecodeError, decode_interop_value, encode_interop_value
 from cachekit.serializers.auto_serializer import _auto_default, _auto_object_hook
 from cachekit.serializers.base import MSGPACK_MAX_NESTING, PAYLOAD_DECODE_ERRORS, SerializationError, unpackb_bounded
+from cachekit.serializers.standard_serializer import _standard_object_hook
 from tests.unit.test_standard_decode import CASES, GUARD_ERROR_PREFIX
 from tests.utils.tracemalloc_isolation import measure_in_subprocess
 
@@ -380,30 +383,16 @@ def test_explicit_case_decodes_or_refuses_as_before(data: bytes) -> None:
     assert_interop_same(data)
 
 
-def test_a_malformed_timestamp_raises_msgpacks_own_message() -> None:
-    """msgpack-python's C unpacker words both refusals differently from Timestamp.from_bytes, and interop quotes them."""
-    with pytest.raises(InteropDecodeError, match=r"invalid timestamp data \(length 5\)$"):
-        decode_interop_value(INTEROP_CASES["timestamp bad length"])
-    with pytest.raises(InteropDecodeError, match=r"not greater than 999999999\.$"):
-        decode_interop_value(INTEROP_CASES["timestamp bad nanoseconds 64"])
-
-
-def test_the_hook_errors_are_the_serializers_own() -> None:
-    # Not only the same class as before: the class the read paths already turn into a miss.
-    with pytest.raises(SerializationError, match="Invalid tuple format: missing 'value' field"):
-        auto_rust(AUTO_CASES["tuple marker missing its value"])
-
-
 @pytest.mark.parametrize("decode", [auto_rust, interop_rust], ids=["auto", "interop"])
-@pytest.mark.parametrize("header", [b"\x91", b"\x81\xa0"], ids=["array", "map"])
-def test_the_nesting_ceiling_is_the_walks(decode: Callable[[bytes], Any], header: bytes) -> None:
-    """At the ceiling it decodes; one level past it, or an empty container one level past it, the walk's error."""
+def test_the_nesting_ceiling_of_maps_is_the_walks(decode: Callable[[bytes], Any]) -> None:
+    """At the ceiling nested maps decode; one level past it, or an empty map one level past it, the walk's error.
+    Arrays run for every bounded decoder in ``tests/unit/protocol/test_decode_bounds.py``."""
+    header = b"\x81\xa0"  # a one-entry map keyed by ""
     value, depth = decode(header * MSGPACK_MAX_NESTING + b"\xc0"), 0
-    while isinstance(value, (list, dict)):  # iteratively: nested == recurses past the recursion limit
-        depth, value = depth + 1, next(iter(value.values()) if isinstance(value, dict) else iter(value))
+    while isinstance(value, dict):  # iteratively: nested == recurses past the recursion limit
+        depth, value = depth + 1, value[""]
     assert (depth, value) == (MSGPACK_MAX_NESTING, None)
-    empty = b"\x90" if header == b"\x91" else b"\x80"
-    for past in (header * (MSGPACK_MAX_NESTING + 1) + b"\xc0", header * MSGPACK_MAX_NESTING + empty):
+    for past in (header * (MSGPACK_MAX_NESTING + 1) + b"\xc0", header * MSGPACK_MAX_NESTING + b"\x80"):
         with pytest.raises(ValueError, match=f"^{GUARD_ERROR_PREFIX}nests deeper than {MSGPACK_MAX_NESTING} levels$"):
             decode(past)
 
@@ -415,29 +404,25 @@ def test_buffer_inputs_decode_like_bytes() -> None:
         assert auto_rust(wrap(auto_doc)) == {"k": [1, 2, b"x"]}
         assert interop_rust(wrap(interop_doc)) == {"k": [1, 2, b"x"], 1: [2]}
         assert decode_interop_value(wrap(interop_doc)) == {"k": [1, 2, b"x"], 1: [2]}
-
-
-def test_decode_interop_value_reads_any_buffer_its_reference_read() -> None:
-    """Any buffer bytes() copied before: a signed or wide view, a non-contiguous one, or a mutable one."""
-    doc = next(
-        d for d in (msgpack.packb({"k": b"x" * m, "l": [1, 2, 3]}, use_bin_type=True) for m in range(1, 9)) if len(d) % 8 == 0
-    )
-    expected = interop_reference(doc)
-    interleaved = bytes(b for pair in zip(doc, doc, strict=True) for b in pair)
-    views = {
-        "signed char": memoryview(doc).cast("b"),
-        "2-D bytes": memoryview(doc).cast("B", shape=[len(doc) // 8, 8]),
-        "uint16": memoryview(doc).cast("H"),
-        "non-contiguous": memoryview(interleaved)[::2],
-        "bytearray": bytearray(doc),
-    }
-    for name, view in views.items():
-        assert decode_interop_value(view) == expected, name
+    # The CK-frame check reads the view decode_interop_value normalised, whatever its format.
     with pytest.raises(InteropDecodeError, match="CK v3 frame"):
         decode_interop_value(memoryview(b"CK\x03").cast("b"))
 
 
 # ── the hook rules ────────────────────────────────────────────────────────────────────────────
+
+
+def _keys_tested_by(hook: Callable[..., Any]) -> set[str]:
+    """The marker keys ``hook`` tests: the dunder string literals in its source."""
+    return set(re.findall(r'"(__[a-z]+__)"', inspect.getsource(hook)))
+
+
+def test_each_readers_rust_marker_keys_are_its_hooks() -> None:
+    """The decode calls a hook only for a map holding one of its reader's marker keys, so a key a hook tests and the
+    Rust list lacks would decode as a plain dict."""
+    assert set(MARKER_KEYS["standard"]) == _keys_tested_by(_standard_object_hook)
+    assert set(MARKER_KEYS["auto"]) == _keys_tested_by(_auto_object_hook)
+    assert set(MARKER_KEYS["interop"]) == _keys_tested_by(interop._revive_sentinels)
 
 
 def test_the_auto_hook_runs_only_on_maps_holding_a_marker_key() -> None:

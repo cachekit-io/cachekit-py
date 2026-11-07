@@ -496,10 +496,11 @@ _MAX_NON_STRING_KEYS = 32
 
 
 def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
-    """msgpack object_pairs_hook: build one map, refusing one whose keys could make the build quadratic.
+    """Build one map from its pairs, refusing one whose keys could make the build quadratic.
 
-    The Rust decode (unpackb_interop) builds a map whose keys are all str or bytes itself, and hands only a map
-    holding any other key here, as a list of its pairs in read order.
+    The pairs hook of the Rust decode (unpackb_interop), which builds a map whose keys are all str or bytes itself
+    and hands only a map holding any other key here, as a list of its pairs in read order. The decode it replaced
+    passed it to msgpack as object_pairs_hook for every map.
     """
     # msgpack's C unpacker passes a list, its pure-Python fallback a one-shot generator: materialise it
     # once, or the count below consumes it and the map silently decodes empty.

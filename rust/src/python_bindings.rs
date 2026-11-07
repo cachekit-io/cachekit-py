@@ -211,7 +211,8 @@ pub fn unpackb_interop_py(
 
 /// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
 /// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
-/// touches the Python heap). It covers `retrieve`, `check_msgpack_structure` and `unpackb_standard`, and the exact
+/// touches the Python heap). It covers `retrieve`, `check_msgpack_structure`, `unpackb_standard`, `unpackb_auto`
+/// and `unpackb_interop`, and the exact
 /// `bytes` and `B`/`c` `memoryview` inputs the decrypt bindings read through `ciphertext_view`;
 /// that function's `bytes(obj)` route for every other input is outside it. It does not pin how a
 /// caller uses the view: that the callers pass `as_slice()` on without copying it is held by

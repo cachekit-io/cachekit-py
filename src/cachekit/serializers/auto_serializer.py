@@ -548,8 +548,6 @@ class AutoSerializer:
         # tuple in an index, a name or a column label packs as an array. They keep the non-strict
         # packer, under which the default never sees a tuple, so their bytes stay as they were.
         self._columnar_pack_opts = {**self._msgpack_pack_opts, "strict_types": False}
-        # Every read decodes with unpackb_auto: msgpack.unpackb's raw=False, use_list=True (the columnar
-        # documents need lists) and object_hook=_auto_object_hook, under the untrusted-decode bounds.
 
     @cached_property
     def _arrow_serializer(self) -> ArrowSerializer | None:

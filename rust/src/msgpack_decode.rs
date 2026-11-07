@@ -277,7 +277,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                         Some(key) => {
                             if let Some(held) = held {
                                 // Through the sequence protocol, as in `hold`.
-                                pair(py, key, value)
+                                PyTuple::new(py, [key, value])
                                     .and_then(|p| held.pairs.as_sequence().set_item(held.next, p))
                                     .map_err(|e| restore(py, e))?;
                                 held.next += 1;
@@ -548,15 +548,6 @@ fn key_error(key: &Bound<'_, PyAny>) -> PyErr {
     ))
 }
 
-/// The `(key, value)` tuple msgpack-python hands a pairs hook for each pair.
-fn pair<'py>(
-    py: Python<'py>,
-    key: Bound<'py, PyAny>,
-    value: Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyTuple>> {
-    PyTuple::new(py, [key, value])
-}
-
 /// A map's held pairs as it reads its first key neither `str` nor `bytes`, and the next slot to
 /// fill: `dict`'s pairs, in the order they were read, then that one, in a list with a slot for
 /// each of the `rest` pairs still to read. A `dict` keeps a repeated key where it was first read,
@@ -576,11 +567,12 @@ fn hold<'py>(
     let pairs = nones(py, dict.len() as u64 + 1 + rest)?;
     let slots = pairs.as_sequence();
     let mut next = 0;
+    // Each pair as the `(key, value)` tuple msgpack-python hands a pairs hook.
     for (k, v) in dict.iter() {
-        slots.set_item(next, pair(py, k, v)?)?;
+        slots.set_item(next, PyTuple::new(py, [k, v])?)?;
         next += 1;
     }
-    slots.set_item(next, pair(py, key, value)?)?;
+    slots.set_item(next, PyTuple::new(py, [key, value])?)?;
     dict.clear();
     Ok((pairs, next + 1))
 }
@@ -591,6 +583,21 @@ fn msgpack_attr<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>>
         .get_or_try_init(py, || py.import("msgpack").map(Bound::unbind))?
         .bind(py)
         .getattr(name)
+}
+
+/// Each reader's marker keys, as `str`s, by reader: `MARKER_KEYS` in the extension, which a test
+/// compares with the keys each Python hook tests, so a key added to a hook but not here fails it.
+pub fn marker_keys(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let keys = PyDict::new(py);
+    for (reader, markers) in [
+        ("standard", TEMPORAL_MARKERS),
+        ("auto", AUTO_MARKERS),
+        ("interop", TEMPORAL_MARKERS),
+    ] {
+        let names = markers.iter().map(|k| String::from_utf8_lossy(k));
+        keys.set_item(reader, PyTuple::new(py, names)?)?;
+    }
+    Ok(keys)
 }
 
 /// Decode `data` as `unpackb_bounded(data, raw=False, use_list=True, object_hook=hook)` does
