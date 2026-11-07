@@ -226,7 +226,8 @@ class _Str(str):
 
 class TestAutoSerializerSetHashFloodBound:
     """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, at most
-    _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets (or tuples holding them) on one hash. Each refusal
+    _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in a
+    tuple of the set). Each refusal
     comes before set() builds the set, so a forged one never pays for a quadratic build. The writer refuses the same
     sets, so an honest one fails at write, not on every read."""
 
@@ -302,7 +303,9 @@ class TestAutoSerializerSetHashFloodBound:
         same-hash frozensets one level down, so nested same-hash frozensets cost more with every level. Even two on
         one hash are refused, bare or in a tuple, before set() compares them."""
         inner = [{"__set__": True, "value": [_uuid_marker(i)], "frozen": True} for i in _SAME_HASH[:2]]
-        with pytest.raises(SerializationError, match="two frozensets, or two tuples holding frozensets, that share"):
+        with pytest.raises(
+            SerializationError, match="two frozensets, or two tuples in a set where a tuple holds a frozenset, that share"
+        ):
             AutoSerializer(enable_integrity_checking=False).deserialize(_set_doc([wrap(m) for m in inner], frozen))
         assert counts["eq"] == 0
 
@@ -318,7 +321,9 @@ class TestAutoSerializerSetHashFloodBound:
             {(((frozenset({-1}),),),), (((frozenset({-2}),),),)},  # however deep the frozenset sits
             {(-1, "x"), (-2, "x"), (0, (frozenset(),))},  # once any tuple holds one, every tuple counts
         ):
-            with pytest.raises(TypeError, match="two frozensets, or two tuples holding frozensets, that share"):
+            with pytest.raises(
+                TypeError, match="two frozensets, or two tuples in a set where a tuple holds a frozenset, that share"
+            ):
                 serializer.serialize(value)
 
     @pytest.mark.parametrize("frozen", [False, True])

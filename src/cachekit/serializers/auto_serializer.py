@@ -342,7 +342,7 @@ def _auto_default(obj: Any) -> Any:
         types = list(map(type, value))
         # Counted as the reader will see them (a str or bytes subclass reads back as str or bytes), but only when the
         # count could matter: below it a str subclass counts as exposed, which can only make the writer stricter.
-        exposed = len(types) - types.count(str) - types.count(bytes)
+        exposed = _exposed_count(types)
         if exposed > _MAX_NON_STRING_SET_ELEMENTS:
             exposed = sum(not isinstance(x, (str, bytes)) for x in value)
         reason = _set_bound_error(value, types, exposed)
@@ -374,6 +374,11 @@ def _auto_default(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not MessagePack serializable")
 
 
+def _exposed_count(types: list[type]) -> int:
+    """How many of the values these are the types of are neither str nor bytes, counted in C by list.count."""
+    return len(types) - types.count(str) - types.count(bytes)
+
+
 def _frozenset_in_tuples(values: list[Any], types: list[type]) -> bool:
     """Whether a frozenset sits at any depth inside a tuple among ``values``.
 
@@ -388,8 +393,9 @@ def _frozenset_in_tuples(values: list[Any], types: list[type]) -> bool:
             return True
 
 
-def _frozenset_comparison(values: list[Any], types: list[type]) -> bool:
-    """Whether set() over ``values`` could compare two frozensets: two of them, or two tuples holding them, on one hash.
+def _may_compare_frozensets(values: list[Any], types: list[type]) -> bool:
+    """Whether set() over ``values`` could compare two frozensets: two of them share a hash, or two tuples do while a
+    frozenset sits inside one of the set's tuples.
 
     Distinct types are few, and a type hashes by identity, so set(types) is safe.
     """
@@ -416,8 +422,8 @@ def _set_bound_error(values: list[Any], types: list[type], exposed: int) -> str 
     if types.count(int) == len(types):
         return None
     # Hashes are sorted, never tallied in a dict or set: a table keyed by them is the very build being bounded.
-    if _frozenset_comparison(values, types):
-        return "two frozensets, or two tuples holding frozensets, that share one hash"
+    if _may_compare_frozensets(values, types):
+        return "two frozensets, or two tuples in a set where a tuple holds a frozenset, that share one hash"
     # Fewer exposed elements cannot fill one hash past the bound: a str or bytes hash is secret, so only the
     # others' hashes are sorted.
     if exposed <= _MAX_SAME_HASH_SET_ELEMENTS:
@@ -432,7 +438,7 @@ def _check_untrusted_set(values: list[Any]) -> None:
     """Refuse a stored set's elements if set() over them could be quadratic, before set() builds it."""
     # Counted by list.count, which runs in C: a Python loop over every element would slow honest sets several-fold.
     types = list(map(type, values))
-    reason = _set_bound_error(values, types, len(types) - types.count(str) - types.count(bytes))
+    reason = _set_bound_error(values, types, _exposed_count(types))
     if reason:
         raise SerializationError(
             f"Invalid set format: {reason}: a hash-flood bound, not a framing error. Either the entry is forged, "
