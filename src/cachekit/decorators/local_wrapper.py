@@ -9,15 +9,20 @@ from __future__ import annotations
 import functools
 import inspect
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from typing import Any
 
+from cachekit._rust_serializer import HitCounter, HitMemo
+from cachekit._rust_serializer import memo_key as _memo_key
 from cachekit.decorators.single_flight import AsyncFlights, ThreadFlights
 from cachekit.decorators.wrapper import CacheInfo, InvalidationOutcome
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.object_cache import ObjectCache
 
 _ALLOWED_PARAMS: frozenset[str] = frozenset({"ttl", "max_entries", "namespace", "key"})
+
+# What HitMemo.get returns when it cannot answer a call.
+_MISS = object()
 
 
 def create_local_wrapper(
@@ -66,12 +71,26 @@ def create_local_wrapper(
         raise ValueError(f"max_entries must be >= 1, got {max_entries}")
 
     # --- Build cache and key generator ---
-    object_cache = ObjectCache(max_entries=max_entries)
+    # On generated keys a hit is one call into the extension (HitMemo.get), which reads the memo the
+    # cache keeps in step under its lock, as on @cache(backend=None) (wrapper.py, _enter_l1_only). The
+    # memo holds its callers' arguments in memory; every invalidation of this cache runs in this
+    # process and drops what it erases. A key= function builds its key on every call: the memo keys a
+    # call by its arguments, and key= can read more than them (a context variable, say).
+    # The memo answers only while func.__module__ and func.__qualname__ are the objects read here:
+    # the key generator reads them on every call, so renaming the function re-keys it as before.
+    # Exact str names only: the key generator formats them, and only an immutable name formats the
+    # same way every time it is the same object. __module__ can be any object.
+    names = func.__module__, func.__qualname__
+    hit_counter = HitCounter()
+    memo = HitMemo(func, hit_counter, *names) if key is None and type(names[0]) is str and type(names[1]) is str else None
+    hit = None if memo is None else memo.get
+    object_cache = ObjectCache(max_entries=max_entries, memo=memo)
     key_gen = CacheKeyGenerator()
 
     # cache_info() counts calls, not lookups: a hit is a call served without running the function,
     # from the cache or by a concurrent call on the same key it joined; a miss is a call that ran it.
-    # The cache counts the plain hits; these count the rest, on the miss path only.
+    # The cache counts the hits under its lock and hit_counter the lock-free ones; these count the
+    # rest, on the miss path only.
     runs = shared = 0
     counts_lock = threading.Lock()
 
@@ -94,6 +113,19 @@ def create_local_wrapper(
             integrity_checking=False,
             serializer_type="local",
         )
+
+    def _call_key(args: tuple[Any, ...], kw: dict[str, Any]) -> tuple[str, Hashable | None]:
+        """A call's cache key, and with a memo the memo key to memoise its entry under, or None.
+
+        A call is memoised only when its key was built with the names the memo answers for. They are
+        read before the key is built, so a rename in between leaves the call unmemoised."""
+        if memo is None:
+            return _make_key(args, kw), None
+        module, qualname = func.__module__, func.__qualname__
+        cache_key = _make_key(args, kw)
+        if module is not names[0] or qualname is not names[1]:
+            return cache_key, None
+        return cache_key, _memo_key(args, kw)
 
     # A miss runs the function once for every concurrent miss on its key (single_flight): every
     # caller of one call gets the same object, as a later hit does. One map is used, by kind.
@@ -142,7 +174,7 @@ def create_local_wrapper(
         and not at all when that call raised; only the call that ran the function counts a miss.
         """
         with counts_lock:
-            hits, misses = object_cache.hits + shared, runs
+            hits, misses = object_cache.hits + hit_counter.count + shared, runs
         return CacheInfo(
             hits=hits,
             misses=misses,
@@ -159,20 +191,25 @@ def create_local_wrapper(
 
     if inspect.iscoroutinefunction(func):
 
-        async def _fill_async(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
+        async def _fill_async(cache_key: str, memo_key: Hashable | None, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)
             epoch = object_cache.invalidation_epoch  # before the call: see ObjectCache, "Invalidation epoch"
             result = await func(*args, **kw)
-            object_cache.put(cache_key, result, ttl, epoch=epoch)
+            object_cache.put(cache_key, result, ttl, memo_key=memo_key, epoch=epoch)
             return result
 
         @functools.wraps(func)
         async def async_wrapper(*args: Any, **kw: Any) -> Any:
-            cache_key = _make_key(args, kw)
-            found, cached_value = object_cache.get(cache_key)
+            # A memoised hit is one call into the extension: no key, no lock (ObjectCache, "Lock-free hits").
+            if hit is not None:
+                value = hit(args, kw, _MISS)
+                if value is not _MISS:
+                    return value
+            cache_key, memo_key = _call_key(args, kw)
+            found, cached_value = object_cache.get(cache_key, memo_key)
             if found:
                 return cached_value
-            result, joined = await flights.run((cache_key,), functools.partial(_fill_async, cache_key, args, kw))
+            result, joined = await flights.run((cache_key,), functools.partial(_fill_async, cache_key, memo_key, args, kw))
             if joined:
                 _count(ran=False)
             return result
@@ -180,22 +217,27 @@ def create_local_wrapper(
         wrapper: Any = async_wrapper
     else:
 
-        def _fill(cache_key: str, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
+        def _fill(cache_key: str, memo_key: Hashable | None, args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
             _count(ran=True)
             epoch = object_cache.invalidation_epoch  # before the call: see ObjectCache, "Invalidation epoch"
             result = func(*args, **kw)
-            object_cache.put(cache_key, result, ttl, epoch=epoch)
+            object_cache.put(cache_key, result, ttl, memo_key=memo_key, epoch=epoch)
             return result
 
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kw: Any) -> Any:
-            cache_key = _make_key(args, kw)
-            found, cached_value = object_cache.get(cache_key)
+            # As in async_wrapper.
+            if hit is not None:
+                value = hit(args, kw, _MISS)
+                if value is not _MISS:
+                    return value
+            cache_key, memo_key = _call_key(args, kw)
+            found, cached_value = object_cache.get(cache_key, memo_key)
             if found:
                 return cached_value
             result, joined = thread_flights.run(
                 (cache_key,),
-                functools.partial(_fill, cache_key, args, kw),
+                functools.partial(_fill, cache_key, memo_key, args, kw),
                 functools.partial(object_cache.peek, cache_key),
             )
             if joined:

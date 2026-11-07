@@ -756,9 +756,10 @@ def _sized(value: _Sized) -> int:
 
 
 @pytest.mark.unit
-def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Threads hit, fill, invalidate and clear a small key range whose values overflow the byte budget,
-    so entries are also evicted all along. Every removal is stamped once it is done, on a counter each
+@pytest.mark.parametrize("local", [False, True], ids=["backend-none", "local"])
+def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.MonkeyPatch, local: bool) -> None:
+    """Threads hit, fill, invalidate and clear a small key range whose values overflow the byte budget
+    (@cache.local(): its entry bound), so entries are also evicted all along. Every removal is stamped once it is done, on a counter each
     call reads before it starts: a hit that returns a value whose removal was stamped before the call
     started was served it after the removal returned. A call that joined a concurrent miss gets that
     miss's value, removed or not, by the single-flight contract, so it is not a hit and is not checked.
@@ -794,13 +795,17 @@ def test_no_value_is_served_after_its_removal_returned(monkeypatch: pytest.Monke
     payload = b"x" * 150_000  # about 7 fit the 1 MiB budget, of 16 keys
     created: list[Any] = []  # keeps every value alive, so no id() is reused
 
-    @cache(backend=None, ttl=300, l1=L1CacheConfig(max_size_mb=1))
-    def fn(k: int) -> tuple[int, bytes]:
+    def body(k: int) -> tuple[int, bytes]:
         value = (k, payload)
         created.append(value)
         return value
 
-    oc, _ = _cache_and_memo(fn)
+    if local:
+        fn = cache.local(ttl=300, max_entries=7)(body)
+        oc = _closure_cell(fn, "object_cache").cell_contents
+    else:
+        fn = cache(backend=None, ttl=300, l1=L1CacheConfig(max_size_mb=1))(body)
+        oc, _ = _cache_and_memo(fn)
 
     def cleared() -> None:
         """fn.cache_clear(), then every entry stored before it began is stamped removed: whatever way
