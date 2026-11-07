@@ -22,9 +22,14 @@ pub use cachekit_core::{
 #[cfg(feature = "python")]
 pub mod python_bindings;
 
-// StandardSerializer's one-pass bounded MessagePack decode
+// The one-pass bounded MessagePack decode of StandardSerializer, AutoSerializer and interop reads
 #[cfg(feature = "python")]
 pub mod msgpack_decode;
+
+// Short byte slices read without a call to memcpy or memcmp, for that decode's string cache.
+// Built for its tests too, so they run in the pure-Rust test build.
+#[cfg(any(feature = "python", test))]
+mod short_bytes;
 
 // The decorator's lock-free L1-hit counter. Not gated: its Python class is, so the counter's
 // own tests run in the pure-Rust test build too.
@@ -90,14 +95,18 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::verify_checksum_py, m)?)?;
 
-    // Untrusted-decode structural bound — zero-copy header walk that
-    // serializers/base.py::unpackb_bounded runs before every msgpack.unpackb
+    // Untrusted-decode structural bound — the zero-copy header walk. The decodes below apply it
+    // inline; serializers/base.py::unpackb_bounded, the decode they reproduce, runs it first
     m.add_function(wrap_pyfunction!(
         python_bindings::check_msgpack_structure_py,
         m
     )?)?;
-    // StandardSerializer's read decode: the walk above and msgpack.unpackb in one pass
+    // The read decodes of StandardSerializer, AutoSerializer and interop: the walk above and
+    // msgpack.unpackb in one pass
     m.add_function(wrap_pyfunction!(python_bindings::unpackb_standard_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_auto_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::unpackb_interop_py, m)?)?;
+    m.add("MARKER_KEYS", msgpack_decode::marker_keys(m.py())?)?;
     // Test-only probe of the zero-copy buffer borrow (tests/critical/test_decrypt_buffer_input.py)
     m.add_function(wrap_pyfunction!(python_bindings::bytes_view_borrows_py, m)?)?;
 

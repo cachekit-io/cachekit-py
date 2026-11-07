@@ -37,7 +37,9 @@ from pathlib import Path, PurePath
 from typing import Any
 from uuid import UUID
 
-from .serializers.base import SerializationError, unpackb_bounded
+from cachekit._rust_serializer import unpackb_interop
+
+from .serializers.base import MSGPACK_MAX_NESTING, SerializationError, immutable_buffer
 
 # Full-string match REQUIRED: re.match with a $ anchor still accepts a
 # trailing newline. Pinned by the reject_trailing_newline error vector.
@@ -468,7 +470,12 @@ def encode_interop_value(value: Any) -> bytes:
 
 
 def _revive_sentinels(obj: dict[Any, Any]) -> Any:
-    """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is."""
+    """Revive a decoded wire-format.md temporal sentinel map; any other map is returned as-is.
+
+    The Rust decode (unpackb_interop) calls this only for a map holding one of the str keys tested below, as
+    each test reads its key with .get(); _build_map calls it for the maps it builds. A new sentinel key here
+    needs adding to TEMPORAL_MARKERS in rust/src/msgpack_decode.rs, or its maps decode as plain dicts.
+    """
     if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
         return datetime.fromisoformat(obj["value"])
     if obj.get("__date__") is True and isinstance(obj.get("value"), str):
@@ -489,7 +496,12 @@ _MAX_NON_STRING_KEYS = 32
 
 
 def _build_map(pairs: Iterable[tuple[Any, Any]]) -> Any:
-    """msgpack object_pairs_hook: build one map, refusing one whose keys could make the build quadratic."""
+    """Build one map from its pairs, refusing one whose keys could make the build quadratic.
+
+    The pairs hook of the Rust decode (unpackb_interop), which builds a map whose keys are all str or bytes itself
+    and hands only a map holding any other key here, as a list of its pairs in read order. The decode it replaced
+    passed it to msgpack as object_pairs_hook for every map.
+    """
     # msgpack's C unpacker passes a list, its pure-Python fallback a one-shot generator: materialise it
     # once, or the count below consumes it and the map silently decodes empty.
     pairs = list(pairs)
@@ -515,18 +527,21 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
     bytes are rejected (msgpack-python raises ExtraData). A CK v3 frame prefix
     gets the protocol#11 diagnostic instead of decoding its magic byte as int 67.
     """
-    raw = bytes(data)
-    if raw[: len(_CK_FRAME_MAGIC)] == _CK_FRAME_MAGIC:
+    # bytes is read in place. A mutable buffer is snapshotted, so the frame check and the decode judge one document.
+    if type(data) is not bytes:
+        data = immutable_buffer(data)
+    if data[: len(_CK_FRAME_MAGIC)] == _CK_FRAME_MAGIC:
         raise InteropDecodeError(
             "stored value is a Python-SDK-internal auto-mode entry (CK v3 frame), not an "
             "interop value. An auto-mode writer and an interop reader are sharing a key — "
             "check that every writer for this key uses @cache(interop=...)."
         )
-    # strict_map_key=False: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must
-    # accept. msgpack's default exists against hash flooding; _build_map bounds that instead, and an
-    # array/map key still fails as unhashable.
+    # Any key type: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must accept.
+    # msgpack's strict_map_key default exists against hash flooding; _build_map bounds that instead, and an
+    # array/map key still fails as unhashable. One Rust pass, as unpackb_bounded(data, raw=False,
+    # strict_map_key=False, object_pairs_hook=_build_map) decoded it.
     try:
-        return unpackb_bounded(raw, raw=False, strict_map_key=False, object_pairs_hook=_build_map)
+        return unpackb_interop(data, MSGPACK_MAX_NESTING, _revive_sentinels, _build_map)
     except InteropDecodeError:
         raise
     except Exception as e:

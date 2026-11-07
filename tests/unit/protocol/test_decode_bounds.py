@@ -7,7 +7,7 @@ msgpack-python bump cannot silently move it:
   by the pre-decode structural guard itself: the error (or one in its cause/context chain) is the guard's own
   ``Unpack failed: MessagePack document ...``, which no decoder produces, so a path that
   skips the guard fails even if msgpack still rejects the bytes later; the peak stays bounded;
-- ``validate_data`` (which returns a bool) proves the same through a spy on the guard;
+- ``validate_data`` (which returns a bool) proves the same through a spy on its decode;
 - every accept vector decodes on every path at its declared depth (the bound cannot over-tighten);
 - fed to ``ByteStorage.retrieve`` as envelope bytes, every reject vector is refused by cachekit-core's
   envelope pre-scan (Retrieve Flow step 2; a vector whose only reason is depth or overclaim, for that
@@ -35,11 +35,12 @@ from typing import Any
 import msgpack
 import pytest
 
-import cachekit.serializers.base as serializers_base
-from cachekit._rust_serializer import ByteStorage, check_msgpack_structure, unpackb_standard
+import cachekit.interop as interop
+import cachekit.serializers.auto_serializer as auto_serializer
+from cachekit._rust_serializer import ByteStorage, check_msgpack_structure, unpackb_auto, unpackb_interop, unpackb_standard
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.interop import decode_interop_value
-from cachekit.serializers.auto_serializer import AutoSerializer
+from cachekit.serializers.auto_serializer import AutoSerializer, _auto_object_hook
 from cachekit.serializers.base import MSGPACK_MAX_NESTING, SerializationError, unpackb_bounded
 from cachekit.serializers.interop_serializer import InteropSerializer
 from cachekit.serializers.standard_serializer import StandardSerializer, _standard_object_hook
@@ -89,11 +90,23 @@ def _standard_decode(data: bytes | bytearray | memoryview) -> Any:
     return unpackb_standard(data, MSGPACK_MAX_NESTING, _standard_object_hook)
 
 
-# Every path that decodes backend-supplied MessagePack. Each must reach unpackb_bounded, or for
-# StandardSerializer the Rust decode that enforces the same bounds in its one pass.
+def _auto_decode(data: bytes | bytearray | memoryview) -> Any:
+    """AutoSerializer's decode, the same one pass with its own hook."""
+    return unpackb_auto(data, MSGPACK_MAX_NESTING, _auto_object_hook)
+
+
+def _interop_decode(data: bytes | bytearray | memoryview) -> Any:
+    """Interop's decode, the same one pass with any key type (IOP-18)."""
+    return unpackb_interop(data, MSGPACK_MAX_NESTING, interop._revive_sentinels, interop._build_map)
+
+
+# Every path that decodes backend-supplied MessagePack. Each must reach a Rust decode that enforces the
+# bounds in its one pass (unpackb_standard, unpackb_auto, unpackb_interop), whose reference is unpackb_bounded.
 DECODE_PATHS: dict[str, Callable[[bytes], Any]] = {
     "unpackb_bounded": lambda b: unpackb_bounded(b, raw=False),
     "unpackb_standard": _standard_decode,
+    "unpackb_auto": _auto_decode,
+    "unpackb_interop": _interop_decode,
     "interop": decode_interop_value,
     "interop_serializer": InteropSerializer().deserialize,
     "standard/plain": StandardSerializer(enable_integrity_checking=False).deserialize,
@@ -244,9 +257,11 @@ class TestEnvelopeEntryPoint:
         assert AutoSerializer().deserialize(doc) == msgpack.unpackb(doc)
 
 
-# The two bounded decoders: unpackb_bounded (walk, then msgpack-python) and StandardSerializer's one-pass decode.
+# The bounded decoders: unpackb_bounded (walk, then msgpack-python) and the three one-pass decodes.
 BOUNDED_DECODERS = pytest.mark.parametrize(
-    "decode", [unpackb_bounded, _standard_decode], ids=["unpackb_bounded", "unpackb_standard"]
+    "decode",
+    [unpackb_bounded, _standard_decode, _auto_decode, _interop_decode],
+    ids=["unpackb_bounded", "unpackb_standard", "unpackb_auto", "unpackb_interop"],
 )
 
 
@@ -299,14 +314,21 @@ class TestOwnedBounds:
 
     @pytest.mark.parametrize(
         "decode",
-        [lambda b: unpackb_bounded(b, raw=False), StandardSerializer(enable_integrity_checking=False).deserialize],
-        ids=["unpackb_bounded", "standard/plain"],
+        [
+            lambda b: unpackb_bounded(b, raw=False),
+            StandardSerializer(enable_integrity_checking=False).deserialize,
+            AutoSerializer(enable_integrity_checking=False).deserialize,
+            # True for every view, or the comparison below fails.
+            lambda b: AutoSerializer(enable_integrity_checking=False).validate_data(b) and msgpack.unpackb(bytes(b), raw=False),
+            decode_interop_value,
+        ],
+        ids=["unpackb_bounded", "standard/plain", "auto/plain", "auto/validate_data", "interop"],
     )
     def test_memoryview_shapes_and_formats_decode_like_bytes(self, decode: Callable[..., Any]) -> None:
         # The Rust walk takes PyBuffer<u8>; msgpack takes any itemsize-1 buffer. Views are normalised
         # to a flat "B" view first so the two agree, len(data) is the byte count the caps need, and a
         # legitimate document is never rejected for the shape or format of the view it arrived in.
-        # StandardSerializer's Rust decode takes PyBuffer<u8> too, so its plain read normalises the same way.
+        # The Rust decodes take PyBuffer<u8> too, so the reads that hand them a caller's buffer normalise it the same way.
         doc = next(
             d
             for d in (msgpack.packb({"k": b"x" * m, "l": [1, 2, 3]}, use_bin_type=True) for m in range(1, 9))
@@ -385,24 +407,25 @@ class TestOwnedBounds:
         self, vector: dict[str, Any], peaks: dict[str, int], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Python-only validate_data is a decode path too: a bomb must read as invalid (not raise),
-        # and the walk must have stopped it before the decoder pre-allocated ~8000x the input. The
-        # bool hides which check rejected, so a spy on the guard (looked up as a module global of
-        # serializers.base by unpackb_bounded at call time) records its error.
-        guard, guard_errors = serializers_base.check_msgpack_structure, []
+        # and the walk's bounds must have stopped it before the decoder pre-allocated ~8000x the input.
+        # The bool hides which check rejected, so a spy on the decode (looked up as a module global of
+        # auto_serializer at call time) records its error, which must be the guard's own.
+        decode, decode_errors = auto_serializer.unpackb_auto, []
 
-        def spy(data: Any, max_depth: int) -> None:
+        def spy(data: Any, max_depth: int, hook: Any) -> Any:
             try:
-                guard(data, max_depth)
+                return decode(data, max_depth, hook)
             except ValueError as e:
-                guard_errors.append(e)
+                decode_errors.append(e)
                 raise
 
-        monkeypatch.setattr(serializers_base, "check_msgpack_structure", spy)
+        monkeypatch.setattr(auto_serializer, "unpackb_auto", spy)
         serializer = AutoSerializer(enable_integrity_checking=False)
         assert serializer.validate_data(msgpack.packb({"t": 1})) is True
         bomb = bytes.fromhex(vector["input_hex"])
         assert serializer.validate_data(bomb) is False
-        assert guard_errors, "validate_data rejected the bomb without the structural guard raising"
+        assert len(decode_errors) == 1, "validate_data rejected the bomb without decoding it"
+        _assert_guard_rejected(decode_errors[0])
         peak = peaks[f"validate_data:{vector['name']}"]
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(bomb), f"validate_data peaked at {peak} bytes"
 

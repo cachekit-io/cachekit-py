@@ -502,6 +502,11 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
     already turn into a controlled cache miss. Trailing bytes are still rejected
     by ``unpackb`` itself.
 
+    No read path calls this any more: the StandardSerializer, AutoSerializer and
+    interop reads decode in one Rust pass under the same bounds (``unpackb_standard``,
+    ``unpackb_auto``, ``unpackb_interop``). It stays as the decode those reproduce,
+    which their parity tests run beside them.
+
     Examples:
         >>> unpackb_bounded(msgpack.packb({"a": [1, 2]}), raw=False)
         {'a': [1, 2]}

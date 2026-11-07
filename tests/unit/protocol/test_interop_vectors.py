@@ -302,8 +302,8 @@ h.test_array_key_still_raises()
 
 
 def test_reader_vectors_under_msgpacks_pure_python_unpacker():
-    """msgpack falls back to a pure-Python unpacker without its C extension (PyPy, no wheel), and that one
-    hands object_pairs_hook a one-shot generator instead of a list. Run the reader's vectors under it."""
+    """msgpack without its C extension (PyPy, no wheel) is a pure-Python module. The reader decodes in the Rust
+    extension either way but takes its Timestamp and ExtType types from msgpack: run its vectors with that module."""
     env = {**os.environ, "MSGPACK_PUREPYTHON": "1"}
     root = Path(__file__).resolve().parents[3]
     result = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code

@@ -1,8 +1,12 @@
-//! StandardSerializer's MessagePack decode: cachekit-core's structure walk and the decode in one pass.
+//! The MessagePack decode of StandardSerializer, AutoSerializer and interop reads: cachekit-core's
+//! structure walk and the decode in one pass.
 //!
-//! It returns what `msgpack.unpackb(data, raw=False, use_list=True, strict_map_key=True,
-//! object_hook=hook)` returns after `check_msgpack_structure(data, max_depth)` passed, and raises
-//! the same exception class where either refuses (`serializers/base.py::unpackb_bounded`).
+//! Each returns what `msgpack.unpackb(data, raw=False, use_list=True, ...)` returns after
+//! `check_msgpack_structure(data, max_depth)` passed, and raises the same exception class where either
+//! refuses (`serializers/base.py::unpackb_bounded`):
+//! - `unpackb_standard` and `unpackb_auto`: `strict_map_key=True, object_hook=hook`;
+//! - `unpackb_interop`: `strict_map_key=False, object_pairs_hook=_build_map` (`interop.py`), whose map
+//!   is `object_hook`'s on its `dict(pairs)`.
 //!
 //! The bounds are the walk's, applied at the same points: before a header's container is
 //! allocated, its depth and the elements every open container still owes are checked against the
@@ -10,16 +14,23 @@
 //! walk over the whole input and raises its error if it has one, which keeps today's precedence:
 //! a bound the walk would refuse anywhere in the document wins over a decode error before it.
 //!
-//! The hook runs only on a map holding a `str` key equal to a marker key. Any other map it would
-//! return unchanged, because each marker test reads its key with `dict.get`.
+//! The hook runs only on a map holding a `str` key equal to one of its caller's marker keys. Any
+//! other map it would return unchanged, because each marker test reads its key with `dict.get`.
+//!
+//! Interop keys (IOP-18) may be of any type. A map's `str` and `bytes` keys go straight into its dict:
+//! they hash under the per-process secret, so no input can make that build quadratic. From its first
+//! key of another type, the map's pairs are held in read order after the dict's (`hold`), and
+//! `_build_map` makes the map from them at its close, as msgpack-python's `object_pairs_hook` did: it
+//! counts how many such keys the map holds before it hashes any.
 //!
 //! Safe Rust only (`SECURITY.md`): every object is a PyO3 `Bound`, so each reference is released
 //! by its owner on any exit. PyO3's plain constructors abort the process when CPython is out of
 //! memory (the release profile sets `panic = "abort"`). A single allocation the input sizes, a
-//! long array's list or the bytes of a str, bin, ext or `ExtraData`, goes through a constructor
-//! that raises MemoryError instead (`nones`, `bytes_of`, `PyString::from_bytes`). A dict, a list
-//! of at most `SHORT_LIST` items, a float or an int outside -5..=256 does not: running out of
-//! memory while building one aborts the process, where msgpack-python raises MemoryError.
+//! long array's list, a map's held pairs or the bytes of a str, bin, ext or `ExtraData`, goes
+//! through a constructor that raises MemoryError instead (`nones`, `bytes_of`,
+//! `PyString::from_bytes`). A dict, a list of at most `SHORT_LIST` items, a pair's tuple, a float
+//! or an int outside -5..=256 does not: running out of memory while building one aborts the
+//! process, where msgpack-python raises MemoryError.
 
 use std::convert::Infallible;
 
@@ -27,10 +38,36 @@ use cachekit_core::check_msgpack_structure;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
-/// The keys `_standard_object_hook` tests (`standard_serializer.py`).
-const MARKER_KEYS: [&[u8]; 3] = [b"__datetime__", b"__date__", b"__time__"];
+use crate::short_bytes::{load8, same, word};
+
+/// The keys `_standard_object_hook` (`standard_serializer.py`) and `_revive_sentinels` (`interop.py`)
+/// test.
+const TEMPORAL_MARKERS: &[&[u8]] = &[b"__datetime__", b"__date__", b"__time__"];
+/// The keys `_auto_object_hook` (`auto_serializer.py`) tests.
+const AUTO_MARKERS: &[&[u8]] = &[
+    b"__datetime__",
+    b"__date__",
+    b"__time__",
+    b"__uuid__",
+    b"__tuple__",
+    b"__set__",
+    b"__ndarray__",
+];
+
+/// `Decoder::is_marker` tests `__` before the list, so every marker key must start with it.
+const fn dunder_prefixed(keys: &[&[u8]]) -> bool {
+    let mut i = 0;
+    while i < keys.len() {
+        if keys[i].len() < 2 || keys[i][0] != b'_' || keys[i][1] != b'_' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(dunder_prefixed(TEMPORAL_MARKERS) && dunder_prefixed(AUTO_MARKERS));
 
 /// Strings at most this long go through a per-decode cache, so a repeated one is one object: map
 /// keys in one table, values in another.
@@ -50,16 +87,31 @@ enum Fail {
 }
 
 /// An open container, filled as each element arrives.
-enum Open<'py> {
+enum Open<'a, 'py> {
     /// An array: its list, made with `None` in every slot, and the next index to fill.
     List(Bound<'py, PyList>, usize),
-    /// A map: its dict, and the key read, awaiting its value.
-    Map(Bound<'py, PyDict>, Option<Bound<'py, PyAny>>),
+    /// A map: its dict, the key read, awaiting its value, and its held pairs once it has any.
+    Map(
+        Bound<'py, PyDict>,
+        Option<Bound<'py, PyAny>>,
+        Option<Held<'a, 'py>>,
+    ),
+}
+
+/// A map's pairs from its first key neither `str` nor `bytes` on (interop only), for `build`.
+struct Held<'a, 'py> {
+    /// `(key, value)` tuples in read order, one slot per pair the map has left (`hold`): the
+    /// dict's pairs, then every pair read since. Full when the map closes.
+    pairs: Bound<'py, PyList>,
+    /// The next slot to fill.
+    next: usize,
+    /// The caller's pairs hook, which makes the map from them at its close.
+    build: &'a Bound<'py, PyAny>,
 }
 
 /// An open array or map.
-struct Frame<'py> {
-    open: Open<'py>,
+struct Frame<'a, 'py> {
+    open: Open<'a, 'py>,
     /// Elements still to read: items for an array, keys plus values for a map.
     owed: u64,
     /// Map: a `str` key equal to a marker key was read.
@@ -78,9 +130,14 @@ struct Decoder<'a, 'py> {
     data: &'a [u8],
     pos: usize,
     max_depth: usize,
+    /// The keys the hook tests.
+    markers: &'static [&'static [u8]],
+    /// None: `strict_map_key=True`, a key must be exactly `str` or `bytes`. Some: any key, and a map
+    /// holding one of another type is made by this pairs hook (see the module docs).
+    pairs_hook: Option<&'a Bound<'py, PyAny>>,
     /// Elements owed across every open container, the root included (the walk's `pending`).
     pending: u64,
-    stack: Vec<Frame<'py>>,
+    stack: Vec<Frame<'a, 'py>>,
     /// Cached strings; a table slot holds an index into it plus one, or 0 when empty. A slot holds
     /// one string at a time, a colliding one replacing it, so this never exceeds `2 * CACHE_SLOTS`.
     cached: Vec<StrSlot<'py>>,
@@ -91,25 +148,28 @@ struct Decoder<'a, 'py> {
 /// The cache slot for `bytes`: its first and last eight bytes, multiplied and shifted.
 #[inline]
 fn slot_of(bytes: &[u8]) -> usize {
-    fn word(b: &[u8]) -> u64 {
-        let mut w = [0u8; 8];
-        w[..b.len()].copy_from_slice(b);
-        u64::from_le_bytes(w)
-    }
     let n = bytes.len();
-    let head = word(&bytes[..n.min(8)]);
-    let tail = if n > 8 { word(&bytes[n - 8..]) } else { 0 };
+    let head = if n >= 8 { load8(bytes, 0) } else { word(bytes) };
+    let tail = if n > 8 { load8(bytes, n - 8) } else { 0 };
     let h = (head ^ tail.rotate_left(29) ^ (n as u64)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     (h >> (64 - CACHE_BITS)) as usize
 }
 
 impl<'a, 'py> Decoder<'a, 'py> {
-    fn new(py: Python<'py>, data: &'a [u8], max_depth: usize) -> Self {
+    fn new(
+        py: Python<'py>,
+        data: &'a [u8],
+        max_depth: usize,
+        markers: &'static [&'static [u8]],
+        pairs_hook: Option<&'a Bound<'py, PyAny>>,
+    ) -> Self {
         Self {
             py,
             data,
             pos: 0,
             max_depth,
+            markers,
+            pairs_hook,
             pending: 1,
             stack: Vec::new(),
             cached: Vec::new(),
@@ -148,10 +208,16 @@ impl<'a, 'py> Decoder<'a, 'py> {
         matches!(
             self.stack.last(),
             Some(Frame {
-                open: Open::Map(_, None),
+                open: Open::Map(_, None, _),
                 ..
             })
         )
+    }
+
+    /// Whether `key`, a `str` key's bytes, is one of the keys the hook tests.
+    #[inline]
+    fn is_marker(&self, key: &[u8]) -> bool {
+        key.starts_with(b"__") && self.markers.contains(&key)
     }
 
     fn decode(&mut self, hook: &Bound<'py, PyAny>) -> Result<Bound<'py, PyAny>, Fail> {
@@ -203,19 +269,31 @@ impl<'a, 'py> Decoder<'a, 'py> {
                         list.set_item(*index, value).map_err(|e| restore(py, e))?;
                         *index += 1;
                     }
-                    Open::Map(dict, awaiting_key) => match awaiting_key.take() {
+                    Open::Map(dict, awaiting_key, held) => match awaiting_key.take() {
                         None => {
                             *awaiting_key = Some(value);
                             break;
                         }
                         Some(key) => {
-                            // strict_map_key=True: a map key must be exactly `str` or `bytes`.
-                            if !(key.is_exact_instance_of::<PyString>()
-                                || key.is_exact_instance_of::<PyBytes>())
+                            if let Some(held) = held {
+                                // Through the sequence protocol, as in `hold`.
+                                PyTuple::new(py, [key, value])
+                                    .and_then(|p| held.pairs.as_sequence().set_item(held.next, p))
+                                    .map_err(|e| restore(py, e))?;
+                                held.next += 1;
+                            } else if key.is_exact_instance_of::<PyString>()
+                                || key.is_exact_instance_of::<PyBytes>()
                             {
+                                dict.set_item(key, value).map_err(|e| restore(py, e))?;
+                            } else if let Some(build) = self.pairs_hook {
+                                // `owed` counts the keys and values of the pairs still to read.
+                                let (pairs, next) = hold(py, dict, key, value, f.owed / 2)
+                                    .map_err(|e| restore(py, e))?;
+                                *held = Some(Held { pairs, next, build });
+                            } else {
+                                // strict_map_key=True: a map key must be exactly `str` or `bytes`.
                                 return Err(restore(py, key_error(&key)));
                             }
-                            dict.set_item(key, value).map_err(|e| restore(py, e))?;
                         }
                     },
                 }
@@ -225,11 +303,16 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 let done = self.stack.pop().expect("a frame was just read");
                 value = match done.open {
                     Open::List(list, _) => list.into_any(),
-                    Open::Map(dict, _) => dict.into_any(),
+                    // The pairs hook makes the map, revived as it is (`_build_map`), so the hook does not run.
+                    Open::Map(_, _, Some(held)) => held
+                        .build
+                        .call1((held.pairs,))
+                        .map_err(|e| restore(py, e))?,
+                    Open::Map(dict, _, None) if done.marker => {
+                        hook.call1((dict,)).map_err(|e| restore(py, e))?
+                    }
+                    Open::Map(dict, _, None) => dict.into_any(),
                 };
-                if done.marker {
-                    value = hook.call1((value,)).map_err(|e| restore(py, e))?;
-                }
             }
         }
     }
@@ -259,7 +342,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let at_key = self.at_key();
         let start = self.pos;
         let bytes = self.take(len);
-        if at_key && MARKER_KEYS.contains(&bytes) {
+        if at_key && self.is_marker(bytes) {
             if let Some(f) = self.stack.last_mut() {
                 f.marker = true;
             }
@@ -275,7 +358,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let i = slot_of(bytes);
         let held = if at_key { self.keys[i] } else { self.values[i] };
         if let Some(s) = (held as usize).checked_sub(1).map(|j| &self.cached[j]) {
-            if s.len == bytes.len() && &self.data[s.start..s.start + s.len] == bytes {
+            if s.len == bytes.len() && same(&self.data[s.start..s.start + s.len], bytes) {
                 return Ok(Some(s.obj.clone()));
             }
         }
@@ -335,20 +418,19 @@ impl<'a, 'py> Decoder<'a, 'py> {
     }
 
     /// An ext of `len` data bytes after its type byte, decoded as msgpack-python's defaults do:
-    /// type -1 to `msgpack.Timestamp` (through its own `from_bytes`), any other to
-    /// `msgpack.ExtType(code, data)`. cachekit never writes an ext, so this path is not hot.
+    /// type -1 to `msgpack.Timestamp` (`timestamp`), any other to `msgpack.ExtType(code, data)`.
+    /// cachekit never writes an ext, so this path is not hot.
     fn ext(&mut self, len: u64) -> Result<Option<Bound<'py, PyAny>>, Fail> {
         let py = self.py;
         self.account(len + 1, 0)?;
         let code = self.take(1)[0] as i8;
         let data = self.take(len);
-        let made = bytes_of(py, data).and_then(|data| {
-            if code == -1 {
-                msgpack_attr(py, "Timestamp").and_then(|t| t.call_method1("from_bytes", (data,)))
-            } else {
-                msgpack_attr(py, "ExtType").and_then(|t| t.call1((code, data)))
-            }
-        });
+        let made = if code == -1 {
+            timestamp(py, data)
+        } else {
+            bytes_of(py, data)
+                .and_then(|data| msgpack_attr(py, "ExtType").and_then(|t| t.call1((code, data))))
+        };
         made.map(Some).map_err(|e| restore(py, e))
     }
 
@@ -369,9 +451,9 @@ impl<'a, 'py> Decoder<'a, 'py> {
             }));
         }
         let open = if is_map {
-            Open::Map(PyDict::new(self.py), None)
+            Open::Map(PyDict::new(self.py), None, None)
         } else {
-            Open::List(self.nones(n).map_err(|e| restore(self.py, e))?, 0)
+            Open::List(nones(self.py, n).map_err(|e| restore(self.py, e))?, 0)
         };
         self.stack.push(Frame {
             open,
@@ -380,23 +462,22 @@ impl<'a, 'py> Decoder<'a, 'py> {
         });
         Ok(None)
     }
+}
 
-    /// A list of `n` `None`s, which the decode replaces in order. `n` is at most the input length,
-    /// so a list longer than `SHORT_LIST` is made as `[None] * n`, which raises MemoryError where
-    /// PyO3's list constructor would abort. A shorter one, at most 512 bytes of slots, comes from
-    /// that constructor: making it by repeat would add about 1% to a small document's decode.
-    fn nones(&self, n: u64) -> PyResult<Bound<'py, PyList>> {
-        let py = self.py;
-        let none = py.None().into_bound(py);
-        if n <= SHORT_LIST {
-            return PyList::new(py, std::iter::repeat_n(none, n as usize));
-        }
-        let seed = PyList::new(py, [none])?;
-        Ok(seed
-            .as_sequence()
-            .repeat(n as usize)?
-            .cast_into::<PyList>()?)
+/// A list of `n` `None`s, which the decode replaces in order. `n` is at most the input length,
+/// so a list longer than `SHORT_LIST` is made as `[None] * n`, which raises MemoryError where
+/// PyO3's list constructor would abort. A shorter one, at most 512 bytes of slots, comes from
+/// that constructor: making it by repeat would add about 1% to a small document's decode.
+fn nones(py: Python<'_>, n: u64) -> PyResult<Bound<'_, PyList>> {
+    let none = py.None().into_bound(py);
+    if n <= SHORT_LIST {
+        return PyList::new(py, std::iter::repeat_n(none, n as usize));
     }
+    let seed = PyList::new(py, [none])?;
+    Ok(seed
+        .as_sequence()
+        .repeat(n as usize)?
+        .cast_into::<PyList>()?)
 }
 
 /// A Python `int`.
@@ -423,6 +504,32 @@ fn big_endian(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
 }
 
+/// `msgpack.Timestamp(seconds, nanoseconds)` from a type -1 ext's data, read and checked as
+/// msgpack-python's C unpacker does (`unpack_timestamp`), with its error messages: interop's
+/// InteropDecodeError quotes them. `Timestamp.from_bytes` words both refusals differently.
+fn timestamp<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    let (seconds, nanoseconds) = match data.len() {
+        4 => (big_endian(data) as i64, 0),
+        8 => {
+            let packed = big_endian(data);
+            ((packed & 0x3_ffff_ffff) as i64, packed >> 34)
+        }
+        // A signed 64-bit count of seconds after the nanoseconds.
+        12 => (big_endian(&data[4..]) as i64, big_endian(&data[..4])),
+        n => {
+            return Err(PyValueError::new_err(format!(
+                "invalid timestamp data (length {n})"
+            )))
+        }
+    };
+    if nanoseconds > 999_999_999 {
+        return Err(PyValueError::new_err(
+            "nanoseconds must be a non-negative integer not greater than 999999999.",
+        ));
+    }
+    msgpack_attr(py, "Timestamp")?.call1((seconds, nanoseconds))
+}
+
 /// Set `e` as the current Python error, for the `Fail::Py` path to fetch.
 fn restore(py: Python<'_>, e: PyErr) -> Fail {
     e.restore(py);
@@ -441,6 +548,35 @@ fn key_error(key: &Bound<'_, PyAny>) -> PyErr {
     ))
 }
 
+/// A map's held pairs as it reads its first key neither `str` nor `bytes`, and the next slot to
+/// fill: `dict`'s pairs, in the order they were read, then that one, in a list with a slot for
+/// each of the `rest` pairs still to read. A `dict` keeps a repeated key where it was first read,
+/// with its last value, as `dict(pairs)` would. `dict` is emptied, so it holds no second copy.
+///
+/// The slots are set through the sequence protocol, not `PyList::set_item`: with a second caller,
+/// LLVM stops inlining that into the decode loop, and a 79-byte StandardSerializer decode ran 3.5%
+/// more instructions on CPython 3.12.
+fn hold<'py>(
+    py: Python<'py>,
+    dict: &Bound<'py, PyDict>,
+    key: Bound<'py, PyAny>,
+    value: Bound<'py, PyAny>,
+    rest: u64,
+) -> PyResult<(Bound<'py, PyList>, usize)> {
+    // At most the map's pairs, so at most the input length.
+    let pairs = nones(py, dict.len() as u64 + 1 + rest)?;
+    let slots = pairs.as_sequence();
+    let mut next = 0;
+    // Each pair as the `(key, value)` tuple msgpack-python hands a pairs hook.
+    for (k, v) in dict.iter() {
+        slots.set_item(next, PyTuple::new(py, [k, v])?)?;
+        next += 1;
+    }
+    slots.set_item(next, PyTuple::new(py, [key, value])?)?;
+    dict.clear();
+    Ok((pairs, next + 1))
+}
+
 fn msgpack_attr<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
     static MSGPACK: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
     MSGPACK
@@ -449,15 +585,75 @@ fn msgpack_attr<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>>
         .getattr(name)
 }
 
+/// Each reader's marker keys, as `str`s, by reader: `MARKER_KEYS` in the extension, which a test
+/// compares with the keys each Python hook tests, so a key added to a hook but not here fails it.
+pub fn marker_keys(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let keys = PyDict::new(py);
+    for (reader, markers) in [
+        ("standard", TEMPORAL_MARKERS),
+        ("auto", AUTO_MARKERS),
+        ("interop", TEMPORAL_MARKERS),
+    ] {
+        let names = markers.iter().map(|k| String::from_utf8_lossy(k));
+        keys.set_item(reader, PyTuple::new(py, names)?)?;
+    }
+    Ok(keys)
+}
+
 /// Decode `data` as `unpackb_bounded(data, raw=False, use_list=True, object_hook=hook)` does
-/// (see the module docs), calling `hook` only on maps holding a marker key.
+/// (see the module docs), calling `hook` only on maps holding a `__datetime__`, `__date__` or
+/// `__time__` key: StandardSerializer's decode.
 pub fn unpackb_standard(
     py: Python<'_>,
     data: &[u8],
     max_depth: usize,
     hook: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let mut decoder = Decoder::new(py, data, max_depth);
+    unpackb(py, data, max_depth, TEMPORAL_MARKERS, hook, None)
+}
+
+/// [`unpackb_standard`] for AutoSerializer, whose hook also tests `__uuid__`, `__tuple__`, `__set__`
+/// and `__ndarray__`.
+pub fn unpackb_auto(
+    py: Python<'_>,
+    data: &[u8],
+    max_depth: usize,
+    hook: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    unpackb(py, data, max_depth, AUTO_MARKERS, hook, None)
+}
+
+/// Decode `data` as `unpackb_bounded(data, raw=False, strict_map_key=False,
+/// object_pairs_hook=pairs_hook)` does, where `pairs_hook` builds a map and returns
+/// `hook(dict(pairs))` (`interop.py`'s `_build_map` and `_revive_sentinels`). A map whose keys are all
+/// `str` or `bytes` is built here and goes to `hook` only if it holds a `__datetime__`, `__date__` or
+/// `__time__` key; one holding any other key goes to `pairs_hook` (see the module docs).
+pub fn unpackb_interop(
+    py: Python<'_>,
+    data: &[u8],
+    max_depth: usize,
+    hook: &Bound<'_, PyAny>,
+    pairs_hook: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    unpackb(
+        py,
+        data,
+        max_depth,
+        TEMPORAL_MARKERS,
+        hook,
+        Some(pairs_hook),
+    )
+}
+
+fn unpackb<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    max_depth: usize,
+    markers: &'static [&'static [u8]],
+    hook: &Bound<'py, PyAny>,
+    pairs_hook: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let mut decoder = Decoder::new(py, data, max_depth, markers, pairs_hook);
     let outcome = decoder.decode(hook);
     let consumed = decoder.pos;
     drop(decoder);
