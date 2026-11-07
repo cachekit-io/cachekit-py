@@ -229,7 +229,7 @@ class TestAutoSerializerSetHashFloodBound:
     _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in
     a tuple of the set). Each refusal comes before set() builds the set, so a forged one never pays for a quadratic
     build. The writer refuses the same sets, so an honest one fails at write, not on every read (unless its elements
-    only become equal when read back, as datetimes that differ below a microsecond do)."""
+    only share a hash once read back, as pandas Timestamps that differ only in nanoseconds do)."""
 
     @pytest.fixture
     def counts(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
@@ -262,6 +262,16 @@ class TestAutoSerializerSetHashFloodBound:
             AutoSerializer(enable_integrity_checking=False).deserialize(data)
         # Hashed once each, by the sort; set() would have compared each to every earlier one.
         assert counts == {"hash": len(_SAME_HASH), "eq": 0}
+
+    def test_timestamps_that_read_back_equal_are_refused_on_read_past_the_bounds(self) -> None:
+        """The writer sees distinct nanosecond Timestamps; the reader sees equal datetimes, so equal hashes."""
+        pd = pytest.importorskip("pandas")
+        stamps = [pd.Timestamp("2026-01-01") + pd.Timedelta(i, "ns") for i in range(9)]
+        serializer = AutoSerializer()
+        for value in (set(stamps), {frozenset(stamps[:1]), frozenset(stamps[1:2])}):
+            with pytest.raises(SerializationError, match="for a shared hash, its elements read back equal"):
+                serializer.deserialize(*serializer.serialize(value))
+        assert serializer.deserialize(*serializer.serialize(set(stamps[:8]))) == {datetime(2026, 1, 1)}
 
     def test_eight_elements_may_share_a_hash_but_not_nine(self) -> None:
         """hash(-1) == hash(-2), so 3-D offsets over -1 and -2 put 8 honest tuples on one hash; 4-D offsets put 16."""

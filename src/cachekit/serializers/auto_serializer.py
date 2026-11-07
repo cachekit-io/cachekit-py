@@ -89,8 +89,8 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 # a frozenset sits anywhere inside a tuple of the set; a tuple holding no frozenset compares in time linear in its
 # size. At these bounds, the costliest forged set found (1024 ints on one merged chain) decodes in about 5x
 # the time of an honest set of the same size. _auto_default applies the same bounds to what it writes, so a refused
-# set fails loudly at write instead of missing on every read, unless its elements only become equal when read back
-# (datetimes that differ below a microsecond).
+# set fails loudly at write instead of missing on every read, unless its elements only share a hash once read back
+# (pandas Timestamps that differ only in nanoseconds read back as one datetime).
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
 _STR_TYPES = frozenset({str, bytes})
@@ -445,8 +445,8 @@ def _check_untrusted_set(values: list[Any]) -> None:
     if reason:
         raise SerializationError(
             f"Invalid set format: {reason}: a hash-flood bound, not a framing error. Either the entry is forged, a "
-            "cachekit version without this bound wrote it, or its elements read back equal (such as datetimes that "
-            "differ below a microsecond)."
+            "cachekit version without this bound wrote it, or, for a shared hash, its elements read back equal (such "
+            "as pandas Timestamps that differ only in nanoseconds)."
         )
 
 
