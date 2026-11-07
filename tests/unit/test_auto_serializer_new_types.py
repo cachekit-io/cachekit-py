@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import msgpack
 import pytest
@@ -228,8 +230,9 @@ class TestAutoSerializerSetHashFloodBound:
     """A stored set holds at most _MAX_NON_STRING_SET_ELEMENTS elements that are neither str nor bytes, at most
     _MAX_SAME_HASH_SET_ELEMENTS on one hash, and no two frozensets on one hash (nor two tuples, once a frozenset sits in
     a tuple of the set). Each refusal comes before set() builds the set, so a forged one never pays for a quadratic
-    build. The writer refuses the same sets, so an honest one fails at write, not on every read (unless its elements
-    only share a hash once read back, as pandas Timestamps that differ only in nanoseconds do)."""
+    build. The writer refuses the same sets, so an honest one fails at write, not on every read. It also refuses the
+    elements whose hash the round trip changes (TestAutoSerializerDatetimeRoundTrip), so no set it writes crosses a
+    bound only once read back."""
 
     @pytest.fixture
     def counts(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
@@ -266,15 +269,15 @@ class TestAutoSerializerSetHashFloodBound:
         # Hashed once each, by the sort; set() would have compared each to every earlier one.
         assert counts == {"hash": len(_SAME_HASH), "eq": 0}
 
-    def test_timestamps_that_read_back_equal_are_refused_on_read_past_the_bounds(self) -> None:
-        """The writer sees distinct nanosecond Timestamps; the reader sees equal datetimes, so equal hashes."""
+    def test_timestamps_that_would_read_back_equal_are_refused_at_write(self) -> None:
+        """Timestamps 1 ns apart are distinct to the writer but would read back as one datetime: 8 of them would
+        collapse into one element, and 9, or two frozensets of them, would fail every read."""
         pd = pytest.importorskip("pandas")
         stamps = [pd.Timestamp("2026-01-01") + pd.Timedelta(i, "ns") for i in range(9)]
         serializer = AutoSerializer()
-        for value in (set(stamps), {frozenset(stamps[:1]), frozenset(stamps[1:2])}):
-            with pytest.raises(SerializationError, match="for a shared hash, its elements read back equal"):
-                serializer.deserialize(*serializer.serialize(value))
-        assert serializer.deserialize(*serializer.serialize(set(stamps[:8]))) == {datetime(2026, 1, 1)}
+        for value in (set(stamps[:8]), set(stamps), {frozenset(stamps[:1]), frozenset(stamps[1:2])}):
+            with pytest.raises(TypeError, match="sub-microsecond precision is not kept"):
+                serializer.serialize(value)
 
     def test_eight_elements_may_share_a_hash_but_not_nine(self) -> None:
         """hash(-1) == hash(-2), so 3-D offsets over -1 and -2 put 8 honest tuples on one hash; 4-D offsets put 16."""
@@ -431,6 +434,76 @@ class TestAutoSerializerSetHashFloodBound:
     def test_the_writer_refuses_a_set_over_the_count(self, kind: type) -> None:
         with pytest.raises(TypeError, match=rf"cannot store this {kind.__name__}: it holds more than 1024 elements"):
             AutoSerializer().serialize({"v": [kind(range(_MAX_NON_STRING_SET_ELEMENTS + 1))]})
+
+
+_NEW_YORK = ZoneInfo("America/New_York")
+# 01:30 happens twice in New York on 2025-11-02: fold=1 is the second, at -05:00, the same instant as _UTC_TWIN.
+_FOLDED = datetime(2025, 11, 2, 1, 30, fold=1, tzinfo=_NEW_YORK)
+_UTC_TWIN = datetime(2025, 11, 2, 6, 30, tzinfo=UTC)
+_FOLDED_MARKER = b"\x82\xac__datetime__\xc3\xa5value\xb92025-11-02T01:30:00-05:00"
+_MICRO_MARKER = b"\x82\xac__datetime__\xc3\xa5value\xba2026-01-01T12:00:00.123456"
+
+
+class TestAutoSerializerDatetimeRoundTrip:
+    """A datetime is stored as its ISO text, which reads back to the microsecond and without fold. The writer refuses a
+    value that would read back as another one, and writes every other datetime as it always has."""
+
+    @pytest.mark.parametrize(
+        "wrap",
+        [lambda t: t, lambda t: [t], lambda t: {"k": t}, lambda t: {t}, lambda t: frozenset({t})],
+        ids=["bare", "list", "dict-value", "set", "frozenset"],
+    )
+    def test_a_timestamp_with_nanoseconds_is_refused_at_write(self, wrap: Callable[[Any], Any]) -> None:
+        pd = pytest.importorskip("pandas")
+        with pytest.raises(TypeError, match=r"cannot store this Timestamp: .*sub-microsecond precision is not kept"):
+            AutoSerializer().serialize(wrap(pd.Timestamp("2026-01-01T12:00:00.123456789")))
+
+    def test_nat_is_not_refused_as_sub_microsecond(self) -> None:
+        """pd.NaT is a datetime whose nanosecond is nan, and no Timestamp: the guard leaves it alone."""
+        pd = pytest.importorskip("pandas")
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        assert serializer.serialize(pd.NaT)[0] == msgpack.packb({"__datetime__": True, "value": "NaT"})
+        assert serializer.serialize([pd.NaT])[0] == msgpack.packb([{"__datetime__": True, "value": "NaT"}])
+
+    def test_a_timestamp_without_nanoseconds_writes_the_bytes_a_datetime_always_has(self) -> None:
+        pd = pytest.importorskip("pandas")
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        stamp = pd.Timestamp("2026-01-01T12:00:00.123456")
+        assert serializer.serialize(stamp)[0] == _MICRO_MARKER
+        assert serializer.serialize(datetime(2026, 1, 1, 12, 0, 0, 123456))[0] == _MICRO_MARKER
+        assert serializer.deserialize(*serializer.serialize(stamp)) == stamp
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {frozenset({_FOLDED}), frozenset({_UTC_TWIN})},
+            {_FOLDED, _UTC_TWIN},
+            {(_FOLDED,), (_UTC_TWIN,)},
+            {(1, ((_FOLDED, "x"),))},  # however deep in its tuples
+        ],
+        ids=["frozensets", "set", "tuples", "deep-tuple"],
+    )
+    def test_a_set_holding_a_folded_datetime_is_refused_at_write(self, value: set) -> None:
+        """Written, these read back with fewer elements, or as two equal frozensets that every read refuses."""
+        assert _FOLDED != _UTC_TWIN and _FOLDED.isoformat() == _UTC_TWIN.astimezone(_NEW_YORK).isoformat()
+        with pytest.raises(TypeError, match="it holds an aware datetime at fold=1"):
+            AutoSerializer().serialize(value)
+
+    def test_a_folded_datetime_outside_a_set_writes_the_bytes_it_always_has(self) -> None:
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        assert serializer.serialize(_FOLDED)[0] == _FOLDED_MARKER
+        assert serializer.serialize([_FOLDED])[0] == b"\x91" + _FOLDED_MARKER
+        assert serializer.serialize({"k": _FOLDED})[0] == b"\x81\xa1k" + _FOLDED_MARKER
+
+    def test_fold_that_does_not_move_the_offset_is_not_refused(self) -> None:
+        """Naive, or in a zone with one offset, fold=1 is equal to and hashes as fold=0, so it reads back equal."""
+        serializer = AutoSerializer()
+        for value in (
+            {datetime(2025, 11, 2, 1, 30, fold=1)},
+            {datetime(2025, 11, 2, 1, 30, fold=1, tzinfo=UTC)},
+            {datetime(2025, 7, 1, 1, 30, fold=1, tzinfo=_NEW_YORK)},
+        ):
+            assert serializer.deserialize(*serializer.serialize(value)) == value
 
 
 class TestAutoSerializerComplexNesting:

@@ -82,6 +82,7 @@ _HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 _MAX_NON_STRING_SET_ELEMENTS = 1024
 _MAX_SAME_HASH_SET_ELEMENTS = 8
 _STR_TYPES = frozenset({str, bytes})
+_FOLD = operator.attrgetter("fold")
 _EMPTY_TWICE = 'the empty str or bytes ("" or b"") more than once'
 
 # Error message constants for unsupported types
@@ -316,6 +317,16 @@ def _auto_default(obj: Any) -> Any:
 
     # Existing: datetime/date/time support (KEEP)
     if isinstance(obj, datetime):
+        # A pandas Timestamp can hold nanoseconds: its ISO text keeps them and fromisoformat drops them, so it would
+        # read back as another value, and set elements 1 ns apart would read back equal. pd.NaT is a datetime but no
+        # Timestamp, so it never reaches the check (its nanosecond is nan).
+        pd_loaded = sys.modules.get("pandas")
+        if pd_loaded is not None and isinstance(obj, pd_loaded.Timestamp) and cast("pd.Timestamp", obj).nanosecond:
+            raise TypeError(
+                f"AutoSerializer cannot store this {type(obj).__name__}: it has nanoseconds, and a datetime is stored to "
+                "the microsecond, so sub-microsecond precision is not kept. Round it first (ts.floor('us')) or cache its "
+                "int nanoseconds (ts.value)."
+            )
         return {"__datetime__": True, "value": obj.isoformat()}
     if isinstance(obj, date):
         return {"__date__": True, "value": obj.isoformat()}
@@ -340,6 +351,12 @@ def _auto_default(obj: Any) -> Any:
             raise TypeError(
                 f"AutoSerializer cannot store this {type(obj).__name__}: it holds {reason}, which its reader refuses "
                 "as a hash-flood bound. Cache the elements as a list instead."
+            )
+        if _fold_shifts_offset(value, types):
+            raise TypeError(
+                f"AutoSerializer cannot store this {type(obj).__name__}: it holds an aware datetime at fold=1, which is "
+                "stored with its UTC offset but not fold, so it can read back equal to another element. Convert it to "
+                "UTC first (dt.astimezone(timezone.utc)) or cache the elements as a list."
             )
         return {"__set__": True, "value": value, "frozen": isinstance(obj, frozenset)}
 
@@ -376,6 +393,28 @@ def _frozenset_in_tuples(values: list[Any], types: list[type]) -> bool:
         types = list(map(type, values))
         if any(issubclass(t, frozenset) for t in set(types)):
             return True
+
+
+def _fold_shifts_offset(values: list[Any], types: list[type]) -> bool:
+    """Whether an aware datetime at fold=1 whose offset differs at fold=0 sits among ``values`` or at any depth inside a
+    tuple among them. ``types`` holds each value's type.
+
+    Such a datetime never equals one in another zone (PEP 495), but it reads back at a fixed offset, without fold, and
+    can then equal one. A frozenset among ``values`` is checked when its own encode runs. Walked a level at a time in C
+    passes, as _frozenset_in_tuples is: only the datetimes at fold=1 reach a Python check.
+    """
+    while values:
+        kinds = set(types)
+        if any(issubclass(t, datetime) for t in kinds):
+            stamps = list(compress(values, map(issubclass, types, repeat(datetime))))
+            folded = compress(stamps, map(_FOLD, stamps))
+            if any(d.utcoffset() != d.replace(fold=0).utcoffset() for d in folded):
+                return True
+        if not any(issubclass(t, tuple) for t in kinds):
+            return False
+        values = list(chain.from_iterable(compress(values, map(issubclass, types, repeat(tuple)))))
+        types = list(map(type, values))
+    return False
 
 
 def _hash_run_over(values: Iterable[Any], limit: int) -> bool:
