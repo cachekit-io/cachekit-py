@@ -324,28 +324,28 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 2,942 | 2,765 |
-| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CacheKit Cloud backend with telemetry on does, so each call pays the 1-in-256 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 81,324 | 81,620 |
-| `l1_hit_backed_auto` | `@cache` with `serializer="auto"` and a backend that keeps no hit-latency report, L1 hit (decodes the verified MessagePack the auto serializer keeps) | 92,399 | 93,277 |
-| `l1_hit_interop` | `@cache(interop=..., namespace=...)` with a backend that keeps no hit-latency report, L1 hit (builds its interop key, decodes the plain MessagePack value L1 holds) | 105,857 | 105,921 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,936 | 2,765 |
-| `local_hit` | `@cache.local()` hit (the stored object itself, no key built, no lock taken) | 3,086 | 2,947 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 163,949 | 158,507 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 214,442 | 205,117 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 125,572 | 125,697 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 163,975 | 158,845 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 48,394 | 48,772 |
-| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,029,044 | 1,005,428 |
-| `serializer_auto` | `AutoSerializer` round trip | 64,450 | 65,597 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 21,752 | 22,528 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,976,247 | 1,978,979 |
-| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,817,530 | 61,270,925 |
-| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,814,922 | 61,272,845 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 89,723 | 91,055 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,682 | 2,559 |
-| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,568 | 720,558 |
-| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,559 | 73,603 |
-| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 164,782 | 160,868 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 2,939 | 2,765 |
+| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CacheKit Cloud backend with telemetry on does, so each call pays the 1-in-256 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 81,098 | 81,500 |
+| `l1_hit_backed_auto` | `@cache` with `serializer="auto"` and a backend that keeps no hit-latency report, L1 hit (decodes the verified MessagePack the auto serializer keeps) | 81,149 | 81,382 |
+| `l1_hit_interop` | `@cache(interop=..., namespace=...)` with a backend that keeps no hit-latency report, L1 hit (builds its interop key, decodes the plain MessagePack value L1 holds) | 105,995 | 105,923 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,939 | 2,765 |
+| `local_hit` | `@cache.local()` hit (the stored object itself, no key built, no lock taken) | 3,091 | 2,947 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 163,772 | 158,332 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,639 | 205,114 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 125,371 | 125,528 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 163,540 | 158,664 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 48,345 | 48,601 |
+| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,002,380 | 978,261 |
+| `serializer_auto` | `AutoSerializer` round trip | 53,231 | 53,558 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 21,734 | 22,490 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,968,784 | 1,980,081 |
+| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,776,047 | 61,293,994 |
+| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,783,522 | 61,305,613 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 89,664 | 90,828 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,685 | 2,559 |
+| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,600 | 720,546 |
+| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,742 | 73,687 |
+| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,510 | 161,359 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. Every committed budget comes from one reference machine: x86_64, Ubuntu 24.04, glibc 2.39, valgrind 3.22.0, CPython 3.12.12 and 3.14.3 (uv's builds), the release extension that `uv sync` builds, and the dependencies in `uv.lock`. Counts depend on that whole build, so on any other machine, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. `l2_hit` and `l2_hit_async_metrics` cost the same within 0.4%: a cache operation records into per-thread cells in either mode.
 
