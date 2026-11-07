@@ -645,11 +645,15 @@ def test_threads_decode_one_document_concurrently() -> None:
     sentinel = {"__datetime__": True, "value": "2024-01-01T00:00:00+00:00"}
     interop_doc = _repeat_map([("rows", [{"id": i, "at": sentinel} for i in range(50)]), (7, sentinel)])
     expected = (auto_reference(auto_doc), interop_reference(interop_doc))
-    failures, barrier = [], threading.Barrier(8)
+    failures: list[object] = []
+    barrier = threading.Barrier(8)
 
     def work() -> None:
         barrier.wait()
-        failures.extend(1 for _ in range(100) if (auto_rust(auto_doc), decode_interop_value(interop_doc)) != expected)
+        try:
+            failures.extend(1 for _ in range(100) if (auto_rust(auto_doc), decode_interop_value(interop_doc)) != expected)
+        except Exception as e:  # noqa: BLE001 - a raise would end only this thread; the test thread asserts it
+            failures.append(e)
 
     threads = [threading.Thread(target=work) for _ in range(8)]
     for t in threads:

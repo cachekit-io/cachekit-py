@@ -419,7 +419,10 @@ def test_threads_decode_one_document_concurrently() -> None:
 
     def work() -> None:
         barrier.wait()
-        failures.extend(1 for _ in range(200) if rust(doc) != expected)
+        try:
+            failures.extend(1 for _ in range(200) if rust(doc) != expected)
+        except Exception as e:  # noqa: BLE001 - a raise would end only this thread; the test thread asserts it
+            failures.append(e)
 
     threads = [threading.Thread(target=work) for _ in range(8)]
     for t in threads:
