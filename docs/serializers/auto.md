@@ -30,12 +30,14 @@ How the default `StandardSerializer` (MessagePack) and `AutoSerializer` handle P
 | `tuple` | → `list` | Preserved |
 | `set` | Raises `TypeError` | Preserved |
 | `frozenset` | Raises `TypeError` | Preserved |
-| `datetime` | Preserved | Preserved (ISO-8601 roundtrip) |
+| `datetime` | Preserved | Preserved (ISO-8601 roundtrip, to the microsecond) |
 | `date` / `time` | Preserved | Preserved |
 | `UUID` | Raises `TypeError` | Preserved |
 | `numpy.ndarray` | Not supported | Preserved (zero-copy binary) |
 | `pandas.DataFrame` | Not supported | Preserved (columnar format), top-level value only |
 | `pandas.Series` | Not supported | Preserved, top-level value only |
+
+A pandas `Timestamp` is a `datetime` and is stored as one: it reads back as a `datetime`, exact to the microsecond. A `Timestamp` with non-zero nanoseconds raises `TypeError` at write, bare or inside any container, because the read would drop them and return another value. Round it first (`ts.floor("us")`) or cache its int nanoseconds (`ts.value`). `pd.NaT` is written without an error, but no read can parse it, so every read of it raises `SerializationError`, a miss under `@cache`.
 
 A DataFrame or Series is encoded only as the whole cached value. Nested inside a dict, list or other container it raises `TypeError`; return it on its own, or convert it first (for example with `df.to_dict("list")`). A NumPy array has no such limit and can sit at any depth.
 
@@ -71,7 +73,7 @@ Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is i
 
 A set or frozenset holds at most 1,024 elements that are neither strings nor bytes, at most 8 of those that share one hash value, and the empty string `""` and empty bytes `b""` at most once each. No two of its frozensets may share a hash, and no two of its tuples may once a frozenset sits anywhere inside one of its tuples. Writing a set over any of these bounds raises `TypeError`; under `@cache` the result is returned but not cached, and the failure is logged (see [Serialization unsupported type](../error-codes.md#serialization-unsupported-type)). Reading one, which a forged entry or an earlier cachekit version can hold, raises `SerializationError`, which a cached read treats as a miss.
 
-A set whose elements change their hash on the round trip can cross these bounds only once read back, so the writer accepts it and every read refuses it. pandas `Timestamp`s that differ only in nanoseconds read back as one `datetime`, so more than 8 of them, or two frozensets of them, are refused, while up to 8 bare ones collapse into one element without an error. An aware `datetime` at `fold=1` reads back with its offset but without `fold`, so it can come back equal to another element of the set.
+The writer also refuses elements that the round trip could make equal to another element, because such a set could cross these bounds only once read back, or read back with fewer elements than it held. A pandas `Timestamp` with nanoseconds raises `TypeError` wherever it sits (see [What It Preserves](#what-it-preserves)): `Timestamp`s that differ only in nanoseconds would read back as one `datetime`. A set or frozenset that holds an aware `datetime` whose UTC offset depends on `fold`, as an element or anywhere inside one of its tuples, raises `TypeError` too. That is a wall time its zone repeats or skips, such as 01:30 on the night New York leaves daylight saving time, at either `fold`. Python never finds such a `datetime` equal to one in another zone, but it reads back with its offset and without `fold`, so it can come back equal to another element. Convert it to UTC first (`dt.astimezone(timezone.utc)`). The same `datetime` outside a set is stored as before. An earlier cachekit version wrote such sets without an error: reading one either refuses it as above or returns fewer elements than were written.
 
 The count takes every element that is not a string or bytes, whatever its type: an int, a float, a bool, `None`, a UUID, a tuple, a frozenset or a datetime. Ints, floats, UUIDs and tuples hash without a random seed, so a forged entry could choose colliding element hashes that make one read quadratic in the set's size. A stored set is a list, so it can also repeat an element, and every copy counts toward both bounds. Strings and bytes hash under a per-process secret, so a set of them is bounded only by the size bounds every read applies, except `""` and `b""`, which hash to 0 in every process. The secret holds while Python's hash randomization is on, its default: a process run with `PYTHONHASHSEED` set to a fixed value hashes strings and bytes predictably, so a forged entry could then flood a set of them too.
 
