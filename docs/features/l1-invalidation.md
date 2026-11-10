@@ -278,7 +278,7 @@ The counters are kept per stripe of keys: each cache, and each backed decorated 
 
 An invalidation still does not stop these writes:
 
-- **An invalidation in another process.** This process cannot see it before its own write lands: the backends have no conditional write. A call here that missed before another process's invalidation still stores its result in L2 after it, and in this process's L1, even when the invalidation is [announced](#cross-process-l1-eviction). The L2 entry stays until its TTL (with `ttl=None`, until the next invalidation) and the L1 copy until its L1 TTL.
+- **An invalidation in another process.** This process cannot see it before its own write lands: the backends have no conditional write. A call here that missed before another process's invalidation still stores its result in L2 after it, and in this process's L1, even when the invalidation is [announced](#cross-process-l1-eviction). The L2 entry stays until its TTL (with `ttl=None`, until the next invalidation, or on CacheKit Cloud until your plan's [maximum TTL](../backends/cachekitio.md#ttl-range-and-plan-maximum)) and the L1 copy until its L1 TTL.
 - **An L2 write already on its way.** A write that passed its check before the invalidation started can reach the backend after the invalidation's L2 delete; a stream that has begun counts as a write already on its way. The value then stays in L2 until its TTL or the next invalidation. Its L1 put is skipped, but the next read in any process copies the L2 entry into its L1.
 - **A second decoration of the same function.** Each decorated function object keeps its own counters, so an invalidation through one does not skip a write in flight through the other.
 
