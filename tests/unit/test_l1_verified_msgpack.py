@@ -3,16 +3,16 @@ that is no longer; otherwise L1 keeps the envelope. The auto serializer's Messag
 serializer's checksummed JSON are kept the same way (the last section); everything else here is the default
 serializer's.
 
-The first L1 hit on an entry decodes the envelope as before, and its retrieve() yields the MessagePack; when that is
+The first L1 hit on an entry decodes the envelope as before, and its retrieve_data() yields the MessagePack; when that is
 no longer than the envelope, L1 then holds it in place of the envelope (``CacheSerializationHandler.deserialize_l1``,
-``L1Cache.shrink_if_held``), and later hits skip retrieve(). An envelope L1 keeps is decoded in full on every hit.
+``L1Cache.shrink_if_held``), and later hits skip retrieve_data(). An envelope L1 keeps is decoded in full on every hit.
 No hit skips the structure bounds: every StandardSerializer decode is one Rust pass (``unpackb_standard``) that
 enforces them as it decodes, kept entry or not. Each rule that keeps this from costing L1 hits or security is
 pinned here:
 
 - L1 admits and stores envelopes exactly as before; a hit only ever shrinks an entry in place. So L1 never
   holds fewer entries than it would hold envelopes (the replay property below).
-- MessagePack enters L1 only from a retrieve() that verified it; a corrupt envelope is never swapped.
+- MessagePack enters L1 only from a retrieve_data() that verified it; a corrupt envelope is never swapped.
 - Every decode, of bytes from L1 or L2 and of a kept entry alike, goes through the bounded decode, so a nesting
   bomb is refused wherever it comes from, and nothing refused is ever kept.
 - Every decode equals the decode every read ran before the Rust one: the structure walk, then msgpack with
@@ -106,7 +106,7 @@ def _stored(backend: _Backend, namespace: str) -> tuple[bytes, bytes | None]:
 
 
 def _corrupt(envelope: bytes) -> bytes:
-    """``envelope`` with one byte of its ByteStorage payload flipped: the frame still parses, retrieve() fails."""
+    """``envelope`` with one byte of its ByteStorage payload flipped: the frame still parses, retrieve_data() fails."""
     corrupt = bytearray(envelope)
     corrupt[-20] ^= 0xFF
     return bytes(corrupt)
@@ -199,8 +199,8 @@ def test_an_l2_hit_backfills_the_envelope_and_the_next_hit_swaps_it() -> None:
 
 
 def test_a_corrupt_envelope_backfilled_into_l1_is_never_swapped(monkeypatch: pytest.MonkeyPatch) -> None:
-    """MessagePack enters L1 only from a retrieve() that verified it. The L2 decode is stubbed to accept the
-    corrupt envelope, so the backfill puts it in L1; the next hit's retrieve() refuses it, and L1 drops it."""
+    """MessagePack enters L1 only from a retrieve_data() that verified it. The L2 decode is stubbed to accept the
+    corrupt envelope, so the backfill puts it in L1; the next hit's retrieve_data() refuses it, and L1 drops it."""
     backend, namespace = _Backend(), _namespace()
 
     @cache(backend=backend, ttl=60, namespace=namespace)
@@ -416,7 +416,7 @@ def _decorated(backend: _Backend, namespace: str, value: Any, mode: str) -> Call
 def test_every_hit_runs_the_bounded_decode_and_only_kept_msgpack_skips_retrieve(
     value: Any, kept: type, mode: str, decodes: list[str], retrieves: list[int]
 ) -> None:
-    """Kept MessagePack saves a hit retrieve(), never the structure bounds: each hit's decode is one bounded pass,
+    """Kept MessagePack saves a hit retrieve_data(), never the structure bounds: each hit's decode is one bounded pass,
     the first hit's and the kept entry's alike. An envelope L1 keeps is retrieved and decoded on every hit."""
     backend, namespace = _Backend(), _namespace()
     fn = _decorated(backend, namespace, value, mode)
@@ -537,12 +537,12 @@ def _outcome(decode: Callable[[], Any]) -> Any:
 
 
 def _verified(envelope: bytes) -> VerifiedPayload:
-    """``envelope``'s MessagePack as retrieve() verifies it, held as L1 holds a kept entry, whatever its length."""
-    return VerifiedPayload(ByteStorage("msgpack").retrieve(SerializationWrapper.unwrap(envelope)[0])[0], StandardSerializer)
+    """``envelope``'s MessagePack as retrieve_data() verifies it, held as L1 holds a kept entry, whatever its length."""
+    return VerifiedPayload(ByteStorage("msgpack").retrieve_data(SerializationWrapper.unwrap(envelope)[0]), StandardSerializer)
 
 
 def _walked_hooked(envelope: bytes) -> Any:
-    """The outcome of the decode every StandardSerializer read ran before the Rust one: retrieve(), the structure
+    """The outcome of the decode every StandardSerializer read ran before the Rust one: the envelope check, the structure
     walk, then msgpack with the object hook on every map. Any error is SerializationError, as the read paths raise it."""
     raw = _verified(envelope).data
     outcome = _outcome(lambda: unpackb_bounded(raw, raw=False, use_list=True, object_hook=_standard_object_hook))
@@ -566,7 +566,7 @@ def test_every_decode_of_a_kept_entry_equals_the_walked_hooked_decode(value: Any
         return
     assert repr(first) == expected
     verified = _verified(envelope)
-    assert kept is None or kept.data == verified.data  # what L1 would hold is what retrieve() verified
+    assert kept is None or kept.data == verified.data  # what L1 would hold is what retrieve_data() verified
     assert _outcome(lambda: handler.deserialize_l1(verified, cache_key="k")[0]) == expected
 
 
@@ -900,8 +900,8 @@ def checks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     for name in ("retrieve", "retrieve_data"):
         real = getattr(ByteStorage, name)
 
-        def retrieve(self: ByteStorage, data: Any, real: Callable[..., Any] = real) -> Any:
-            seen.append("retrieve")
+        def retrieve(self: ByteStorage, data: Any, real: Callable[..., Any] = real, name: str = name) -> Any:
+            seen.append(name)
             return real(self, data)
 
         monkeypatch.setattr(ByteStorage, name, retrieve)

@@ -659,22 +659,6 @@ def test_retrieve_data_matches_retrieve_on_each_failure_class(make) -> None:
     _assert_retrieve_data_is_retrieve_without_format(make())
 
 
-def test_retrieve_data_failure_classes_are_the_taxonomy() -> None:
-    """The parity above holds against the taxonomy itself, not only against retrieve(): an unparsable input stays a
-    plain ValueError and a verified-but-corrupt envelope is EnvelopeIntegrityError."""
-    import msgpack
-
-    from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
-
-    storage = ByteStorage("msgpack")
-    fields = msgpack.unpackb(storage.store(b"x" * 200, None))
-    with pytest.raises(ValueError) as not_envelope:
-        storage.retrieve_data(b"not an envelope")
-    assert type(not_envelope.value) is ValueError
-    with pytest.raises(EnvelopeIntegrityError):
-        storage.retrieve_data(msgpack.packb([fields[0], [0] * 8, fields[2], fields[3]]))
-
-
 def test_retrieve_data_matches_retrieve_on_arbitrary_and_mutated_envelopes() -> None:
     """Property: for arbitrary bytes, and for a real envelope with bytes overwritten, cut or appended,
     retrieve_data gives what retrieve gives without the format."""

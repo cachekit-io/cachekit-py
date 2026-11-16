@@ -729,8 +729,9 @@ def deserialize(data: bytes, metadata) -> Any:
         # Parse header + np.frombuffer()
         return reconstruct_numpy(data)  # illustrative - not defined
 
-    # Rust envelope path
-    original_data, format_id = ByteStorage.retrieve(data)  # illustrative - Rust FFI
+    # Rust envelope path. StandardSerializer reads with retrieve_data(), which skips the format;
+    # AutoSerializer reads with retrieve(), which also returns the format it dispatches on.
+    original_data = ByteStorage.retrieve_data(data)  # illustrative - Rust FFI
     # ↓ Rust layer:
     #   1. Deserialize envelope (MessagePack)
     #   2. Security checks (size, compression ratio)
