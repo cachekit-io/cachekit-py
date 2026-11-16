@@ -343,6 +343,7 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 | `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,783,522 | 61,305,613 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 89,664 | 90,828 |
 | `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,685 | 2,559 |
+| `byte_storage_store_1k` | `ByteStorage.store()` alone, 1 KiB of address-like text (from 64 bytes to under 4 KiB, cachekit-core compresses with one LZ4 table kept per thread) | TBD | TBD |
 | `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,600 | 720,546 |
 | `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,742 | 73,687 |
 | `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,510 | 161,359 |
@@ -354,7 +355,7 @@ Budgets are per interpreter (minor version, build flavour, machine); an interpre
 **Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. A Prometheus scrape, which sums each thread's cache-operation cells, runs outside the measured calls and is not budgeted. Part of pyarrow's work on the real-data paths is not budgeted either: about half of their instructions run on pyarrow's threads. Unrelated changes can still move a path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`). A change to the Rust extension moves the paths that run through it more, with no change in their work: `main`'s own source, built with and without symbol stripping, moved the `ByteStorage` round trip of `serializer_default` by 1.9%, while every function in it cost the same over 5,000 round trips, so the move is a one-time allocator event that the binary's layout puts inside one loop size. After an extension change, re-record the serializer paths that fail (`--update --allow-increase --path <path>`) and say why in the PR.
 
 ```bash
-make perf-ir         # gate: fail on a >=1% per-call regression (needs valgrind; 210 runs, several minutes)
+make perf-ir         # gate: fail on a >=1% per-call regression (needs valgrind; 230 runs, several minutes)
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 

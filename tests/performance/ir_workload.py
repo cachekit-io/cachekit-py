@@ -20,11 +20,14 @@ from typing import Any
 FILE_SET_ENTRIES = 1000
 OBJECT_CACHE_ENTRIES = 10_000
 # ByteStorage.store() inputs. 40 B is under cachekit-core's 64 B literals-only LZ4 threshold, which
-# every serializer path's input clears (the smallest, serializer_default's msgpack, is 79 B). The
-# 64 KiB input is address-like text, so the encoder finds many short matches rather than one run.
+# every serializer path's input clears (the smallest, serializer_default's msgpack, is 79 B). From
+# 64 B to under 4 KiB the encoder reuses one hash table per thread: 1 KiB is inside that range and
+# 64 KiB above it. Both are address-like text, so the encoder finds many short matches, not one run.
+_addresses = b"".join(b"%d,user-%d@example.com;" % (i, i) for i in range(4000))[:65536]
 BYTE_STORAGE_PAYLOADS = {
     "byte_storage_store_40b": b"cachekit" * 5,
-    "byte_storage_store_64k": b"".join(b"%d,user-%d@example.com;" % (i, i) for i in range(4000))[:65536],
+    "byte_storage_store_1k": _addresses[:1024],
+    "byte_storage_store_64k": _addresses,
 }
 _scratch_dirs: list[str] = []  # removed before exit; the removal costs the same at both loop sizes
 

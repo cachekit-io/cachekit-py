@@ -112,6 +112,7 @@ PATHS = (
     "serializer_auto_usgs",
     "serializer_encrypted",
     "byte_storage_store_40b",
+    "byte_storage_store_1k",
     "byte_storage_store_64k",
     "file_set",
     "object_cache_put_full",
