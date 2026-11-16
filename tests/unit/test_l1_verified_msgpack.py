@@ -370,15 +370,16 @@ def test_deserialize_l1_decodes_or_refuses_every_entry_as_deserialize_data_does(
 
 @pytest.fixture
 def retrieves(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """One entry per ByteStorage.retrieve() call, by any instance."""
+    """One entry per ByteStorage.retrieve() or retrieve_data() call, by any instance."""
     seen: list[int] = []
-    real = ByteStorage.retrieve
+    for name in ("retrieve", "retrieve_data"):
+        real = getattr(ByteStorage, name)
 
-    def recording(self: ByteStorage, data: Any) -> Any:
-        seen.append(1)
-        return real(self, data)
+        def recording(self: ByteStorage, data: Any, real: Callable[..., Any] = real) -> Any:
+            seen.append(1)
+            return real(self, data)
 
-    monkeypatch.setattr(ByteStorage, "retrieve", recording)
+        monkeypatch.setattr(ByteStorage, name, recording)
     return seen
 
 
@@ -890,21 +891,25 @@ def _verified_payload(serializer_name: str, envelope: bytes) -> bytes:
 
 @pytest.fixture
 def checks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """One entry per integrity check either serializer runs: ByteStorage.retrieve(), or orjson's xxHash3-64."""
+    """One entry per integrity check either serializer runs: ByteStorage.retrieve() or retrieve_data(), or orjson's
+    xxHash3-64."""
     import xxhash
 
     seen: list[str] = []
-    real_retrieve, real_digest = ByteStorage.retrieve, xxhash.xxh3_64_digest
+    real_digest = xxhash.xxh3_64_digest
+    for name in ("retrieve", "retrieve_data"):
+        real = getattr(ByteStorage, name)
 
-    def retrieve(self: ByteStorage, data: Any) -> Any:
-        seen.append("retrieve")
-        return real_retrieve(self, data)
+        def retrieve(self: ByteStorage, data: Any, real: Callable[..., Any] = real) -> Any:
+            seen.append("retrieve")
+            return real(self, data)
+
+        monkeypatch.setattr(ByteStorage, name, retrieve)
 
     def digest(data: Any) -> bytes:
         seen.append("xxh3")
         return real_digest(data)
 
-    monkeypatch.setattr(ByteStorage, "retrieve", retrieve)
     monkeypatch.setattr(xxhash, "xxh3_64_digest", digest)  # the module both serializers call it through
     return seen
 

@@ -211,8 +211,8 @@ pub fn unpackb_interop_py(
 
 /// Whether `bytes_view` borrows `obj` (True) or copies it (False). Test-only: it pins what
 /// `bytes_view` decides for an input, which tracemalloc cannot see (a Rust-side copy never
-/// touches the Python heap). It covers `retrieve`, `check_msgpack_structure`, `unpackb_standard`, `unpackb_auto`
-/// and `unpackb_interop`, and the exact
+/// touches the Python heap). It covers `retrieve`, `retrieve_data`, `check_msgpack_structure`, `unpackb_standard`,
+/// `unpackb_auto` and `unpackb_interop`, and the exact
 /// `bytes` and `B`/`c` `memoryview` inputs the decrypt bindings read through `ciphertext_view`;
 /// that function's `bytes(obj)` route for every other input is outside it. It does not pin how a
 /// caller uses the view: that the callers pass `as_slice()` on without copying it is held by
@@ -260,6 +260,8 @@ impl PyByteStorage {
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)
+    ///
+    /// A caller that discards the format should call `retrieve_data`.
     pub fn retrieve(
         &self,
         py: Python,
@@ -271,6 +273,26 @@ impl PyByteStorage {
         let data = view.as_slice();
         // Detach from the GIL for decompression + checksum (see store()).
         py.detach(|| self.inner.retrieve(data))
+            .map_err(retrieve_error_to_py)
+    }
+
+    /// Retrieve and validate stored bytes, without the format identifier
+    ///
+    /// Same input, checks, data and exceptions as `retrieve`. It skips building the
+    /// format `str` and the result tuple, which a caller that discards the format
+    /// (`StandardSerializer`) pays for on every read.
+    ///
+    /// Returns:
+    ///     bytes: original_data
+    pub fn retrieve_data(
+        &self,
+        py: Python,
+        envelope_bytes: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<u8>> {
+        // Same borrow and GIL release as retrieve(), for the same reasons.
+        let view = bytes_view(py, envelope_bytes)?;
+        let data = view.as_slice();
+        py.detach(|| self.inner.retrieve_data(data))
             .map_err(retrieve_error_to_py)
     }
 
@@ -320,7 +342,7 @@ use zeroize::Zeroizing;
 /// hands the wrapper, go through `bytes_view` (borrowed when the storage is immutable `bytes`).
 /// Every other input (a `bytes` subclass, a `bytearray`, a custom exporter) is read by
 /// `bytes(obj)` itself, so it gets exactly the semantics of the `bytes(data)` coercion these
-/// bindings replaced: `__bytes__` first, then a single export. `retrieve`,
+/// bindings replaced: `__bytes__` first, then a single export. `retrieve`, `retrieve_data`,
 /// `check_msgpack_structure` and `unpackb_standard` keep the strict `bytes_view` on purpose.
 #[cfg(feature = "encryption")]
 fn ciphertext_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {

@@ -28,14 +28,15 @@ LZ4_BOUND_FOR_BUDGET = 20 + PROBE_BUDGET * 110 // 100  # lz4_flex get_maximum_ou
 
 
 class _RetrieveSpy:
-    """Counts retrieve() calls on the wrapped ByteStorage."""
+    """Counts retrieve_data() calls on the wrapped ByteStorage, the one read StandardSerializer makes. It has no
+    retrieve(), so a probe that called it would fail, which the probe reads as "not verified"."""
 
     def __init__(self, inner) -> None:
         self.inner, self.calls = inner, 0
 
-    def retrieve(self, data):
+    def retrieve_data(self, data):
         self.calls += 1
-        return self.inner.retrieve(data)
+        return self.inner.retrieve_data(data)
 
 
 # Integrity-off values and the bytes main wrote for them. The first three are shaped like a ByteStorage

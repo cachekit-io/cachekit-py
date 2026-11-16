@@ -433,8 +433,8 @@ def bounded_error(exc: BaseException | str) -> str:
 class VerifiedPayload:
     """A payload its serializer's own integrity check returned and a decode in this process accepted, which an L1
     entry holds in place of its envelope (``CacheSerializationHandler.deserialize_l1``). ``owner`` (the serializer's
-    class) decodes it without that check again: the MessagePack ``ByteStorage.retrieve()`` returned for
-    StandardSerializer and AutoSerializer, the JSON under a matching xxHash3-64 for OrjsonSerializer.
+    class) decodes it without that check again: the MessagePack ``ByteStorage`` verified for StandardSerializer
+    (``retrieve_data()``) and AutoSerializer (``retrieve()``), the JSON under a matching xxHash3-64 for OrjsonSerializer.
 
     The type is the mark, not the bytes: no backend returns this type, so bytes from L2 never skip the check,
     whatever they hold. ``owner`` keeps one serializer from decoding another's payload. Its length is that of

@@ -558,3 +558,146 @@ class TestByteStorageBufferProtocol:
 
         with pytest.raises(SerializationError):
             StandardSerializer().deserialize(np.zeros(4))
+
+
+# ── retrieve_data(): retrieve() without the format ─────────────────────────────────────────────────────
+
+
+def _read_outcome(read):
+    """What a read returns, or the exact class and message it raises."""
+    try:
+        return ("ok", read())
+    except Exception as e:  # the class and message are the result under test
+        return ("raise", type(e), str(e))
+
+
+def _assert_retrieve_data_is_retrieve_without_format(data) -> None:
+    """retrieve_data(data) returns retrieve(data)[0] as bytes, or raises the same class with the same message."""
+    from cachekit._rust_serializer import ByteStorage
+
+    storage = ByteStorage("msgpack")
+    full = _read_outcome(lambda: storage.retrieve(data))
+    expected = ("ok", full[1][0]) if full[0] == "ok" else full
+    got = _read_outcome(lambda: storage.retrieve_data(data))
+    assert got == expected
+    if got[0] == "ok":
+        assert type(got[1]) is bytes
+
+
+def _protocol_hex_inputs() -> list:
+    """Every ``*_hex`` string in the vendored protocol fixtures: valid envelopes, rejected ones, and payloads."""
+    import json
+    from pathlib import Path
+
+    found: dict[str, str] = {}
+
+    def walk(node, where: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key.endswith("_hex") and isinstance(value, str):
+                    found.setdefault(value, f"{where}.{key}")
+                walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                walk(value, f"{where}[{i}]")
+
+    for fixture in sorted((Path(__file__).parents[1] / "unit" / "protocol" / "fixtures").glob("*.json")):
+        walk(json.loads(fixture.read_text()), fixture.stem)
+    params = []
+    for text, where in found.items():
+        try:
+            params.append(pytest.param(bytes.fromhex(text), id=where))
+        except ValueError:  # the encryption fixture's deliberately malformed master-key hex, not bytes
+            continue
+    assert len(params) > 50, "the protocol fixtures moved: this parity test no longer reads their vectors"
+    return params
+
+
+@pytest.mark.parametrize("data", _protocol_hex_inputs())
+def test_retrieve_data_matches_retrieve_on_protocol_vectors(data: bytes) -> None:
+    _assert_retrieve_data_is_retrieve_without_format(data)
+
+
+def _failure_inputs() -> list:
+    """One input per way retrieve() fails, plus the buffer shapes it accepts. Each param is a factory, so the
+    512 MiB over-cap input exists only while its own case runs."""
+    import msgpack
+
+    from cachekit._rust_serializer import ByteStorage
+
+    storage = ByteStorage("msgpack")
+    payload = b"cachekit retrieve_data parity " * 40
+    envelope = storage.store(payload, None)
+    fields = msgpack.unpackb(envelope)
+    flipped = bytearray(envelope)
+    flipped[len(flipped) // 2] ^= 0x01
+    strided = bytes(b for byte in envelope for b in (byte, 0xFF))
+    cases = {
+        "valid": lambda: envelope,
+        "valid-literal-other-format": lambda: storage.store(b"tiny", "json"),
+        "empty": lambda: b"",
+        "not-an-envelope": lambda: b"not an envelope",
+        "flipped-byte": lambda: bytes(flipped),
+        "truncated": lambda: envelope[:-1],
+        "checksum-mismatch": lambda: msgpack.packb([fields[0], [0] * 8, fields[2], fields[3]]),
+        "size-mismatch": lambda: msgpack.packb([fields[0], fields[1], fields[2] + 1, fields[3]]),
+        "ratio-bomb": lambda: msgpack.packb([b"\x00" * 1000, [0] * 8, 200 * 1024 * 1024, "msgpack"]),
+        "format-not-utf8": lambda: msgpack.packb([fields[0], fields[1], fields[2], b"\xff"]),
+        "over-max-compressed-size": lambda: b"\x00" * (storage.max_compressed_size + 1),
+        "memoryview": lambda: memoryview(envelope),
+        "bytearray": lambda: bytearray(envelope),
+        "memoryview-of-bytearray": lambda: memoryview(bytearray(envelope)),
+        "strided-memoryview": lambda: memoryview(strided)[::2],
+        "corrupt-memoryview": lambda: memoryview(bytes(flipped)),
+        "not-a-buffer": lambda: 12345,
+    }
+    return [pytest.param(make, id=name) for name, make in cases.items()]
+
+
+@pytest.mark.parametrize("make", _failure_inputs())
+def test_retrieve_data_matches_retrieve_on_each_failure_class(make) -> None:
+    _assert_retrieve_data_is_retrieve_without_format(make())
+
+
+def test_retrieve_data_failure_classes_are_the_taxonomy() -> None:
+    """The parity above holds against the taxonomy itself, not only against retrieve(): an unparsable input stays a
+    plain ValueError and a verified-but-corrupt envelope is EnvelopeIntegrityError."""
+    import msgpack
+
+    from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
+
+    storage = ByteStorage("msgpack")
+    fields = msgpack.unpackb(storage.store(b"x" * 200, None))
+    with pytest.raises(ValueError) as not_envelope:
+        storage.retrieve_data(b"not an envelope")
+    assert type(not_envelope.value) is ValueError
+    with pytest.raises(EnvelopeIntegrityError):
+        storage.retrieve_data(msgpack.packb([fields[0], [0] * 8, fields[2], fields[3]]))
+
+
+def test_retrieve_data_matches_retrieve_on_arbitrary_and_mutated_envelopes() -> None:
+    """Property: for arbitrary bytes, and for a real envelope with bytes overwritten, cut or appended,
+    retrieve_data gives what retrieve gives without the format."""
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+
+    from cachekit._rust_serializer import ByteStorage
+
+    storage = ByteStorage("msgpack")
+    envelopes = [storage.store(p, None) for p in (b"", b"a" * 40, b"cachekit " * 120, bytes(range(256)) * 4)]
+
+    @st.composite
+    def mutated(draw):
+        envelope = bytearray(draw(st.sampled_from(envelopes)))
+        for _ in range(draw(st.integers(0, 3))):
+            if envelope:
+                envelope[draw(st.integers(0, len(envelope) - 1))] = draw(st.integers(0, 255))
+        cut = draw(st.integers(0, len(envelope)))
+        return bytes(envelope[:cut] if draw(st.booleans()) else envelope) + draw(st.binary(max_size=3))
+
+    @settings(max_examples=3000, deadline=None)
+    @given(data=st.one_of(st.binary(max_size=64), mutated()))
+    def check(data: bytes) -> None:
+        _assert_retrieve_data_is_retrieve_without_format(data)
+
+    check()
