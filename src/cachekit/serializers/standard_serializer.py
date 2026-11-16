@@ -345,7 +345,7 @@ class StandardSerializer:
                 fails. With integrity checking off, also if the entry is a ByteStorage envelope,
                 which this reader does not unwrap: ``metadata.compressed`` says so, or the bytes
                 have the layout ByteStorage writes, declare at most 256 KiB, and pass
-                ``ByteStorage.retrieve()``. Shape alone never refuses a value, unlike
+                ``ByteStorage.retrieve_data()``. Shape alone never refuses a value, unlike
                 :class:`AutoSerializer`: the docs send users here to escape that refusal, and a
                 look-alike cannot match the checksum by chance. So without a ``compressed=True``
                 header, a rotted envelope, one declaring more than 256 KiB, and one in another
@@ -364,12 +364,12 @@ class StandardSerializer:
             >>> result == {"test": 123}
             True
         """
-        # No bytes() coercion: Rust retrieve accepts the buffer protocol, so
+        # No bytes() coercion: Rust retrieve_data accepts the buffer protocol, so
         # unwrap's zero-copy memoryview flows through without a full-payload copy.
         try:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
-                msgpack_data, _ = self._byte_storage.retrieve(data)
+                msgpack_data = self._byte_storage.retrieve_data(data)
                 return unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
             # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
             if metadata is not None and metadata.compressed:
@@ -393,8 +393,8 @@ class StandardSerializer:
         self, data: bytes | memoryview, metadata: SerializationMetadata
     ) -> tuple[Any, VerifiedPayload] | None:
         """What :meth:`deserialize` returns for a ByteStorage envelope when integrity checking is on, plus the
-        MessagePack ``retrieve()`` verified and this decode accepted, for the caller to keep and decode later
-        without retrieve() (:meth:`_deserialize_verified`). None, decoding nothing, when the header does not say
+        MessagePack ``retrieve_data()`` verified and this decode accepted, for the caller to keep and decode later
+        without retrieve_data() (:meth:`_deserialize_verified`). None, decoding nothing, when the header does not say
         what an integrity-on writer wrote (``compressed``): the caller decodes such an entry as any other. It
         always unwraps the envelope, so call it only for an integrity-on serializer. Raises SerializationError as
         deserialize does then.
@@ -409,7 +409,7 @@ class StandardSerializer:
         if not metadata.compressed:
             return None
         try:
-            msgpack_data, _ = self._byte_storage.retrieve(data)
+            msgpack_data = self._byte_storage.retrieve_data(data)
             value = unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
@@ -417,7 +417,7 @@ class StandardSerializer:
 
     def _deserialize_verified(self, msgpack_data: bytes) -> Any:
         """Decode MessagePack a decode in this process already verified (:meth:`_deserialize_keeping`),
-        without retrieve(). Raises SerializationError as deserialize does."""
+        without retrieve_data(). Raises SerializationError as deserialize does."""
         try:
             return unpackb_standard(msgpack_data, MSGPACK_MAX_NESTING, _standard_object_hook)
         except PAYLOAD_DECODE_ERRORS as e:
@@ -425,9 +425,9 @@ class StandardSerializer:
 
     def _is_verified_envelope(self, data: bytes | memoryview, value: Any, markers: frozenset[int]) -> bool:
         """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope whose payload marker
-        is in ``markers`` and that passes ``retrieve()``."""
+        is in ``markers`` and that passes ``retrieve_data()``."""
         # Necessary conditions, never a verdict. The layout test spares ordinary reads the attempt. The
-        # size caps bound it: retrieve() copies the whole payload slot and decompresses the whole declared
+        # size caps bound it: retrieve_data() copies the whole payload slot and decompresses the whole declared
         # payload before it checks the checksum, and a caller can cache a value shaped like a large
         # envelope. A 0x94 lead that decoded is a 4-element list whose slot 0 is bytes or a list, so
         # value[2] is the declared original_size and len(value[0]) the compressed length.
@@ -438,7 +438,7 @@ class StandardSerializer:
         if len(value[0]) > _ENVELOPE_PROBE_MAX_COMPRESSED:
             return False
         try:
-            self._byte_storage.retrieve(data)
+            self._byte_storage.retrieve_data(data)
         except Exception:  # any failure (not an envelope, checksum, size) means "not verified"
             return False
         return True

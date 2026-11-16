@@ -19,8 +19,9 @@ name = "cachekit_storage"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Compression, checksums, encryption (https://crates.io/crates/cachekit-core)
-cachekit-core = { version = "0.7.0", features = ["compression", "checksum", "messagepack", "encryption"] }
+# Compression, checksums, encryption (https://crates.io/crates/cachekit-core).
+# 0.7.5 is the floor: the binding calls ByteStorage::retrieve_data, new in 0.7.5.
+cachekit-core = { version = "0.7.5", features = ["compression", "checksum", "messagepack", "encryption"] }
 
 # Python integration - optional for Rust-only builds
 pyo3 = { workspace = true, optional = true }

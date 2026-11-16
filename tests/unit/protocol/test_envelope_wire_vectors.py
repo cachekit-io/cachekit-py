@@ -13,8 +13,9 @@ writers emit, at the bin8 and bin16 header widths. This module proves — not as
 paths that:
 
 1. **Legacy-read**: pre-0.4.0 envelopes decode through ``ByteStorage.retrieve``
-   (the exact FFI call every serializer's deserialize path makes) and through
-   the full decorator retrieve path.
+   (the FFI read ``AutoSerializer`` makes; ``StandardSerializer`` makes
+   ``ByteStorage.retrieve_data``, the same core decode without the format) and
+   through the full decorator retrieve path, which reads through ``retrieve_data``.
 2. **Bin-emit**: fresh writes carry ``bin``-encoded envelopes (marker
    ``0xc4``/``0xc5``/``0xc6`` on element[0]), observed inside the CK v3 frame
    through the real decorator store path and at every width tier through the
@@ -39,6 +40,12 @@ paths that:
    checked against ``Cargo.lock``): the spec lets an SDK over core do so when it
    passes the envelope bytes through, and ``ByteStorage.retrieve`` hands them to
    core with no allocation of its own sized from an envelope field.
+   ``StandardSerializer`` reads through ``ByteStorage.retrieve_data``, and the bound
+   carries over to it: in core ``retrieve_data`` runs the same decode and extract
+   as ``retrieve`` and only skips allocating the format ``String``, so it requests
+   no more than ``retrieve`` does, and the binding hands it the envelope bytes the
+   same way. Core's probe also measures ``retrieve_data`` directly, on rejected
+   envelopes and on every ``bin`` vector.
 7. **Payload decode bounds**: every ``payload_reject_vectors`` envelope passes the
    envelope read, and ``StandardSerializer`` then refuses its payload with the
    structural guard's own error, before the decode allocates.
@@ -73,7 +80,7 @@ pytestmark = pytest.mark.unit
 
 CARGO_LOCK = Path(__file__).parents[3] / "Cargo.lock"
 # The cachekit-core release whose publish job ran core's allocation probe (docstring item 6).
-PROBE_VERIFIED_CORE_VERSION = "0.7.4"
+PROBE_VERIFIED_CORE_VERSION = "0.7.5"
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "wire-format.json"
 FIXTURE_SHA256 = "806de79dca2e0e6b221b8ec191526207d32f9fe5d88597098dd2549427b4993c"  # pragma: allowlist secret
