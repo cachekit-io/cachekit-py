@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.26.1](https://github.com/cachekit-io/cachekit-py/compare/v0.26.0...v0.26.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **perf:** keep the instruction gate's workload directory off sys.path (LAB-12430) ([#727](https://github.com/cachekit-io/cachekit-py/issues/727)) ([af03ace](https://github.com/cachekit-io/cachekit-py/commit/af03ace489d03f0a76392776b7a58bd894b1625b))
+
+
+### Performance Improvements
+
+* **ir:** budget a 1 KiB ByteStorage store, and name estimate_compression's thread table (LAB-12169) ([#724](https://github.com/cachekit-io/cachekit-py/issues/724)) ([4e223d1](https://github.com/cachekit-io/cachekit-py/commit/4e223d1e2d3aa705e2da957da27c5b935b59ffbb))
+* **serializers:** read StandardSerializer envelopes through ByteStorage.retrieve_data (LAB-12131) ([#725](https://github.com/cachekit-io/cachekit-py/issues/725)) ([2647733](https://github.com/cachekit-io/cachekit-py/commit/2647733a307d2f8f7f63dfa093b17710c3996e6f))
+
 ## [0.26.0](https://github.com/cachekit-io/cachekit-py/compare/v0.25.1...v0.26.0) (2026-11-08)
 
 
