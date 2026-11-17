@@ -304,7 +304,9 @@ class L1Cache:
         """Store value in L1 cache with TTL.
 
         A value larger than an eighth of max_memory_bytes is not stored, and any older entry under
-        the key is dropped; callers serve it from L2, or recompute it if L2 did not store it.
+        the key is dropped; callers serve it from L2, or recompute it if L2 did not store it. The
+        same holds, for every caller, for a value whose expiry is non-finite or already past once
+        ttl_buffer_seconds is taken off: a declined put never leaves the previous value serving.
 
         Args:
             key: Cache key
@@ -328,6 +330,11 @@ class L1Cache:
                 "the mapped file for the entry's TTL. Materialize to bytes before caching."
             )
 
+        # Before the first _state use, the declined put's removal below included: the take-over
+        # replaces a state whose lock fork orphaned.
+        if self._before_store is not None:
+            self._before_store()
+
         # Calculate expiry time
         current_time = time.time()
         if expires_at is not None:
@@ -339,17 +346,16 @@ class L1Cache:
 
         # Skip caching if the effective TTL is non-finite (NaN/inf would create an
         # immortal entry that never expires) or too short (would expire immediately).
+        # Any older entry under the key is dropped, as for an oversized value below: a put that
+        # declines to store a newer value must not leave the previous one serving.
         if not math.isfinite(expiry) or expiry <= current_time:
+            self._on_current_state(_L1State.remove, key)
             logger.debug(
                 "Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)",
                 redact_key_for_log(key),
                 expiry,
             )
             return
-
-        # Before the first _state use: the take-over replaces a state whose lock fork orphaned.
-        if self._before_store is not None:
-            self._before_store()
 
         # Estimate size
         size = self._estimate_size(value)

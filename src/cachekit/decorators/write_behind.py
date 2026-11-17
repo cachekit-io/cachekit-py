@@ -22,6 +22,9 @@ calls are already what invalidation uses off the loop.
   bytes have no cap from those values: each can be any size, and they stay queued while older entries
   are sent. At most ``MAX_WORKERS`` threads send, started on demand.
   The bounds are sized so a full queue drains within ``EXIT_FLUSH_SECONDS`` at half a second per write.
+- **Discarded values.** A queued value that is replaced, superseded at the cap or cancelled is never sent;
+  its ``on_drop`` (``submit``) runs once, with no writer lock held, so the caller can undo what it did on
+  the promise of the write (the decorator drops its L1 copy of the value).
 - **Parking.** A thread whose queue is empty waits up to ``IDLE_S`` for the next write before it ends, and
   ``submit`` wakes it instead of starting a thread: ``Thread.start()`` waits for the new thread to run, which
   costs a miss more than a local Redis SET does. At most ``MAX_PARKED`` threads wait per process; past that a
@@ -51,7 +54,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from .. import l1_cache
 from ..hash_utils import redact_cache_key, redact_error_for_log
@@ -81,6 +84,10 @@ class _Job(NamedTuple):
     send: Callable[[], None]
     context: contextvars.Context
     size: int
+    # Called, outside the writer's lock, when the job is discarded without being sent: replaced by a newer
+    # value for its entry, superseded at the cap, or cancelled. Its caller's provisional state (an L1 copy
+    # of a value that will now never be written) is undone there.
+    on_drop: Optional[Callable[[], None]] = None
 
 
 class _State:
@@ -139,12 +146,29 @@ class WriteBehind:
                 state = self._state = _State()
             return state
 
-    def submit(self, entry: Entry, size: int, send: Callable[[], None]) -> bool:
-        """Queue ``send`` as the write of ``entry``. False if refused: the caller writes it synchronously."""
+    def submit(self, entry: Entry, size: int, send: Callable[[], None], on_drop: Optional[Callable[[], None]] = None) -> bool:
+        """Queue ``send`` as the write of ``entry``. False if refused: the caller writes it synchronously.
+        ``on_drop`` runs if the job is later discarded unsent (see ``_Job``)."""
         s = self._current()
         if l1_cache._forked_without_hooks():
             return False  # no thread may start here
-        job = _Job(send, contextvars.copy_context(), size)
+        job = _Job(send, contextvars.copy_context(), size, on_drop)
+        dropped: list[tuple[Entry, _Job]] = []
+        try:
+            return self._submit(s, entry, size, job, dropped)
+        finally:
+            self._dropped(dropped)
+
+    def _dropped(self, dropped: list[tuple[Entry, _Job]]) -> None:
+        """Run the ``on_drop`` of jobs discarded unsent, with no writer lock held: it takes its caller's locks."""
+        for entry, job in dropped:
+            if job.on_drop is not None:
+                try:
+                    job.on_drop()
+                except Exception as exc:  # noqa: BLE001 - reported like a send's failure, never raised into a caller
+                    self._on_error(entry, exc)
+
+    def _submit(self, s: _State, entry: Entry, size: int, job: _Job, dropped: list[tuple[Entry, _Job]]) -> bool:
         with s.cond:
             if s.closed:
                 return False
@@ -159,7 +183,10 @@ class WriteBehind:
                 if old is not None:  # superseded by the value the caller now writes itself
                     del s.pending[entry]
                     s.bytes -= old_size
+                    dropped.append((entry, old))
                 return False
+            if old is not None:  # replaced by this newer value: the old one is never sent
+                dropped.append((entry, old))
             s.pending[entry] = job
             s.bytes += size - old_size
             if s.idle:
@@ -224,9 +251,18 @@ class WriteBehind:
         sent before a write returns could be overtaken by it. Never call it from a ``send``: that send would
         wait on itself."""
         s = self._current()
+        dropped: list[tuple[Entry, _Job]] = []
+        try:
+            self._cancel(s, match, wait, dropped)
+        finally:
+            self._dropped(dropped)
+
+    def _cancel(self, s: _State, match: Callable[[Entry], bool], wait: bool, dropped: list[tuple[Entry, _Job]]) -> None:
         with s.cond:
             for entry in [e for e in s.pending if match(e)]:
-                s.bytes -= s.pending.pop(entry).size
+                job = s.pending.pop(entry)
+                s.bytes -= job.size
+                dropped.append((entry, job))
             if wait:
                 # Jobs, not entries: a later send of the same entry is another job.
                 sending = [(e, job) for e, job in s.sending.items() if match(e)]
