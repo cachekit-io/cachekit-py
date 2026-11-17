@@ -1369,10 +1369,9 @@ class CacheSerializationHandler:
 
         When this handler keeps verified payloads (``keeps_verified_in_l1``), the entry is its own plaintext envelope
         of a kind its serializer keeps, and the payload this decode verified is no longer than the entry, that payload
-        (:class:`VerifiedPayload`: the MessagePack ``ByteStorage.retrieve()`` returned for the default and auto
-        serializers, the checksummed JSON for orjson), for the caller to swap in (``L1Cache.shrink_if_held``) at no
-        second decode: later hits skip the integrity check (retrieve()'s decompress and checksum, or orjson's
-        checksum). Everything else gets None: a kept entry decodes that way, a longer payload would grow the entry
+        (:class:`VerifiedPayload`: the MessagePack ``ByteStorage`` verified for the default and auto serializers,
+        the checksummed JSON for orjson), for the caller to swap in (``L1Cache.shrink_if_held``) at no second decode:
+        later hits skip the integrity check (ByteStorage's decompress and checksum, or orjson's checksum). Everything else gets None: a kept entry decodes that way, a longer payload would grow the entry
         so L1 keeps the envelope, and any other entry goes to deserialize_data, which refuses another handler's kept
         entry. Every decode, kept or not, runs its serializer's bounded decode. Raises as deserialize_data.
 

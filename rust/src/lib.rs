@@ -83,7 +83,7 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The Memcached backend's rendezvous node choice (backends/memcached/hasher.py)
     m.add_function(wrap_pyfunction!(rendezvous::rendezvous_node, m)?)?;
 
-    // ByteStorage.retrieve() envelope-verification-failure taxonomy. Same
+    // ByteStorage.retrieve() / retrieve_data() envelope-verification-failure taxonomy. Same
     // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the
     // bare "_rust_serializer", which breaks pickling back to a parent process otherwise.
     let envelope_integrity_error = m.py().get_type::<python_bindings::EnvelopeIntegrityError>();
