@@ -385,6 +385,18 @@ def test_a_second_signal_anywhere_inside_the_kill_leaves_no_run_behind(tmp_path,
                 os.kill(int(f.name), signal.SIGKILL)
 
 
+def test_the_measured_process_does_not_import_from_the_workload_directory(tmp_path, monkeypatch) -> None:
+    """A new entry in the workload's directory (pytest's __pycache__) moved figures by up to 2% while it was
+    sys.path[0], so the measured process runs with that directory off its import path."""
+    script = tmp_path / "workload.py"
+    script.write_text("import json, sys\nopen(sys.argv[0] + '.path', 'w').write(json.dumps(sys.path))\n")
+    monkeypatch.setattr(ir_budget, "_measure_one", lambda *args: 0)  # the warm-up run is the real process
+    ir_budget.measure(["l1_hit"], 1, workload=script)
+    path = json.loads((tmp_path / "workload.py.path").read_text())
+    assert str(tmp_path) not in path
+    assert path  # the probe did see an import path: the stdlib's
+
+
 def test_every_path_has_a_committed_budget() -> None:
     """A new path must land with its budget, or `make perf-ir` fails on every machine."""
     data = json.loads(ir_budget.BASELINES.read_text())

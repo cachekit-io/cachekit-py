@@ -313,10 +313,10 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 - Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped. The two real-data paths cost about 60 million instructions per call, so they run 10 and 30 calls after 5 warmup calls; startup still cancels.
 - Startup cancels only if it costs the same in every run. Three things made it vary, and the measured process takes each out. pyarrow's bundled jemalloc starts a background thread at import, and how it was scheduled against the main thread put a run in one of two startup states: `JE_ARROW_MALLOC_CONF=background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1` turns it off without moving its real-time purging onto the main thread. pyarrow's default allocator, mimalloc, purges freed memory after a real-time delay that the freeing thread checks: `MIMALLOC_PURGE_DELAY=-1`. `numpy.random`, which pandas imports, seeds its global generator from OS entropy, and the value drawn moves the heap layout: `ir_workload.pin_os_entropy` seeds Python's OS entropy first. With all three, 16 runs at one layout agree within 4,000 instructions at each loop size on 16 of the 20 paths then gated, on CPython 3.12 and 3.14.
 - Four paths keep noise this setup does not reach. The three Arrow round trips (`serializer_arrow` and the two real-data paths) run part of each call on pyarrow's thread pool, and how that work interleaves with the main thread's allocations moves the main thread's count by 0.5 to 2.8 million instructions per run, growing with the number of calls, with or without these settings: up to 0.1% of one layout's figure for `serializer_arrow` and 0.25% for the real-data paths. `file_set`'s startup still varies by up to 126,000 instructions, from a source not identified: up to 0.15% of one layout's figure. All four sit well inside the 1% threshold.
-- The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day L1 cleanup interval, pyarrow's allocators set as above, nothing inherited), seeded log sampling and OS entropy, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
+- The measured process has a fixed environment (`PYTHONHASHSEED=0`, the script's directory off the import path, one BLAS/OpenMP thread, a one-day L1 cleanup interval, pyarrow's allocators set as above, nothing inherited), seeded log sampling and OS entropy, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
 - Nothing that runs on real time lands in the measured loop: no background thread wakes, cyclic GC is off, and the GIL switch interval is long enough that the main thread gives up the GIL only where the code releases it.
 - Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the median. Any code change moves the layout, and the allocators take shorter or longer paths in some heap states: single layouts of the orjson round trip and the minimal L1 hit sat up to 2.4% from the rest. The median ignores one or two such layouts. The cheapest layout is not used, because a lucky one can sit 1% below the rest, and a budget recorded there makes every later run look like a regression.
-- `ir_workload.py`'s text is compiled into every measured process, so editing it moves the layout the budgets were recorded at: re-record after any change to it. The gate itself (`ir_budget.py`) is kept out of the measured process, so editing it does not move a budget. The measured script's directory, `tests/performance/`, is first on the measured process's import path, so anything added there moves the layout too. A `__pycache__` there, which importing `ir_budget` or `ir_workload` without `-B` creates (pytest does), moved `serializer_orjson` on CPython 3.12 by 0.16% to 2.0%, depending on the tree. Record and gate with that directory as a fresh checkout has it, and change nothing in it while a run is measuring.
+- `ir_workload.py`'s text is compiled into every measured process, so editing it moves the layout the budgets were recorded at: re-record after any change to it. The gate itself (`ir_budget.py`) is kept out of the measured process, so editing it does not move a budget. The measured process runs with `PYTHONSAFEPATH=1`, which keeps the script's directory, `tests/performance/`, off its import path. While that directory was first on the path, the import system listed it on every import, so anything added there moved the layout: a `__pycache__`, which pytest creates when it imports `ir_budget` or `ir_workload`, moved `serializer_orjson` on CPython 3.12 by 0.16% to 2.0%, depending on the tree. Off the path, gate runs with and without that `__pycache__` read the same figures on CPython 3.12 and 3.14, apart from the run-to-run noise two identical runs also show.
 - The L2 paths and the backed L1 hit use an in-process dict backend, so they cost instructions only: no sockets, retries or timeouts.
 - The metrics collector starts synchronous and switches to batched mode (generic metrics queue for a worker thread) when its 5 s check sees more than 100 records/s. Cache operations record into per-thread cells in either mode. Pinned clocks never reach that check, so the plain paths measure a synchronous collector, and `l2_hit_async_metrics` the batched collector a busy long-lived process runs; it checks that no cache operation queues. Every metrics path records once per call through the same method, so one batched path covers that mode.
 
@@ -324,29 +324,29 @@ The regression gate is the instruction budget: `make perf-ir` on your machine, a
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 2,938 | 2,765 |
-| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CacheKit Cloud backend with telemetry on does, so each call pays the 1-in-256 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 81,385 | 81,597 |
-| `l1_hit_backed_auto` | `@cache` with `serializer="auto"` and a backend that keeps no hit-latency report, L1 hit (decodes the verified MessagePack the auto serializer keeps) | 81,186 | 81,501 |
-| `l1_hit_interop` | `@cache(interop=..., namespace=...)` with a backend that keeps no hit-latency report, L1 hit (builds its interop key, decodes the plain MessagePack value L1 holds) | 106,054 | 106,027 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,939 | 2,765 |
-| `local_hit` | `@cache.local()` hit (the stored object itself, no key built, no lock taken) | 3,091 | 2,947 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 161,478 | 156,355 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,791 | 205,344 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 123,462 | 123,391 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 161,419 | 156,501 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 46,091 | 46,387 |
-| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 999,474 | 975,870 |
-| `serializer_auto` | `AutoSerializer` round trip | 51,641 | 52,049 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 22,208 | 22,561 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,968,895 | 1,979,166 |
-| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,764,052 | 61,361,844 |
-| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,746,762 | 61,379,809 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 87,427 | 88,677 |
-| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,049 | 1,919 |
-| `byte_storage_store_1k` | `ByteStorage.store()` alone, 1 KiB of address-like text (from 64 bytes to under 4 KiB, cachekit-core compresses with one LZ4 table kept per thread) | 22,330 | 22,199 |
-| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,624 | 720,416 |
-| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,665 | 73,767 |
-| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,417 | 161,413 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 2,936 | 2,758 |
+| `l1_hit_backed` | `@cache` with a backend configured, L1 hit (never reaches the in-process dict backend; decodes the verified MessagePack L1 holds after the first hit). The backend keeps an L1 hit-latency report, as a CacheKit Cloud backend with telemetry on does, so each call pays the 1-in-256 timing draw and the timed hits' clock reads ([Telemetry](backends/cachekitio.md#telemetry)) | 81,040 | 81,736 |
+| `l1_hit_backed_auto` | `@cache` with `serializer="auto"` and a backend that keeps no hit-latency report, L1 hit (decodes the verified MessagePack the auto serializer keeps) | 81,299 | 81,600 |
+| `l1_hit_interop` | `@cache(interop=..., namespace=...)` with a backend that keeps no hit-latency report, L1 hit (builds its interop key, decodes the plain MessagePack value L1 holds) | 106,198 | 106,135 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 2,936 | 2,758 |
+| `local_hit` | `@cache.local()` hit (the stored object itself, no key built, no lock taken) | 3,089 | 2,940 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit, as one in-process single-flight trip | 161,386 | 156,451 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write, all as one in-process single-flight trip | 213,990 | 205,148 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (builds its key, decrypts the ciphertext L1 holds) | 123,052 | 123,557 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 161,532 | 156,617 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 46,087 | 46,495 |
+| `serializer_default_records` | `StandardSerializer` round trip, list of 100 six-field records (dict-heavy decode) | 1,000,277 | 984,853 |
+| `serializer_auto` | `AutoSerializer` round trip | 51,632 | 52,130 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 22,177 | 22,514 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,971,905 | 1,981,779 |
+| `serializer_arrow_usgs` | `ArrowSerializer` round trip, real 12,535-row DataFrame (see Real data below) | 61,754,496 | 61,287,381 |
+| `serializer_auto_usgs` | `AutoSerializer` round trip, same frame (it hands the frame to Arrow) | 61,750,294 | 61,294,994 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 87,357 | 88,750 |
+| `byte_storage_store_40b` | `ByteStorage.store()` alone, 40-byte compressible input (under cachekit-core's 64-byte literals-only LZ4 threshold) | 2,042 | 1,967 |
+| `byte_storage_store_1k` | `ByteStorage.store()` alone, 1 KiB of address-like text (from 64 bytes to under 4 KiB, cachekit-core compresses with one LZ4 table kept per thread) | 22,327 | 22,201 |
+| `byte_storage_store_64k` | `ByteStorage.store()` alone, 64 KiB of address-like text | 720,435 | 724,450 |
+| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 75,723 | 73,714 |
+| `object_cache_put_full` | `ObjectCache.put()` of a new key into a full 10,000-entry byte budget (evicts the LRU entry; nothing expired) | 165,267 | 161,430 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. Every committed budget comes from one reference machine: x86_64, Ubuntu 24.04, glibc 2.39, valgrind 3.22.0, CPython 3.12.12 and 3.14.3 (uv's builds), the release extension that `uv sync` builds, and the dependencies in `uv.lock`. Counts depend on that whole build, so on any other machine, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. `l2_hit` and `l2_hit_async_metrics` cost the same within 0.4%: a cache operation records into per-thread cells in either mode.
 

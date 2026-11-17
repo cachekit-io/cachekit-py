@@ -261,6 +261,10 @@ def measure(
         "LC_ALL": "C.UTF-8",
         "PYTHONHASHSEED": "0",
         "PYTHONNOUSERSITE": "1",
+        # The script's directory would be sys.path[0], and the import system lists it on every import,
+        # so any new entry there (a __pycache__ from pytest, say) moved the layout: serializer_orjson by
+        # up to 2% per op on 3.12. ir_workload.py imports nothing beside it.
+        "PYTHONSAFEPATH": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
         # pyarrow's two allocators run on real time. Its bundled jemalloc starts a background thread at
