@@ -2,7 +2,7 @@
 
 # cachekit
 
-> **Python caching, batteries included**
+> **Caching for Python, TypeScript and Rust, with opt-in zero-knowledge encryption, circuit breakers and stampede protection.**
 
 Backend-agnostic caching with intent-based decorators — circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge encryption on a Rust-powered core. Zero config to start, any backend when you scale.
 
