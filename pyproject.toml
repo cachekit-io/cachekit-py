@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.26.0"
+version = "0.26.1"
 description = "Caching for Python, TypeScript and Rust, with opt-in zero-knowledge encryption, circuit breakers and stampede protection."
 readme = "README.md"
 license = {text = "MIT"}
