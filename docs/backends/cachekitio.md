@@ -136,6 +136,44 @@ async with backend.acquire_lock("my-key", timeout=30.0, blocking_timeout=5.0) as
 The `@cache` decorators use this automatically on cache miss for **async**
 functions — see [Distributed Locking](../features/distributed-locking.md).
 
+## TTL Range and Plan Maximum
+
+A TTL is 1 to 7,776,000 seconds (90 days), and `ttl + stale_ttl` stays within the same 7,776,000.
+The decorator rejects a larger `ttl + stale_ttl` at decoration time. Your plan then sets the
+longest an entry is kept, its stale window included:
+
+| Plan | Maximum TTL |
+| :--- | :--- |
+| Free | 86,400 s (24 hours) |
+| Startup | 2,592,000 s (30 days) |
+| Professional | 7,776,000 s (90 days) |
+| Enterprise | None |
+
+A longer TTL is clamped to the maximum, not rejected, and the stale window gets only what the
+maximum leaves after the fresh TTL. A write without a TTL (`ttl=None`) is stored for the plan
+maximum. An entry never expires only on a plan without a maximum, or where none applied when
+it was written: a write whose plan the service could not determine is stored as stated, and an
+entry written before the maximum applied keeps its timing until its next write. `refresh_ttl` is
+clamped the same way.
+
+The server reports the result in the `PUT` response's `X-CacheKit-Fresh-For`, and the decorator
+bounds its in-process (L1) copy of the value it wrote by it: the copy lives at most
+`min(ttl, fresh_for)` from the response, so a clamped write is never served from L1 past the
+plan maximum. A malformed or `0` value keeps no L1 copy; a server that sends no header leaves the
+copy at `ttl`. The `PATCH` response of `refresh_ttl` does not report the applied TTL, so it never
+lengthens an L1 copy. A `CachekitIOBackend` subclass that overrides `set` keeps this bound as long
+as its override calls `super().set(...)` on the same thread. The same holds for a wrapper or proxy
+backend whose `set` calls a `CachekitIOBackend`'s `set` on the same thread, provided the decorator
+can find that backend at its first L2 write: in an instance or class attribute (`__slots__` included), or in a dict,
+list, tuple or set there (a router or a shard ring), at most three wrappers down. A wrapper too
+large to search is assumed to hold one. A wrapper that holds its backend only in a closure,
+or creates it on first use (even into an attribute: the search runs before the first write and its
+answer is kept), is not found: its L1 copies keep `ttl`, and the decorator logs this once per
+wrapper class. Hold the backend in an attribute from construction to get the bound. A wrapper that delegates on another thread (a timeout wrapper with its own executor) must
+run the call under `contextvars.copy_context().run`; otherwise its L1 copies keep `ttl` and ignore
+Fresh-For. A subclass that writes any other way gives the decorator no response to read, so it
+keeps no L1 copy of that write.
+
 ## TTL Inspection (async only)
 
 ```python notest
