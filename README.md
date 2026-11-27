@@ -2,7 +2,9 @@
 
 [![PyPI Version][pypi-badge]][pypi-url] [![Python Versions][python-badge]][pypi-url] [![codecov][codecov-badge]][codecov-url] [![License: MIT][license-badge]][license-url]
 
-Python caching, batteries included: backend-agnostic caching with intent-based decorators — circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge encryption on a Rust-powered core; zero config to start, any backend when you scale.
+> **Caching for Python, TypeScript and Rust, with opt-in zero-knowledge encryption, circuit breakers and stampede protection.**
+
+Backend-agnostic caching with intent-based decorators — circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge encryption on a Rust-powered core; zero config to start, any backend when you scale.
 
 > [!NOTE]
 > **Status: beta** — CacheKit is in closed beta ahead of 1.0. APIs are stabilising; minor breaking changes may still occur between 0.x releases.
