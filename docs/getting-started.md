@@ -23,7 +23,7 @@
 ## Quick Start
 
 CacheKit provides a unified caching API with pluggable backends. You write `@cache`
-once; the backend (Redis, CacheKit Cloud, Memcached, or File / L1-only) is selected from
+once; the backend (Redis, CacheKit Cloud, Memcached, Google Cloud Storage, or File / L1-only) is selected from
 your environment. See [Choose Your Backend](#choose-your-backend) for the full menu.
 
 With nothing configured, `@cache` caches in L1 only, in process, like `lru_cache`. It
@@ -252,13 +252,14 @@ export CACHEKIT_CONNECTION_POOL_SIZE=50
 
 ## Choose Your Backend
 
-Four paths depending on your situation:
+Five paths depending on your situation:
 
 | Backend | When to use | Setup effort |
 |:--------|:------------|:-------------|
 | **Redis** (recommended) | Production, existing infra, full control | Medium — run Redis yourself |
 | **CacheKit Cloud** (closed beta) | Skip Redis ops, managed edge caching | Low — API key only |
 | **Memcached** (optional) | High-throughput, existing Memcached infra | Low — `pip install cachekit[memcached]` |
+| **Google Cloud Storage** (optional) | Cloud Run and jobs: durable results, no server | Low — `pip install cachekit[gcs]` and a bucket |
 | **File / L1-only** | Local dev, tests, no external deps | None |
 
 ### Redis (Recommended)
@@ -321,6 +322,28 @@ def get_user(user_id: int):
 ```
 
 Everything else — TTL, namespaces, serializers — works the same as with Redis. See the [Backend Guide](backends/README.md) for multi-server configuration.
+
+### Google Cloud Storage (Optional)
+
+One object per cache entry in a bucket you own. Durable and shared, with no server to run; each L1 miss is a request to GCS.
+
+```bash
+pip install cachekit[gcs]
+# Auth: Application Default Credentials (the workload's service account, or gcloud auth application-default login)
+```
+
+```python notest
+from cachekit import cache
+from cachekit.backends.gcs import GCSBackend, GCSBackendConfig
+
+backend = GCSBackend(GCSBackendConfig(bucket="my-cache-bucket"))
+
+@cache(backend=backend, ttl=3600)
+def get_user(user_id: int):
+    return fetch_from_db(user_id)
+```
+
+See [Google Cloud Storage Backend](backends/gcs.md) for IAM and the bucket lifecycle rule.
 
 ### File / L1-Only (Dev and Testing)
 

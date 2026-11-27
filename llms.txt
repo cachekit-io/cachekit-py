@@ -1,8 +1,8 @@
 # cachekit
 
-> Caching for Python, TypeScript and Rust, with opt-in zero-knowledge encryption, circuit breakers and stampede protection. This is the Python SDK: intent-based decorators with distributed locking, Prometheus metrics and AES-256-GCM encryption on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CacheKit Cloud.
+> Caching for Python, TypeScript and Rust, with opt-in zero-knowledge encryption, circuit breakers and stampede protection. This is the Python SDK: intent-based decorators with distributed locking, Prometheus metrics and AES-256-GCM encryption on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, Google Cloud Storage, or CacheKit Cloud.
 
-cachekit provides decorator-based caching with circuit breaker, distributed locking, Prometheus metrics, L1+L2 dual-layer caching, and optional zero-knowledge encryption. Supports 4 built-in backends (Redis, Memcached, File, CacheKit Cloud) plus custom backends via the BaseBackend protocol.
+cachekit provides decorator-based caching with circuit breaker, distributed locking, Prometheus metrics, L1+L2 dual-layer caching, and optional zero-knowledge encryption. Supports 5 built-in backends (Redis, Memcached, File, Google Cloud Storage, CacheKit Cloud) plus custom backends via the BaseBackend protocol.
 
 ## Quick Start
 
@@ -30,13 +30,14 @@ def get_patient(id: int):
 
 ## Backends
 
-4 built-in backends, all implementing the BaseBackend protocol (get/set/delete/exists/health_check):
+5 built-in backends, all implementing the BaseBackend protocol (get/set/delete/exists/health_check):
 
 | Backend | Install | Use Case |
 |---------|---------|----------|
 | **Redis** | included | Production, distributed |
 | **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra |
 | **File** | included | Single-machine, zero-dependency |
+| **Google Cloud Storage** | `pip install cachekit[gcs]` | Durable shared cache with no server (Cloud Run, jobs) |
 | **CacheKit Cloud** (`CachekitIOBackend`) | included | Managed, zero infrastructure (closed beta) |
 
 ### Redis
@@ -70,6 +71,19 @@ config = FileBackendConfig(cache_dir="/tmp/cache", max_size_mb=500)
 backend = FileBackend(config)
 
 @cache(backend=backend)
+def cached_fn():
+    return data
+```
+
+### Google Cloud Storage
+```python
+from cachekit.backends.gcs import GCSBackend, GCSBackendConfig
+
+# Environment: CACHEKIT_GCS_BUCKET=my-cache-bucket (auth: Application Default Credentials)
+config = GCSBackendConfig(bucket="my-cache-bucket", prefix="cachekit/")
+backend = GCSBackend(config)
+
+@cache(backend=backend, ttl=3600)
 def cached_fn():
     return data
 ```
@@ -139,6 +153,10 @@ CACHEKIT_MEMCACHED_KEY_PREFIX=myapp:
 CACHEKIT_FILE_CACHE_DIR=/tmp/cache
 CACHEKIT_FILE_MAX_SIZE_MB=500
 
+# Google Cloud Storage (auth: Application Default Credentials)
+CACHEKIT_GCS_BUCKET=my-cache-bucket
+CACHEKIT_GCS_PREFIX=cachekit/
+
 # CacheKit Cloud
 CACHEKIT_API_KEY=your-api-key
 CACHEKIT_API_URL=https://api.cachekit.io
@@ -164,6 +182,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Redis](docs/backends/redis.md): Recommended production backend
 - [File](docs/backends/file.md): Local filesystem caching
 - [Memcached](docs/backends/memcached.md): High-throughput caching
+- [Google Cloud Storage](docs/backends/gcs.md): One object per entry, file-backend format, IAM and lifecycle rule
 - [CacheKit Cloud](docs/backends/cachekitio.md): Managed backend (closed beta)
 - [Custom Backends](docs/backends/custom.md): Implement BaseBackend
 

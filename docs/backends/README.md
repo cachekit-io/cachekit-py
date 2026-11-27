@@ -2,7 +2,7 @@
 
 # Backend Guide
 
-Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis, File (local), Memcached, and CacheKit Cloud (managed). With no backend configured, a plaintext decorator runs in [L1-only mode](none.md), as `backend=None` does; encrypted and interop decorators still need a backend ([Nothing Configured](#4-nothing-configured-l1-only)). You can also implement custom backends for any key-value store.
+Pluggable L2 cache storage for cachekit. Five backends are included out of the box — Redis, File (local), Memcached, Google Cloud Storage, and CacheKit Cloud (managed). With no backend configured, a plaintext decorator runs in [L1-only mode](none.md), as `backend=None` does; encrypted and interop decorators still need a backend ([Nothing Configured](#4-nothing-configured-l1-only)). You can also implement custom backends for any key-value store.
 
 ## Overview
 
@@ -98,6 +98,7 @@ class BaseBackend(Protocol):
 | **[File](file.md)** | set = fsync + a scan of every entry, so slow on a large cache; get waits on a concurrent set ([cost model](file.md#performance-characteristics)) | Yes (disk) | Format shared; one writer process | Yes | File locks |
 | **[Redis](redis.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Yes (RDB/AOF) | Yes | Yes | Yes |
 | **[Memcached](memcached.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | No | Yes | Yes (max 30d) | No |
+| **[Google Cloud Storage](gcs.md)** | One HTTPS request to GCS per ordinary operation ([request counts](gcs.md#requests-per-operation); [not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes (checked on read) | No |
 | **[CacheKit Cloud](cachekitio.md)** | 42–45ms p50 hit, measured from MEL ([varies by vantage](cachekitio.md#characteristics)) | Yes | Yes | Yes | Yes |
 | **[HTTP (custom)](custom.md)** | One HTTP request per operation ([not measured here](../performance.md#not-measured-here)) | Varies | Yes | Varies | Varies |
 | **[DynamoDB (custom)](custom.md)** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes | No |
@@ -106,6 +107,8 @@ class BaseBackend(Protocol):
 `TTLInspectableBackend` protocol): supported by **File**, **Redis**, and **CacheKit Cloud**.
 **Memcached** supports `refresh_ttl` (via `touch`) directly but not `get_ttl`, so
 `refresh_ttl_on_get` does not apply to it (see [Memcached](memcached.md#ttl-inspection--refresh)).
+**Google Cloud Storage** supports neither: an object cannot be edited in place
+(see [Google Cloud Storage](gcs.md#limitations)).
 
 **Cross-process whole-function invalidation** (a server-side key registry, via the
 `KeyTrackableBackend` protocol): supported only by the tenant-scoped **Redis** backend that env
@@ -133,6 +136,11 @@ calling process knows (see [Whole-Function Invalidation](../features/l1-invalida
 - Simple key-value caching without persistence needs
 - Existing Memcached infrastructure you want to reuse
 - Read-heavy workloads where a network round trip on each L1 miss is acceptable ([not measured here](../performance.md#not-measured-here))
+
+**Use [GCSBackend](gcs.md) when**:
+- The workload runs on Cloud Run, Cloud Functions or batch jobs, with no Redis and no disk that survives a run
+- The cached call is expensive and its result is worth keeping for hours or days
+- A round trip to GCS on each L1 miss is acceptable ([not measured here](../performance.md#not-measured-here))
 
 **Use [CacheKit Cloud](cachekitio.md) (`CachekitIOBackend`) when** *(closed beta: sign-up is by waitlist at [dash.cachekit.io](https://dash.cachekit.io))*:
 - You want managed, zero-ops distributed caching
@@ -220,7 +228,7 @@ it builds its own `CachekitIOBackend` and never consults `set_default_backend()`
 
 If no explicit backend and no module-level default, `DefaultBackendProvider`
 picks a backend at the function's first call from the one environment selector that is
-set. The four prefixed selectors are mutually exclusive, with no precedence between them:
+set. The five prefixed selectors are mutually exclusive, with no precedence between them:
 set exactly one.
 
 | Environment variable        | Backend            |
@@ -229,6 +237,7 @@ set exactly one.
 | `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
 | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
+| `CACHEKIT_GCS_BUCKET`       | `GCSBackend`       |
 | none of the above: `REDIS_URL` | Redis, as above |
 | nothing set at all | plaintext, non-interop decorators: [L1-only](#4-nothing-configured-l1-only), no backend; secure and `encryption=True` decorators: Redis at `redis://localhost:6379`, tenant-scoped as above; `interop=` decorators: the same Redis, which interop refuses (see below) |
 
@@ -237,7 +246,7 @@ set exactly one.
 `backend=RedisBackend()` instead ([Interop Mode](../features/interop-mode.md)). A
 `CachekitIOBackend` from `CACHEKIT_API_KEY` prefixes nothing and serves interop as resolved.
 
-Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
+Setting more than one of the five `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
 the `cachekit.decorators.orchestrator` logger, and runs the function uncached:
 
@@ -415,6 +424,7 @@ first call (and runs uncached if nothing listens there): give it `backend=RedisB
 | **HTTP API** | One HTTP request per operation ([not measured here](../performance.md#not-measured-here)) | Custom cloud services | Network dependent |
 | **DynamoDB** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Serverless, low-traffic | High availability |
 | **Memcached** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Alternative to Redis | No persistence |
+| **Google Cloud Storage** | One HTTPS request to GCS per ordinary operation ([request counts](gcs.md#requests-per-operation); [not measured here](../performance.md#not-measured-here)) | Expensive results kept across runs, no server | No locking; expiry checked on read |
 
 ---
 
@@ -423,6 +433,7 @@ first call (and runs uncached if nothing listens there): give it `backend=RedisB
 - [Redis Backend](redis.md) — Production-grade, shared cache
 - [File Backend](file.md) — Local disk, single-process, no infrastructure
 - [Memcached Backend](memcached.md) — High-throughput, volatile, multi-process
+- [Google Cloud Storage Backend](gcs.md) — Durable, one object per entry, no server
 - [CacheKit Cloud Backend](cachekitio.md) — Managed, zero-ops, zero-knowledge
 - [Custom Backends](custom.md) — HTTP, DynamoDB, and your own implementations
 

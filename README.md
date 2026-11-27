@@ -88,6 +88,7 @@ backend that fits your infrastructure — they're peers behind the same `@cache`
 | Redis | Self-hosted, full control | `REDIS_URL` / `CACHEKIT_REDIS_URL` |
 | CacheKit Cloud | Managed, zero-ops (closed beta) | `CACHEKIT_API_KEY` |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
+| Google Cloud Storage | Durable results on Cloud Run and jobs, no server | `CACHEKIT_GCS_BUCKET` |
 | File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / nothing (or `backend=None`) |
 
 ```bash
@@ -154,6 +155,28 @@ def expensive_api_call(user_id: int):
 ```
 
 *Requires: `pip install cachekit[memcached]` or `uv add cachekit[memcached]`*
+
+</details>
+
+<details>
+<summary><strong>Google Cloud Storage — Optional</strong></summary>
+
+```python notest
+from cachekit import cache
+from cachekit.backends.gcs import GCSBackend, GCSBackendConfig
+
+# pip install cachekit[gcs]
+
+backend = GCSBackend(GCSBackendConfig(bucket="my-cache-bucket"))  # Application Default Credentials
+
+@cache(backend=backend, ttl=3600)
+def expensive_api_call(user_id: int):
+    return fetch_user_data(user_id)
+```
+
+One object per entry, in the file backend's format. See [Google Cloud Storage Backend](docs/backends/gcs.md) for IAM and the bucket lifecycle rule.
+
+*Requires: `pip install cachekit[gcs]` or `uv add cachekit[gcs]`*
 
 </details>
 
@@ -294,7 +317,7 @@ Hosted runners come with other CPU models too: in a run of an earlier commit, an
 - Connection pooling with thread affinity
 - The CacheKit Cloud backend keeps idle connections pooled until the server closes them, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
 - Distributed locking guards against cache stampedes across pods, best effort (async functions, on a backend that supports it)
-- Pluggable backend abstraction (Redis, CacheKit Cloud, File, Memcached, custom)
+- Pluggable backend abstraction (Redis, CacheKit Cloud, File, Memcached, Google Cloud Storage, custom)
 - Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/42ea601f3c1656df0a06904afa2406604f43f57d/test-vectors/decode-bounds.json) vectors
 
 > [!NOTE]
@@ -520,7 +543,7 @@ info = expensive_func.cache_info()
 
 ```bash
 # Backend selection: set exactly ONE of CACHEKIT_REDIS_URL, CACHEKIT_API_KEY,
-# CACHEKIT_MEMCACHED_SERVERS, CACHEKIT_FILE_CACHE_DIR. Two or more is a ConfigurationError at
+# CACHEKIT_MEMCACHED_SERVERS, CACHEKIT_FILE_CACHE_DIR, CACHEKIT_GCS_BUCKET. Two or more is a ConfigurationError at
 # first call, and decorators relying on env auto-detection run uncached (docs/backends/README.md).
 # REDIS_URL is only a fallback and never conflicts. With none of them set, decorators cache
 # L1-only, in process (encrypted decorators still use localhost Redis; interop decorators refuse
@@ -540,6 +563,11 @@ CACHEKIT_API_URL="https://api.cachekit.io"  # Default CacheKit Cloud endpoint
 CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0                   # Default: 2.0 seconds
 CACHEKIT_MEMCACHED_TIMEOUT=1.0                            # Default: 1.0 seconds
 CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"                    # Default: "" (none)
+
+# Google Cloud Storage Backend (optional: pip install cachekit[gcs]; Application Default Credentials)
+# CACHEKIT_GCS_BUCKET="my-cache-bucket"                   # Required to select it
+CACHEKIT_GCS_PREFIX="cachekit/"                           # Default: "" (bucket root)
+CACHEKIT_GCS_TIMEOUT=10.0                                 # Default: 10.0 seconds
 
 # Optional Configuration
 CACHEKIT_MAX_VALUE_SIZE=104857600

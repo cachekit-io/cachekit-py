@@ -161,6 +161,12 @@ jobs:
       if: github.event_name == 'push'
       run: bash .github/scripts/start-memcached.sh
 
+    # Push runs only: tests/integration/test_gcs_integration.py skips its whole module when
+    # nothing answers on localhost:4443.
+    - name: Start the GCS emulator
+      if: github.event_name == 'push'
+      run: bash .github/scripts/start-fake-gcs.sh
+
     - name: Run full test suite (main)
       if: github.event_name == 'push'
       env:
@@ -185,6 +191,10 @@ jobs:
     - name: Check the memcached integration tests ran
       if: github.event_name == 'push'
       run: python3 .github/scripts/assert-junit-ran.py junit.xml tests.integration.test_memcached_integration
+
+    - name: Check the GCS integration tests ran
+      if: github.event_name == 'push'
+      run: python3 .github/scripts/assert-junit-ran.py junit.xml tests.integration.test_gcs_integration
 
     # Executable docs are tests: docstring examples, tests/docs/ and the docs/
     # markdown blocks. None of them sit under tests/unit or tests/critical, so

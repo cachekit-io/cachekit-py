@@ -386,6 +386,46 @@ class TestDefaultBackendProvider:
                     assert backend is mock_instance
                     mock_file.assert_called_once()
 
+    def test_get_backend_returns_gcs_when_bucket_set(self) -> None:
+        """CACHEKIT_GCS_BUCKET alone → GCSBackend, built once from the environment."""
+        from cachekit.backends.gcs import GCSBackendConfig
+
+        provider = DefaultBackendProvider()
+        assert provider._gcs_backend is None
+
+        with mock.patch.dict("os.environ", {"CACHEKIT_GCS_BUCKET": "cache-bucket"}, clear=True):
+            with mock.patch("cachekit.backends.gcs.GCSBackend") as mock_gcs:
+                backend = provider.get_backend()
+
+                assert backend is mock_gcs.return_value
+                assert provider.get_backend() is backend
+                mock_gcs.assert_called_once()
+                (config,) = mock_gcs.call_args.args
+                assert isinstance(config, GCSBackendConfig)
+                assert config.bucket == "cache-bucket"
+
+    def test_gcs_bucket_with_file_cache_dir_is_ambiguous(self, tmp_path: Path) -> None:
+        """CACHEKIT_GCS_BUCKET is a selector like the others: a second one raises, and the message lists it."""
+        from cachekit.config.validation import ConfigurationError
+
+        provider = DefaultBackendProvider()
+
+        with mock.patch.dict(
+            "os.environ", {"CACHEKIT_GCS_BUCKET": "cache-bucket", "CACHEKIT_FILE_CACHE_DIR": str(tmp_path)}, clear=True
+        ):
+            with pytest.raises(ConfigurationError, match="Ambiguous backend") as exc_info:
+                provider.get_backend()
+
+        message = str(exc_info.value)
+        assert "(CACHEKIT_FILE_CACHE_DIR, CACHEKIT_GCS_BUCKET)" in message
+        assert "CACHEKIT_FILE_CACHE_DIR / CACHEKIT_GCS_BUCKET, or pass backend=" in message
+
+    def test_gcs_bucket_counts_as_configured(self) -> None:
+        """With only CACHEKIT_GCS_BUCKET set, in any casing, a decorator must not fall back to L1 only."""
+        for name in ("CACHEKIT_GCS_BUCKET", "cachekit_gcs_bucket"):
+            with mock.patch.dict("os.environ", {name: "cache-bucket"}, clear=True):
+                assert DefaultBackendProvider()._is_configured() is True
+
     def test_get_backend_explicit_redis_url(self) -> None:
         """CACHEKIT_REDIS_URL is an explicit selector → RedisBackend."""
         provider = DefaultBackendProvider()
