@@ -110,7 +110,8 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> _Transport:
     def build(project: str | None) -> storage.Client:
         credentials = AnonymousCredentials()
         session = AuthorizedSession(credentials)
-        session.mount("https://", transport)
+        for scheme in ("https://", "http://"):  # http: an ambient STORAGE_EMULATOR_HOST must not reach a real server
+            session.mount(scheme, transport)
         return storage.Client(project=project or "test-project", credentials=credentials, _http=session)
 
     monkeypatch.setattr("cachekit.backends.gcs.backend._build_client", build)

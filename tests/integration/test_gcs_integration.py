@@ -134,6 +134,7 @@ class TestRoundTrip:
         for thread in threads:
             thread.join(timeout=60)
 
+        assert not any(thread.is_alive() for thread in threads)
         assert errors == []
 
 

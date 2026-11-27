@@ -98,7 +98,7 @@ class BaseBackend(Protocol):
 | **[File](file.md)** | set = fsync + a scan of every entry, so slow on a large cache; get waits on a concurrent set ([cost model](file.md#performance-characteristics)) | Yes (disk) | Format shared; one writer process | Yes | File locks |
 | **[Redis](redis.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Yes (RDB/AOF) | Yes | Yes | Yes |
 | **[Memcached](memcached.md)** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | No | Yes | Yes (max 30d) | No |
-| **[Google Cloud Storage](gcs.md)** | One HTTPS request to GCS per operation ([not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes (checked on read) | No |
+| **[Google Cloud Storage](gcs.md)** | One HTTPS request to GCS per ordinary operation ([request counts](gcs.md#requests-per-operation); [not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes (checked on read) | No |
 | **[CacheKit Cloud](cachekitio.md)** | 42–45ms p50 hit, measured from MEL ([varies by vantage](cachekitio.md#characteristics)) | Yes | Yes | Yes | Yes |
 | **[HTTP (custom)](custom.md)** | One HTTP request per operation ([not measured here](../performance.md#not-measured-here)) | Varies | Yes | Varies | Varies |
 | **[DynamoDB (custom)](custom.md)** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Yes | Yes | Yes | No |
@@ -424,7 +424,7 @@ first call (and runs uncached if nothing listens there): give it `backend=RedisB
 | **HTTP API** | One HTTP request per operation ([not measured here](../performance.md#not-measured-here)) | Custom cloud services | Network dependent |
 | **DynamoDB** | One DynamoDB API request per operation ([not measured here](../performance.md#not-measured-here)) | Serverless, low-traffic | High availability |
 | **Memcached** | One network round trip per operation ([not measured here](../performance.md#not-measured-here)) | Alternative to Redis | No persistence |
-| **Google Cloud Storage** | One HTTPS request to GCS per operation ([not measured here](../performance.md#not-measured-here)) | Expensive results kept across runs, no server | No locking; expiry checked on read |
+| **Google Cloud Storage** | One HTTPS request to GCS per ordinary operation ([request counts](gcs.md#requests-per-operation); [not measured here](../performance.md#not-measured-here)) | Expensive results kept across runs, no server | No locking; expiry checked on read |
 
 ---
 

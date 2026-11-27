@@ -97,15 +97,19 @@ class GCSBackend:
         """Delete an expired or corrupt object that a read just saw. Best effort: the read is a miss either way.
 
         The delete is conditional on the generation the read saw, so an entry a writer stored in
-        between survives; a response that named no generation deletes nothing. A failure (a
-        read-only identity, a lost race) is logged and dropped.
+        between survives; a response that named no generation deletes nothing. A failed request
+        (a read-only identity, a lost race, the network) is logged and dropped; anything else is
+        a bug and propagates.
         """
+        from google.api_core.exceptions import GoogleAPICallError
+        from google.auth.exceptions import GoogleAuthError
+
         generation = blob.generation
         if generation is None:
             return
         try:
             blob.delete(if_generation_match=generation, timeout=self._timeout, retry=None)
-        except Exception as exc:
+        except (GoogleAPICallError, GoogleAuthError, OSError) as exc:
             _logger.debug("GCS cleanup of a dead entry failed: %s", redact_error_for_log(exc))
 
     def _read(self, operation: str, key: str, header_only: bool) -> bytes | None:

@@ -110,6 +110,9 @@ gcloud storage buckets update gs://my-cache-bucket --lifecycle-file=lifecycle.js
 
 `age` is in days and counts from when the object was written. Drop `matchesPrefix` when the bucket holds nothing else.
 
+> [!CAUTION]
+> `--lifecycle-file` replaces the bucket's whole lifecycle configuration. If the bucket already has rules, read them first (`gcloud storage buckets describe gs://my-cache-bucket --format="default(lifecycle_config)"`) and apply a file that holds them and the cache rule together.
+
 > [!WARNING]
 > The rule deletes by age alone. An entry cached with no TTL, or with a TTL longer than `age`, is deleted when it reaches `age` and becomes a miss.
 
@@ -130,9 +133,9 @@ The backend retries no request. The one exception is in the credentials layer: a
 | HTTP 401, 403; credentials missing or refused | `AUTHENTICATION` |
 | HTTP 429, 5xx; connection failed; token endpoint or metadata server unreachable; checksum mismatch | `TRANSIENT` |
 | Timeout; HTTP 408 | `TIMEOUT` |
-| Any other HTTP error, such as a bucket that does not exist | `PERMANENT` |
+| Any other HTTP error, such as a `set` to a bucket that does not exist | `PERMANENT` |
 
-A 404 for an object is not an error: `get` returns `None` and `delete` returns `False`. Under `@cache`, a failed read is a miss and the function runs, and a failed write skips the backend only.
+A 404 on a read or a delete is not an error: `get` returns `None`, `exists` and `delete` return `False`. GCS answers 404 for an absent bucket too, so a wrong bucket name reads as an empty cache; `set` raises, and `health_check()` reports it. Under `@cache`, a failed read is a miss and the function runs, and a failed write skips the backend only.
 
 ## When to Use
 
