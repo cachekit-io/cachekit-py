@@ -49,8 +49,8 @@ class GCSBackend:
     expired entry is a miss, and the read deletes it. An entry nobody reads again stays until a
     bucket lifecycle rule removes it (see docs/backends/gcs.md).
 
-    Authentication is Application Default Credentials only. No request is retried: a failed
-    request raises a ``BackendError`` and the next call tries again.
+    Authentication is Application Default Credentials only. The backend retries no request: a
+    failed one raises a ``BackendError`` and the next call tries again.
 
     Examples:
         Create a backend (requires credentials and a bucket):
@@ -65,7 +65,7 @@ class GCSBackend:
     """
 
     def __init__(self, config: GCSBackendConfig | None = None) -> None:
-        """Initialize GCSBackend. Builds the client and sends no request.
+        """Initialize GCSBackend. Builds the client and sends no request to Cloud Storage.
 
         Args:
             config: Optional configuration. Defaults to loading from environment.
@@ -97,10 +97,14 @@ class GCSBackend:
         """Delete an expired or corrupt object that a read just saw. Best effort: the read is a miss either way.
 
         The delete is conditional on the generation the read saw, so an entry a writer stored in
-        between survives. A failure (a read-only identity, a lost race) is logged and dropped.
+        between survives; a response that named no generation deletes nothing. A failure (a
+        read-only identity, a lost race) is logged and dropped.
         """
+        generation = blob.generation
+        if generation is None:
+            return
         try:
-            blob.delete(if_generation_match=blob.generation, timeout=self._timeout, retry=None)
+            blob.delete(if_generation_match=generation, timeout=self._timeout, retry=None)
         except Exception as exc:
             _logger.debug("GCS cleanup of a dead entry failed: %s", redact_error_for_log(exc))
 
@@ -122,7 +126,9 @@ class GCSBackend:
         except NotFound:
             return None
         except RequestRangeNotSatisfiable:
-            data = b""  # an empty object has no byte range to serve: truncated, like any short header
+            # An empty object has no byte range to serve. Read it whole instead: that response
+            # carries the generation, which the cleanup of this truncated entry is conditional on.
+            return self._read(operation, key, header_only=False)
         except Exception as exc:
             raise classify_gcs_error(exc, operation=operation, key=key) from exc
 
@@ -157,7 +163,7 @@ class GCSBackend:
         """Store value in Google Cloud Storage, replacing the key's object in one upload.
 
         An entry of up to 8 MiB goes in a single request. A larger one is a resumable upload of
-        two requests; the object is replaced only when the second completes.
+        several requests; the object is replaced only when the last completes.
 
         Args:
             key: Cache key to store.

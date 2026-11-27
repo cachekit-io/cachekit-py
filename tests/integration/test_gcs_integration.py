@@ -83,7 +83,7 @@ def bucket(admin: Any) -> Iterator[Any]:
 def backend(bucket: Any) -> Any:
     from cachekit.backends.gcs import GCSBackend, GCSBackendConfig
 
-    return GCSBackend(GCSBackendConfig(bucket=bucket.name, timeout=5.0))
+    return GCSBackend(GCSBackendConfig(bucket=bucket.name))
 
 
 def _names(bucket: Any) -> list[str]:
@@ -174,11 +174,12 @@ class TestObjectFormat:
 
 class TestExpiry:
     def test_expired_entry_is_a_miss_and_get_deletes_it(self, backend: Any, bucket: Any) -> None:
-        backend.set("k", b"v", ttl=1)
+        # The expiry is a whole second, rounded down: a 2-second TTL lasts between 1 and 2 seconds.
+        backend.set("k", b"v", ttl=2)
         assert backend.exists("k") is True
         assert len(_names(bucket)) == 1
 
-        time.sleep(1.1)  # the expiry is a whole second: the entry is dead once the clock reaches it
+        time.sleep(2.1)
 
         assert backend.get("k") is None
         assert _names(bucket) == []

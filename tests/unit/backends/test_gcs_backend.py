@@ -7,6 +7,7 @@ the process. tests/integration/test_gcs_integration.py covers a live server.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import io
@@ -23,6 +24,7 @@ import time_machine
 
 pytest.importorskip("google.cloud.storage", reason="needs the gcs extra")
 
+import google_crc32c
 import requests
 import requests.adapters
 import urllib3
@@ -30,6 +32,7 @@ from google.auth.credentials import AnonymousCredentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
 from google.auth.transport.requests import AuthorizedSession
 from google.cloud import storage
+from google.cloud.storage.exceptions import DataCorruption
 
 from cachekit.backends.base import BaseBackend, TTLInspectableBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
@@ -53,11 +56,20 @@ def _name(key: str) -> str:
 class _Reply:
     """One scripted HTTP response, or the exception the transport raises instead."""
 
-    def __init__(self, status: int = 200, body: bytes = b"{}", generation: int | None = None, error: Exception | None = None):
+    def __init__(
+        self,
+        status: int = 200,
+        body: bytes = b"{}",
+        generation: int | None = None,
+        error: Exception | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         self.status = status
         self.body = body
-        self.generation = generation
         self.error = error
+        self.headers = dict(headers or {})
+        if generation is not None:
+            self.headers["X-Goog-Generation"] = str(generation)
 
 
 class _Transport(requests.adapters.BaseAdapter):
@@ -75,9 +87,7 @@ class _Transport(requests.adapters.BaseAdapter):
         reply = self.replies.pop(0)
         if reply.error is not None:
             raise reply.error
-        headers = {"Content-Length": str(len(reply.body))}
-        if reply.generation is not None:
-            headers["X-Goog-Generation"] = str(reply.generation)
+        headers = {"Content-Length": str(len(reply.body)), **reply.headers}
         raw = urllib3.HTTPResponse(body=io.BytesIO(reply.body), headers=headers, status=reply.status, preload_content=False)
         return self._build.build_response(request, raw)
 
@@ -110,6 +120,10 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> _Transport:
 @pytest.fixture
 def backend(transport: _Transport) -> GCSBackend:
     return GCSBackend(GCSBackendConfig(bucket=BUCKET))
+
+
+def _if_generation_match(request: requests.PreparedRequest) -> list[str] | None:
+    return parse_qs(urlsplit(request.url or "").query).get("ifGenerationMatch")
 
 
 def _uploaded(request: requests.PreparedRequest) -> bytes:
@@ -171,7 +185,7 @@ class TestGet:
 
         assert transport.sent() == [("GET", f"/o/{_name('k')}"), ("DELETE", f"/o/{_name('k')}")]
         # Only the generation that was read: an entry stored in between survives.
-        assert parse_qs(urlsplit(transport.requests[1].url or "").query)["ifGenerationMatch"] == ["7"]
+        assert _if_generation_match(transport.requests[1]) == ["7"]
 
     @pytest.mark.parametrize(
         "body",
@@ -183,6 +197,14 @@ class TestGet:
 
         assert backend.get("k") is None
         assert [method for method, _ in transport.sent()] == ["GET", "DELETE"]
+        assert _if_generation_match(transport.requests[1]) == ["3"]
+
+    def test_dead_entry_of_unknown_generation_is_not_deleted(self, backend: GCSBackend, transport: _Transport) -> None:
+        """With no generation to condition on, a delete could remove an entry stored since the read."""
+        transport.script(_Reply(body=b"CK"))
+
+        assert backend.get("k") is None
+        assert [method for method, _ in transport.sent()] == ["GET"]
 
     @pytest.mark.parametrize("reserved,flags", [(1, 0), (0, 1), (0, 0x8000)])
     @time_machine.travel(1_000_000, tick=False)
@@ -213,6 +235,13 @@ class TestExists:
         assert transport.sent() == [("GET", f"/o/{_name('k')}")]
         assert transport.requests[0].headers["Range"] == "bytes=0-13"
 
+    def test_header_is_not_checked_against_the_whole_objects_checksum(self, backend: GCSBackend, transport: _Transport) -> None:
+        """A ranged response still carries the checksum of the whole object, which 14 bytes never match."""
+        whole = base64.b64encode(google_crc32c.Checksum(_header() + b"a long payload").digest()).decode()
+        transport.script(_Reply(status=206, body=_header(), headers={"X-Goog-Hash": f"crc32c={whole}"}))
+
+        assert backend.exists("k") is True
+
     def test_absent_object(self, backend: GCSBackend, transport: _Transport) -> None:
         transport.script(_Reply(status=404))
         assert backend.exists("k") is False
@@ -223,11 +252,22 @@ class TestExists:
         assert backend.exists("k") is False
 
     def test_empty_object_is_a_miss_and_is_deleted(self, backend: GCSBackend, transport: _Transport) -> None:
-        """An empty object has no first byte, so the ranged read is refused with a 416."""
-        transport.script(_Reply(status=416), _Reply(status=204, body=b""))
+        """An empty object has no first byte, so the ranged read is refused with a 416.
+
+        The 416 names no generation, so the object is read again, whole, before the conditional delete.
+        """
+        transport.script(_Reply(status=416), _Reply(body=b"", generation=5), _Reply(status=204, body=b""))
 
         assert backend.exists("k") is False
-        assert [method for method, _ in transport.sent()] == ["GET", "DELETE"]
+        assert [method for method, _ in transport.sent()] == ["GET", "GET", "DELETE"]
+        assert "Range" not in transport.requests[1].headers
+        assert _if_generation_match(transport.requests[2]) == ["5"]
+
+    def test_entry_stored_over_an_empty_object_is_found(self, backend: GCSBackend, transport: _Transport) -> None:
+        transport.script(_Reply(status=416), _Reply(body=_header() + b"v", generation=6))
+
+        assert backend.exists("k") is True
+        assert len(transport.requests) == 2
 
     def test_unknown_transform_is_a_miss_left_untouched(self, backend: GCSBackend, transport: _Transport) -> None:
         transport.script(_Reply(status=206, body=_header(flags=1)))
@@ -330,11 +370,16 @@ _TRANSPORT_CASES = [
     (requests.ReadTimeout(), BackendErrorType.TIMEOUT),
     (requests.ConnectTimeout(), BackendErrorType.TIMEOUT),
     (TimeoutError(), BackendErrorType.TIMEOUT),
+    (requests.ConnectionError(urllib3.exceptions.ReadTimeoutError(None, None, "Read timed out.")), BackendErrorType.TIMEOUT),  # type: ignore[arg-type]
     (requests.ConnectionError(), BackendErrorType.TRANSIENT),
+    (requests.exceptions.ChunkedEncodingError(), BackendErrorType.TRANSIENT),
+    (DataCorruption(None, "checksum mismatch"), BackendErrorType.TRANSIENT),
     (ConnectionResetError(), BackendErrorType.TRANSIENT),
     (RefreshError("token"), BackendErrorType.AUTHENTICATION),
     (DefaultCredentialsError("none"), BackendErrorType.AUTHENTICATION),
     (TransportError("metadata server"), BackendErrorType.TRANSIENT),
+    (RefreshError(TransportError("metadata server")), BackendErrorType.TRANSIENT),
+    (RefreshError("token endpoint busy", retryable=True), BackendErrorType.TRANSIENT),
     (ValueError("?"), BackendErrorType.UNKNOWN),
 ]
 _OPERATIONS = {
@@ -362,7 +407,9 @@ class TestErrors:
         assert len(transport.requests) == 1  # no retry
 
     @pytest.mark.parametrize("operation", _OPERATIONS)
-    @pytest.mark.parametrize("error,error_type", _TRANSPORT_CASES, ids=lambda v: type(v).__name__)
+    @pytest.mark.parametrize(
+        "error,error_type", _TRANSPORT_CASES, ids=[f"{i}-{type(e).__name__}" for i, (e, _) in enumerate(_TRANSPORT_CASES)]
+    )
     def test_transport_error_mapping(
         self, backend: GCSBackend, transport: _Transport, operation: str, error: Exception, error_type: BackendErrorType
     ) -> None:
@@ -436,12 +483,19 @@ class TestHealthCheck:
 
 @pytest.mark.unit
 class TestNoBucketLevelRequest:
-    def test_no_operation_reads_bucket_metadata(self, backend: GCSBackend, transport: _Transport) -> None:
+    def test_no_operation_reads_bucket_metadata(
+        self, backend: GCSBackend, transport: _Transport, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Every request is to an object or the object listing, so object-level IAM is enough.
 
         The client library would otherwise fetch the bucket itself in a background thread, on the
-        first request and again after every 404.
+        first request and again after every 404. Its two entry points to that are recorded here,
+        on the calling thread, so the test does not depend on when a background thread runs.
         """
+        cache_module = pytest.importorskip("google.cloud.storage._bucket_metadata_cache")
+        fetches: list[str] = []
+        for entry_point in ("get_or_queue_fetch", "check_and_evict"):
+            monkeypatch.setattr(cache_module.BucketMetadataCache, entry_point, lambda self, name: fetches.append(name))
         transport.script(
             _Reply(status=404),  # get: miss
             _Reply(),  # set
@@ -460,7 +514,7 @@ class TestNoBucketLevelRequest:
         backend.delete("k")
         backend.health_check()
 
-        assert backend._client._bucket_metadata_cache is None
+        assert fetches == []
         assert transport.replies == []
         assert all(path == "/o" or path.startswith("/o/") for _, path in transport.sent())
 

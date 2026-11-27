@@ -12,12 +12,16 @@ from cachekit.backends.errors import BackendError, BackendErrorType
 def _classify(exc: Exception) -> tuple[BackendErrorType, str]:
     """The error type for exc, and the word that names it in the message."""
     import requests.exceptions
+    import urllib3.exceptions
     from google.api_core.exceptions import GoogleAPICallError
-    from google.auth.exceptions import DefaultCredentialsError, GoogleAuthError, RefreshError
+    from google.auth.exceptions import GoogleAuthError, TransportError
+    from google.cloud.storage.exceptions import DataCorruption
 
+    cause = exc.args[0] if exc.args else None
     # Before the OSError branch: requests' exceptions are OSErrors, and its ConnectTimeout is also
-    # a ConnectionError.
-    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)):
+    # a ConnectionError. A read that times out part-way through a response body reaches here as a
+    # plain requests ConnectionError around urllib3's timeout.
+    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)) or isinstance(cause, urllib3.exceptions.TimeoutError):
         return BackendErrorType.TIMEOUT, "timeout"
     if isinstance(exc, GoogleAPICallError):
         status = exc.code
@@ -28,10 +32,17 @@ def _classify(exc: Exception) -> tuple[BackendErrorType, str]:
         if status == 429 or (status is not None and status >= 500):
             return BackendErrorType.TRANSIENT, "transient error"
         return BackendErrorType.PERMANENT, "permanent error"
-    if isinstance(exc, (DefaultCredentialsError, RefreshError)):
-        return BackendErrorType.AUTHENTICATION, "authentication error"
-    # Any other auth failure is the token endpoint or metadata server being unreachable.
-    if isinstance(exc, (GoogleAuthError, OSError)):
+    if isinstance(exc, GoogleAuthError):
+        # The token endpoint or metadata server being unreachable is not a refused credential. It
+        # arrives as a TransportError, as a RefreshError wrapping one, or flagged retryable.
+        unreachable = isinstance(exc, TransportError) or isinstance(cause, TransportError) or getattr(exc, "retryable", False)
+        return (
+            (BackendErrorType.TRANSIENT, "transient error")
+            if unreachable
+            else (BackendErrorType.AUTHENTICATION, "authentication error")
+        )
+    # DataCorruption: the bytes received do not match the checksum the server sent with them.
+    if isinstance(exc, (OSError, DataCorruption)):
         return BackendErrorType.TRANSIENT, "transient error"
     return BackendErrorType.UNKNOWN, "unknown error"
 

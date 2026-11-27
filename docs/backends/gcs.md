@@ -118,17 +118,17 @@ gcloud storage buckets update gs://my-cache-bucket --lifecycle-file=lifecycle.js
 | Operation | Requests |
 |-----------|----------|
 | `get` | One download. A hit, a miss and an absent object each cost one request; an expired or corrupt entry costs a second, to delete it. |
-| `set` | One upload that replaces the object. An entry above 8 MiB is a resumable upload of two requests. |
-| `exists` | One ranged read of the 14-byte header. |
+| `set` | One upload that replaces the object: a single request up to 8 MiB, a resumable upload of several requests above it. The object is replaced when the upload completes. |
+| `exists` | One ranged read of the 14-byte header. An empty object costs a second read, and a corrupt or expired one a delete. |
 | `delete` | One delete. |
 | `health_check()` | One listing of at most one object under the prefix. |
 
-No request is retried. A failed request raises a `BackendError`:
+The backend retries no request. The one exception is in the credentials layer: after an HTTP 401 it refreshes the access token and sends the request again. A failed request raises a `BackendError`:
 
 | Failure | `BackendErrorType` |
 |---------|--------------------|
 | HTTP 401, 403; credentials missing or refused | `AUTHENTICATION` |
-| HTTP 429, 5xx; connection failed | `TRANSIENT` |
+| HTTP 429, 5xx; connection failed; token endpoint or metadata server unreachable; checksum mismatch | `TRANSIENT` |
 | Timeout; HTTP 408 | `TIMEOUT` |
 | Any other HTTP error, such as a bucket that does not exist | `PERMANENT` |
 
@@ -153,7 +153,7 @@ A 404 for an object is not an error: `get` returns `None` and `delete` returns `
 - TTL support: Yes, checked on read; no upper bound below the file format's 10 years
 - Cross-process: Yes (shared by every process that can reach the bucket)
 - Persistence: Yes
-- Thread-safe: Yes. Threads may share one backend
+- Threads: threads may share one backend
 - Fork: build the backend after `fork()`, not before
 
 ## Limitations
