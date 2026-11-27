@@ -2,6 +2,8 @@
 
 # cachekit Documentation
 
+The canonical CacheKit Python docs are at [docs.cachekit.io](https://docs.cachekit.io/python/quickstart/); the pages here are the in-repository reference.
+
 > **Smart caching that just works — from simple to advanced**
 
 </div>

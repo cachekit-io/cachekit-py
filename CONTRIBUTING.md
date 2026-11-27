@@ -365,6 +365,21 @@ comment with the result, every path's figures included, updated in place on each
 from forks get none, and their shard logs carry the result. Method, budgets and the CI job:
 [docs/performance.md](docs/performance.md#instruction-budgets).
 
+### Running Security Checks
+
+```bash
+make security-install  # Install security tools (one-time)
+make security-fast     # Run fast checks (< 3 min)
+```
+
+**Security Tiers:**
+
+| Tier | Time | Coverage |
+|:-----|:----:|:---------|
+| Fast | < 3 min | Vulnerability scanning, license checks, linting |
+| Medium | < 15 min | Unsafe code analysis (cargo-geiger) |
+| Deep | < 2 hours | Formal verification, extended fuzzing, full sanitizers |
+
 ### Formatting Code
 
 ```bash
