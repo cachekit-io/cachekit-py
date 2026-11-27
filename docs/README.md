@@ -29,6 +29,7 @@ Choose your storage backend:
 | [Redis](backends/redis.md) | Self-hosted, production-grade, connection pooling |
 | [File](backends/file.md) | Local filesystem, zero dependencies |
 | [Memcached](backends/memcached.md) | High-throughput, consistent hashing |
+| [Google Cloud Storage](backends/gcs.md) | Durable, one object per entry, no server |
 | [CacheKit Cloud](backends/cachekitio.md) | Managed, zero infrastructure |
 | [L1-Only (None)](backends/none.md) | In-memory only, no external services |
 | [Custom](backends/custom.md) | Implement your own backend |
@@ -88,6 +89,7 @@ docs/
 │   ├── README.md                    # Backend overview (auto-rendered)
 │   ├── redis.md, file.md           # Built-in backends
 │   ├── memcached.md, cachekitio.md # Optional backends
+│   ├── gcs.md                      # Google Cloud Storage (optional)
 │   ├── none.md                     # L1-only mode
 │   └── custom.md                   # Custom backend guide
 │

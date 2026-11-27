@@ -18,6 +18,7 @@ import pytest
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
+from cachekit.backends.gcs.config import GCSBackendConfig
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 
@@ -27,7 +28,11 @@ BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
     FileBackendConfig,
     CachekitIOBackendConfig,
     MemcachedBackendConfig,
+    GCSBackendConfig,
 ]
+
+# Constructor arguments for a config that has a required field and is still instantiated below.
+REQUIRED_KWARGS: dict[type[BaseBackendConfig], dict[str, str]] = {GCSBackendConfig: {"bucket": "cache-bucket"}}
 
 # Required model_config settings from BaseBackendConfig
 REQUIRED_MODEL_CONFIG_KEYS = {
@@ -54,7 +59,7 @@ class TestBackendConfigInheritance:
         if config_cls is CachekitIOBackendConfig:
             pytest.skip("CachekitIOBackendConfig requires api_key")
 
-        instance = config_cls()
+        instance = config_cls(**REQUIRED_KWARGS.get(config_cls, {}))
         assert isinstance(instance, BaseBackendConfig), f"{config_cls.__name__} instance should be instanceof BaseBackendConfig"
 
 
@@ -95,7 +100,7 @@ class TestModelConfigConsistency:
             pytest.skip("CachekitIOBackendConfig requires api_key")
 
         with pytest.raises(ValidationError) as exc_info:
-            config_cls(totally_fake_field_that_doesnt_exist="value")  # type: ignore[call-arg]
+            config_cls(totally_fake_field_that_doesnt_exist="value", **REQUIRED_KWARGS.get(config_cls, {}))  # type: ignore[call-arg]
 
         # Verify it's an "extra fields" error
         errors = exc_info.value.errors()

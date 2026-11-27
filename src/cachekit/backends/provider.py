@@ -168,7 +168,7 @@ class PooledClientProvider(CacheClientProvider):
 
 class _BackendEnv(BaseSettings):
     """The backend env vars as pydantic-settings reads them, for DefaultBackendProvider._is_configured():
-    its four _SELECTORS plus REDIS_URL."""
+    its five _SELECTORS plus REDIS_URL."""
 
     model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
 
@@ -177,6 +177,7 @@ class _BackendEnv(BaseSettings):
     cachekit_redis_url: Optional[SecretStr] = None
     cachekit_memcached_servers: Optional[SecretStr] = None
     cachekit_file_cache_dir: Optional[SecretStr] = None
+    cachekit_gcs_bucket: Optional[SecretStr] = None
     redis_url: Optional[SecretStr] = None
 
 
@@ -189,6 +190,7 @@ class DefaultBackendProvider(BackendProviderInterface):
         - CACHEKIT_REDIS_URL          → Redis (tenant-scoped PerRequestRedisBackend)
         - CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
         - CACHEKIT_FILE_CACHE_DIR     → FileBackend
+        - CACHEKIT_GCS_BUCKET         → GCSBackend
     With none of them set, ``REDIS_URL`` → Redis, as above (12-factor).
 
     With nothing set at all, ``_is_configured()`` is False and a plaintext decorator
@@ -196,7 +198,7 @@ class DefaultBackendProvider(BackendProviderInterface):
     Only the decorators that cannot run L1-only (encryption, ``interop=``) still call
     it then, and get Redis at ``RedisBackendConfig``'s localhost default.
 
-    Setting more than one of the four prefixed selectors raises
+    Setting more than one of the five prefixed selectors raises
     ``ConfigurationError`` — auto-detection must be unambiguous; pass
     ``backend=`` explicitly to override. The non-prefixed ``REDIS_URL`` is only a
     fallback and never counts as a conflict (12-factor convention).
@@ -216,6 +218,7 @@ class DefaultBackendProvider(BackendProviderInterface):
         ("CACHEKIT_REDIS_URL", "redis"),
         ("CACHEKIT_MEMCACHED_SERVERS", "memcached"),
         ("CACHEKIT_FILE_CACHE_DIR", "file"),
+        ("CACHEKIT_GCS_BUCKET", "gcs"),
     )
 
     def __init__(self):
@@ -223,6 +226,7 @@ class DefaultBackendProvider(BackendProviderInterface):
         self._redis_backend = None
         self._memcached_backend = None
         self._file_backend = None
+        self._gcs_backend = None
 
     def _matched(self) -> list[tuple[str, str]]:
         """The prefixed selectors set to a non-empty value, matched by exact name."""
@@ -243,7 +247,8 @@ class DefaultBackendProvider(BackendProviderInterface):
             raise ConfigurationError(
                 f"Ambiguous backend auto-detection: multiple selectors set ({names}). "
                 "Set exactly one of CACHEKIT_API_KEY / CACHEKIT_REDIS_URL / "
-                "CACHEKIT_MEMCACHED_SERVERS / CACHEKIT_FILE_CACHE_DIR, or pass backend= explicitly."
+                "CACHEKIT_MEMCACHED_SERVERS / CACHEKIT_FILE_CACHE_DIR / CACHEKIT_GCS_BUCKET, "
+                "or pass backend= explicitly."
             )
         return matched[0][1] if matched else None
 
@@ -288,6 +293,13 @@ class DefaultBackendProvider(BackendProviderInterface):
 
                 self._file_backend = FileBackend(FileBackendConfig.from_env())
             return self._file_backend
+
+        if choice == "gcs":
+            if self._gcs_backend is None:
+                from cachekit.backends.gcs import GCSBackend, GCSBackendConfig
+
+                self._gcs_backend = GCSBackend(GCSBackendConfig.from_env())
+            return self._gcs_backend
 
         # choice == "redis" (explicit CACHEKIT_REDIS_URL) or None: REDIS_URL, else RedisBackendConfig's default.
         # Shared backend: it resolves the tenant per operation, so caching it cannot pin a tenant.

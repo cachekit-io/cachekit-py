@@ -11,7 +11,7 @@
 
 ## Backend Options
 
-cachekit supports four backends. Pick the one that fits your infrastructure:
+cachekit supports five backends. Pick the one that fits your infrastructure:
 
 | Backend | Best For | Required Config |
 |---------|----------|----------------|
@@ -19,8 +19,9 @@ cachekit supports four backends. Pick the one that fits your infrastructure:
 | CacheKit Cloud | Managed, zero-ops | `CACHEKIT_API_KEY` |
 | File | Local dev, testing | None |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
+| Google Cloud Storage | Durable results on Cloud Run and jobs, no server | `CACHEKIT_GCS_BUCKET` |
 
-`@cache` picks its backend from env vars at a function's first call; with nothing configured it caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). CacheKit Cloud is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
+`@cache` picks its backend from env vars at a function's first call; with nothing configured it caches L1-only, in process, and connects to nothing ([details](backends/README.md#4-nothing-configured-l1-only)). CacheKit Cloud is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`), and so is Google Cloud Storage (`pip install cachekit[gcs]`).
 
 ### Redis Backend
 
@@ -58,6 +59,14 @@ File-based cache for local development and testing. No external services require
 High-throughput in-memory caching with consistent hashing across multiple servers.
 
 **Configuration:** See the [Memcached Backend](#memcached-backend-environment-variables) section below.
+
+### Google Cloud Storage Backend
+
+> Requires: `pip install cachekit[gcs]`
+
+One object per cache entry in a GCS bucket, authenticated with Application Default Credentials. See [Google Cloud Storage Backend](backends/gcs.md) for IAM and the bucket lifecycle rule.
+
+**Configuration:** See the [Google Cloud Storage Backend](#google-cloud-storage-backend-environment-variables) section below.
 
 ---
 
@@ -248,6 +257,26 @@ CACHEKIT_MEMCACHED_RETRY_ATTEMPTS=2        # Default: 2 (range: 0-10)
 CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"     # Default: "" (none)
 ```
 
+### Google Cloud Storage Backend Environment Variables
+
+> Requires: `pip install cachekit[gcs]` or `uv add cachekit[gcs]`
+
+```bash
+# Bucket that holds the entries (required; a bucket name, not a gs:// URL). Setting it selects the backend
+CACHEKIT_GCS_BUCKET=my-cache-bucket
+
+# Object-name prefix, used verbatim (default: "", the bucket root). A storage location only
+CACHEKIT_GCS_PREFIX=cachekit/
+
+# Google Cloud project passed to the storage client (default: none; object reads and writes need no project)
+CACHEKIT_GCS_PROJECT=my-project
+
+# Seconds to wait for a connection, and between bytes of a response (default: 10.0, range: 0.1-600.0)
+CACHEKIT_GCS_TIMEOUT=10.0
+```
+
+There is no credential variable: the backend uses [Application Default Credentials](backends/gcs.md#authentication).
+
 ---
 
 ## L1 Cache Configuration
@@ -411,7 +440,7 @@ def secure_function():
 
 > [!IMPORTANT]
 > When multiple environment variables could apply, cachekit follows this priority order.
-> The four backend selectors are the exception: they have no order, so set exactly one
+> The five backend selectors are the exception: they have no order, so set exactly one
 > ([details](backends/README.md#3-environment-variable-auto-detection)).
 
 ### Redis URL Priority

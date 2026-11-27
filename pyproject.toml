@@ -94,6 +94,9 @@ json = [
 memcached = [
     "pymemcache>=4.0.0",
 ]
+gcs = [
+    "google-cloud-storage>=3.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/cachekit-io/cachekit-py"
@@ -264,6 +267,7 @@ dev = [
     # ArrowSerializer return_format="polars" tests (zero-copy column aliasing). Not in `test`:
     # polars ships abi3 wheels only, which a free-threaded interpreter cannot install.
     "polars>=2.0.0",
+    "google-cloud-storage>=3.0.0",
 ]
 # Linux CI only - Atheris requires libFuzzer (not available on macOS without building LLVM)
 fuzz = [

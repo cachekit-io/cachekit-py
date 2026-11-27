@@ -617,7 +617,13 @@ class TestEncryptionRefusesL1Only:
         assert msg.startswith("encryption requires a backend")
         tiers = ["set_default_backend()", "CACHEKIT_*", "REDIS_URL"]
         assert [msg.index(t) for t in tiers] == sorted(msg.index(t) for t in tiers)
-        for selector in ("CACHEKIT_API_KEY", "CACHEKIT_REDIS_URL", "CACHEKIT_MEMCACHED_SERVERS", "CACHEKIT_FILE_CACHE_DIR"):
+        for selector in (
+            "CACHEKIT_API_KEY",
+            "CACHEKIT_REDIS_URL",
+            "CACHEKIT_MEMCACHED_SERVERS",
+            "CACHEKIT_FILE_CACHE_DIR",
+            "CACHEKIT_GCS_BUCKET",
+        ):
             assert selector in msg
 
     def test_secure_with_backend_still_decorates(self):

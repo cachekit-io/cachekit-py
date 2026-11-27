@@ -16,6 +16,7 @@ Public API:
     - CapabilityNotAvailableError: Exception for missing optional capabilities
     - RedisBackend: Redis implementation
     - MemcachedBackend: Memcached implementation (requires pymemcache)
+    - GCSBackend: Google Cloud Storage implementation (requires google-cloud-storage)
 
 Usage:
     >>> from cachekit.backends import BaseBackend, RedisBackend, BackendError
@@ -47,6 +48,7 @@ from cachekit.backends.errors import (
 )
 
 if TYPE_CHECKING:
+    from cachekit.backends.gcs import GCSBackend
     from cachekit.backends.memcached import MemcachedBackend
     from cachekit.backends.redis import RedisBackend
 
@@ -64,6 +66,7 @@ __all__ = [
     "CapabilityNotAvailableError",
     "RedisBackend",
     "MemcachedBackend",
+    "GCSBackend",
 ]
 
 
@@ -109,7 +112,7 @@ class BackendProvider(Protocol):
 
 
 def __getattr__(name: str):
-    """Lazy imports: pymemcache may not be installed, and redis-py loads only for a program that uses Redis.
+    """Lazy imports: pymemcache or google-cloud-storage may not be installed, and redis-py loads only for a program that uses Redis.
 
     Loading redis-py loads hiredis, which re-enables the GIL on a free-threaded build, so
     ``import cachekit`` must not load it (see cachekit.hiredis_compat).
@@ -122,4 +125,8 @@ def __getattr__(name: str):
         from cachekit.backends.memcached import MemcachedBackend
 
         return MemcachedBackend
+    if name == "GCSBackend":
+        from cachekit.backends.gcs import GCSBackend
+
+        return GCSBackend
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
